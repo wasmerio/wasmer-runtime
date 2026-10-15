@@ -523,3 +523,148 @@ pub(crate) fn emit_local_function(
     }
     Ok(bytes)
 }
+
+/// Serialize a dynamic function trampoline into its own relocatable object
+/// file. Host functions that throw unwind through it, so it gets an
+/// `.eh_frame` entry too.
+pub(crate) fn emit_dynamic_trampoline(
+    #[cfg(feature = "unwind")] isa: &dyn TargetIsa,
+    target: &Target,
+    kind: &CompiledKind,
+    body: &FunctionBody,
+    #[cfg(feature = "unwind")] fde: Option<FrameDescriptionEntry>,
+) -> Result<Vec<u8>, CompileError> {
+    let mut object = get_object_for_target(target.triple())
+        .map_err(|e| CompileError::Codegen(format!("cannot create object: {e}")))?;
+    let symbol = object.add_symbol(Symbol {
+        name: kind.linkage_name().into_bytes(),
+        value: 0,
+        size: body.body.len() as u64,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Linkage,
+        weak: false,
+        section: SymbolSection::Undefined,
+        flags: SymbolFlags::None,
+    });
+    let text = object.section_id(StandardSection::Text);
+    object.add_symbol_data(symbol, text, &body.body, 4);
+
+    #[cfg(feature = "unwind")]
+    if let Some(fde) = fde {
+        emit_unwind_info(&mut object, isa, symbol, fde, None)?;
+    }
+
+    object
+        .write()
+        .map_err(|e| CompileError::Codegen(format!("failed to serialize object: {e}")))
+}
+
+/// Emit the `.eh_frame` unwind table for `function_symbol` (and, if `lsda` is
+/// given, the matching `.gcc_except_table`).
+#[cfg(feature = "unwind")]
+fn emit_unwind_info(
+    object: &mut Object<'static>,
+    isa: &dyn TargetIsa,
+    function_symbol: object::write::SymbolId,
+    fde: FrameDescriptionEntry,
+    lsda: Option<&FunctionLsdaData>,
+) -> Result<(), CompileError> {
+    if let Some(mut cie) = isa.create_systemv_cie() {
+        let pointer_bytes = isa.frontend_config().pointer_bytes();
+
+        // Emit the LSDA into `.gcc_except_table`, plus a per-object tag section
+        // holding the exception tag constants referenced by its type table.
+        let lsda_section_symbol = if let Some(lsda) = lsda {
+            let tag_section_symbol = emit_eh_tag_section(object, lsda);
+
+            let gcc_section = object.add_section(
+                object.segment_name(StandardSegment::Data).to_vec(),
+                b".gcc_except_table".to_vec(),
+                SectionKind::ReadOnlyData,
+            );
+            let lsda_offset =
+                object.append_section_data(gcc_section, &lsda.bytes, u64::from(pointer_bytes));
+            // The type-table slots use `DW_EH_PE_pcrel | sdata4` encoding,
+            // so their relocations are PC-relative 32-bit (`R_X86_64_PC32`).
+            // This keeps `.gcc_except_table` position-independent and read-only.
+            let tag_relocation_flags = RelocationFlags::Generic {
+                kind: object::RelocationKind::Relative,
+                encoding: RelocationEncoding::Generic,
+                size: 32,
+            };
+            for reloc in &lsda.relocations {
+                let (tag_symbol, tag_offset) = tag_section_symbol
+                    .as_ref()
+                    .and_then(|(symbol, offsets)| {
+                        offsets.get(&reloc.tag).map(|offset| (*symbol, *offset))
+                    })
+                    .ok_or_else(|| {
+                        CompileError::Codegen(format!(
+                            "missing exception tag {} for LSDA relocation",
+                            reloc.tag
+                        ))
+                    })?;
+                object
+                    .add_relocation(
+                        gcc_section,
+                        ObjectRelocation {
+                            offset: lsda_offset + reloc.offset as u64,
+                            flags: tag_relocation_flags,
+                            symbol: tag_symbol,
+                            addend: tag_offset as i64,
+                        },
+                    )
+                    .map_err(|e| {
+                        CompileError::Codegen(format!("failed to add LSDA relocation: {e}"))
+                    })?;
+            }
+            Some(object.section_symbol(gcc_section))
+        } else {
+            None
+        };
+
+        // The ELF image may be mapped at any base address, so make the FDE's
+        // function reference position-independent.
+        cie.fde_address_encoding = constants::DW_EH_PE_pcrel | constants::DW_EH_PE_sdata4;
+        let mut fde = fde;
+        if lsda_section_symbol.is_some() {
+            // Reference the personality pointer indirectly and PC-relative.
+            // The shared ELF emitter creates the local pointer slot and its
+            // dynamic relocation. The LSDA lives in the same image and is
+            // referenced directly, PC-relative.
+            cie.personality = Some((
+                constants::DW_EH_PE_indirect
+                    | constants::DW_EH_PE_pcrel
+                    | constants::DW_EH_PE_sdata4,
+                Address::Symbol {
+                    symbol: WriterRelocate::PERSONALITY_SYMBOL,
+                    addend: 0,
+                },
+            ));
+            cie.lsda_encoding = Some(constants::DW_EH_PE_pcrel | constants::DW_EH_PE_sdata4);
+            fde.lsda = Some(Address::Symbol {
+                symbol: WriterRelocate::LSDA_SYMBOL,
+                addend: 0,
+            });
+        }
+
+        let mut frametable = FrameTable::default();
+        let cie_id = frametable.add_cie(cie);
+        frametable.add_fde(cie_id, fde);
+
+        let mut eh_frame = EhFrame(EhFrameWriter::new());
+        frametable
+            .write_eh_frame(&mut eh_frame)
+            .map_err(|e| CompileError::Codegen(format!("failed to write .eh_frame: {e}")))?;
+
+        let relocations = std::mem::take(&mut eh_frame.0.relocs);
+        emit_eh_frame_section(
+            object,
+            &eh_frame.0.into_bytes(),
+            &relocations,
+            function_symbol,
+            lsda_section_symbol,
+        )?;
+    }
+    Ok(())
+}
