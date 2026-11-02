@@ -83,6 +83,7 @@ impl Function {
                 let env = env::FunctionEnvMut {
                     store_mut,
                     func_env: func_env.clone(),
+                    split_lease: None,
                 }
                 .into();
                 let sig = func_ty.clone();
@@ -1091,6 +1092,7 @@ macro_rules! impl_host_function {
                         let f_env = crate::backend::sys::function::env::FunctionEnvMut {
                             store_mut: store,
                             func_env: env.env.as_sys().clone(),
+                            split_lease: None,
                         }.into();
                         to_invocation_result((env.func)(f_env, $($x),* ).into_result())
                     }))
