@@ -348,6 +348,25 @@ unsafe fn volatile_memcpy_write(mut src: *const u8, mut dst: *mut u8, mut len: u
 }
 
 impl crate::Memory {
+    /// Retains native static backing and current bounds without retaining its
+    /// Store or VM definition. This grants no shared-memory attachment rights.
+    #[doc(hidden)]
+    pub fn host_memory_access(
+        &self,
+        store: &impl AsStoreRef,
+    ) -> Result<wasmer_vm::HostMemoryAccess, MemoryError> {
+        match &self.0 {
+            BackendMemory::Sys(memory) => memory
+                .handle
+                .get(store.as_store_ref().objects().as_sys())
+                .host_memory_access(),
+            #[allow(unreachable_patterns)]
+            _ => Err(MemoryError::UnsupportedOperation {
+                message: "native memory access is unsupported by this backend".into(),
+            }),
+        }
+    }
+
     /// Retains only a native static anonymous allocation's lifetime, independently
     /// of its Store. Exact host ranges need their own pins before publication.
     #[doc(hidden)]

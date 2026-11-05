@@ -19,7 +19,7 @@ use std::cell::UnsafeCell;
 use std::convert::TryInto;
 use std::ptr::NonNull;
 use std::slice;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 use wasmer_types::{Bytes, MemoryError, MemoryStyle, MemoryType, Pages, WASM_PAGE_SIZE};
 
@@ -404,6 +404,7 @@ impl VMOwnedMemory {
                 host_ranges: Arc::new(Mutex::new(HostRanges::new(
                     host_private,
                     (mmap.alloc.len() - offset_guard_bytes) as u64,
+                    mmap.size.bytes().0 as u64,
                 ))),
                 mmap,
                 config: VMMemoryConfig {
@@ -434,6 +435,7 @@ impl VMOwnedMemory {
             host_ranges: Arc::new(Mutex::new(HostRanges::new(
                 true,
                 (self.mmap.alloc.len() - self.config.offset_guard_size) as u64,
+                self.mmap.size.bytes().0 as u64,
             ))),
             mmap: self.mmap.copy()?,
             config: self.config.clone(),
@@ -458,7 +460,7 @@ impl LinearMemory for VMOwnedMemory {
         &self,
         range: std::ops::Range<u64>,
     ) -> Result<HostMemoryMappingChange, MemoryError> {
-        HostRanges::begin_change(&self.host_ranges, range, || self.mmap.size.bytes().0 as u64)
+        HostRanges::begin_change(&self.host_ranges, range)
     }
 
     /// Returns the memory style for this memory.
@@ -471,21 +473,39 @@ impl LinearMemory for VMOwnedMemory {
     /// Returns `None` if memory can't be grown by the specified amount
     /// of wasm pages.
     fn grow(&mut self, delta: Pages) -> Result<Pages, MemoryError> {
-        let ranges = self.host_ranges.lock().unwrap();
+        let mut ranges = self.host_ranges.lock().unwrap();
         if delta.0 != 0 {
             ranges.can_grow()?;
         }
-        self.mmap.grow(delta, self.config.clone())
+        let previous = self.mmap.grow(delta, self.config.clone())?;
+        ranges.committed_bytes = self.mmap.size.bytes().0 as u64;
+        Ok(previous)
     }
 
     /// Grows the memory to at least a minimum size. If the memory is already big enough
     /// for the min size then this function does nothing
     fn grow_at_least(&mut self, min_size: u64) -> Result<(), MemoryError> {
-        let ranges = self.host_ranges.lock().unwrap();
+        let mut ranges = self.host_ranges.lock().unwrap();
         if min_size > self.mmap.size.bytes().0 as u64 {
             ranges.can_grow()?;
         }
-        self.mmap.grow_at_least(min_size, self.config.clone())
+        self.mmap.grow_at_least(min_size, self.config.clone())?;
+        ranges.committed_bytes = self.mmap.size.bytes().0 as u64;
+        Ok(())
+    }
+
+    fn host_memory_access(&self) -> Result<HostMemoryAccess, MemoryError> {
+        if self.config.style != MemoryStyle::Static
+            || self.config.maximum.unwrap_or(Pages::max_value()) > MemoryStyle::static_bound()
+        {
+            return Err(host_range_unavailable());
+        }
+        HostMemoryAccess::new(
+            self.mmap.alloc.pin_allocation(),
+            self.host_ranges.clone(),
+            self.mmap.alloc.as_ptr() as usize,
+            self.config.maximum.unwrap_or(Pages::max_value()).bytes().0 as u64,
+        )
     }
 
     fn retain_host_allocation(&self) -> Result<HostMemoryAllocation, MemoryError> {
@@ -530,9 +550,10 @@ impl LinearMemory for VMOwnedMemory {
 
     /// Resets the memory down to a zero size
     fn reset(&mut self) -> Result<(), MemoryError> {
-        let ranges = self.host_ranges.lock().unwrap();
+        let mut ranges = self.host_ranges.lock().unwrap();
         ranges.can_reset()?;
         self.mmap.reset()?;
+        ranges.committed_bytes = 0;
         Ok(())
     }
 
@@ -565,15 +586,18 @@ struct HostRanges {
     // Original backing capability; remapped holes still need exact admission.
     pin_capable: bool,
     next_id: u64,
+    committed_bytes: u64,
+    accesses: usize,
     private: Vec<std::ops::Range<u64>>,
     pins: Vec<(u64, std::ops::Range<u64>)>,
     changes: Vec<(u64, std::ops::Range<u64>)>,
 }
 
 impl HostRanges {
-    fn new(private: bool, capacity: u64) -> Self {
+    fn new(private: bool, capacity: u64, committed_bytes: u64) -> Self {
         Self {
             pin_capable: private,
+            committed_bytes,
             private: if private {
                 std::iter::once(0..capacity).collect()
             } else {
@@ -586,10 +610,9 @@ impl HostRanges {
     fn begin_change(
         state: &Arc<Mutex<Self>>,
         range: std::ops::Range<u64>,
-        size: impl FnOnce() -> u64,
     ) -> Result<HostMemoryMappingChange, MemoryError> {
         let mut ranges = state.lock().unwrap();
-        if range.start >= range.end || range.end > size() || ranges.busy(&range) {
+        if range.start >= range.end || range.end > ranges.committed_bytes || ranges.busy(&range) {
             return Err(host_range_unavailable());
         }
         let was_private = ranges
@@ -608,7 +631,7 @@ impl HostRanges {
     }
 
     fn can_reset(&self) -> Result<(), MemoryError> {
-        if self.pins.is_empty() && self.changes.is_empty() {
+        if self.accesses == 0 && self.pins.is_empty() && self.changes.is_empty() {
             Ok(())
         } else {
             Err(host_range_unavailable())
@@ -723,6 +746,200 @@ impl HostMemoryAllocation {
     #[doc(hidden)]
     pub fn allocation_owner_count(&self) -> usize {
         Arc::strong_count(&self.allocation)
+    }
+}
+
+/// Detached native access to one bounded static anonymous allocation.
+///
+/// This retains no Store, VM definition, or attachable memory. Raw accesses must
+/// obey ordinary guest synchronization and the caller's range permissions.
+#[derive(Clone)]
+pub struct HostMemoryAccess {
+    // Unregister before releasing bytes, and release bytes before accounting.
+    registration: Arc<HostMemoryAccessRegistration>,
+    allocation: Arc<dyn Send + Sync>,
+    base: usize,
+    maximum: u64,
+    owner: Option<Arc<dyn Send + Sync>>,
+    accounting_identity: Option<Weak<dyn Send + Sync>>,
+}
+
+struct HostMemoryAccessRegistration {
+    ranges: Arc<Mutex<HostRanges>>,
+}
+impl Drop for HostMemoryAccessRegistration {
+    fn drop(&mut self) {
+        let mut ranges = self.ranges.lock().unwrap();
+        ranges.accesses -= 1;
+    }
+}
+impl std::fmt::Debug for HostMemoryAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostMemoryAccess")
+            .field("maximum", &self.maximum)
+            .finish()
+    }
+}
+impl HostMemoryAccess {
+    fn new(
+        allocation: Arc<dyn Send + Sync>,
+        state: Arc<Mutex<HostRanges>>,
+        base: usize,
+        maximum: u64,
+    ) -> Result<Self, MemoryError> {
+        {
+            let mut ranges = state.lock().unwrap();
+            if !ranges.pin_capable || ranges.committed_bytes > maximum {
+                return Err(host_range_unavailable());
+            }
+            ranges.accesses = ranges
+                .accesses
+                .checked_add(1)
+                .ok_or_else(host_range_unavailable)?;
+        }
+        Ok(Self {
+            allocation,
+            registration: Arc::new(HostMemoryAccessRegistration { ranges: state }),
+            base,
+            maximum,
+            owner: None,
+            accounting_identity: None,
+        })
+    }
+
+    /// Keeps wrapper accounting with this allocation. An existing owner is
+    /// never replaced; the supplied owner must retain no Store or access token.
+    #[doc(hidden)]
+    pub fn retain_owner(
+        &mut self,
+        owner: Arc<dyn Send + Sync>,
+    ) -> Result<(), Arc<dyn Send + Sync>> {
+        if self.owner.is_some() {
+            return Err(owner);
+        }
+        self.owner = Some(owner);
+        Ok(())
+    }
+
+    /// Identifies the funding source kept alive by the retained accounting
+    /// owner. The weak identity grants no authority and invokes no owner Drop.
+    /// The owner must keep this exact funding source alive for its own lifetime.
+    #[doc(hidden)]
+    pub fn set_accounting_identity(
+        &mut self,
+        identity: Weak<dyn Send + Sync>,
+    ) -> Result<(), Weak<dyn Send + Sync>> {
+        if self.owner.is_none() || self.accounting_identity.is_some() {
+            return Err(identity);
+        }
+        self.accounting_identity = Some(identity);
+        Ok(())
+    }
+
+    /// Whether this backing is already charged to the exact funding source.
+    #[doc(hidden)]
+    pub fn is_accounted_by(&self, identity: &Weak<dyn Send + Sync>) -> bool {
+        self.accounting_identity
+            .as_ref()
+            .is_some_and(|existing| existing.ptr_eq(identity))
+    }
+
+    /// Stable base and current committed byte length. Size is published only
+    /// after successful growth; a live access registration excludes reset.
+    #[doc(hidden)]
+    pub fn host_data(&self) -> Option<(*mut u8, u64)> {
+        let size = self.registration.ranges.lock().unwrap().committed_bytes;
+        Some((self.base as *mut u8, size))
+    }
+
+    /// Whether both authorities name the exact same allocation and range state.
+    #[doc(hidden)]
+    pub fn same_allocation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.allocation, &other.allocation)
+            && Arc::ptr_eq(&self.registration.ranges, &other.registration.ranges)
+    }
+
+    /// Counts physical allocation owners without consulting VM metadata.
+    #[doc(hidden)]
+    pub fn allocation_owner_count(&self) -> usize {
+        Arc::strong_count(&self.allocation)
+    }
+
+    /// The allocation's checked Wasm maximum in bytes.
+    #[doc(hidden)]
+    pub fn maximum_byte_length(&self) -> u64 {
+        self.maximum
+    }
+
+    /// Admits physical replacement; retain this access until the change ends.
+    #[doc(hidden)]
+    pub fn begin_host_mapping_change(
+        &self,
+        range: std::ops::Range<u64>,
+    ) -> Result<HostMemoryMappingChange, MemoryError> {
+        HostRanges::begin_change(&self.registration.ranges, range)
+    }
+
+    /// Pins an exact known private writable range without consulting VM metadata.
+    #[doc(hidden)]
+    pub fn pin_host_range(
+        &self,
+        range: std::ops::Range<u64>,
+    ) -> Result<HostMemoryPin, MemoryError> {
+        let mut ranges = self.registration.ranges.lock().unwrap();
+        if range.start >= range.end
+            || range.end > ranges.committed_bytes
+            || ranges.busy(&range)
+            || !ranges
+                .private
+                .iter()
+                .any(|known| known.start <= range.start && range.end <= known.end)
+        {
+            return Err(host_range_unavailable());
+        }
+        let id = ranges.next_id()?;
+        ranges.pins.push((id, range.clone()));
+        Ok(self.pin(id, range))
+    }
+
+    /// Promotes this exact allocation's completed mapping change into a pin.
+    ///
+    /// # Safety
+    /// The entire range must now have anonymous private writable backing, with
+    /// all physical operations and mapping metadata complete.
+    #[doc(hidden)]
+    pub unsafe fn commit_private_host_pin(
+        &self,
+        mut mapping: HostMemoryMappingChange,
+    ) -> Result<HostMemoryPin, MemoryError> {
+        if !Arc::ptr_eq(&self.registration.ranges, &mapping.ranges) {
+            return Err(host_range_unavailable());
+        }
+        let mut ranges = self.registration.ranges.lock().unwrap();
+        if mapping.range.end > ranges.committed_bytes {
+            return Err(host_range_unavailable());
+        }
+        let id = mapping.id.take().expect("mapping change is still active");
+        let index = ranges
+            .changes
+            .iter()
+            .position(|(other, range)| *other == id && *range == mapping.range)
+            .expect("exact mapping change remains registered");
+        ranges.insert_private(mapping.range.clone());
+        ranges.pins.push((id, mapping.range.clone()));
+        ranges.changes.swap_remove(index);
+        Ok(self.pin(id, mapping.range.clone()))
+    }
+
+    fn pin(&self, id: u64, range: std::ops::Range<u64>) -> HostMemoryPin {
+        HostMemoryPin {
+            _allocation: self.allocation.clone(),
+            ranges: self.registration.ranges.clone(),
+            base: self.base,
+            id,
+            range,
+            owner: self.owner.clone(),
+        }
     }
 }
 
@@ -1038,6 +1255,7 @@ impl VMSharedMemory {
             host_ranges: Arc::new(Mutex::new(HostRanges::new(
                 true,
                 (guard.alloc.len() - self.config.offset_guard_size) as u64,
+                guard.size.bytes().0 as u64,
             ))),
             mmap: Arc::new(RwLock::new(guard.copy()?)),
             config: self.config.clone(),
@@ -1047,6 +1265,26 @@ impl VMSharedMemory {
 }
 
 impl LinearMemory for VMSharedMemory {
+    fn host_memory_access(&self) -> Result<HostMemoryAccess, MemoryError> {
+        if self.config.style != MemoryStyle::Static
+            || self.config.maximum.unwrap_or(Pages::max_value()) > MemoryStyle::static_bound()
+        {
+            return Err(host_range_unavailable());
+        }
+        // Drop the mmap read guard before registering against HostRanges: all
+        // mutations acquire HostRanges first, then the mmap write lock.
+        let (allocation, base) = {
+            let mmap = self.mmap.read().unwrap();
+            (mmap.alloc.pin_allocation(), mmap.alloc.as_ptr() as usize)
+        };
+        HostMemoryAccess::new(
+            allocation,
+            self.host_ranges.clone(),
+            base,
+            self.config.maximum.unwrap_or(Pages::max_value()).bytes().0 as u64,
+        )
+    }
+
     fn retain_host_allocation(&self) -> Result<HostMemoryAllocation, MemoryError> {
         if self.config.style != MemoryStyle::Static
             || self.config.maximum.unwrap_or(Pages::max_value()) > MemoryStyle::static_bound()
@@ -1082,9 +1320,7 @@ impl LinearMemory for VMSharedMemory {
         &self,
         range: std::ops::Range<u64>,
     ) -> Result<HostMemoryMappingChange, MemoryError> {
-        HostRanges::begin_change(&self.host_ranges, range, || {
-            self.mmap.read().unwrap().size.bytes().0 as u64
-        })
+        HostRanges::begin_change(&self.host_ranges, range)
     }
 
     /// Returns the memory style for this memory.
@@ -1097,31 +1333,36 @@ impl LinearMemory for VMSharedMemory {
     /// Returns `None` if memory can't be grown by the specified amount
     /// of wasm pages.
     fn grow(&mut self, delta: Pages) -> Result<Pages, MemoryError> {
-        let ranges = self.host_ranges.lock().unwrap();
+        let mut ranges = self.host_ranges.lock().unwrap();
         if delta.0 != 0 {
             ranges.can_grow()?;
         }
         let mut guard = self.mmap.write().unwrap();
-        guard.grow(delta, self.config.clone())
+        let previous = guard.grow(delta, self.config.clone())?;
+        ranges.committed_bytes = guard.size.bytes().0 as u64;
+        Ok(previous)
     }
 
     /// Grows the memory to at least a minimum size. If the memory is already big enough
     /// for the min size then this function does nothing
     fn grow_at_least(&mut self, min_size: u64) -> Result<(), MemoryError> {
-        let ranges = self.host_ranges.lock().unwrap();
+        let mut ranges = self.host_ranges.lock().unwrap();
         let mut guard = self.mmap.write().unwrap();
         if min_size > guard.size.bytes().0 as u64 {
             ranges.can_grow()?;
         }
-        guard.grow_at_least(min_size, self.config.clone())
+        guard.grow_at_least(min_size, self.config.clone())?;
+        ranges.committed_bytes = guard.size.bytes().0 as u64;
+        Ok(())
     }
 
     /// Resets the memory down to a zero size
     fn reset(&mut self) -> Result<(), MemoryError> {
-        let ranges = self.host_ranges.lock().unwrap();
+        let mut ranges = self.host_ranges.lock().unwrap();
         ranges.can_reset()?;
         let mut guard = self.mmap.write().unwrap();
         guard.reset()?;
+        ranges.committed_bytes = 0;
         Ok(())
     }
 
@@ -1229,6 +1470,10 @@ impl LinearMemory for VMMemory {
         range: std::ops::Range<u64>,
     ) -> Result<HostMemoryMappingChange, MemoryError> {
         self.0.begin_host_mapping_change(range)
+    }
+
+    fn host_memory_access(&self) -> Result<HostMemoryAccess, MemoryError> {
+        self.0.host_memory_access()
     }
 
     fn retain_host_allocation(&self) -> Result<HostMemoryAllocation, MemoryError> {
@@ -1398,6 +1643,13 @@ where
         &self,
         _range: std::ops::Range<u64>,
     ) -> Result<HostMemoryMappingChange, MemoryError> {
+        Err(host_range_unavailable())
+    }
+
+    /// Retains checked native static backing and current bounds, without Store
+    /// access or shared-memory attachment rights. Unknown wrappers fail closed.
+    #[doc(hidden)]
+    fn host_memory_access(&self) -> Result<HostMemoryAccess, MemoryError> {
         Err(host_range_unavailable())
     }
 

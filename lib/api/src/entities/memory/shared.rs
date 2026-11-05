@@ -132,6 +132,23 @@ impl SharedMemory {
         self.memory.host_data()
     }
 
+    /// Retains native backing without Store or VM-definition ownership.
+    #[cfg(feature = "sys")]
+    #[doc(hidden)]
+    pub fn host_memory_access(&self) -> Result<crate::sys::HostMemoryAccess, MemoryError> {
+        use wasmer_vm::LinearMemory as _;
+        if let Some(owner) = &self.native_owner {
+            return owner.host_memory_access();
+        }
+        match &self.memory {
+            VMSharedMemory::Sys(memory) => memory.host_memory_access(),
+            #[allow(unreachable_patterns)]
+            _ => Err(MemoryError::UnsupportedOperation {
+                message: "native memory access is unsupported by this backend".into(),
+            }),
+        }
+    }
+
     /// Pins an exact anonymous private writable range in native static memory.
     /// Cloned handles share the same physical mapping exclusion.
     #[cfg(feature = "sys")]
@@ -317,6 +334,136 @@ impl From<SharedMemory> for MemoryOps {
 mod tests {
     #[cfg(feature = "sys")]
     #[test]
+    fn detached_native_access_tracks_committed_growth_and_vetoes_reset() {
+        use wasmer_types::{MemoryStyle, MemoryType, Pages};
+        use wasmer_vm::{LinearMemory as _, VMMemory};
+        const PAGE: u64 = 65536;
+        for shared in [false, true] {
+            let mut raw =
+                VMMemory::new(&MemoryType::new(1, Some(4), shared), &MemoryStyle::Static).unwrap();
+            let access = raw.host_memory_access().unwrap();
+            let sibling = access.clone();
+            let (base, initial) = access.host_data().unwrap();
+            assert_eq!(initial, PAGE);
+            assert_eq!(access.maximum_byte_length(), 4 * PAGE);
+            assert!(raw.reset().is_err());
+            raw.grow_at_least(3 * PAGE).unwrap();
+            assert_eq!(sibling.host_data(), Some((base, 3 * PAGE)));
+            assert!(raw.grow(Pages(2)).is_err());
+            assert_eq!(access.host_data(), Some((base, 3 * PAGE)));
+            raw.grow(Pages(0)).unwrap();
+            assert!(access.pin_host_range(3 * PAGE..4 * PAGE).is_err());
+            assert!(
+                access
+                    .begin_host_mapping_change(3 * PAGE..4 * PAGE)
+                    .is_err()
+            );
+            let mapping = access.begin_host_mapping_change(PAGE..2 * PAGE).unwrap();
+            assert!(sibling.pin_host_range(PAGE..2 * PAGE).is_err());
+            assert!(raw.grow(Pages(1)).is_err());
+            assert_eq!(access.host_data(), Some((base, 3 * PAGE)));
+            // SAFETY: no physical mutation was needed: this test's range is
+            // still the original anonymous private writable backing.
+            let pin = unsafe { sibling.commit_private_host_pin(mapping) }.unwrap();
+            assert!(access.begin_host_mapping_change(PAGE..2 * PAGE).is_err());
+            drop(access);
+            drop(sibling);
+            assert!(raw.reset().is_err(), "the derived pin keeps reset excluded");
+            drop(pin);
+            raw.reset().unwrap();
+            assert_eq!(raw.host_memory_access().unwrap().host_data().unwrap().1, 0);
+        }
+    }
+
+    #[cfg(feature = "sys")]
+    #[test]
+    fn detached_native_access_copy_has_independent_identity_and_to_shared_preserves_it() {
+        use wasmer_types::{MemoryStyle, MemoryType, Pages};
+        use wasmer_vm::{LinearMemory as _, VMOwnedMemory};
+        const PAGE: u64 = 65536;
+        let raw =
+            VMOwnedMemory::new(&MemoryType::new(2, Some(4), false), &MemoryStyle::Static).unwrap();
+        let access = raw.host_memory_access().unwrap();
+        let mapping = access.begin_host_mapping_change(PAGE..2 * PAGE).unwrap();
+        assert!(
+            raw.copy().is_err(),
+            "a physical replacement excludes copying"
+        );
+        // SAFETY: this test has not changed the original private backing.
+        let pin = unsafe { access.commit_private_host_pin(mapping) }.unwrap();
+        let mut copy = raw.copy().unwrap();
+        let copied = copy.host_memory_access().unwrap();
+        assert!(access.same_allocation(&access.clone()));
+        assert!(access.same_allocation(&raw.host_memory_access().unwrap()));
+        assert!(!access.same_allocation(&copied));
+        assert_ne!(access.host_data().unwrap().0, copied.host_data().unwrap().0);
+        assert!(copied.pin_host_range(PAGE..2 * PAGE).is_ok());
+        let foreign_change = access.begin_host_mapping_change(0..PAGE).unwrap();
+        // SAFETY: the original range remains anonymous private writable memory;
+        // a different allocation must reject its token without publishing a pin.
+        assert!(unsafe { copied.commit_private_host_pin(foreign_change) }.is_err());
+        assert!(access.pin_host_range(0..PAGE).is_err());
+        assert!(copied.pin_host_range(0..PAGE).is_ok());
+        copy.grow(Pages(1)).unwrap();
+        assert_eq!(copied.host_data().unwrap().1, 3 * PAGE);
+        assert_eq!(access.host_data().unwrap().1, 2 * PAGE);
+        let mut shared = raw.to_shared();
+        assert!(shared.begin_host_mapping_change(PAGE..2 * PAGE).is_err());
+        shared.grow(Pages(1)).unwrap();
+        assert_eq!(access.host_data().unwrap().1, 3 * PAGE);
+        drop(pin);
+        drop(access);
+        shared.reset().unwrap();
+        assert_eq!(copied.host_data().unwrap().1, 3 * PAGE);
+    }
+
+    #[cfg(all(feature = "sys", feature = "wat", feature = "compiler"))]
+    #[test]
+    fn detached_native_access_outlives_private_inline_definition_and_store() {
+        use crate::{FunctionEnv, Imports, Instance, Module, Store};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct ObserveDrop(Arc<AtomicUsize>);
+        impl Drop for ObserveDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let access = {
+            let mut store = Store::default();
+            let _env = FunctionEnv::new(&mut store, ObserveDrop(dropped.clone()));
+            let module = Module::new(&store, r#"(module (memory (export "memory") 2 4))"#).unwrap();
+            let instance = Instance::new(&mut store, &module, &Imports::new()).unwrap();
+            let memory = instance.exports.get_memory("memory").unwrap();
+            assert!(memory.as_shared(&store).is_none());
+            let access = memory.host_memory_access(&store).unwrap();
+            assert!(
+                access.allocation_owner_count() > 1,
+                "authority must own its physical allocation before metadata teardown"
+            );
+            access
+        };
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        std::thread::spawn(move || {
+            assert_eq!(access.host_data().unwrap().1, 2 * 65536);
+            let pin = access.pin_host_range(65536..131072).unwrap();
+            // SAFETY: no guest or Store remains; the exact pin owns these bytes.
+            unsafe {
+                pin.as_ptr().write(42);
+                assert_eq!(pin.as_ptr().read(), 42);
+            }
+            drop(pin);
+            drop(access);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[cfg(feature = "sys")]
+    #[test]
     fn host_data_requires_a_reservation_covering_the_full_maximum() {
         use wasmer_types::{MemoryStyle, MemoryType, Pages};
         use wasmer_vm::LinearMemory as _;
@@ -484,10 +631,12 @@ mod tests {
             "an accounting owner must never be silently replaced"
         );
         drop(receipt);
+        let unknown = Unknown(raw);
         assert!(
-            Unknown(raw).retain_host_allocation().is_err(),
+            unknown.retain_host_allocation().is_err(),
             "unknown wrappers fail closed"
         );
+        assert!(unknown.host_memory_access().is_err());
         let dynamic = VMOwnedMemory::new(
             &ty,
             &MemoryStyle::Dynamic {
@@ -496,6 +645,7 @@ mod tests {
         )
         .unwrap();
         assert!(dynamic.retain_host_allocation().is_err());
+        assert!(dynamic.host_memory_access().is_err());
         let directory = tempfile::tempdir().unwrap();
         let backing = directory.path().join("backing");
         std::fs::write(&backing, b"").unwrap();
@@ -507,6 +657,7 @@ mod tests {
         )
         .unwrap();
         assert!(file_backed.retain_host_allocation().is_err());
+        assert!(file_backed.host_memory_access().is_err());
     }
 
     #[cfg(all(feature = "sys", feature = "wat", feature = "compiler"))]
