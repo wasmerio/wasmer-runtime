@@ -50,6 +50,8 @@ struct LocalRwLockInner<T> {
     write_waiters: RefCell<Waiters>,
     #[cfg(feature = "sys")]
     unlock_observers: RefCell<Vec<Weak<dyn Fn()>>>,
+    #[cfg(feature = "sys")]
+    write_release_epoch: Cell<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -113,6 +115,8 @@ impl<T> LocalRwLock<T> {
                 write_waiters: RefCell::default(),
                 #[cfg(feature = "sys")]
                 unlock_observers: RefCell::default(),
+                #[cfg(feature = "sys")]
+                write_release_epoch: Cell::new(0),
             }),
         }
     }
@@ -120,6 +124,11 @@ impl<T> LocalRwLock<T> {
     #[cfg(feature = "sys")]
     pub(crate) fn observe_unlock(&self, observer: Weak<dyn Fn()>) {
         self.inner.unlock_observers.borrow_mut().push(observer);
+    }
+
+    #[cfg(feature = "sys")]
+    pub(crate) fn write_release_epoch(&self) -> u64 {
+        self.inner.write_release_epoch.get()
     }
 
     /// Acquires a read lock, waiting asynchronously if necessary.
@@ -243,6 +252,13 @@ impl<T> LocalRwLockInner<T> {
         match self.state.get() {
             LockState::Writing => {
                 self.state.set(LockState::Unlocked);
+                #[cfg(feature = "sys")]
+                self.write_release_epoch.set(
+                    self.write_release_epoch
+                        .get()
+                        .checked_add(1)
+                        .expect("Store write-release epoch exhausted"),
+                );
                 self.wake_waiters();
             }
             _ => panic!("LocalRwLock: release_write called but not in Writing state"),
