@@ -36,6 +36,108 @@ pub(crate) fn call_function_async(
     AsyncCallFuture::new(function, store, params)
 }
 
+/// Calls a native function with weak, owner-thread metadata for its outer call.
+/// The embedder retains the strong owner through physical settlement and its
+/// local continuation drain. Ordinary call_async installs no metadata.
+#[doc(hidden)]
+#[allow(clippy::type_complexity)]
+pub fn call_async_with_local_owner(
+    function: &crate::Function,
+    store: &StoreAsync,
+    params: Vec<Value>,
+    owner: std::rc::Weak<dyn std::any::Any>,
+) -> Pin<Box<dyn Future<Output = Result<Box<[Value]>, RuntimeError>>>> {
+    match &function.0 {
+        crate::BackendFunction::Sys(function) => Box::pin(AsyncCallFuture::new_with_local_owner(
+            function.clone(),
+            store.clone(),
+            params,
+            Some(owner),
+        )),
+        #[cfg(any(feature = "v8", feature = "js"))]
+        _ => Box::pin(async {
+            Err(RuntimeError::new(
+                "local call owners require the native backend",
+            ))
+        }),
+    }
+}
+
+/// Returns only the outermost explicit local owner in the actual native ancestry.
+/// A dead or differently typed outer owner never falls through to an inner one.
+#[doc(hidden)]
+pub fn current_native_local_owner<T: 'static>() -> Option<Rc<T>> {
+    let current = CoroutineContext::current_root()?;
+    outermost_local_owner(&current.control)?
+        .upgrade()?
+        .downcast::<T>()
+        .ok()
+}
+
+fn outermost_local_owner(
+    current: &Rc<NativeRootControl>,
+) -> Option<std::rc::Weak<dyn std::any::Any>> {
+    let mut pending = vec![current.clone()];
+    let mut rows = Vec::new();
+    let mut visited = Vec::new();
+    while let Some(control) = pending.pop() {
+        if visited.contains(&control.future_id) {
+            continue;
+        }
+        visited.push(control.future_id);
+        let mut parents = control.parent.iter().cloned().collect::<Vec<_>>();
+        {
+            let edges = control.native_edges.borrow();
+            parents.extend(edges.iter().map(|edge| edge.parent.clone()));
+        }
+        // Upgrades and all eventual payload/control drops happen outside metadata borrows.
+        let parents = parents
+            .into_iter()
+            .filter_map(|parent| parent.upgrade())
+            .collect::<Vec<_>>();
+        let parent_ids = parents
+            .iter()
+            .map(|parent| parent.future_id)
+            .collect::<Vec<_>>();
+        rows.push((control.future_id, control.local_owner.clone(), parent_ids));
+        pending.extend(parents);
+    }
+    let mut selected = None;
+    for (id, owner, _) in &rows {
+        let Some(owner) = owner else {
+            continue;
+        };
+        let mut ancestors = vec![*id];
+        let mut seen = Vec::new();
+        let mut shadowed = false;
+        while let Some(at) = ancestors.pop() {
+            if seen.contains(&at) {
+                continue;
+            }
+            seen.push(at);
+            if let Some((_, candidate, parents)) = rows.iter().find(|(id, _, _)| *id == at) {
+                if at != *id && candidate.is_some() {
+                    shadowed = true;
+                    break;
+                }
+                ancestors.extend(parents);
+            }
+        }
+        if shadowed {
+            continue;
+        }
+        if selected
+            .as_ref()
+            .is_some_and(|old| !std::rc::Weak::ptr_eq(old, owner))
+        {
+            // Distinct incomparable explicit owners have no single outer dispatcher.
+            return None;
+        }
+        selected = Some(owner.clone());
+    }
+    selected
+}
+
 // Keep the existing default coroutine capacity, excluding its guard pages.
 const NATIVE_COROUTINE_STACK_BYTES: usize = 1024 * 1024;
 
@@ -1090,6 +1192,7 @@ struct NativeRootControl {
     previous_row: RefCell<Option<Weak<Self>>>,
     reason: OnceCell<RuntimeError>,
     terminal: OnceCell<RuntimeError>,
+    local_owner: Option<std::rc::Weak<dyn std::any::Any>>,
 }
 
 struct NativeParent {
@@ -2170,6 +2273,15 @@ impl AsStoreMut for AsyncCallStoreMut {
 
 impl AsyncCallFuture {
     pub(crate) fn new(function: SysFunction, store: StoreAsync, params: Vec<Value>) -> Self {
+        Self::new_with_local_owner(function, store, params, None)
+    }
+
+    fn new_with_local_owner(
+        function: SysFunction,
+        store: StoreAsync,
+        params: Vec<Value>,
+        local_owner: Option<std::rc::Weak<dyn std::any::Any>>,
+    ) -> Self {
         let store_id = store.id;
         let store_context_id = StoreContext::new_installation_id();
         let id = NEXT_ASYNC_CALL_FUTURE_ID
@@ -2225,6 +2337,7 @@ impl AsyncCallFuture {
             previous_row: RefCell::new(None),
             reason: OnceCell::new(),
             terminal: OnceCell::new(),
+            local_owner,
         });
         if let Some(scope) = &control.scope
             && scope.generation.owner == std::thread::current().id()
@@ -6023,6 +6136,103 @@ mod tests {
             "backend::sys::async_runtime::tests::an_unmanaged_native_frame_transports_and_passes_on_ancestor_cancellation",
             FrameProof::Unmanaged,
         );
+    }
+
+    #[test]
+    fn native_local_owner_is_weak_typed_and_absent_from_ordinary_calls() {
+        struct LocalOwner(Cell<i32>);
+        let mut store = Store::default();
+        let env = crate::FunctionEnv::new(&mut store, ());
+        let function = crate::Function::new_typed_with_env(
+            &mut store,
+            &env,
+            |_env: crate::FunctionEnvMut<'_, ()>| -> i32 {
+                current_native_local_owner::<LocalOwner>().map_or(-1, |owner| {
+                    owner.0.set(owner.0.get() + 1);
+                    owner.0.get()
+                })
+            },
+        );
+        let store = store.into_async();
+        let owner = Rc::new(LocalOwner(Cell::new(40)));
+        let erased: Rc<dyn std::any::Any> = owner.clone();
+        let result = futures::executor::block_on(call_async_with_local_owner(
+            &function,
+            &store,
+            vec![],
+            Rc::downgrade(&erased),
+        ))
+        .unwrap();
+        assert_eq!(result.as_ref(), &[Value::I32(41)]);
+        assert_eq!(owner.0.get(), 41);
+        let ordinary = futures::executor::block_on(function.call_async(&store, vec![])).unwrap();
+        assert_eq!(ordinary.as_ref(), &[Value::I32(-1)]);
+        let wrong: Rc<dyn std::any::Any> = Rc::new(7_u32);
+        let result = futures::executor::block_on(call_async_with_local_owner(
+            &function,
+            &store,
+            vec![],
+            Rc::downgrade(&wrong),
+        ))
+        .unwrap();
+        assert_eq!(result.as_ref(), &[Value::I32(-1)]);
+        let pending =
+            call_async_with_local_owner(&function, &store, vec![], Rc::downgrade(&erased));
+        drop(erased);
+        drop(owner);
+        let result = futures::executor::block_on(pending).unwrap();
+        assert_eq!(result.as_ref(), &[Value::I32(-1)]);
+    }
+
+    #[test]
+    fn native_owner_metadata_selects_outer_explicit_owner_before_upgrade_or_downcast() {
+        fn control(
+            id: AsyncCallFutureId,
+            store_id: StoreId,
+            owner: Option<std::rc::Weak<dyn std::any::Any>>,
+            parent: Option<&Rc<NativeRootControl>>,
+        ) -> Rc<NativeRootControl> {
+            Rc::new(NativeRootControl {
+                future_id: id,
+                scope: None,
+                ancestors: None,
+                store_id,
+                installation: StoreContext::new_installation_id(),
+                retiring: Cell::new(false),
+                settled: Cell::new(false),
+                retained: Cell::new(false),
+                parent: parent.map(Rc::downgrade),
+                native_edges: RefCell::new(vec![]),
+                native_reason: OnceCell::new(),
+                previous_row: RefCell::new(None),
+                reason: OnceCell::new(),
+                terminal: OnceCell::new(),
+                local_owner: owner,
+            })
+        }
+        let store_id = Store::default().id();
+        let inner_owner: Rc<dyn std::any::Any> = Rc::new(17_u32);
+        let outer_owner: Rc<dyn std::any::Any> = Rc::new("outer");
+        let outer = control(1, store_id, Some(Rc::downgrade(&outer_owner)), None);
+        let middle = control(2, store_id, None, Some(&outer));
+        let inner = control(
+            3,
+            store_id,
+            Some(Rc::downgrade(&inner_owner)),
+            Some(&middle),
+        );
+        let selected = outermost_local_owner(&inner).unwrap().upgrade().unwrap();
+        assert!(
+            selected.downcast::<u32>().is_err(),
+            "wrong outer type never selects inner"
+        );
+        drop(outer_owner);
+        assert!(
+            outermost_local_owner(&inner).unwrap().upgrade().is_none(),
+            "dead outer never selects inner"
+        );
+        let absent = control(4, store_id, None, None);
+        assert!(outermost_local_owner(&absent).is_none());
     }
 
     fn native_frame_proof(name: &str, proof: FrameProof) {
