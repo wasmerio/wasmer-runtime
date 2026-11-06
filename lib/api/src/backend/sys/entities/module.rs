@@ -183,22 +183,27 @@ impl Module {
                 return Err(InstantiationError::DifferentStores);
             }
         }
+        #[cfg(feature = "experimental-async")]
+        super::function::check_native_retirement(store).map_err(InstantiationError::Start)?;
         let signal_handler = store.as_store_ref().signal_handler();
-        let mut store_mut = store.as_store_mut();
-        let store_ptr = store_mut.inner as *mut _;
-        let (engine, objects) = store_mut.engine_and_objects_mut();
+        let (engine, mut instance_handle, store_id) = {
+            let mut store_mut = store.as_store_mut();
+            let (engine, objects) = store_mut.engine_and_objects_mut();
+            let instance_handle = unsafe {
+                self.artifact.instantiate(
+                    engine.tunables(),
+                    &imports
+                        .iter()
+                        .map(|e| crate::Extern::to_vm_extern(e).unwrap_sys())
+                        .collect::<Vec<_>>(),
+                    objects.as_sys_mut(),
+                )?
+            };
+            (engine.clone(), instance_handle, objects.id())
+        };
+
         let config = engine.tunables().vmconfig();
         unsafe {
-            let mut instance_handle = self.artifact.instantiate(
-                engine.tunables(),
-                &imports
-                    .iter()
-                    .map(|e| crate::Extern::to_vm_extern(e).unwrap_sys())
-                    .collect::<Vec<_>>(),
-                objects.as_sys_mut(),
-            )?;
-
-            let store_id = objects.id();
             #[cfg(feature = "experimental-host-interrupt")]
             let interrupt_guard = match interrupt_registry::install(store_id) {
                 Ok(x) => x,
@@ -209,26 +214,38 @@ impl Module {
                 }
             };
 
-            let store_install_guard = StoreContext::install(store_ptr);
+            // Match a borrowed Function::call: the enclosing host callback's
+            // Store borrow stays inaccessible while guest startup can suspend.
+            let store_install_guard =
+                StoreContext::install_borrowed(store.as_store_mut().inner as *mut _);
 
-            // After the instance handle is created, we need to initialize
-            // the data, call the start function and so. However, if any
-            // of this steps traps, we still need to keep the instance alive
-            // as some of the Instance elements may have placed in other
-            // instance tables.
-            if let Err(err) =
+            // Initializers can publish funcrefs before startup traps or unwinds.
+            // Release all guest scopes before reacquiring the Store to root them.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Uninstall during the original unwind, before it is caught.
+                #[cfg(feature = "experimental-host-interrupt")]
+                let _interrupt_guard = interrupt_guard;
+                let _store_install_guard = store_install_guard;
+                let _pause_guard = StoreContext::pause(store_id);
                 self.artifact
                     .finish_instantiation(config, signal_handler, &mut instance_handle)
-            {
-                // Keep the partially initialized instance alive: its funcrefs may already
-                // have been written into imported tables.
-                let _ = StoreHandle::new(objects.as_sys_mut(), instance_handle);
-                return Err(err.into());
-            }
+            }));
 
-            drop(store_install_guard);
-            #[cfg(feature = "experimental-host-interrupt")]
-            drop(interrupt_guard);
+            let result = match result {
+                Ok(result) => result.map_err(InstantiationError::from),
+                Err(payload) => {
+                    let _ = StoreHandle::new(store.objects_mut().as_sys_mut(), instance_handle);
+                    std::panic::resume_unwind(payload);
+                }
+            };
+            #[cfg(feature = "experimental-async")]
+            let result = result.and_then(|()| {
+                super::function::check_native_retirement(store).map_err(InstantiationError::Start)
+            });
+            if let Err(err) = result {
+                let _ = StoreHandle::new(store.objects_mut().as_sys_mut(), instance_handle);
+                return Err(err);
+            }
 
             Ok(VMInstance::Sys(instance_handle))
         }

@@ -18,6 +18,7 @@ use corosensei::{
 use dashmap::DashMap;
 
 use super::entities::function::Function as SysFunction;
+use crate::utils::teardown_tls::{TeardownTls, TeardownTlsGuard};
 use crate::{
     AsStoreAsync, AsStoreMut, AsStoreRef, ForcedStoreInstallGuard, LocalRwLock,
     LocalRwLockReadGuard, LocalRwLockWriteGuard, RuntimeError, Store, StoreAsync, StoreContext,
@@ -47,20 +48,105 @@ pub(super) struct NativeStackBounds {
 thread_local! {
     // This is physical call-stack metadata, not cancellation/coroutine TLS.
     // A wrapper may be executing code on its caller before/after the switch.
-    static NATIVE_STACK_BOUNDS: RefCell<Vec<NativeStackBounds>> = const { RefCell::new(Vec::new()) };
+    static NATIVE_STACK_BOUNDS_PRIMARY: Rc<RefCell<Vec<NativeStackBounds>>> = Rc::new(RefCell::new(Vec::new()));
+    static NATIVE_STACK_BOUNDS_TEARDOWN: Cell<*const Rc<RefCell<Vec<NativeStackBounds>>>> = const { Cell::new(std::ptr::null()) };
 }
+static NATIVE_STACK_BOUNDS: TeardownTls<Vec<NativeStackBounds>> =
+    TeardownTls::new(&NATIVE_STACK_BOUNDS_PRIMARY, &NATIVE_STACK_BOUNDS_TEARDOWN);
 
 pub(super) fn current_native_stack_bounds() -> Option<NativeStackBounds> {
     let marker = 0u8;
     let address = &marker as *const u8 as usize;
-    NATIVE_STACK_BOUNDS.with(|bounds| {
-        bounds
-            .borrow()
-            .iter()
-            .rev()
-            .copied()
-            .find(|bounds| bounds.low <= address && address < bounds.base)
-    })
+    NATIVE_STACK_BOUNDS
+        .try_with(|bounds| {
+            bounds
+                .borrow()
+                .iter()
+                .rev()
+                .copied()
+                .find(|bounds| bounds.low <= address && address < bounds.base)
+        })
+        .ok()
+        .flatten()
+}
+
+// Cells own metadata, never their physical roots. Escaped physical owners keep
+// the exact cells alive after the ordinary TLS references have been destroyed.
+#[derive(Clone)]
+struct RuntimeThreadState {
+    stores: crate::StoreThreadState,
+    bounds: Rc<RefCell<Vec<NativeStackBounds>>>,
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    paused: Rc<RefCell<Vec<NativePausedStack>>>,
+    current: Rc<RefCell<Vec<*const CoroutineContext>>>,
+    retained: Rc<RefCell<HashMap<StoreId, Weak<NativeRootControl>>>>,
+    retiring: Rc<RefCell<Option<Rc<NativeRootControl>>>>,
+}
+impl RuntimeThreadState {
+    fn capture() -> Self {
+        Self {
+            stores: crate::StoreThreadState::capture(),
+            bounds: NATIVE_STACK_BOUNDS.capture(),
+            #[cfg(all(
+                target_os = "linux",
+                target_arch = "x86_64",
+                target_pointer_width = "64"
+            ))]
+            paused: NATIVE_PAUSED_STACKS.capture(),
+            current: CURRENT_CONTEXT.capture(),
+            retained: RETAINED_ROOTS.capture(),
+            retiring: RETIRING_ROOT.capture(),
+        }
+    }
+    fn enter(&self) -> RuntimeThreadScope {
+        let mut scope = RuntimeThreadScope {
+            _stores: self.stores.enter(),
+            _bounds: NATIVE_STACK_BOUNDS.enter(self.bounds.clone()),
+            #[cfg(all(
+                target_os = "linux",
+                target_arch = "x86_64",
+                target_pointer_width = "64"
+            ))]
+            _paused: NATIVE_PAUSED_STACKS.enter(self.paused.clone()),
+            _current: CURRENT_CONTEXT.enter(self.current.clone()),
+            _retained: RETAINED_ROOTS.enter(self.retained.clone()),
+            _retiring: RETIRING_ROOT.enter(self.retiring.clone()),
+            _late_cleanup: None,
+        };
+        let late = scope._stores.is_late()
+            || scope._bounds.is_late()
+            || scope._current.is_late()
+            || scope._retained.is_late()
+            || scope._retiring.is_late();
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        ))]
+        let late = late || scope._paused.is_late();
+        if late && !native_cleanup_no_yield() {
+            scope._late_cleanup = Some(NativeCleanupNoYield::enter());
+        }
+        scope
+    }
+}
+struct RuntimeThreadScope {
+    _stores: TeardownTlsGuard<Vec<StoreContext>>,
+    _bounds: TeardownTlsGuard<Vec<NativeStackBounds>>,
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    _paused: TeardownTlsGuard<Vec<NativePausedStack>>,
+    _current: TeardownTlsGuard<Vec<*const CoroutineContext>>,
+    _retained: TeardownTlsGuard<HashMap<StoreId, Weak<NativeRootControl>>>,
+    _retiring: TeardownTlsGuard<Option<Rc<NativeRootControl>>>,
+    _late_cleanup: Option<NativeCleanupNoYield>,
 }
 
 // Only the audited SysV64 profile exposes paused conservative-GC segments.
@@ -131,9 +217,19 @@ struct NativePausedStack {
 thread_local! {
     // Numeric rows own no stack. Each row's caller owns its live spill record;
     // physical engine-frame custody separately retains parked coroutine bytes.
-    static NATIVE_PAUSED_STACKS: RefCell<Vec<NativePausedStack>> = const { RefCell::new(Vec::new()) };
+    static NATIVE_PAUSED_STACKS_PRIMARY: Rc<RefCell<Vec<NativePausedStack>>> = Rc::new(RefCell::new(Vec::new()));
+    static NATIVE_PAUSED_STACKS_TEARDOWN: Cell<*const Rc<RefCell<Vec<NativePausedStack>>>> = const { Cell::new(std::ptr::null()) };
     static NEXT_NATIVE_PAUSE: Cell<u64> = const { Cell::new(0) };
 }
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+))]
+static NATIVE_PAUSED_STACKS: TeardownTls<Vec<NativePausedStack>> = TeardownTls::new(
+    &NATIVE_PAUSED_STACKS_PRIMARY,
+    &NATIVE_PAUSED_STACKS_TEARDOWN,
+);
 
 #[cfg(all(
     target_os = "linux",
@@ -174,13 +270,16 @@ pub(super) fn native_paused_stack_top(bounds: Option<NativeStackBounds>) -> Opti
         target_pointer_width = "64"
     ))]
     {
-        NATIVE_PAUSED_STACKS.with(|rows| {
-            rows.borrow()
-                .iter()
-                .filter(|row| row.bounds == bounds)
-                .map(|row| row.top)
-                .min()
-        })
+        NATIVE_PAUSED_STACKS
+            .try_with(|rows| {
+                rows.borrow()
+                    .iter()
+                    .filter(|row| row.bounds == bounds)
+                    .map(|row| row.top)
+                    .min()
+            })
+            .ok()
+            .flatten()
     }
     #[cfg(not(all(
         target_os = "linux",
@@ -272,6 +371,7 @@ impl Drop for NativeStackBoundary {
 struct NativeCoroutine {
     inner: Option<Coroutine<AsyncResume, AsyncYield, Result<Box<[Value]>, RuntimeError>>>,
     bounds: NativeStackBounds,
+    thread_state: RuntimeThreadState,
 }
 impl NativeCoroutine {
     fn new(
@@ -292,6 +392,7 @@ impl NativeCoroutine {
         Self {
             inner: Some(Coroutine::with_stack(stack, body)),
             bounds: NativeStackBounds { low, base },
+            thread_state: RuntimeThreadState::capture(),
         }
     }
     fn done(&self) -> bool {
@@ -315,6 +416,7 @@ impl NativeCoroutine {
 }
 impl Drop for NativeCoroutine {
     fn drop(&mut self) {
+        let _state = self.thread_state.enter();
         let _physical = NativeStackBoundary::enter(self.bounds);
         with_native_stack_pause(|| drop(self.inner.take()));
     }
@@ -366,7 +468,142 @@ pub struct NativeInvocationScope {
     local: Rc<InvocationScopeLocal>,
 }
 
+/// Owner-local custody shared by every image of one managed runner. Futures
+/// live in this explicit owner, never in a thread-local registry or a Waker.
+/// Each pending continuation must have an owner-thread producer that calls
+/// notify: a bound native root, an observed Store guard, or an enrolled job.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct NativeCleanupOwner(Rc<NativeCleanupState>);
+struct NativeCleanupState {
+    owner: std::thread::ThreadId,
+    futures: RefCell<std::collections::VecDeque<NativeCleanupTask>>,
+    running: Cell<bool>,
+    ready: Cell<bool>,
+    observers: RefCell<Vec<NativeUnlockObserver>>,
+    thread_state: RuntimeThreadState,
+}
+struct NativeCleanupTask {
+    future: Pin<Box<dyn Future<Output = ()>>>,
+    _owner: NativeCleanupOwner,
+}
+struct NativeUnlockObserver {
+    store: crate::WeakLocalRwLock<Box<StoreInner>>,
+    _callback: Rc<dyn Fn()>,
+}
+impl Default for NativeCleanupOwner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl NativeCleanupOwner {
+    /// Create before any image or cleanup admission; retain across exec.
+    pub fn new() -> Self {
+        Self(Rc::new(NativeCleanupState {
+            owner: std::thread::current().id(),
+            futures: RefCell::default(),
+            running: Cell::new(false),
+            ready: Cell::new(false),
+            observers: RefCell::default(),
+            thread_state: RuntimeThreadState::capture(),
+        }))
+    }
+    /// Commit exact continuation custody before the first host-only poll.
+    pub fn retain(&self, future: Pin<Box<dyn Future<Output = ()>>>) {
+        self.0.futures.borrow_mut().push_back(NativeCleanupTask {
+            future,
+            _owner: self.clone(),
+        });
+        self.notify();
+    }
+    /// Pump from an owning-thread physical-unlock or completion event.
+    pub fn notify(&self) {
+        assert_eq!(
+            self.0.owner,
+            std::thread::current().id(),
+            "native cleanup moved threads"
+        );
+        let _state = self.0.thread_state.enter();
+        self.0.ready.set(true);
+        if self.0.running.replace(true) {
+            return;
+        }
+        struct Running<'a>(&'a Cell<bool>);
+        impl Drop for Running<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let running = Running(&self.0.running);
+        let mut failures = Vec::new();
+        while self.0.ready.replace(false) {
+            let futures = std::mem::take(&mut *self.0.futures.borrow_mut());
+            for mut task in futures {
+                // Remove before polling: unlock/settlement callbacks can notify
+                // or enqueue another exact owner while this continuation runs.
+                let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _caller = DetachedCoroutineContext::new();
+                    let _stores = StoreContext::detach_current();
+                    let _logical = DetachedRootMetadata::new();
+                    let _host_cleanup = NativeCleanupNoYield::enter();
+                    task.future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                }));
+                match polled {
+                    Ok(Poll::Pending) => self.0.futures.borrow_mut().push_back(task),
+                    Ok(Poll::Ready(())) => defer_cleanup(&mut failures, || drop(task)),
+                    Err(panic) => {
+                        failures.push(panic);
+                        // A panicked cleanup orchestration releases its concrete
+                        // owner into this same queue; physical roots are unchanged.
+                        defer_cleanup(&mut failures, || drop(task));
+                    }
+                }
+            }
+        }
+        drop(running);
+        resume_cleanup_panics(failures);
+    }
+    fn observe_store(&self, store: &StoreAsync) {
+        let key = store.inner.downgrade();
+        {
+            let mut observers = self.0.observers.borrow_mut();
+            observers.retain(|observer| observer.store.upgrade().is_some());
+            if observers.iter().any(|observer| observer.store.ptr_eq(&key)) {
+                return;
+            }
+        }
+        let weak = Rc::downgrade(&self.0);
+        let callback: Rc<dyn Fn()> = Rc::new(move || {
+            if let Some(owner) = weak.upgrade() {
+                NativeCleanupOwner(owner).notify();
+            }
+        });
+        store.inner.observe_unlock(Rc::downgrade(&callback));
+        self.0.observers.borrow_mut().push(NativeUnlockObserver {
+            store: key,
+            _callback: callback,
+        });
+    }
+}
+
+/// Capture during owner construction, before any teardown. The returned handle
+/// and native root events use direct local ownership after registry destruction.
+#[doc(hidden)]
+pub fn native_cleanup_owner(store: &StoreAsync) -> Option<NativeCleanupOwner> {
+    let generation = store.native_invocation.as_ref()?;
+    INVOCATION_SCOPES.with(|scopes| {
+        let scope = scopes.borrow().get(&generation.id)?.upgrade()?;
+        let owner = scope.cleanup.clone()?;
+        owner.observe_store(store);
+        Some(owner)
+    })
+}
+
 struct InvocationScopeLocal {
+    thread_state: RuntimeThreadState,
+    cleanup: Option<NativeCleanupOwner>,
     generation: Arc<NativeInvocationGeneration>,
     controls: RefCell<HashMap<AsyncCallFutureId, Weak<NativeRootControl>>>,
 }
@@ -434,12 +671,26 @@ impl NativeInvocationScope {
                 "Store already has a native invocation generation",
             ));
         }
-        let scope = Self::new(store.id());
+        Self::bind_with_cleanup(store, None)
+    }
+
+    /// The local owner is created before preparation and reused across exec.
+    #[doc(hidden)]
+    pub fn bind_with_cleanup(
+        store: &mut Store,
+        cleanup: Option<NativeCleanupOwner>,
+    ) -> Result<Self, RuntimeError> {
+        if !store.inner.store.is_sys() || store.inner.native_invocation.is_some() {
+            return Err(RuntimeError::new(
+                "Store cannot bind a native invocation generation",
+            ));
+        }
+        let scope = Self::new_with_cleanup(store.id(), cleanup);
         store.inner.native_invocation = Some(scope.local.generation.clone());
         Ok(scope)
     }
 
-    fn new(store_id: StoreId) -> Self {
+    fn new_with_cleanup(store_id: StoreId, cleanup: Option<NativeCleanupOwner>) -> Self {
         let id = NEXT_NATIVE_INVOCATION_SCOPE
             .fetch_update(
                 std::sync::atomic::Ordering::SeqCst,
@@ -448,6 +699,8 @@ impl NativeInvocationScope {
             )
             .expect("native invocation generation identity exhausted");
         let local = Rc::new(InvocationScopeLocal {
+            thread_state: RuntimeThreadState::capture(),
+            cleanup,
             generation: Arc::new(NativeInvocationGeneration {
                 id,
                 store_id,
@@ -477,6 +730,7 @@ impl NativeInvocationScope {
     /// Reject all new entries and cancel every existing root in this generation.
     /// Waker callbacks run after all metadata borrows have ended.
     pub fn close(&self) {
+        let _state = self.local.thread_state.enter();
         let generation = &self.local.generation;
         if generation
             .closed
@@ -533,9 +787,12 @@ impl NativeInvocationScope {
     /// Escaped guards held by the caller must be released before this wait.
     pub async fn close_and_wait(&mut self) -> Result<(), RuntimeError> {
         self.close();
-        let current = CoroutineContext::current_root()
-            .map(|root| root.control)
-            .or_else(|| RETIRING_ROOT.with(|root| root.borrow().clone()));
+        let current = {
+            let _state = self.local.thread_state.enter();
+            CoroutineContext::current_root()
+                .map(|root| root.control)
+                .or_else(|| RETIRING_ROOT.with(|root| root.borrow().clone()))
+        };
         if current.is_some_and(|control| control.contains_scope(self.local.generation.id)) {
             return Err(RuntimeError::new(
                 "cannot wait for the current native invocation lineage",
@@ -606,7 +863,7 @@ impl NativeInvocationScope {
                 "native invocation generation cannot be replaced yet",
             ));
         }
-        let scope = Self::new(old.store_id);
+        let scope = Self::new_with_cleanup(old.store_id, self.local.cleanup.clone());
         // No callbacks occur between sealing the old consumption authority and
         // publishing the new generation under the exact Store write guard.
         old.superseded
@@ -637,6 +894,7 @@ impl Drop for InvocationScopeLocal {
 }
 
 struct RootInvocationScope {
+    cleanup: Option<std::rc::Weak<NativeCleanupState>>,
     local: Weak<InvocationScopeLocal>,
     generation: Arc<NativeInvocationGeneration>,
     started: Cell<bool>,
@@ -655,7 +913,10 @@ impl Drop for ScopeWaiterRegistration {
 // this only after inner stack, TLS and Store guards have left, and combines a
 // notification panic with any pending cleanup panic before propagating either.
 fn notify_scope_after<T>(
-    generation: Option<Arc<NativeInvocationGeneration>>,
+    generation: Option<(
+        Arc<NativeInvocationGeneration>,
+        Option<std::rc::Weak<NativeCleanupState>>,
+    )>,
     outcome: Result<T, DeferredPanic>,
 ) -> T {
     let mut failures = Vec::new();
@@ -666,8 +927,11 @@ fn notify_scope_after<T>(
             None
         }
     };
-    if let Some(generation) = generation {
+    if let Some((generation, cleanup)) = generation {
         defer_cleanup(&mut failures, || generation.notify_settled());
+        if let Some(owner) = cleanup.and_then(|owner| owner.upgrade()) {
+            defer_cleanup(&mut failures, || NativeCleanupOwner(owner).notify());
+        }
     }
     if !failures.is_empty() {
         let _caller = DetachedCoroutineContext::new();
@@ -689,6 +953,7 @@ struct NativeRootOwner {
     frame_gate: OnceCell<LocalRwLock<()>>,
     frame_resume_waiting: Cell<bool>,
     stack: RefCell<NativeRootStack>,
+    thread_state: RuntimeThreadState,
 }
 
 #[allow(clippy::type_complexity)]
@@ -731,9 +996,16 @@ struct NativeParent {
 thread_local! {
     // A retained original write guard makes this a single-owner association.
     // Weak metadata cannot keep a coroutine, Store or cleanup task alive.
-    static RETAINED_ROOTS: RefCell<HashMap<StoreId, Weak<NativeRootControl>>> = RefCell::new(HashMap::new());
-    static RETIRING_ROOT: RefCell<Option<Rc<NativeRootControl>>> = const { RefCell::new(None) };
+    static RETAINED_ROOTS_PRIMARY: Rc<RefCell<HashMap<StoreId, Weak<NativeRootControl>>>> = Rc::new(RefCell::new(HashMap::new()));
+    static RETAINED_ROOTS_TEARDOWN: Cell<*const Rc<RefCell<HashMap<StoreId, Weak<NativeRootControl>>>>> = const { Cell::new(std::ptr::null()) };
+    static RETIRING_ROOT_PRIMARY: Rc<RefCell<Option<Rc<NativeRootControl>>>> = Rc::new(RefCell::new(None));
+    static RETIRING_ROOT_TEARDOWN: Cell<*const Rc<RefCell<Option<Rc<NativeRootControl>>>>> = const { Cell::new(std::ptr::null()) };
 }
+static RETIRING_ROOT: TeardownTls<Option<Rc<NativeRootControl>>> =
+    TeardownTls::new(&RETIRING_ROOT_PRIMARY, &RETIRING_ROOT_TEARDOWN);
+
+static RETAINED_ROOTS: TeardownTls<HashMap<StoreId, Weak<NativeRootControl>>> =
+    TeardownTls::new(&RETAINED_ROOTS_PRIMARY, &RETAINED_ROOTS_TEARDOWN);
 
 // Destructors run without a coroutine yielder or Store authority. Keep only
 // the exact cancellation metadata available to managed entry checks.
@@ -1103,12 +1375,15 @@ fn current_retirement_control() -> Option<Rc<NativeRootControl>> {
             return Some(root.control.clone());
         }
     }
-    RETIRING_ROOT.with(|current| {
-        current
-            .borrow()
-            .clone()
-            .filter(|control| !control.settled.get())
-    })
+    RETIRING_ROOT
+        .try_with(|current| {
+            current
+                .borrow()
+                .clone()
+                .filter(|control| !control.settled.get())
+        })
+        .ok()
+        .flatten()
 }
 
 // Select exact import bookkeeping without granting a new ancestry edge.
@@ -1333,6 +1608,11 @@ impl NativeCleanupGuard {
 
 impl Drop for NativeCleanupGuard {
     fn drop(&mut self) {
+        let state = self
+            .root
+            .as_ref()
+            .map(|root| root._owner.thread_state.clone());
+        let _state = state.as_ref().map(RuntimeThreadState::enter);
         let already_unwinding = std::thread::panicking();
         let mut failures = Vec::new();
         // The caller has exited/restored the actual engine frame before Drop.
@@ -1410,6 +1690,11 @@ pub struct NativeFrameGuard {
 
 impl Drop for NativeFrameGuard {
     fn drop(&mut self) {
+        let state = self
+            ._root
+            .as_ref()
+            .map(|root| root._owner.thread_state.clone());
+        let _state = state.as_ref().map(RuntimeThreadState::enter);
         let already_unwinding = std::thread::panicking();
         let mut failures = Vec::new();
         // Finish every ownership phase before replaying the first panic. A gate
@@ -1515,6 +1800,11 @@ pub(crate) struct NativeLoanWriteGuard {
 
 impl Drop for NativeLoanReadGuard {
     fn drop(&mut self) {
+        let state = self
+            ._root
+            .as_ref()
+            .map(|root| root._owner.thread_state.clone());
+        let _state = state.as_ref().map(RuntimeThreadState::enter);
         let already_unwinding = std::thread::panicking();
         let mut failures = Vec::new();
         defer_cleanup(&mut failures, || drop(self._gate.take()));
@@ -1533,6 +1823,11 @@ impl NativeLoanReadGuard {
 
 impl Drop for NativeLoanWriteGuard {
     fn drop(&mut self) {
+        let state = self
+            ._root
+            .as_ref()
+            .map(|root| root._owner.thread_state.clone());
+        let _state = state.as_ref().map(RuntimeThreadState::enter);
         let already_unwinding = std::thread::panicking();
         let mut failures = Vec::new();
         defer_cleanup(&mut failures, || drop(self._gate.take()));
@@ -1792,6 +2087,15 @@ impl AsyncCallFuture {
                 .native_invocation
                 .as_ref()
                 .map(|generation| RootInvocationScope {
+                    cleanup: INVOCATION_SCOPES.with(|scopes| {
+                        scopes
+                            .borrow()
+                            .get(&generation.id)
+                            .and_then(Weak::upgrade)
+                            .and_then(|scope| {
+                                scope.cleanup.as_ref().map(|owner| Rc::downgrade(&owner.0))
+                            })
+                    }),
                     local: INVOCATION_SCOPES.with(|scopes| {
                         scopes
                             .borrow()
@@ -1854,6 +2158,7 @@ impl AsyncCallFuture {
                     result
                 });
             NativeRootOwner {
+                thread_state: coroutine.thread_state.clone(),
                 store: Some(store),
                 store_context_id,
                 control,
@@ -1998,12 +2303,14 @@ pub(crate) fn check_async_entry(store: &StoreAsync) -> Result<(), RuntimeError> 
 impl Future for AsyncCallFuture {
     type Output = Result<Box<[Value]>, RuntimeError>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let state = self.root().thread_state.clone();
+        let _state = state.enter();
         let generation = self
             .root()
             .control
             .scope
             .as_ref()
-            .map(|scope| scope.generation.clone());
+            .map(|scope| (scope.generation.clone(), scope.cleanup.clone()));
         if generation.is_none() {
             return self.poll_inner(cx);
         }
@@ -2260,6 +2567,7 @@ impl AsyncCallFuture {
         let Some(root) = self.root.take() else {
             return;
         };
+        let _state = root.thread_state.enter();
         if !root.control.settled.get() {
             root.control.retire(managed_reason);
         }
@@ -2324,11 +2632,12 @@ impl Drop for RootTeardown {
 
 impl Drop for NativeRootOwner {
     fn drop(&mut self) {
+        let _state = self.thread_state.enter();
         let generation = self
             .control
             .scope
             .as_ref()
-            .map(|scope| scope.generation.clone());
+            .map(|scope| (scope.generation.clone(), scope.cleanup.clone()));
         if generation.is_none() {
             return self.drop_stack();
         }
@@ -2609,6 +2918,17 @@ pub enum AsyncRuntimeError {
     RuntimeError(RuntimeError),
 }
 
+/// Whether the current native root can release ordinary Store custody for a
+/// sibling invocation. Call synchronously in an async host-import factory,
+/// before its future is polled outside the coroutine. Grants no Store access.
+#[doc(hidden)]
+pub fn context_switch_supported() -> bool {
+    CoroutineContext::get_current().is_some_and(|context| {
+        // The current context pointer is valid only during this synchronous factory.
+        StoreContext::can_switch_context(unsafe { &*context }.store_context_id)
+    })
+}
+
 pub(crate) fn block_on_host_future<Fut>(future: Fut) -> Result<Vec<Value>, AsyncRuntimeError>
 where
     Fut: Future<Output = Result<Vec<Value>, RuntimeError>> + 'static,
@@ -2677,11 +2997,14 @@ fn notify_descendant_futures(ancestor: AsyncCallFutureId) -> Vec<DeferredPanic> 
 }
 
 thread_local! {
-    static CURRENT_CONTEXT: RefCell<Vec<*const CoroutineContext>> = const { RefCell::new(Vec::new()) };
+    static CURRENT_CONTEXT_PRIMARY: Rc<RefCell<Vec<*const CoroutineContext>>> = Rc::new(RefCell::new(Vec::new()));
+    static CURRENT_CONTEXT_TEARDOWN: Cell<*const Rc<RefCell<Vec<*const CoroutineContext>>>> = const { Cell::new(std::ptr::null()) };
     // This synchronous physical-scope restriction survives metadata detachment
     // around arbitrary Waker callbacks. It owns no Store or coroutine authority.
     static NATIVE_CLEANUP_DEPTH: Cell<usize> = const { Cell::new(0) };
 }
+static CURRENT_CONTEXT: TeardownTls<Vec<*const CoroutineContext>> =
+    TeardownTls::new(&CURRENT_CONTEXT_PRIMARY, &CURRENT_CONTEXT_TEARDOWN);
 
 struct CoroutineContext {
     yielder: *const Yielder<AsyncResume, AsyncYield>,
@@ -2795,7 +3118,10 @@ impl CoroutineContext {
     }
 
     fn get_current() -> Option<*const Self> {
-        CURRENT_CONTEXT.with(|cell| cell.borrow().last().copied())
+        CURRENT_CONTEXT
+            .try_with(|cell| cell.borrow().last().copied())
+            .ok()
+            .flatten()
     }
 
     fn current_root() -> Option<WeakNativeRoot> {
@@ -2855,6 +3181,213 @@ fn run_immediate(
 mod tests {
     use super::*;
     use crate::{Function, Instance, Module};
+
+    #[test]
+    fn native_cleanup_retires_escaped_physical_frames_after_both_tls_orders() {
+        if !runtime_subprocess(
+            "backend::sys::async_runtime::tests::native_cleanup_retires_escaped_physical_frames_after_both_tls_orders",
+        ) {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        thread_local! {
+            static FRAME: RefCell<Option<NativeFrameGuard>> = const { RefCell::new(None) };
+            static ROOT: RefCell<Option<WeakNativeInvocation>> = const { RefCell::new(None) };
+        }
+        #[derive(Debug)]
+        struct StackProbe(Arc<AtomicUsize>);
+        impl std::fmt::Display for StackProbe {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("late physical cleanup error")
+            }
+        }
+        impl std::error::Error for StackProbe {}
+        impl Drop for StackProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        for external_first in [false, true] {
+            let physical = Arc::new(AtomicUsize::new(0));
+            let settled = Arc::new(AtomicUsize::new(0));
+            let payload = Arc::new(AtomicUsize::new(0));
+            let (physical_thread, settled_thread, payload_thread) =
+                (physical.clone(), settled.clone(), payload.clone());
+            std::thread::spawn(move || {
+                if external_first {
+                    FRAME.with(|_| ());
+                }
+                let owner = NativeCleanupOwner::new();
+                let mut store = Store::default();
+                let mut scope =
+                    NativeInvocationScope::bind_with_cleanup(&mut store, Some(owner.clone()))
+                        .unwrap();
+                let physical_thread_check = physical_thread.clone();
+                let bridge =
+                    Function::new_typed(&mut store, move || -> Result<i32, RuntimeError> {
+                        let _physical = StackProbe(physical_thread.clone());
+                        let mut foreign = Store::default();
+                        let leaf = Function::new_async(
+                            &mut foreign,
+                            crate::FunctionType::new([], [crate::Type::I32]),
+                            |_| {
+                                ROOT.with(|root| {
+                                    *root.borrow_mut() = WeakNativeInvocation::current()
+                                });
+                                std::future::pending::<Result<Vec<Value>, RuntimeError>>()
+                            },
+                        );
+                        let module = Module::new(
+                            &foreign,
+                            wat::parse_str(
+                                r#"(module
+                        (import "proof" "leaf" (func $leaf (result i32)))
+                        (func (export "run") (result i32) call $leaf))"#,
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        let instance = Instance::new(
+                            &mut foreign,
+                            &module,
+                            &crate::imports! { "proof" => { "leaf" => leaf } },
+                        )
+                        .unwrap();
+                        instance
+                            .exports
+                            .get_typed_function::<(), i32>(&foreign, "run")
+                            .unwrap()
+                            .call(&mut foreign)
+                    });
+                let store = store.into_async();
+                native_cleanup_owner(&store).unwrap();
+                let mut call = Box::pin(bridge.call_async(&store, vec![]));
+                assert!(
+                    call.as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                let root = ROOT.with(|root| root.borrow_mut().take().unwrap());
+                FRAME.with(|frame| {
+                    *frame.borrow_mut() = Some(unsafe { root.enter_descendant_frame().unwrap() })
+                });
+                drop(call);
+                assert_eq!(
+                    physical_thread_check.load(Ordering::SeqCst),
+                    0,
+                    "the actual foreign synchronous frame remains pinned"
+                );
+                assert!(root.retirement_error().is_some());
+                let mut fence = Box::pin(store.write_lock());
+                assert!(
+                    fence
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_ready(),
+                    "A's actual Store lock is free while its physical frame is pinned"
+                );
+                drop(fence);
+                let payload_check = payload_thread.clone();
+                let error = RuntimeError::user(Box::new(StackProbe(payload_thread)));
+                let exact = error.clone();
+                let settled_check = settled_thread.clone();
+                owner.retain(Box::pin(async move {
+                    scope.close_and_wait_for_cleanup().await;
+                    drop(store.write_lock().await);
+                    assert!(error.downcast_ref::<StackProbe>().is_some());
+                    drop(exact);
+                    drop(error);
+                    settled_thread.fetch_add(1, Ordering::SeqCst);
+                }));
+                assert_eq!(settled_check.load(Ordering::SeqCst), 0);
+                assert_eq!(payload_check.load(Ordering::SeqCst), 0);
+                drop(root);
+                drop(owner);
+                // Actual NativeFrameGuard destruction runs from FRAME's TLS
+                // destructor, before or after the runtime's droppable TLS keys.
+            })
+            .join()
+            .unwrap();
+            assert_eq!(physical.load(Ordering::SeqCst), 1);
+            assert_eq!(settled.load(Ordering::SeqCst), 1);
+            assert_eq!(payload.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
+    fn native_cleanup_observes_recreated_store_locks_and_keeps_exec_owner() {
+        let owner = NativeCleanupOwner::new();
+        let mut store = Store::default();
+        let scope =
+            NativeInvocationScope::bind_with_cleanup(&mut store, Some(owner.clone())).unwrap();
+        let mut store = store.into_async();
+        for _ in 0..4 {
+            let captured = native_cleanup_owner(&store).unwrap();
+            assert!(Rc::ptr_eq(&captured.0, &owner.0));
+            let held = futures::executor::block_on(store.write_lock());
+            let finished = Rc::new(Cell::new(false));
+            let finished_task = finished.clone();
+            let pending = store.store();
+            owner.retain(Box::pin(async move {
+                drop(pending.write_lock().await);
+                finished_task.set(true);
+            }));
+            assert!(!finished.get());
+            drop(held);
+            assert!(finished.get(), "unlock alone must finish retained cleanup");
+            drop(captured);
+            store = store.into_store().unwrap().into_async();
+            assert!(owner.0.futures.borrow().is_empty());
+        }
+        assert_eq!(owner.0.observers.borrow().len(), 1);
+        scope.close();
+        let mut write = futures::executor::block_on(store.write_lock());
+        let (next, store) = scope.successor(&store, &mut write.as_store_mut()).unwrap();
+        drop(write);
+        assert!(Rc::ptr_eq(
+            &native_cleanup_owner(&store).unwrap().0,
+            &owner.0
+        ));
+        drop(next);
+    }
+
+    #[test]
+    fn native_cleanup_unlock_survives_both_external_tls_initialization_orders() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        thread_local! {
+            static HELD: RefCell<Option<crate::StoreAsyncWriteLock>> = const { RefCell::new(None) };
+        }
+        for external_first in [false, true] {
+            let finished = Arc::new(AtomicUsize::new(0));
+            let finished_task = finished.clone();
+            std::thread::spawn(move || {
+                if external_first {
+                    HELD.with(|_| ());
+                }
+                let owner = NativeCleanupOwner::new();
+                let mut store = Store::default();
+                let scope =
+                    NativeInvocationScope::bind_with_cleanup(&mut store, Some(owner.clone()))
+                        .unwrap();
+                let store = store.into_async();
+                native_cleanup_owner(&store).unwrap();
+                HELD.with(|held| {
+                    *held.borrow_mut() = Some(futures::executor::block_on(store.write_lock()))
+                });
+                owner.retain(Box::pin(async move {
+                    drop(store.write_lock().await);
+                    finished_task.fetch_add(1, Ordering::SeqCst);
+                }));
+                drop(scope);
+                drop(owner);
+                // No executor or subsequent Store operation: the TLS guard's
+                // actual unlock owns the only remaining progress notification.
+            })
+            .join()
+            .unwrap();
+            assert_eq!(finished.load(Ordering::SeqCst), 1);
+        }
+    }
 
     #[test]
     fn physical_stack_bounds_survive_detached_metadata_and_coroutine_drop() {

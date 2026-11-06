@@ -51,7 +51,7 @@ enum NativeCallEntry {
 }
 
 #[cfg(feature = "experimental-async")]
-fn check_native_retirement(store: &impl AsStoreRef) -> Result<(), RuntimeError> {
+pub(super) fn check_native_retirement(store: &impl AsStoreRef) -> Result<(), RuntimeError> {
     use crate::backend::sys::async_runtime::{current_retirement_error, store_retirement_error};
     if let Some(error) = current_retirement_error() {
         return Err(error);

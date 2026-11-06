@@ -34,6 +34,10 @@ impl<T> Clone for WeakLocalRwLock<T> {
 }
 
 impl<T> WeakLocalRwLock<T> {
+    #[cfg(feature = "sys")]
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.inner, &other.inner)
+    }
     pub(crate) fn upgrade(&self) -> Option<LocalRwLock<T>> {
         self.inner.upgrade().map(|inner| LocalRwLock { inner })
     }
@@ -44,6 +48,8 @@ struct LocalRwLockInner<T> {
     state: Cell<LockState>,
     read_waiters: RefCell<Waiters>,
     write_waiters: RefCell<Waiters>,
+    #[cfg(feature = "sys")]
+    unlock_observers: RefCell<Vec<Weak<dyn Fn()>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -105,8 +111,15 @@ impl<T> LocalRwLock<T> {
                 state: Cell::new(LockState::Unlocked),
                 read_waiters: RefCell::default(),
                 write_waiters: RefCell::default(),
+                #[cfg(feature = "sys")]
+                unlock_observers: RefCell::default(),
             }),
         }
+    }
+
+    #[cfg(feature = "sys")]
+    pub(crate) fn observe_unlock(&self, observer: Weak<dyn Fn()>) {
+        self.inner.unlock_observers.borrow_mut().push(observer);
     }
 
     /// Acquires a read lock, waiting asynchronously if necessary.
@@ -237,16 +250,50 @@ impl<T> LocalRwLockInner<T> {
     }
 
     fn wake_waiters(&self) {
-        // Invalidate old slot keys before arbitrary wake code can register new waiters.
         let write_waiters = self.write_waiters.borrow_mut().take_all();
-        if write_waiters.iter().any(Option::is_some) {
-            for waker in write_waiters.into_iter().flatten() {
-                waker.wake();
-            }
+        let waiters = if write_waiters.iter().any(Option::is_some) {
+            write_waiters
         } else {
-            let read_waiters = self.read_waiters.borrow_mut().take_all();
-            for waker in read_waiters.into_iter().flatten() {
-                waker.wake();
+            self.read_waiters.borrow_mut().take_all()
+        };
+        #[cfg(feature = "sys")]
+        let observers = {
+            let mut observers = self.unlock_observers.borrow_mut();
+            let live = observers
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>();
+            observers.retain(|observer| observer.strong_count() != 0);
+            live
+        };
+        // Neither user Wakers nor owner-local observers execute under list borrows.
+        // A failing Waker must not suppress the physical cleanup event.
+        let unwinding = std::thread::panicking();
+        let mut failures = Vec::new();
+        for waker in waiters.into_iter().flatten() {
+            if let Err(panic) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| waker.wake()))
+            {
+                failures.push(panic);
+            }
+        }
+        #[cfg(feature = "sys")]
+        for observer in observers {
+            if let Err(panic) =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer()))
+            {
+                failures.push(panic);
+            }
+        }
+        if !failures.is_empty() {
+            let first = failures.remove(0);
+            for failure in failures {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(failure)));
+            }
+            if unwinding {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(first)));
+            } else {
+                std::panic::resume_unwind(first);
             }
         }
     }

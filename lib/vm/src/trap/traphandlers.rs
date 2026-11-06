@@ -120,7 +120,7 @@ thread_local! {
 fn acquire_stack(min_size: usize) -> DefaultStack {
     // Fast path: thread-local cache. Steady-state per-thread reuse never
     // touches the SegQueue.
-    if let Some(stack) = TLS_STACK.with(|cache| cache.0.take()) {
+    if let Some(stack) = TLS_STACK.try_with(|cache| cache.0.take()).ok().flatten() {
         if stack.size() >= min_size {
             return stack;
         }
@@ -140,7 +140,12 @@ fn acquire_stack(min_size: usize) -> DefaultStack {
 /// atomics); otherwise pushes to the global `STACK_POOL` so the stack is
 /// still reusable by other threads.
 fn release_stack(stack: DefaultStack) {
-    let displaced = TLS_STACK.with(|cache| cache.0.replace(Some(stack)));
+    // An escaped native frame can release its VM stack after the thread-local
+    // cache was destroyed. Keep ownership until the cache actually takes it.
+    let mut returned = Some(stack);
+    let displaced = TLS_STACK
+        .try_with(|cache| cache.0.replace(returned.take()))
+        .unwrap_or_else(|_| returned.take());
     if let Some(displaced) = displaced {
         STACK_POOL.push(displaced);
     }
@@ -164,7 +169,7 @@ fn release_stack(stack: DefaultStack) {
 pub fn drain_stack_pool() {
     // Drain the calling thread's TLS slot first (best-effort across threads
     // still applies — other threads' caches aren't touched).
-    if let Some(stack) = TLS_STACK.with(|cache| cache.0.take()) {
+    if let Some(stack) = TLS_STACK.try_with(|cache| cache.0.take()).ok().flatten() {
         drop(stack);
     }
     while STACK_POOL.pop().is_some() {}

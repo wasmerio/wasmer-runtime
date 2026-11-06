@@ -170,10 +170,36 @@ pub(crate) struct StoreInstallGuard {
 }
 
 thread_local! {
+    #[cfg(not(all(feature = "sys", feature = "experimental-async")))]
     static STORE_CONTEXT_STACK: RefCell<Vec<StoreContext>> = const { RefCell::new(Vec::new()) };
     static NEXT_STORE_CONTEXT_ID: Cell<u64> = const { Cell::new(0) };
     #[cfg(feature = "sys")]
     static HIDDEN_STORE_CONTEXT_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(all(feature = "sys", feature = "experimental-async"))]
+thread_local! {
+    static STORE_CONTEXT_STACK_PRIMARY: Rc<RefCell<Vec<StoreContext>>> = Rc::new(RefCell::new(Vec::new()));
+    static STORE_CONTEXT_STACK_TEARDOWN: Cell<*const Rc<RefCell<Vec<StoreContext>>>> = const { Cell::new(std::ptr::null()) };
+}
+#[cfg(all(feature = "sys", feature = "experimental-async"))]
+static STORE_CONTEXT_STACK: crate::utils::teardown_tls::TeardownTls<Vec<StoreContext>> =
+    crate::utils::teardown_tls::TeardownTls::new(
+        &STORE_CONTEXT_STACK_PRIMARY,
+        &STORE_CONTEXT_STACK_TEARDOWN,
+    );
+
+#[cfg(all(feature = "sys", feature = "experimental-async"))]
+#[derive(Clone)]
+pub(crate) struct StoreThreadState(Rc<RefCell<Vec<StoreContext>>>);
+#[cfg(all(feature = "sys", feature = "experimental-async"))]
+impl StoreThreadState {
+    pub(crate) fn capture() -> Self {
+        Self(STORE_CONTEXT_STACK.capture())
+    }
+    pub(crate) fn enter(&self) -> crate::utils::teardown_tls::TeardownTlsGuard<Vec<StoreContext>> {
+        STORE_CONTEXT_STACK.enter(self.0.clone())
+    }
 }
 
 impl StoreContext {
@@ -717,6 +743,20 @@ impl StoreContext {
             // The existing same-Store path has no synchronous suffix. Its
             // retained-borrow ownership requires a separate Store loan mechanism.
             stack.len() == depth + 1 || Self::suspendable_suffix(&stack, depth)
+        })
+    }
+
+    /// Independent sibling roots require ordinary owned Async custody, including
+    /// the no-suffix case. A Loan may suspend, but retains its original caller's
+    /// actual mutable Store borrow and cannot admit another root on this Store.
+    #[cfg(all(feature = "experimental-async", feature = "sys"))]
+    pub(crate) fn can_switch_context(installation: StoreContextId) -> bool {
+        STORE_CONTEXT_STACK.with(|cell| {
+            let stack = cell.borrow();
+            stack
+                .iter()
+                .position(|entry| entry.installation == installation)
+                .is_some_and(|depth| Self::suspendable_suffix(&stack, depth))
         })
     }
 
@@ -1429,6 +1469,7 @@ mod native_suspension {
         });
         assert_ne!(identities[1], identities[3]);
         assert!(StoreContext::can_suspend_suffix(root_id));
+        assert!(StoreContext::can_switch_context(root_id));
         let mut suspended = SuspendedStoreContexts::default();
         root.suspend_suffix(&mut suspended);
         drop(root);
@@ -1464,13 +1505,22 @@ mod native_suspension {
         let store = Store::default().into_async();
         let root_id = StoreContext::new_installation_id();
         let root = StoreContext::install_async_with_id(store.inner.try_write().unwrap(), root_id);
+        assert!(
+            StoreContext::can_switch_context(root_id),
+            "ordinary Async root without a suffix releases its Store"
+        );
         let borrowed = unsafe { StoreContext::get_current(store.id) };
+        assert!(
+            !StoreContext::can_switch_context(root_id),
+            "a live root borrow cannot admit a sibling"
+        );
         // No suffix: preserve the existing supported same-Store call path.
         assert!(StoreContext::can_suspend_suffix(root_id));
         let pause = unsafe { StoreContext::pause(store.id) };
         let mut other = Store::default();
         let nested = unsafe { StoreContext::install(other.as_store_mut().inner) };
         assert!(!StoreContext::can_suspend_suffix(root_id));
+        assert!(!StoreContext::can_switch_context(root_id));
         drop(nested);
         drop(pause);
         drop(borrowed);
@@ -1479,17 +1529,21 @@ mod native_suspension {
         let nested = unsafe { StoreContext::install(other.as_store_mut().inner) };
         let borrowed = unsafe { StoreContext::get_current(other.id()) };
         assert!(!StoreContext::can_suspend_suffix(root_id));
+        assert!(!StoreContext::can_switch_context(root_id));
         let pause = unsafe { StoreContext::pause(other.id()) };
         assert!(!StoreContext::can_suspend_suffix(root_id));
+        assert!(!StoreContext::can_switch_context(root_id));
         drop(pause);
         drop(borrowed);
         let repeated = unsafe { StoreContext::install(root_ptr) };
         assert!(!StoreContext::can_suspend_suffix(root_id));
+        assert!(!StoreContext::can_switch_context(root_id));
         drop(repeated);
         drop(nested);
         let other = other.into_async();
         let nested = StoreContext::install_async(other.inner.try_write().unwrap());
         assert!(!StoreContext::can_suspend_suffix(root_id));
+        assert!(!StoreContext::can_switch_context(root_id));
         drop(nested);
         drop(root);
         assert!(StoreContext::is_empty());

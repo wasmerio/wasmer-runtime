@@ -20,3 +20,6 @@ pub(crate) mod rt_macros;
 pub(crate) mod polyfill;
 
 pub(crate) mod macros;
+
+#[cfg(all(feature = "sys", feature = "experimental-async"))]
+pub(crate) mod teardown_tls;

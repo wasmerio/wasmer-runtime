@@ -38,6 +38,43 @@ fn an_escaped_store_loan_delays_canceled_stack_retirement() {
 }
 
 #[test]
+fn a_same_store_loan_without_a_sync_suffix_cannot_switch_contexts() {
+    if !run_in_subprocess("a_same_store_loan_without_a_sync_suffix_cannot_switch_contexts") {
+        return;
+    }
+    use wasmer::AsyncFunctionEnvMut;
+    let mut store = Store::default();
+    let leaf = Function::new_typed_async(&mut store, || {
+        assert!(
+            !wasmer::sys::context_switch_supported(),
+            "a Loan root retains its original caller's mutable Store borrow"
+        );
+        async { 42i32 }
+    });
+    let env = FunctionEnv::new(&mut store, leaf);
+    let bridge = Function::new_typed_with_env_async(
+        &mut store,
+        &env,
+        |env: AsyncFunctionEnvMut<Function>| async move {
+            let function = env.read().await.data().clone();
+            let values = function.call_async(&env.as_store_async(), vec![]).await?;
+            Ok::<i32, RuntimeError>(values[0].i32().unwrap())
+        },
+    );
+    let env = FunctionEnv::new(&mut store, bridge);
+    let outer =
+        Function::new_typed_with_env(&mut store, &env, |mut env: FunctionEnvMut<Function>| {
+            let function = env.data().clone();
+            function
+                .call(&mut env, &[])
+                .map(|values| values[0].i32().unwrap())
+        });
+    let result =
+        futures::executor::block_on(outer.call_async(&store.into_async(), vec![])).unwrap();
+    assert_eq!(result[0].i32(), Some(42));
+}
+
+#[test]
 fn a_dynamic_host_callback_can_reenter_its_same_function_context() {
     if !run_in_subprocess("a_dynamic_host_callback_can_reenter_its_same_function_context") {
         return;
@@ -80,6 +117,487 @@ fn a_dynamic_host_callback_can_reenter_its_same_function_context() {
         futures::executor::block_on(run.call_async(&store.into_async(), vec![Value::I32(3)]))
             .unwrap();
     assert_eq!(result[0].i32(), Some(42));
+}
+
+#[test]
+fn native_instance_start_suspends_inside_its_same_store_trampoline() {
+    instance_start_proof(
+        "native_instance_start_suspends_inside_its_same_store_trampoline",
+        StartEnd::Return,
+        false,
+    );
+}
+
+#[test]
+fn native_instance_start_preserves_its_original_error_and_reuses_the_store() {
+    instance_start_proof(
+        "native_instance_start_preserves_its_original_error_and_reuses_the_store",
+        StartEnd::Error,
+        false,
+    );
+}
+
+#[test]
+fn native_instance_start_preserves_its_original_panic_and_published_funcref() {
+    instance_start_proof(
+        "native_instance_start_preserves_its_original_panic_and_published_funcref",
+        StartEnd::Panic,
+        false,
+    );
+}
+
+#[test]
+fn native_instance_start_cancellation_retires_its_frame_and_reuses_the_store() {
+    instance_start_proof(
+        "native_instance_start_cancellation_retires_its_frame_and_reuses_the_store",
+        StartEnd::Cancel,
+        false,
+    );
+}
+
+#[test]
+fn native_instance_start_cancellation_waits_for_its_escaped_store_loan() {
+    instance_start_proof(
+        "native_instance_start_cancellation_waits_for_its_escaped_store_loan",
+        StartEnd::EscapedLoan,
+        false,
+    );
+}
+
+#[test]
+fn native_instance_start_reenters_through_a_parked_c_callback() {
+    instance_start_proof(
+        "native_instance_start_reenters_through_a_parked_c_callback",
+        StartEnd::Return,
+        true,
+    );
+}
+
+#[test]
+fn native_instance_start_c_callback_preserves_the_original_error() {
+    instance_start_proof(
+        "native_instance_start_c_callback_preserves_the_original_error",
+        StartEnd::Error,
+        true,
+    );
+}
+
+#[test]
+fn native_instance_start_c_callback_cancellation_waits_for_the_escaped_loan() {
+    instance_start_proof(
+        "native_instance_start_c_callback_cancellation_waits_for_the_escaped_loan",
+        StartEnd::EscapedLoan,
+        true,
+    );
+}
+
+struct NativeCallbackTarget {
+    // This function's source StoreId is checked by is_from_store before any
+    // access. StoreRef does not expose a public id accessor.
+    expected_store: wasmer_types::StoreId,
+    target: Function,
+    result: Option<Result<(), RuntimeError>>,
+    frame_drops: Arc<AtomicUsize>,
+}
+
+#[derive(Debug)]
+struct WrongCallbackStore(wasmer_types::StoreId);
+impl std::fmt::Display for WrongCallbackStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "callback expected Store {:?}", self.0)
+    }
+}
+impl std::error::Error for WrongCallbackStore {}
+
+// This tests the API primitive across an actual C ABI frame. It is not proof
+// of the exported wasm_func_new implementation, which has a separate wrapper.
+unsafe extern "C" fn native_callback_reenter(payload: *mut std::ffi::c_void) {
+    use wasmer::sys::NativeEngineStackBounds;
+    struct Frame {
+        bounds: NativeEngineStackBounds,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for Frame {
+        fn drop(&mut self) {
+            assert_eq!(NativeEngineStackBounds::current(), Some(self.bounds));
+            let address = self as *const Self as usize;
+            assert!((self.bounds.usable_low..self.bounds.base).contains(&address));
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    // SAFETY: the caller parks the split Store borrow and lends this distinct
+    // function-env payload for precisely the lifetime of this C call.
+    let payload = unsafe { &mut *payload.cast::<NativeCallbackTarget>() };
+    let _frame = Frame {
+        bounds: NativeEngineStackBounds::current().expect("native C callback frame"),
+        drops: payload.frame_drops.clone(),
+    };
+    let result = Store::with_current(|mut current| {
+        if !payload.target.is_from_store(&current) {
+            return Err(RuntimeError::user(Box::new(WrongCallbackStore(
+                payload.expected_store,
+            ))));
+        }
+        payload.target.call(&mut current, &[]).map(|_| ())
+    })
+    .unwrap_or_else(|| Err(RuntimeError::new("C callback has no parked Store")));
+    assert!(payload.result.replace(result).is_none());
+}
+
+fn parked_c_callback(mut env: FunctionEnvMut<NativeCallbackTarget>) -> Result<(), RuntimeError> {
+    let (payload, mut store) = env.data_and_store_mut();
+    store.parked(|| {
+        // SAFETY: the payload remains exclusively borrowed until the callback
+        // returns; no pointer or Store handle escapes this call.
+        unsafe { native_callback_reenter((payload as *mut NativeCallbackTarget).cast()) }
+    });
+    payload
+        .result
+        .take()
+        .expect("C callback reported its result")
+}
+
+#[test]
+fn a_parked_c_callback_rejects_another_store_before_guest_entry() {
+    if !run_in_subprocess("a_parked_c_callback_rejects_another_store_before_guest_entry") {
+        return;
+    }
+    let mut expected = Store::default();
+    let entries = Arc::new(AtomicUsize::new(0));
+    let target = Function::new_typed(&mut expected, {
+        let entries = entries.clone();
+        move || {
+            entries.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let expected_id = expected.id();
+    let frame_drops = Arc::new(AtomicUsize::new(0));
+    let mut foreign = Store::default();
+    assert_ne!(expected.id(), foreign.id());
+    let callback_env = FunctionEnv::new(
+        &mut foreign,
+        NativeCallbackTarget {
+            expected_store: expected_id,
+            target: target.clone(),
+            result: None,
+            frame_drops: frame_drops.clone(),
+        },
+    );
+    let callback = Function::new_typed_with_env(&mut foreign, &callback_env, parked_c_callback);
+    let next = Function::new_typed(&mut foreign, || 17i32);
+    let foreign = foreign.into_async();
+    let error = futures::executor::block_on(callback.call_async(&foreign, vec![])).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<WrongCallbackStore>().unwrap().0,
+        expected_id
+    );
+    assert_eq!(entries.load(Ordering::SeqCst), 0);
+    assert_eq!(frame_drops.load(Ordering::SeqCst), 1);
+    assert!(callback_env.as_ref(&foreign.read()).result.is_none());
+    assert_eq!(
+        futures::executor::block_on(next.call_async(&foreign, vec![]))
+            .unwrap()
+            .as_ref(),
+        &[Value::I32(17)]
+    );
+    assert!(target.call(&mut expected, &[]).unwrap().is_empty());
+    assert_eq!(entries.load(Ordering::SeqCst), 1);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StartEnd {
+    Return,
+    Error,
+    Panic,
+    Cancel,
+    EscapedLoan,
+}
+
+// Exercise existing Instance::new inside the actual native coroutine, rather
+// than wrapping synchronous instantiation in an unrelated future or executor.
+fn instance_start_proof(test_name: &str, end: StartEnd, c_callback: bool) {
+    if !run_in_subprocess(test_name) {
+        return;
+    }
+    use std::cell::RefCell;
+    use wasmer::{
+        AsStoreAsync, AsyncFunctionEnvHandleMut, AsyncFunctionEnvMut, Imports, InstantiationError,
+        sys::NativeEngineStackBounds,
+    };
+
+    thread_local! {
+        static CAP: RefCell<Option<AsyncFunctionEnvMut<()>>> = const { RefCell::new(None) };
+        static GUARD: RefCell<Option<AsyncFunctionEnvHandleMut<()>>> = const { RefCell::new(None) };
+    }
+    struct Setup {
+        payload: Option<(Module, Imports)>,
+        instance: Option<Instance>,
+        frame_drops: Arc<AtomicUsize>,
+        constructed: Arc<AtomicUsize>,
+    }
+    struct Frame {
+        bounds: NativeEngineStackBounds,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for Frame {
+        fn drop(&mut self) {
+            assert_eq!(NativeEngineStackBounds::current(), Some(self.bounds));
+            let address = self as *const Self as usize;
+            assert!((self.bounds.usable_low..self.bounds.base).contains(&address));
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let mut store = Store::default();
+    let expected_store = store.id();
+    let frame_drops = Arc::new(AtomicUsize::new(0));
+    let body_drops = Arc::new(AtomicUsize::new(0));
+    let constructed = Arc::new(AtomicUsize::new(0));
+    let (send, receive) = futures::channel::oneshot::channel::<()>();
+    let receive = Arc::new(Mutex::new(Some(receive)));
+    let original = RuntimeError::user(Box::new(std::io::Error::other("start original error")));
+    let leaf_env = FunctionEnv::new(&mut store, ());
+    let pending = Function::new_with_env_async(&mut store, &leaf_env, FunctionType::new([], []), {
+        let body_drops = body_drops.clone();
+        let original = original.clone();
+        move |mut env: AsyncFunctionEnvMut<()>, _: &[Value]| {
+            let receive = receive.lock().unwrap().take().unwrap();
+            let body_drops = body_drops.clone();
+            let original = original.clone();
+            async move {
+                let _body = Dropped(body_drops);
+                assert_eq!(env.as_store_async().store_id(), expected_store);
+                let write = env.write().await;
+                CAP.with(|slot| assert!(slot.borrow_mut().replace(env.as_mut()).is_none()));
+                if end == StartEnd::EscapedLoan {
+                    GUARD.with(|slot| assert!(slot.borrow_mut().replace(write).is_none()));
+                } else {
+                    drop(write);
+                }
+                receive.await.unwrap();
+                if end == StartEnd::Panic {
+                    std::panic::panic_any(original);
+                }
+                if end == StartEnd::Error {
+                    Err(original)
+                } else {
+                    Ok(vec![])
+                }
+            }
+        }
+    });
+    let callback_drops = Arc::new(AtomicUsize::new(0));
+    let (startup, callback_env) = if c_callback {
+        let leaf = Module::new(
+            &store,
+            r#"(module
+            (import "proof" "pending" (func $pending))
+            (func (export "leaf") call $pending))"#,
+        )
+        .unwrap();
+        let instance = Instance::new(
+            &mut store,
+            &leaf,
+            &imports! {
+                "proof" => { "pending" => pending }
+            },
+        )
+        .unwrap();
+        let callback_env = FunctionEnv::new(
+            &mut store,
+            NativeCallbackTarget {
+                expected_store,
+                target: instance.exports.get_function("leaf").unwrap().clone(),
+                result: None,
+                frame_drops: callback_drops.clone(),
+            },
+        );
+        (
+            Function::new_typed_with_env(&mut store, &callback_env, parked_c_callback),
+            Some(callback_env),
+        )
+    } else {
+        (pending, None)
+    };
+    let module = Module::new(
+        &store,
+        r#"(module
+            (import "proof" "pending" (func $pending))
+            (import "proof" "table" (table 1 funcref))
+            (global $started (mut i32) (i32.const 0))
+            (func $start call $pending i32.const 1 global.set $started)
+            (start $start)
+            (func (export "started") (result i32) global.get $started)
+            (func $reactor (export "reactor") (param i32) (result i32) local.get 0 i32.const 1 i32.add)
+            (elem (i32.const 0) func $reactor))"#,
+    )
+    .unwrap();
+    let table = wasmer::Table::new(
+        &mut store,
+        wasmer::TableType::new(wasmer::Type::FuncRef, 1, None),
+        Value::FuncRef(None),
+    )
+    .unwrap();
+    let setup = FunctionEnv::new(
+        &mut store,
+        Setup {
+            payload: Some((
+                module,
+                imports! { "proof" => { "pending" => startup, "table" => table.clone() } },
+            )),
+            instance: None,
+            frame_drops: frame_drops.clone(),
+            constructed: constructed.clone(),
+        },
+    );
+    let bridge = Function::new_typed_with_env(
+        &mut store,
+        &setup,
+        |mut env: FunctionEnvMut<Setup>| -> Result<(), RuntimeError> {
+            let frame = Frame {
+                bounds: NativeEngineStackBounds::current().expect("native trampoline stack"),
+                drops: env.data().frame_drops.clone(),
+            };
+            let address = &frame as *const Frame as usize;
+            assert!((frame.bounds.usable_low..frame.bounds.base).contains(&address));
+            let (module, imports) = env.data_mut().payload.take().unwrap();
+            let result = Instance::new(&mut env, &module, &imports);
+            let instance = match result {
+                Ok(instance) => instance,
+                Err(InstantiationError::Start(error)) => return Err(error),
+                Err(error) => panic!("unexpected instantiation error: {error}"),
+            };
+            env.data().constructed.fetch_add(1, Ordering::SeqCst);
+            env.data_mut().instance = Some(instance);
+            Ok(())
+        },
+    );
+    let fresh = Function::new_typed(&mut store, || 9i32);
+    let store = store.into_async();
+    let mut call = Box::pin(bridge.call_async(&store, vec![]));
+    let waker = futures::task::noop_waker();
+    assert!(
+        call.as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    assert_eq!(constructed.load(Ordering::SeqCst), 0);
+    assert_eq!(callback_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(frame_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(body_drops.load(Ordering::SeqCst), 0);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.read())).is_err(),
+        "suspended native startup must retain its original Store lock"
+    );
+    if matches!(end, StartEnd::Cancel | StartEnd::EscapedLoan) {
+        drop(call);
+        if end == StartEnd::EscapedLoan {
+            assert_eq!(frame_drops.load(Ordering::SeqCst), 0);
+            assert_eq!(body_drops.load(Ordering::SeqCst), 1);
+            CAP.with(|slot| assert!(slot.borrow().as_ref().unwrap().try_read().is_none()));
+            let mut foreign = Store::default();
+            let release = Function::new_typed(&mut foreign, || {
+                drop(GUARD.with(|slot| slot.borrow_mut().take().unwrap()));
+            });
+            futures::executor::block_on(release.call_async(&foreign.into_async(), vec![])).unwrap();
+        }
+        assert_eq!(constructed.load(Ordering::SeqCst), 0);
+    } else if end == StartEnd::Panic {
+        send.send(()).unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            futures::executor::block_on(call)
+        }))
+        .expect_err("the original startup panic must propagate");
+        let error = panic.downcast_ref::<RuntimeError>().unwrap();
+        assert!(std::ptr::eq(
+            error.downcast_ref::<std::io::Error>().unwrap(),
+            original.downcast_ref::<std::io::Error>().unwrap(),
+        ));
+        assert_eq!(constructed.load(Ordering::SeqCst), 0);
+    } else {
+        send.send(()).unwrap();
+        let result = futures::executor::block_on(call);
+        if end == StartEnd::Error {
+            let error = result.unwrap_err();
+            assert!(std::ptr::eq(
+                error.downcast_ref::<std::io::Error>().unwrap(),
+                original.downcast_ref::<std::io::Error>().unwrap(),
+            ));
+            assert_eq!(constructed.load(Ordering::SeqCst), 0);
+        } else {
+            assert!(result.unwrap().is_empty());
+            assert_eq!(constructed.load(Ordering::SeqCst), 1);
+        }
+    }
+    assert_eq!(frame_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        callback_drops.load(Ordering::SeqCst),
+        usize::from(c_callback)
+    );
+    assert_eq!(body_drops.load(Ordering::SeqCst), 1);
+    if let Some(env) = callback_env {
+        assert!(env.as_ref(&store.read()).result.is_none());
+    }
+    {
+        let read = store.read();
+        assert!(setup.as_ref(&read).payload.is_none());
+        assert_eq!(
+            setup.as_ref(&read).instance.is_some(),
+            end == StartEnd::Return
+        );
+    }
+    let expired = CAP.with(|slot| slot.borrow_mut().take().unwrap());
+    assert!(expired.try_read().is_none());
+    assert!(expired.try_write().is_none());
+    let expired_store = expired.as_store_async().store();
+    drop(expired);
+    assert_eq!(
+        futures::executor::block_on(fresh.call_async(&store, vec![]))
+            .unwrap()
+            .as_ref(),
+        &[Value::I32(9)]
+    );
+    let retained = {
+        let mut write = store.store().write();
+        let Some(Value::FuncRef(Some(function))) = table.get(&mut write, 0) else {
+            panic!("startup lost the instance behind its published table funcref");
+        };
+        function
+    };
+    assert_eq!(
+        futures::executor::block_on(retained.call_async(&store, vec![Value::I32(41)]))
+            .unwrap()
+            .as_ref(),
+        &[Value::I32(42)]
+    );
+    if end == StartEnd::Return {
+        let instance = setup
+            .as_mut(&mut store.store().write())
+            .instance
+            .take()
+            .unwrap();
+        let started = instance.exports.get_function("started").unwrap();
+        assert_eq!(
+            futures::executor::block_on(started.call_async(&store, vec![]))
+                .unwrap()
+                .as_ref(),
+            &[Value::I32(1)]
+        );
+        let reactor = instance.exports.get_function("reactor").unwrap();
+        for value in [41, 42] {
+            assert_eq!(
+                futures::executor::block_on(reactor.call_async(&store, vec![Value::I32(value)]))
+                    .unwrap()
+                    .as_ref(),
+                &[Value::I32(value + 1)]
+            );
+        }
+    }
+    drop(store);
+    assert!(
+        expired_store.into_store().is_err(),
+        "an expired startup loan must not become an ordinary Store"
+    );
 }
 
 fn same_store_loan_proof(test_name: &str, cancel: bool) {
