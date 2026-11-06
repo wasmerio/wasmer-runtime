@@ -7,7 +7,8 @@ pub(crate) mod async_runtime;
 pub use async_runtime::{
     NativeAncestrySettlement, NativeCleanupGuard, NativeCleanupOwner, NativeFrameGuard,
     NativeInvocationScope, WeakNativeInvocation, call_async_with_local_owner,
-    context_switch_supported, current_native_local_owner, native_cleanup_owner,
+    call_native_descendant, context_switch_supported, current_native_local_owner,
+    current_native_store_loan, native_cleanup_owner,
 };
 mod native_frame;
 #[doc(hidden)]

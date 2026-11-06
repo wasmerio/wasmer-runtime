@@ -63,6 +63,166 @@ pub fn call_async_with_local_owner(
     }
 }
 
+/// Calls a foreign native Store after yielding the current parked invocation.
+/// The driver is constructed only on the outside host-future poll. Its future
+/// must retain the supplied child until completion or ordinary cancellation.
+#[doc(hidden)]
+#[allow(clippy::type_complexity)]
+pub fn call_native_descendant<F, D>(
+    function: &crate::Function,
+    store: &StoreAsync,
+    params: Vec<Value>,
+    drive: D,
+) -> Result<Box<[Value]>, RuntimeError>
+where
+    D: FnOnce(Pin<Box<dyn Future<Output = Result<Box<[Value]>, RuntimeError>>>>) -> F + 'static,
+    F: Future<Output = Result<Box<[Value]>, RuntimeError>> + 'static,
+{
+    let caller = CoroutineContext::current_root()
+        .ok_or_else(|| RuntimeError::new("native descendant requires an executing caller"))?;
+    if caller.control.store_id == store.id {
+        return Err(RuntimeError::new(
+            "native descendant requires a foreign Store",
+        ));
+    }
+    if native_cleanup_no_yield()
+        || (!StoreContext::can_suspend_suffix(caller.id)
+            && !StoreContext::can_suspend_borrowed_root(caller.id))
+    {
+        return Err(RuntimeError::new(
+            "native caller has no suspendable parked Store loan",
+        ));
+    }
+    if let Some(error) = caller.control.error() {
+        return Err(error);
+    }
+    // Capture actual borrow authority while its parked Sync entry is installed.
+    // Weak frame metadata alone never authorizes access to an ancestor Store.
+    let caller_loan = current_store_loan(caller.control.store_id);
+    let target = current_native_store_loan(store)?.unwrap_or_else(|| store.store());
+    let function = match &function.0 {
+        crate::BackendFunction::Sys(function) => function.clone(),
+        #[cfg(any(feature = "v8", feature = "js"))]
+        _ => {
+            return Err(RuntimeError::new(
+                "native descendant requires the native backend",
+            ));
+        }
+    };
+    let child = AsyncCallFuture::new_with_caller(
+        function,
+        target,
+        params,
+        None,
+        Some(NativeDescendantCaller {
+            invocation: WeakNativeInvocation {
+                root: caller.clone(),
+            },
+            loan: RefCell::new(caller_loan),
+            frame: RefCell::new(None),
+        }),
+    );
+    // In particular, do not invoke arbitrary safe drive code on the caller's
+    // coroutine stack: an inline poll must see the caller already yielded.
+    let result = block_on_host_future(async move { drive(Box::pin(child)).await.map(Vec::from) })
+        .map(Vec::into_boxed_slice)
+        .map_err(|error| match error {
+            AsyncRuntimeError::RuntimeError(error) => error,
+            AsyncRuntimeError::YieldOutsideAsyncContext => {
+                RuntimeError::new("native descendant lost its caller transport")
+            }
+        });
+    if let Err(error) = &result
+        && error.is_host_abort()
+    {
+        // A C callback can discard its nested trap. The original guest must
+        // still observe this exact terminal control outcome before resuming.
+        caller.control.retire(Some(error.clone()));
+    }
+    result
+}
+
+fn captured_descendant_loan(
+    caller: &WeakNativeRoot,
+    target: StoreId,
+) -> Result<Option<StoreAsync>, RuntimeError> {
+    let mut current = caller.owner.upgrade();
+    while let Some(root) = current {
+        let previous = match root.caller.as_ref() {
+            Some(previous) => previous,
+            None => return Ok(None),
+        };
+        let loan = previous.loan.borrow().as_ref().map(AsStoreAsync::store);
+        if let Some(loan) = loan
+            && loan.id == target
+        {
+            if !loan.loan.as_ref().is_some_and(NativeStoreLoan::is_live) {
+                return Err(RuntimeError::new(
+                    "native ancestor Store loan is no longer live",
+                ));
+            }
+            return Ok(Some(loan));
+        }
+        current = previous.invocation.root.owner.upgrade();
+    }
+    Ok(None)
+}
+
+/// Returns only an existing parked Store loan for host-only metadata access.
+/// A matching but stale/incompatible capture is an error, never permission to
+/// retry the base Store lock. No guest entry or physical frame is created.
+#[doc(hidden)]
+pub fn current_native_store_loan(
+    expected: &StoreAsync,
+) -> Result<Option<StoreAsync>, RuntimeError> {
+    let Some(caller) = CoroutineContext::current_root() else {
+        return Ok(None);
+    };
+    let candidate = if caller.control.store_id == expected.id {
+        Some(
+            current_store_loan(expected.id)
+                .ok_or_else(|| RuntimeError::new("current native Store has no live parked loan"))?,
+        )
+    } else {
+        // The current caller can already be sticky-aborted while its ancestor
+        // remains live: retirement still needs that exact host-only access.
+        captured_descendant_loan(&caller, expected.id)?
+    };
+    let Some(candidate) = candidate else {
+        return Ok(None);
+    };
+    let generation_matches = match (&candidate.native_invocation, &expected.native_invocation) {
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+        (None, None) => true,
+        _ => false,
+    };
+    if candidate.id != expected.id
+        || !candidate
+            .inner
+            .downgrade()
+            .ptr_eq(&expected.inner.downgrade())
+        || !generation_matches
+        || !candidate
+            .loan
+            .as_ref()
+            .is_some_and(NativeStoreLoan::is_live)
+    {
+        return Err(RuntimeError::new(
+            "native Store loan does not match the requested Store",
+        ));
+    }
+    // write_lock's loan future assumes an already parked root. In particular,
+    // a current same-Store borrow which failed with_current must stay a
+    // controlled admission error, not reach that future's stale-pin assertion.
+    let pin = candidate
+        .loan
+        .as_ref()
+        .and_then(NativeStoreLoan::pin)
+        .ok_or_else(|| RuntimeError::new("native Store loan is not parked for host access"))?;
+    drop(pin);
+    Ok(Some(candidate))
+}
+
 /// Returns only the outermost explicit local owner in the actual native ancestry.
 /// A dead or differently typed outer owner never falls through to an inner one.
 #[doc(hidden)]
@@ -1333,6 +1493,13 @@ struct NativeRootOwner {
     frame_resume_waiting: Cell<bool>,
     stack: RefCell<NativeRootStack>,
     thread_state: RuntimeThreadState,
+    caller: Option<NativeDescendantCaller>,
+}
+
+struct NativeDescendantCaller {
+    invocation: WeakNativeInvocation,
+    loan: RefCell<Option<StoreAsync>>,
+    frame: RefCell<Option<NativeFrameGuard>>,
 }
 
 #[allow(clippy::type_complexity)]
@@ -2457,6 +2624,16 @@ impl AsyncCallFuture {
         params: Vec<Value>,
         local_owner: Option<std::rc::Weak<dyn std::any::Any>>,
     ) -> Self {
+        Self::new_with_caller(function, store, params, local_owner, None)
+    }
+
+    fn new_with_caller(
+        function: SysFunction,
+        store: StoreAsync,
+        params: Vec<Value>,
+        local_owner: Option<std::rc::Weak<dyn std::any::Any>>,
+        caller: Option<NativeDescendantCaller>,
+    ) -> Self {
         let store_id = store.id;
         let store_context_id = StoreContext::new_installation_id();
         let id = NEXT_ASYNC_CALL_FUTURE_ID
@@ -2560,6 +2737,7 @@ impl AsyncCallFuture {
                 loan_gate: OnceCell::new(),
                 frame_gate: OnceCell::new(),
                 frame_resume_waiting: Cell::new(false),
+                caller,
                 stack: RefCell::new(NativeRootStack {
                     coroutine: Some(coroutine),
                     suspended_stores: SuspendedStoreContexts::default(),
@@ -2722,6 +2900,36 @@ impl AsyncCallFuture {
             self.retire_root(Some(error.clone()));
             return Poll::Ready(Err(error));
         }
+        let needs_caller_frame = self
+            .root()
+            .caller
+            .as_ref()
+            .is_some_and(|caller| caller.frame.borrow().is_none());
+        if needs_caller_frame {
+            let caller = self.root().caller.as_ref().expect("captured native caller");
+            // This poll occurs outside the caller's actual coroutine/TLS. The
+            // guard belongs to the child root, never either coroutine stack.
+            let mut frame = match unsafe { caller.invocation.enter_descendant_frame() } {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.retire_root(Some(error.clone()));
+                    return Poll::Ready(Err(error));
+                }
+            };
+            frame.binding = match NativeFrameBinding::enter(
+                self.root().control.clone(),
+                &caller.invocation.root.control,
+            ) {
+                Ok(binding) => Some(binding),
+                Err(error) => {
+                    drop(frame);
+                    self.retire_root(Some(error.clone()));
+                    return Poll::Ready(Err(error));
+                }
+            };
+            let previous = caller.frame.replace(Some(frame));
+            assert!(previous.is_none());
+        }
         if native_cleanup_no_yield()
             && matches!(self.next_resume.as_ref(), Some(AsyncResume::Start))
         {
@@ -2796,6 +3004,16 @@ impl AsyncCallFuture {
             // If we're ready, return early
             if !self.root().has_coroutine() {
                 self.remove_from_wakers_list();
+                // A completed Future may remain owned by its driver. Its
+                // finished physical frame must no longer block the caller.
+                let (frame, loan) = self.root().caller.as_ref().map_or((None, None), |caller| {
+                    (
+                        caller.frame.borrow_mut().take(),
+                        caller.loan.borrow_mut().take(),
+                    )
+                });
+                drop(loan);
+                drop(frame);
                 return Poll::Ready(self.result.take().expect("polled after completion"));
             }
 
@@ -2859,6 +3077,26 @@ impl AsyncCallFuture {
                 let root = self.root().clone();
                 let mut stack = root.stack.borrow_mut();
                 ForcedStoreInstallGuard::restore_borrowed_root(&mut stack.suspended_stores)
+            } else if self.root().caller.is_some()
+                && matches!(self.next_resume.as_ref(), Some(AsyncResume::Start))
+            {
+                // Never wait for an unrelated held target. A captured ancestor
+                // uses its original derived loan gate, not its locked Store.
+                let guard = if let Some(loan) = &self.store().loan {
+                    loan.try_write().map(|guard| {
+                        StoreContext::install_loan(guard, self.root().store_context_id, store_id)
+                    })
+                } else {
+                    self.store().inner.try_write().map(|guard| {
+                        StoreContext::install_async_with_id(guard, self.root().store_context_id)
+                    })
+                };
+                let Some(guard) = guard else {
+                    let error = RuntimeError::new("Store has no available native descendant loan");
+                    self.retire_root(None);
+                    return Poll::Ready(Err(error));
+                };
+                guard
             } else {
                 if self.pending_store_install.is_none() {
                     self.pending_store_install = Some(Box::pin(install_store_context(
@@ -3032,8 +3270,16 @@ impl Drop for NativeRootOwner {
             .as_ref()
             .map(|scope| (scope.generation.clone(), scope.cleanup.clone()));
         let settlement = self.control.settlement.clone();
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.drop_stack()));
-        notify_scope_after(generation, settlement, outcome);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.drop_stack()));
+            notify_scope_after(generation, settlement, outcome);
+        }));
+        let mut failures = outcome.err().into_iter().collect::<Vec<_>>();
+        // Finish this child's TLS/stack/original Store unlock before releasing
+        // its predecessor's resume gate, also when either cleanup phase panics.
+        defer_cleanup(&mut failures, || drop(self.caller.take()));
+        resume_cleanup_panics(failures);
     }
 }
 
@@ -3572,6 +3818,370 @@ fn run_immediate(
 mod tests {
     use super::*;
     use crate::{Function, Instance, Module};
+
+    #[test]
+    fn native_descendant_inline_drive_waits_for_the_actual_caller_yield() {
+        if !runtime_subprocess(
+            "backend::sys::async_runtime::tests::native_descendant_inline_drive_waits_for_the_actual_caller_yield",
+        ) {
+            return;
+        }
+        let mut target = Store::default();
+        let function = Function::new_async(
+            &mut target,
+            crate::FunctionType::new([], [crate::Type::I32]),
+            |_| {
+                let mut first = true;
+                std::future::poll_fn(move |cx| {
+                    if std::mem::take(&mut first) {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(Ok(vec![Value::I32(37)]))
+                    }
+                })
+            },
+        );
+        let target = target.into_async();
+        let capability = target.store();
+        let driven = Rc::new(Cell::new(0));
+        let observed = driven.clone();
+        let retained = Rc::new(RefCell::new(None));
+        let keep_completed = retained.clone();
+        let mut caller = Store::default();
+        let bridge = Function::new_async(
+            &mut caller,
+            crate::FunctionType::new([], [crate::Type::I32]),
+            move |_| {
+                let driven = driven.clone();
+                let retained = keep_completed.clone();
+                let result = Store::with_current(|current| {
+                    current.parked(|| {
+                        call_native_descendant(&function, &capability, vec![], move |mut child| {
+                            assert!(CoroutineContext::get_current().is_none());
+                            assert!(StoreContext::async_root_admissible());
+                            driven.set(driven.get() + 1);
+                            // A safe driver is allowed to poll immediately. This
+                            // must enter only T, after S left all native TLS.
+                            let immediate =
+                                child.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+                            async move {
+                                let result = match immediate {
+                                    Poll::Ready(result) => result,
+                                    Poll::Pending => {
+                                        std::future::poll_fn(|cx| child.as_mut().poll(cx)).await
+                                    }
+                                };
+                                *retained.borrow_mut() = Some(child);
+                                result
+                            }
+                        })
+                    })
+                })
+                .unwrap();
+                std::future::ready(result.map(Vec::from))
+            },
+        );
+        let caller = caller.into_async();
+        let result = futures::executor::block_on(bridge.call_async(&caller, vec![])).unwrap();
+        assert_eq!(result[0].i32(), Some(37));
+        assert_eq!(observed.get(), 1);
+        assert!(retained.borrow().is_some());
+        drop(retained.borrow_mut().take());
+        drop(futures::executor::block_on(caller.write_lock()));
+        drop(futures::executor::block_on(target.write_lock()));
+        assert!(StoreContext::is_empty());
+    }
+
+    #[test]
+    fn native_descendant_unavailable_target_fails_before_guest_entry() {
+        if !runtime_subprocess(
+            "backend::sys::async_runtime::tests::native_descendant_unavailable_target_fails_before_guest_entry",
+        ) {
+            return;
+        }
+        let entered = Rc::new(Cell::new(0));
+        let observed = entered.clone();
+        let mut target = Store::default();
+        let function =
+            Function::new_async(&mut target, crate::FunctionType::new([], []), move |_| {
+                entered.set(entered.get() + 1);
+                std::future::ready(Ok(Vec::new()))
+            });
+        let target = target.into_async();
+        let capability = target.store();
+        let guard = futures::executor::block_on(target.write_lock());
+        let mut caller = Store::default();
+        let bridge = Function::new_async(
+            &mut caller,
+            crate::FunctionType::new([], [crate::Type::I32]),
+            move |_| {
+                let result = Store::with_current(|current| {
+                    current.parked(|| {
+                        call_native_descendant(&function, &capability, vec![], |child| child)
+                    })
+                })
+                .unwrap();
+                let error = result.unwrap_err();
+                assert!(!error.is_host_abort());
+                assert_eq!(
+                    error.message(),
+                    "Store has no available native descendant loan"
+                );
+                std::future::ready(Ok(vec![Value::I32(19)]))
+            },
+        );
+        let caller = caller.into_async();
+        let result = futures::executor::block_on(bridge.call_async(&caller, vec![])).unwrap();
+        assert_eq!(result[0].i32(), Some(19));
+        assert_eq!(observed.get(), 0);
+        drop(guard);
+        drop(futures::executor::block_on(target.write_lock()));
+        drop(futures::executor::block_on(caller.write_lock()));
+    }
+
+    #[test]
+    fn native_descendant_preserves_ordinary_errors_and_latches_swallowed_host_aborts() {
+        if !runtime_subprocess(
+            "backend::sys::async_runtime::tests::native_descendant_preserves_ordinary_errors_and_latches_swallowed_host_aborts",
+        ) {
+            return;
+        }
+        for abort in [false, true] {
+            let original = if abort {
+                RuntimeError::host_abort(Box::new(std::io::Error::other(
+                    "exact descendant outcome",
+                )))
+            } else {
+                RuntimeError::user(Box::new(std::io::Error::other("exact descendant outcome")))
+            };
+            let returned = original.clone();
+            let mut target = Store::default();
+            let function =
+                Function::new_async(&mut target, crate::FunctionType::new([], []), move |_| {
+                    std::future::ready(Err(returned.clone()))
+                });
+            let target = target.into_async();
+            let capability = target.store();
+            let mut caller = Store::default();
+            let bridge = Function::new_async(
+                &mut caller,
+                crate::FunctionType::new([], [crate::Type::I32]),
+                move |_| {
+                    let result = Store::with_current(|current| {
+                        current.parked(|| {
+                            call_native_descendant(&function, &capability, vec![], |child| child)
+                        })
+                    })
+                    .unwrap();
+                    assert!(result.is_err());
+                    // Model a C callback swallowing the nested trap.
+                    std::future::ready(Ok(vec![Value::I32(91)]))
+                },
+            );
+            let caller = caller.into_async();
+            let result = futures::executor::block_on(bridge.call_async(&caller, vec![]));
+            if abort {
+                let error = result.unwrap_err();
+                assert!(error.is_host_abort());
+                assert!(std::ptr::eq(
+                    error.downcast_ref::<std::io::Error>().unwrap(),
+                    original.downcast_ref::<std::io::Error>().unwrap(),
+                ));
+            } else {
+                assert_eq!(result.unwrap()[0].i32(), Some(91));
+            }
+            drop(futures::executor::block_on(caller.write_lock()));
+            drop(futures::executor::block_on(target.write_lock()));
+        }
+    }
+
+    #[test]
+    fn native_descendant_host_loan_rejects_stale_lock_and_generation_mismatches() {
+        if !runtime_subprocess(
+            "backend::sys::async_runtime::tests::native_descendant_host_loan_rejects_stale_lock_and_generation_mismatches",
+        ) {
+            return;
+        }
+        let a = Store::default().into_async();
+        let expected = a.store();
+        let unrelated = Store::default().into_async();
+        let mut wrong_lock = unrelated.store();
+        wrong_lock.id = a.id;
+        let mut scoped = Store::default();
+        let scope = NativeInvocationScope::bind(&mut scoped).unwrap();
+        let scoped = scoped.into_async();
+        let mut wrong_generation = a.store();
+        wrong_generation.native_invocation = scoped.native_invocation.clone();
+        // The VM callback keeps only a weak request; its Store cannot own a
+        // capability back to the caller through a host-function capture.
+        let request = Rc::new((expected, unrelated, wrong_lock, wrong_generation));
+        let input = Rc::downgrade(&request);
+        let mut b = Store::default();
+        let bridge = Function::new_async(&mut b, crate::FunctionType::new([], []), move |_| {
+            let request = input.upgrade().unwrap();
+            let (expected, unrelated, wrong_lock, wrong_generation) = &*request;
+            let captured = current_native_store_loan(expected).unwrap().unwrap();
+            assert!(
+                captured
+                    .inner
+                    .downgrade()
+                    .ptr_eq(&expected.inner.downgrade())
+            );
+            assert!(current_native_store_loan(wrong_lock).is_err());
+            assert!(current_native_store_loan(wrong_generation).is_err());
+            assert!(current_native_store_loan(unrelated).unwrap().is_none());
+            let epoch = &captured.loan.as_ref().unwrap().epoch;
+            assert!(epoch.replace(false));
+            assert!(
+                current_native_store_loan(expected).is_err(),
+                "stale authority cannot become an owned capability"
+            );
+            epoch.set(true);
+            std::future::ready(Ok(Vec::new()))
+        });
+        let b = b.into_async();
+        let target = b.store();
+        let root = {
+            let mut guard = futures::executor::block_on(a.write_lock());
+            Function::new_async(
+                &mut guard.as_store_mut(),
+                crate::FunctionType::new([], []),
+                move |_| {
+                    let result = Store::with_current(|current| {
+                        current.parked(|| {
+                            call_native_descendant(&bridge, &target, vec![], |child| child)
+                        })
+                    })
+                    .unwrap();
+                    std::future::ready(result.map(Vec::from))
+                },
+            )
+        };
+        futures::executor::block_on(root.call_async(&a, vec![])).unwrap();
+        drop(futures::executor::block_on(a.write_lock()));
+        drop(futures::executor::block_on(b.write_lock()));
+        drop(scope);
+        drop(scoped);
+    }
+
+    #[test]
+    fn native_descendant_cancellation_keeps_escaped_frames_and_preserves_first_panic() {
+        if !runtime_subprocess(
+            "backend::sys::async_runtime::tests::native_descendant_cancellation_keeps_escaped_frames_and_preserves_first_panic",
+        ) {
+            return;
+        }
+        struct StackProbe(Rc<Cell<usize>>);
+        impl Drop for StackProbe {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        struct PendingBody;
+        impl Future for PendingBody {
+            type Output = Result<Vec<Value>, RuntimeError>;
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Pending
+            }
+        }
+        impl Drop for PendingBody {
+            fn drop(&mut self) {
+                panic!("first descendant host-body failure");
+            }
+        }
+        for escape in [false, true] {
+            let target_root = Rc::new(RefCell::new(None));
+            let capture = target_root.clone();
+            let mut target = Store::default();
+            let function =
+                Function::new_async(&mut target, crate::FunctionType::new([], []), move |_| {
+                    *capture.borrow_mut() = WeakNativeInvocation::current();
+                    PendingBody
+                });
+            let environment = crate::FunctionEnv::new(&mut target, function);
+            let function = Function::new_with_env(
+                &mut target,
+                &environment,
+                crate::FunctionType::new([], []),
+                |mut env, _| {
+                    let target = env.data().clone();
+                    target.call(&mut env.as_store_mut(), &[]).map(Vec::from)
+                },
+            );
+            let target = target.into_async();
+            let capability = target.store();
+            let drops = Rc::new(Cell::new(0));
+            let stack_drops = drops.clone();
+            let parent_root = Rc::new(RefCell::new(None));
+            let capture_parent = parent_root.clone();
+            let mut caller = Store::default();
+            let bridge =
+                Function::new_async(&mut caller, crate::FunctionType::new([], []), move |_| {
+                    let _stack = StackProbe(stack_drops.clone());
+                    *capture_parent.borrow_mut() = WeakNativeInvocation::current();
+                    let result = Store::with_current(|current| {
+                        current.parked(|| {
+                            call_native_descendant(&function, &capability, vec![], |child| child)
+                        })
+                    })
+                    .unwrap();
+                    std::future::ready(result.map(Vec::from))
+                });
+            let caller = caller.into_async();
+            let mut call = Box::pin(bridge.call_async(&caller, vec![]));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(call.as_mut().poll(&mut cx).is_pending());
+            let escaped = escape.then(|| unsafe {
+                target_root
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .enter_descendant_frame()
+                    .unwrap()
+            });
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(call)))
+                .expect_err("the original host-body panic must survive cleanup");
+            assert_eq!(
+                panic.downcast_ref::<&str>(),
+                Some(&"first descendant host-body failure")
+            );
+            if escape {
+                assert_eq!(
+                    drops.get(),
+                    0,
+                    "the descendant still pins its preceding physical caller"
+                );
+                assert!(caller.inner.try_write().is_none());
+                assert!(target.inner.try_write().is_none());
+            }
+            drop(escaped);
+            assert_eq!(drops.get(), 1);
+            assert!(
+                parent_root
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .root
+                    .owner
+                    .upgrade()
+                    .is_none()
+            );
+            assert!(
+                target_root
+                    .borrow()
+                    .as_ref()
+                    .unwrap()
+                    .root
+                    .owner
+                    .upgrade()
+                    .is_none()
+            );
+            drop(futures::executor::block_on(caller.write_lock()));
+            drop(futures::executor::block_on(target.write_lock()));
+            assert!(StoreContext::is_empty());
+        }
+    }
 
     #[test]
     fn native_cleanup_after_pump_allows_reentrant_retained_work_in_fifo_order() {
