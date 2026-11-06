@@ -223,6 +223,71 @@ pub fn current_native_store_loan(
     Ok(Some(candidate))
 }
 
+/// Enrolls owner-local retirement on the outermost actual invocation's future.
+/// The tail is polled after native custody is released, including while escaped
+/// physical frames remain. It must observe its own exact completion fences.
+/// Dropping the call drops each tail; tails retain their own cancellation/drain
+/// custody. This does not create an executor or promise progress without a driver.
+#[doc(hidden)]
+#[allow(clippy::type_complexity)]
+pub fn enroll_native_ancestry_tail(
+    future: Pin<Box<dyn Future<Output = ()>>>,
+) -> Result<(), Pin<Box<dyn Future<Output = ()>>>> {
+    let Some(current) = current_retirement_control() else {
+        return Err(future);
+    };
+    let Some(outer) = outermost_native_control(current) else {
+        return Err(future);
+    };
+    let Some(tails) = outer.tails.upgrade() else {
+        return Err(future);
+    };
+    tails.queue.borrow_mut().push_back(future);
+    let waker = tails.waker.borrow().clone();
+    if let Some(waker) = waker {
+        waker.wake_by_ref();
+    }
+    Ok(())
+}
+
+fn outermost_native_control(current: Rc<NativeRootControl>) -> Option<Rc<NativeRootControl>> {
+    let mut pending = vec![current];
+    let mut visited = Vec::new();
+    let mut outer = None;
+    while let Some(control) = pending.pop() {
+        if visited.contains(&control.future_id) {
+            continue;
+        }
+        visited.push(control.future_id);
+        let mut parents = control.parent.iter().cloned().collect::<Vec<_>>();
+        {
+            let edges = control.native_edges.borrow();
+            parents.extend(edges.iter().map(|edge| edge.parent.clone()));
+        }
+        if parents.is_empty() {
+            if outer
+                .as_ref()
+                .is_some_and(|old: &Rc<NativeRootControl>| !Rc::ptr_eq(old, &control))
+            {
+                return None;
+            }
+            outer = Some(control);
+        } else {
+            // A missing actual ancestor never permits an inner fallback owner.
+            for parent in parents {
+                pending.push(parent.upgrade()?);
+            }
+        }
+    }
+    outer
+}
+
+#[derive(Default)]
+struct NativeCallTails {
+    queue: RefCell<std::collections::VecDeque<Pin<Box<dyn Future<Output = ()>>>>>,
+    waker: RefCell<Option<Arc<Waker>>>,
+}
+
 /// Returns only the outermost explicit local owner in the actual native ancestry.
 /// A dead or differently typed outer owner never falls through to an inner one.
 #[doc(hidden)]
@@ -888,6 +953,10 @@ pub(crate) struct AsyncCallFuture {
     pending_future: Option<HostFuture>,
     next_resume: Option<AsyncResume>,
     result: Option<Result<Box<[Value]>, RuntimeError>>,
+    tails: Rc<NativeCallTails>,
+    tail_phase: bool,
+    tail_result: Option<Result<Box<[Value]>, RuntimeError>>,
+    tail_panics: Vec<DeferredPanic>,
 }
 
 /// An owner-thread generation for native invocations on one Store.
@@ -1533,6 +1602,7 @@ struct NativeRootControl {
     reason: OnceCell<RuntimeError>,
     terminal: OnceCell<RuntimeError>,
     local_owner: Option<std::rc::Weak<dyn std::any::Any>>,
+    tails: Weak<NativeCallTails>,
     settlement: Rc<NativeRootSettlement>,
 }
 
@@ -2650,6 +2720,7 @@ impl AsyncCallFuture {
             Arc::<[AsyncCallFutureId]>::from(ids)
         });
         let settlement = Rc::new(NativeRootSettlement::new(&store));
+        let tails = Rc::new(NativeCallTails::default());
         let control = Rc::new(NativeRootControl {
             future_id: id,
             scope: store
@@ -2691,6 +2762,7 @@ impl AsyncCallFuture {
             reason: OnceCell::new(),
             terminal: OnceCell::new(),
             local_owner,
+            tails: Rc::downgrade(&tails),
             settlement,
         });
         if let Some(scope) = &control.scope
@@ -2755,6 +2827,10 @@ impl AsyncCallFuture {
             pending_future: None,
             next_resume: Some(AsyncResume::Start),
             result: None,
+            tails,
+            tail_phase: false,
+            tail_result: None,
+            tail_panics: Vec::new(),
         }
     }
 
@@ -2875,8 +2951,10 @@ pub(crate) fn check_async_entry(store: &StoreAsync) -> Result<(), RuntimeError> 
 impl Future for AsyncCallFuture {
     type Output = Result<Box<[Value]>, RuntimeError>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.tail_phase {
+            return self.poll_tails(cx);
+        }
         let state = self.root().thread_state.clone();
-        let _state = state.enter();
         let generation = self
             .root()
             .control
@@ -2884,9 +2962,86 @@ impl Future for AsyncCallFuture {
             .as_ref()
             .map(|scope| (scope.generation.clone(), scope.cleanup.clone()));
         let settlement = self.root().control.settlement.clone();
-        let outcome =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.poll_inner(cx)));
-        notify_scope_after(generation, settlement, outcome)
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = state.enter();
+            let outcome =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.poll_inner(cx)));
+            notify_scope_after(generation, settlement, outcome)
+        }));
+        match outcome {
+            Ok(Poll::Pending) => return Poll::Pending,
+            Ok(Poll::Ready(result)) if self.tails.queue.borrow().is_empty() => {
+                return Poll::Ready(result);
+            }
+            Err(panic) if self.tails.queue.borrow().is_empty() => std::panic::resume_unwind(panic),
+            Ok(Poll::Ready(result)) => self.tail_result = Some(result),
+            Err(panic) => self.tail_panics.push(panic),
+        }
+        self.tail_phase = true;
+        let reason = self
+            .tail_result
+            .as_ref()
+            .and_then(|result| result.as_ref().err())
+            .cloned();
+        let mut panics = std::mem::take(&mut self.tail_panics);
+        // Tails may release an escaped frame. Release public native custody
+        // first, then drive them concurrently with their physical observers.
+        defer_cleanup(&mut panics, || self.retire_root(reason));
+        self.tail_panics = panics;
+        self.poll_tails(cx)
+    }
+}
+
+impl AsyncCallFuture {
+    fn poll_tails(&mut self, cx: &mut Context<'_>) -> Poll<Result<Box<[Value]>, RuntimeError>> {
+        let mut next = None;
+        defer_cleanup(&mut self.tail_panics, || {
+            next = Some(Arc::new(cx.waker().clone()));
+        });
+        if let Some(next) = next {
+            let previous = self.tails.waker.borrow_mut().replace(next);
+            defer_cleanup(&mut self.tail_panics, || drop(previous));
+        }
+        let jobs = std::mem::take(&mut *self.tails.queue.borrow_mut());
+        let mut pending = std::collections::VecDeque::new();
+        for mut job in jobs {
+            let polled =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.as_mut().poll(cx)));
+            match polled {
+                Ok(Poll::Pending) => pending.push_back(job),
+                Ok(Poll::Ready(())) => defer_cleanup(&mut self.tail_panics, || drop(job)),
+                Err(panic) => {
+                    self.tail_panics.push(panic);
+                    // A panicked async future is never polled again. Its Drop
+                    // must transfer concrete retirement custody where required.
+                    defer_cleanup(&mut self.tail_panics, || drop(job));
+                }
+            }
+        }
+        {
+            let mut queue = self.tails.queue.borrow_mut();
+            pending.append(&mut queue);
+            *queue = pending;
+            if !queue.is_empty() {
+                return Poll::Pending;
+            }
+        }
+        let previous = self.tails.waker.borrow_mut().take();
+        defer_cleanup(&mut self.tail_panics, || drop(previous));
+        if !self.tails.queue.borrow().is_empty() {
+            defer_cleanup(&mut self.tail_panics, || cx.waker().wake_by_ref());
+            return Poll::Pending;
+        }
+        if !self.tail_panics.is_empty() {
+            let result = self.tail_result.take();
+            defer_cleanup(&mut self.tail_panics, || drop(result));
+            resume_cleanup_panics(std::mem::take(&mut self.tail_panics));
+        }
+        Poll::Ready(
+            self.tail_result
+                .take()
+                .expect("polled after native retirement completion"),
+        )
     }
 }
 
@@ -3231,7 +3386,21 @@ impl AsyncCallFuture {
 
 impl Drop for AsyncCallFuture {
     fn drop(&mut self) {
-        self.retire_root(None);
+        let already_unwinding = std::thread::panicking();
+        let mut failures = std::mem::take(&mut self.tail_panics);
+        let waker = self.tails.waker.borrow_mut().take();
+        defer_cleanup(&mut failures, || drop(waker));
+        defer_cleanup(&mut failures, || self.retire_root(None));
+        // Keep enrollment alive through native destruction: finalizers may
+        // enroll another exact tail. Drop without holding the queue borrow.
+        loop {
+            let job = self.tails.queue.borrow_mut().pop_front();
+            let Some(job) = job else { break };
+            defer_cleanup(&mut failures, || drop(job));
+        }
+        let result = self.tail_result.take();
+        defer_cleanup(&mut failures, || drop(result));
+        resume_guard_cleanup_panics(failures, already_unwinding);
     }
 }
 
@@ -3818,6 +3987,176 @@ fn run_immediate(
 mod tests {
     use super::*;
     use crate::{Function, Instance, Module};
+
+    #[test]
+    fn native_post_tail_runs_on_the_outermost_foreign_invocation() {
+        if !runtime_subprocess(
+            "backend::sys::async_runtime::tests::native_post_tail_runs_on_the_outermost_foreign_invocation",
+        ) {
+            return;
+        }
+        let completed = Rc::new(Cell::new(0));
+        let observed = completed.clone();
+        let mut target = Store::default();
+        let child = Function::new_async(
+            &mut target,
+            crate::FunctionType::new([], [crate::Type::I32]),
+            move |_| {
+                let mut ancestry = NativeAncestrySettlement::current(None).unwrap();
+                let completed = completed.clone();
+                assert!(
+                    enroll_native_ancestry_tail(Box::pin(async move {
+                        assert!(CoroutineContext::get_current().is_none());
+                        // Waiting here inside the child would deadlock its outer caller.
+                        std::future::poll_fn(|cx| Pin::new(&mut ancestry).poll(cx)).await;
+                        completed.set(completed.get() + 1);
+                    }))
+                    .is_ok()
+                );
+                std::future::ready(Ok(vec![Value::I32(37)]))
+            },
+        );
+        let target = target.into_async();
+        let capability = target.store();
+        let mut caller = Store::default();
+        let root = Function::new_async(
+            &mut caller,
+            crate::FunctionType::new([], [crate::Type::I32]),
+            move |_| {
+                let result = Store::with_current(|current| {
+                    current.parked(|| {
+                        call_native_descendant(&child, &capability, vec![], |child| child)
+                    })
+                })
+                .unwrap();
+                std::future::ready(result.map(Vec::from))
+            },
+        );
+        let caller = caller.into_async();
+        let result = futures::executor::block_on(root.call_async(&caller, vec![])).unwrap();
+        assert_eq!(result[0].i32(), Some(37));
+        assert_eq!(observed.get(), 1);
+        drop(futures::executor::block_on(caller.write_lock()));
+        drop(futures::executor::block_on(target.write_lock()));
+    }
+
+    #[test]
+    fn native_post_tail_drives_escaped_frames_before_observer_completion() {
+        if !runtime_subprocess(
+            "backend::sys::async_runtime::tests::native_post_tail_drives_escaped_frames_before_observer_completion",
+        ) {
+            return;
+        }
+        let frame = Rc::new(RefCell::new(None::<NativeFrameGuard>));
+        let input = Rc::downgrade(&frame);
+        let token = Rc::new(RefCell::new(None));
+        let capture = token.clone();
+        let observer = Rc::new(RefCell::new(None));
+        let observed = observer.clone();
+        let completed = Rc::new(Cell::new(false));
+        let marked = completed.clone();
+        let mut store = Store::default();
+        let scope = NativeInvocationScope::bind(&mut store).unwrap();
+        let function =
+            Function::new_async(&mut store, crate::FunctionType::new([], []), move |_| {
+                *capture.borrow_mut() = WeakNativeInvocation::current();
+                *observed.borrow_mut() = NativeAncestrySettlement::current(None);
+                let frame = input.upgrade().unwrap();
+                let marked = marked.clone();
+                let mut first = true;
+                assert!(
+                    enroll_native_ancestry_tail(Box::pin(std::future::poll_fn(move |cx| {
+                        if std::mem::take(&mut first) {
+                            // This exact task owns the frame that the observer needs.
+                            // Polling only after ancestry Ready would never reach here.
+                            let frame = frame.borrow_mut().take();
+                            assert!(frame.is_some());
+                            drop(frame);
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        } else {
+                            marked.set(true);
+                            Poll::Ready(())
+                        }
+                    })))
+                    .is_ok()
+                );
+                std::future::pending::<Result<Vec<Value>, RuntimeError>>()
+            });
+        let store = store.into_async();
+        let mut call = Box::pin(function.call_async(&store, vec![]));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(call.as_mut().poll(&mut cx).is_pending());
+        *frame.borrow_mut() = Some(unsafe {
+            token
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .enter_descendant_frame()
+                .unwrap()
+        });
+        assert!(!observer.borrow().as_ref().unwrap().ready());
+        scope.close();
+        assert!(call.as_mut().poll(&mut cx).is_pending());
+        assert!(observer.borrow().as_ref().unwrap().ready());
+        assert!(store.inner.try_write().is_some());
+        let Poll::Ready(Err(error)) = call.as_mut().poll(&mut cx) else {
+            panic!("canceled invocation must finish after its exact tail");
+        };
+        assert!(error.is_host_abort());
+        assert!(completed.get());
+        drop(call);
+        drop(futures::executor::block_on(store.write_lock()));
+    }
+
+    #[test]
+    fn native_post_tail_preserves_original_panic_until_cleanup_finishes() {
+        if !runtime_subprocess(
+            "backend::sys::async_runtime::tests::native_post_tail_preserves_original_panic_until_cleanup_finishes",
+        ) {
+            return;
+        }
+        let completed = Rc::new(Cell::new(false));
+        let observed = completed.clone();
+        let mut store = Store::default();
+        let function = Function::new_async(
+            &mut store,
+            crate::FunctionType::new([], []),
+            move |_| -> std::future::Ready<Result<Vec<Value>, RuntimeError>> {
+                let completed = completed.clone();
+                let mut first = true;
+                assert!(
+                    enroll_native_ancestry_tail(Box::pin(std::future::poll_fn(move |cx| {
+                        if std::mem::take(&mut first) {
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        } else {
+                            completed.set(true);
+                            Poll::Ready(())
+                        }
+                    })))
+                    .is_ok()
+                );
+                panic!("original native body before retirement");
+            },
+        );
+        let store = store.into_async();
+        let mut call = Box::pin(function.call_async(&store, vec![]));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(call.as_mut().poll(&mut cx).is_pending());
+        assert!(!observed.get());
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = call.as_mut().poll(&mut cx);
+        }))
+        .expect_err("the original panic is transported after retirement");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&"original native body before retirement")
+        );
+        assert!(observed.get());
+        drop(call);
+        drop(futures::executor::block_on(store.write_lock()));
+    }
 
     #[test]
     fn native_descendant_inline_drive_waits_for_the_actual_caller_yield() {
@@ -7416,6 +7755,7 @@ mod tests {
                 reason: OnceCell::new(),
                 terminal: OnceCell::new(),
                 local_owner: owner,
+                tails: Weak::new(),
                 settlement: Rc::new(NativeRootSettlement::new(&Store::default().into_async())),
             })
         }
