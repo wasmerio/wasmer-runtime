@@ -480,11 +480,18 @@ struct NativeCleanupState {
     futures: RefCell<std::collections::VecDeque<NativeCleanupTask>>,
     running: Cell<bool>,
     ready: Cell<bool>,
+    after_pump: RefCell<std::collections::VecDeque<NativeCleanupCallback>>,
+    callbacks_running: Cell<bool>,
+    idle_waker: RefCell<Option<Arc<Waker>>>,
     observers: RefCell<Vec<NativeUnlockObserver>>,
     thread_state: RuntimeThreadState,
 }
 struct NativeCleanupTask {
     future: Pin<Box<dyn Future<Output = ()>>>,
+    _owner: NativeCleanupOwner,
+}
+struct NativeCleanupCallback {
+    callback: Box<dyn FnOnce()>,
     _owner: NativeCleanupOwner,
 }
 struct NativeUnlockObserver {
@@ -504,6 +511,9 @@ impl NativeCleanupOwner {
             futures: RefCell::default(),
             running: Cell::new(false),
             ready: Cell::new(false),
+            after_pump: RefCell::default(),
+            callbacks_running: Cell::new(false),
+            idle_waker: RefCell::default(),
             observers: RefCell::default(),
             thread_state: RuntimeThreadState::capture(),
         }))
@@ -516,6 +526,65 @@ impl NativeCleanupOwner {
         });
         self.notify();
     }
+    /// Run host cleanup after the current pump releases its running guard.
+    /// Callbacks run in admission order, outside all owner metadata borrows.
+    /// They may drive the owning executor and synchronously enqueue or pump
+    /// retained cleanup; recursively admitted callbacks wait their turn.
+    pub fn after_pump(&self, callback: Box<dyn FnOnce()>) {
+        self.0
+            .after_pump
+            .borrow_mut()
+            .push_back(NativeCleanupCallback {
+                callback,
+                _owner: self.clone(),
+            });
+        self.notify();
+    }
+    /// Snapshot whether the native pump and its retained futures are idle.
+    /// Current and queued after_pump callbacks are excluded. This does not close
+    /// cleanup producers or establish loader, Store or physical-frame settlement;
+    /// the caller must observe those separately before destroying its runtime.
+    pub fn is_idle(&self) -> bool {
+        !self.0.running.get() && self.0.futures.borrow().is_empty()
+    }
+    /// Repoll retained native work using one owning executor's real waker.
+    /// Every default notify keeps this registration while work is pending.
+    /// A wake schedules the caller, which must repoll here on the owning thread;
+    /// the waker never carries or pumps this local owner on another thread.
+    ///
+    /// This supports a single drain observer. Ready clears its registration;
+    /// cancellation must call clear_idle_waker, including during unwinding.
+    /// Like is_idle, Ready excludes current and queued after_pump callbacks and
+    /// does not establish loader, Store or physical-frame settlement.
+    pub fn poll_idle(&self, cx: &mut Context<'_>) -> Poll<()> {
+        loop {
+            let current = self.0.idle_waker.borrow().clone();
+            if !current
+                .as_ref()
+                .is_some_and(|current| current.will_wake(cx.waker()))
+            {
+                let next = Arc::new(cx.waker().clone());
+                let previous = self.0.idle_waker.borrow_mut().replace(next);
+                drop(previous);
+            }
+            drop(current);
+            self.notify();
+            if !self.is_idle() {
+                return Poll::Pending;
+            }
+            self.clear_idle_waker();
+            // A user Waker destructor can synchronously admit more cleanup.
+            if self.is_idle() {
+                return Poll::Ready(());
+            }
+        }
+    }
+    /// Cancel the single drain observer without canceling retained cleanup.
+    /// Waker destruction runs outside all owner metadata borrows.
+    pub fn clear_idle_waker(&self) {
+        let previous = self.0.idle_waker.borrow_mut().take();
+        drop(previous);
+    }
     /// Pump from an owning-thread physical-unlock or completion event.
     pub fn notify(&self) {
         assert_eq!(
@@ -524,6 +593,7 @@ impl NativeCleanupOwner {
             "native cleanup moved threads"
         );
         let _state = self.0.thread_state.enter();
+        let already_unwinding = std::thread::panicking();
         self.0.ready.set(true);
         if self.0.running.replace(true) {
             return;
@@ -536,9 +606,11 @@ impl NativeCleanupOwner {
         }
         let running = Running(&self.0.running);
         let mut failures = Vec::new();
+        let mut processed_work = false;
         while self.0.ready.replace(false) {
             let futures = std::mem::take(&mut *self.0.futures.borrow_mut());
             for mut task in futures {
+                processed_work = true;
                 // Remove before polling: unlock/settlement callbacks can notify
                 // or enqueue another exact owner while this continuation runs.
                 let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -546,9 +618,10 @@ impl NativeCleanupOwner {
                     let _stores = StoreContext::detach_current();
                     let _logical = DetachedRootMetadata::new();
                     let _host_cleanup = NativeCleanupNoYield::enter();
-                    task.future
-                        .as_mut()
-                        .poll(&mut Context::from_waker(Waker::noop()))
+                    let waker = self.0.idle_waker.borrow().clone();
+                    task.future.as_mut().poll(&mut Context::from_waker(
+                        waker.as_deref().unwrap_or(Waker::noop()),
+                    ))
                 }));
                 match polled {
                     Ok(Poll::Pending) => self.0.futures.borrow_mut().push_back(task),
@@ -563,7 +636,38 @@ impl NativeCleanupOwner {
             }
         }
         drop(running);
-        resume_cleanup_panics(failures);
+        if !self.0.callbacks_running.replace(true) {
+            let callbacks_running = Running(&self.0.callbacks_running);
+            loop {
+                let callback = self.0.after_pump.borrow_mut().pop_front();
+                let Some(callback) = callback else {
+                    break;
+                };
+                defer_cleanup(&mut failures, || {
+                    let _caller = DetachedCoroutineContext::new();
+                    let _stores = StoreContext::detach_current();
+                    let _logical = DetachedRootMetadata::new();
+                    let _host_cleanup = NativeCleanupNoYield::enter();
+                    (callback.callback)();
+                    drop(callback._owner);
+                });
+            }
+            drop(callbacks_running);
+        }
+        if processed_work && self.is_idle() {
+            let waker = self.0.idle_waker.borrow().clone();
+            if let Some(waker) = waker {
+                defer_cleanup(&mut failures, || {
+                    let _caller = DetachedCoroutineContext::new();
+                    let _stores = StoreContext::detach_current();
+                    let _logical = DetachedRootMetadata::new();
+                    let _host_cleanup = NativeCleanupNoYield::enter();
+                    waker.wake_by_ref();
+                    drop(waker);
+                });
+            }
+        }
+        resume_guard_cleanup_panics(failures, already_unwinding);
     }
     fn observe_store(&self, store: &StoreAsync) {
         let key = store.inner.downgrade();
@@ -3183,6 +3287,269 @@ mod tests {
     use crate::{Function, Instance, Module};
 
     #[test]
+    fn native_cleanup_after_pump_allows_reentrant_retained_work_in_fifo_order() {
+        let owner = NativeCleanupOwner::new();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let task_owner = owner.clone();
+        let task_events = events.clone();
+        owner.retain(Box::pin(async move {
+            assert!(
+                !task_owner.is_idle(),
+                "the active task is outside its queue"
+            );
+            let callback_owner = task_owner.clone();
+            let callback_events = task_events.clone();
+            task_owner.after_pump(Box::new(move || {
+                assert!(!callback_owner.0.running.get());
+                assert!(callback_owner.0.callbacks_running.get());
+                assert!(callback_owner.is_idle(), "callbacks are excluded from idle");
+                drop(callback_owner.0.futures.try_borrow_mut().unwrap());
+                drop(callback_owner.0.after_pump.try_borrow_mut().unwrap());
+                drop(callback_owner.0.observers.try_borrow_mut().unwrap());
+                assert!(StoreContext::is_empty());
+                assert!(CoroutineContext::get_current().is_none());
+                assert!(native_cleanup_no_yield());
+                callback_events.borrow_mut().push(1);
+                let retained_events = callback_events.clone();
+                callback_owner.retain(Box::pin(async move {
+                    retained_events.borrow_mut().push(2);
+                }));
+                callback_owner.notify();
+                let later_events = callback_events.clone();
+                callback_owner.after_pump(Box::new(move || later_events.borrow_mut().push(5)));
+                callback_events.borrow_mut().push(3);
+            }));
+            task_owner.after_pump(Box::new(move || task_events.borrow_mut().push(4)));
+        }));
+        assert_eq!(*events.borrow(), [1, 2, 3, 4, 5]);
+        assert!(owner.is_idle());
+        assert!(!owner.0.callbacks_running.get());
+        assert_eq!(Rc::strong_count(&owner.0), 1);
+
+        let ready = Rc::new(Cell::new(false));
+        let task_ready = ready.clone();
+        owner.retain(Box::pin(std::future::poll_fn(move |_| {
+            if task_ready.get() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })));
+        assert!(!owner.is_idle());
+        ready.set(true);
+        owner.notify();
+        assert!(owner.is_idle());
+    }
+
+    #[test]
+    fn native_cleanup_after_pump_preserves_first_and_active_panics() {
+        struct PumpPanic;
+        struct CallbackPanic;
+        struct OuterPanic;
+        let owner = NativeCleanupOwner::new();
+        let finished = Rc::new(Cell::new(false));
+        let task_owner = owner.clone();
+        let task_finished = finished.clone();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            owner.retain(Box::pin(async move {
+                task_owner.after_pump(Box::new(|| std::panic::panic_any(CallbackPanic)));
+                task_owner.after_pump(Box::new(move || task_finished.set(true)));
+                std::panic::panic_any(PumpPanic);
+            }));
+        }))
+        .expect_err("the first pump panic must propagate after every callback");
+        assert!(panic.is::<PumpPanic>());
+        assert!(finished.get());
+        assert!(owner.is_idle());
+        assert!(!owner.0.callbacks_running.get());
+        assert_eq!(Rc::strong_count(&owner.0), 1);
+
+        struct DuringUnwind(NativeCleanupOwner, Rc<Cell<bool>>);
+        impl Drop for DuringUnwind {
+            fn drop(&mut self) {
+                let finished = self.1.clone();
+                self.0.after_pump(Box::new(move || {
+                    finished.set(true);
+                    std::panic::panic_any(CallbackPanic);
+                }));
+            }
+        }
+        finished.set(false);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _cleanup = DuringUnwind(owner.clone(), finished.clone());
+            std::panic::panic_any(OuterPanic);
+        }))
+        .expect_err("after-pump cleanup must preserve an already-active panic");
+        assert!(panic.is::<OuterPanic>());
+        assert!(finished.get());
+        assert!(owner.is_idle());
+        assert!(!owner.0.callbacks_running.get());
+        assert_eq!(Rc::strong_count(&owner.0), 1);
+    }
+
+    #[test]
+    fn native_cleanup_idle_registration_survives_notify_and_clears_on_ready_or_cancel() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Wake(AtomicUsize);
+        impl std::task::Wake for Wake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let owner = NativeCleanupOwner::new();
+        let ready = Rc::new(Cell::new(false));
+        let last_waker = Rc::new(RefCell::new(None::<Waker>));
+        let task_ready = ready.clone();
+        let task_waker = last_waker.clone();
+        owner.retain(Box::pin(std::future::poll_fn(move |cx| {
+            *task_waker.borrow_mut() = Some(cx.waker().clone());
+            if task_ready.get() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })));
+        let wake = Arc::new(Wake(AtomicUsize::new(0)));
+        let waker = Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(owner.poll_idle(&mut cx).is_pending());
+        owner.notify();
+        assert!(last_waker.borrow().as_ref().unwrap().will_wake(&waker));
+        assert_eq!(
+            wake.0.load(Ordering::SeqCst),
+            0,
+            "Pending must not busy-wake"
+        );
+        last_waker.borrow().as_ref().unwrap().wake_by_ref();
+        assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+        ready.set(true);
+        assert!(owner.poll_idle(&mut cx).is_ready());
+        assert!(owner.0.idle_waker.borrow().is_none());
+        assert_eq!(
+            wake.0.load(Ordering::SeqCst),
+            2,
+            "settlement wakes its observer"
+        );
+        drop(last_waker.borrow_mut().take());
+        assert_eq!(Arc::strong_count(&wake), 2);
+
+        ready.set(false);
+        let task_ready = ready.clone();
+        owner.retain(Box::pin(std::future::poll_fn(move |_| {
+            if task_ready.get() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })));
+        assert!(owner.poll_idle(&mut cx).is_pending());
+        assert_eq!(Arc::strong_count(&wake), 3);
+        owner.clear_idle_waker();
+        assert_eq!(Arc::strong_count(&wake), 2);
+        assert!(
+            !owner.is_idle(),
+            "observer cancellation preserves cleanup custody"
+        );
+        ready.set(true);
+        owner.notify();
+        assert!(owner.is_idle());
+        assert_eq!(Rc::strong_count(&owner.0), 1);
+    }
+
+    #[test]
+    fn native_cleanup_after_pump_drives_dependent_local_tasks_with_real_wakes() {
+        if !runtime_subprocess(
+            "backend::sys::async_runtime::tests::native_cleanup_after_pump_drives_dependent_local_tasks_with_real_wakes",
+        ) {
+            return;
+        }
+        use std::sync::{Condvar, Mutex};
+        struct Wake {
+            ready: Mutex<bool>,
+            changed: Condvar,
+        }
+        impl std::task::Wake for Wake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                *self.ready.lock().unwrap() = true;
+                self.changed.notify_one();
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut local = tokio::task::LocalSet::new();
+        let owner = NativeCleanupOwner::new();
+        let finished = Rc::new(Cell::new(false));
+        let local_owner = owner.clone();
+        let local_finished = finished.clone();
+        local.spawn_local(async move {
+            let (send, receive) = tokio::sync::oneshot::channel();
+            local_owner.retain(Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                send.send(()).unwrap();
+            }));
+            receive.await.unwrap();
+            local_finished.set(true);
+        });
+        let task_owner = owner.clone();
+        owner.retain(Box::pin(async move {
+            let callback_owner = task_owner.clone();
+            task_owner.after_pump(Box::new(move || {
+                struct IdleRegistration(NativeCleanupOwner);
+                impl Drop for IdleRegistration {
+                    fn drop(&mut self) {
+                        self.0.clear_idle_waker();
+                    }
+                }
+                let registration = IdleRegistration(callback_owner.clone());
+                let wake = Arc::new(Wake {
+                    ready: Mutex::new(false),
+                    changed: Condvar::new(),
+                });
+                let waker = Waker::from(wake.clone());
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    assert!(!callback_owner.0.running.get());
+                    let polled = {
+                        let _entered = runtime.enter();
+                        let mut cx = Context::from_waker(&waker);
+                        let local = Pin::new(&mut local).poll(&mut cx);
+                        let cleanup = callback_owner.poll_idle(&mut cx);
+                        (local, cleanup)
+                    };
+                    if polled.0.is_ready() && polled.1.is_ready() {
+                        break;
+                    }
+                    let mut ready = wake.ready.lock().unwrap();
+                    while !*ready {
+                        let remaining = deadline
+                            .checked_duration_since(std::time::Instant::now())
+                            .expect("dependent local cleanup did not wake its real driver");
+                        ready = wake.changed.wait_timeout(ready, remaining).unwrap().0;
+                    }
+                    *ready = false;
+                }
+                assert!(callback_owner.is_idle());
+                assert!(callback_owner.0.idle_waker.borrow().is_none());
+                drop(registration);
+                drop(local);
+                drop(runtime);
+            }));
+        }));
+        assert!(finished.get());
+        assert!(owner.is_idle());
+        assert_eq!(Rc::strong_count(&owner.0), 1);
+    }
+
+    #[test]
     fn native_cleanup_retires_escaped_physical_frames_after_both_tls_orders() {
         if !runtime_subprocess(
             "backend::sys::async_runtime::tests::native_cleanup_retires_escaped_physical_frames_after_both_tls_orders",
@@ -3299,6 +3666,10 @@ mod tests {
                     drop(error);
                     settled_thread.fetch_add(1, Ordering::SeqCst);
                 }));
+                assert!(
+                    !owner.is_idle(),
+                    "the escaped physical frame still owns cleanup"
+                );
                 assert_eq!(settled_check.load(Ordering::SeqCst), 0);
                 assert_eq!(payload_check.load(Ordering::SeqCst), 0);
                 drop(root);
@@ -3335,6 +3706,7 @@ mod tests {
             assert!(!finished.get());
             drop(held);
             assert!(finished.get(), "unlock alone must finish retained cleanup");
+            assert!(owner.is_idle());
             drop(captured);
             store = store.into_store().unwrap().into_async();
             assert!(owner.0.futures.borrow().is_empty());
