@@ -50,7 +50,7 @@ pub fn call_async_with_local_owner(
     match &function.0 {
         crate::BackendFunction::Sys(function) => Box::pin(AsyncCallFuture::new_with_local_owner(
             function.clone(),
-            store.clone(),
+            store.store(),
             params,
             Some(owner),
         )),
@@ -6372,11 +6372,13 @@ mod tests {
             store.native_invocation.is_none(),
             "ordinary Rust caller has no generation"
         );
-        let mut call = instance
-            .exports
-            .get_function("run")
-            .unwrap()
-            .call_async(&store, vec![]);
+        let mut call = Box::pin(
+            instance
+                .exports
+                .get_function("run")
+                .unwrap()
+                .call_async(&store, vec![]),
+        );
         let noop = futures::task::noop_waker();
         assert!(
             call.as_mut()
@@ -6460,11 +6462,13 @@ mod tests {
         )
         .unwrap();
         let store = store.into_async();
-        let mut call = instance
-            .exports
-            .get_function("run")
-            .unwrap()
-            .call_async(&store, vec![]);
+        let mut call = Box::pin(
+            instance
+                .exports
+                .get_function("run")
+                .unwrap()
+                .call_async(&store, vec![]),
+        );
         let noop = futures::task::noop_waker();
         assert!(
             call.as_mut()
@@ -6622,7 +6626,7 @@ mod tests {
             });
         let parent_store = parent_store.into_async();
         let noop = futures::task::noop_waker();
-        let mut parent_call = parent.call_async(&parent_store, vec![]);
+        let mut parent_call = Box::pin(parent.call_async(&parent_store, vec![]));
         assert!(
             parent_call
                 .as_mut()
@@ -6639,7 +6643,7 @@ mod tests {
             std::future::pending::<Result<Vec<Value>, RuntimeError>>()
         });
         let child_store = child_store.into_async();
-        let mut child_call = child.call_async(&child_store, vec![]);
+        let mut child_call = Box::pin(child.call_async(&child_store, vec![]));
         assert!(
             child_call
                 .as_mut()
