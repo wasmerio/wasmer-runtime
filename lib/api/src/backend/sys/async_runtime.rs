@@ -575,9 +575,14 @@ struct RuntimeThreadState {
     stores: crate::StoreThreadState,
     bounds: Rc<RefCell<Vec<NativeStackBounds>>>,
     #[cfg(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        target_pointer_width = "64"
+        target_pointer_width = "64",
+        any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(
+                target_os = "macos",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
     ))]
     paused: Rc<RefCell<Vec<NativePausedStack>>>,
     current: Rc<RefCell<Vec<*const CoroutineContext>>>,
@@ -590,9 +595,14 @@ impl RuntimeThreadState {
             stores: crate::StoreThreadState::capture(),
             bounds: NATIVE_STACK_BOUNDS.capture(),
             #[cfg(all(
-                target_os = "linux",
-                target_arch = "x86_64",
-                target_pointer_width = "64"
+                target_pointer_width = "64",
+                any(
+                    all(target_os = "linux", target_arch = "x86_64"),
+                    all(
+                        target_os = "macos",
+                        any(target_arch = "x86_64", target_arch = "aarch64")
+                    )
+                )
             ))]
             paused: NATIVE_PAUSED_STACKS.capture(),
             current: CURRENT_CONTEXT.capture(),
@@ -605,9 +615,14 @@ impl RuntimeThreadState {
             _stores: self.stores.enter(),
             _bounds: NATIVE_STACK_BOUNDS.enter(self.bounds.clone()),
             #[cfg(all(
-                target_os = "linux",
-                target_arch = "x86_64",
-                target_pointer_width = "64"
+                target_pointer_width = "64",
+                any(
+                    all(target_os = "linux", target_arch = "x86_64"),
+                    all(
+                        target_os = "macos",
+                        any(target_arch = "x86_64", target_arch = "aarch64")
+                    )
+                )
             ))]
             _paused: NATIVE_PAUSED_STACKS.enter(self.paused.clone()),
             _current: CURRENT_CONTEXT.enter(self.current.clone()),
@@ -621,9 +636,14 @@ impl RuntimeThreadState {
             || scope._retained.is_late()
             || scope._retiring.is_late();
         #[cfg(all(
-            target_os = "linux",
-            target_arch = "x86_64",
-            target_pointer_width = "64"
+            target_pointer_width = "64",
+            any(
+                all(target_os = "linux", target_arch = "x86_64"),
+                all(
+                    target_os = "macos",
+                    any(target_arch = "x86_64", target_arch = "aarch64")
+                )
+            )
         ))]
         let late = late || scope._paused.is_late();
         if late && !native_cleanup_no_yield() {
@@ -636,9 +656,14 @@ struct RuntimeThreadScope {
     _stores: TeardownTlsGuard<Vec<StoreContext>>,
     _bounds: TeardownTlsGuard<Vec<NativeStackBounds>>,
     #[cfg(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        target_pointer_width = "64"
+        target_pointer_width = "64",
+        any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(
+                target_os = "macos",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
     ))]
     _paused: TeardownTlsGuard<Vec<NativePausedStack>>,
     _current: TeardownTlsGuard<Vec<*const CoroutineContext>>,
@@ -647,10 +672,10 @@ struct RuntimeThreadScope {
     _late_cleanup: Option<NativeCleanupNoYield>,
 }
 
-// Only the audited SysV64 profile exposes paused conservative-GC segments.
+// Only the audited SysV64 and Darwin profiles expose paused conservative-GC segments.
 // The record belongs to the caller and stays live until its transfer returns.
 #[cfg(all(
-    target_os = "linux",
+    any(target_os = "linux", target_os = "macos"),
     target_arch = "x86_64",
     target_pointer_width = "64"
 ))]
@@ -688,18 +713,87 @@ core::arch::global_asm!(
 );
 
 #[cfg(all(
-    target_os = "linux",
+    target_os = "macos",
     target_arch = "x86_64",
     target_pointer_width = "64"
+))]
+core::arch::global_asm!(
+    ".text",
+    ".p2align 4",
+    ".globl _wasmer_native_stack_pause_capture",
+    ".private_extern _wasmer_native_stack_pause_capture",
+    "_wasmer_native_stack_pause_capture:",
+    ".cfi_startproc",
+    "mov [rdi], rbx",
+    "mov [rdi + 8], rbp",
+    "mov [rdi + 16], r12",
+    "mov [rdi + 24], r13",
+    "mov [rdi + 32], r14",
+    "mov [rdi + 40], r15",
+    "mov [rdi + 48], rsp",
+    "ret",
+    ".cfi_endproc",
+);
+
+#[cfg(all(
+    target_os = "macos",
+    target_arch = "aarch64",
+    target_pointer_width = "64"
+))]
+#[repr(C, align(16))]
+#[derive(Default)]
+struct NativeStackRegisters {
+    preserved: [usize; 12],
+    entry_sp: usize,
+}
+
+#[cfg(all(
+    target_os = "macos",
+    target_arch = "aarch64",
+    target_pointer_width = "64"
+))]
+core::arch::global_asm!(
+    ".text",
+    ".p2align 2",
+    ".globl _wasmer_native_stack_pause_capture",
+    ".private_extern _wasmer_native_stack_pause_capture",
+    "_wasmer_native_stack_pause_capture:",
+    ".cfi_startproc",
+    "stp x19, x20, [x0]",
+    "stp x21, x22, [x0, #16]",
+    "stp x23, x24, [x0, #32]",
+    "stp x25, x26, [x0, #48]",
+    "stp x27, x28, [x0, #64]",
+    "stp x29, x30, [x0, #80]",
+    "mov x9, sp",
+    "str x9, [x0, #96]",
+    "ret",
+    ".cfi_endproc",
+);
+
+#[cfg(all(
+    target_pointer_width = "64",
+    any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
 ))]
 unsafe extern "C" {
     fn wasmer_native_stack_pause_capture(record: *mut NativeStackRegisters);
 }
 
 #[cfg(all(
-    target_os = "linux",
-    target_arch = "x86_64",
-    target_pointer_width = "64"
+    target_pointer_width = "64",
+    any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
 ))]
 #[derive(Clone, Copy)]
 struct NativePausedStack {
@@ -708,9 +802,14 @@ struct NativePausedStack {
     top: usize,
 }
 #[cfg(all(
-    target_os = "linux",
-    target_arch = "x86_64",
-    target_pointer_width = "64"
+    target_pointer_width = "64",
+    any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
 ))]
 thread_local! {
     // Numeric rows own no stack. Each row's caller owns its live spill record;
@@ -720,9 +819,14 @@ thread_local! {
     static NEXT_NATIVE_PAUSE: Cell<u64> = const { Cell::new(0) };
 }
 #[cfg(all(
-    target_os = "linux",
-    target_arch = "x86_64",
-    target_pointer_width = "64"
+    target_pointer_width = "64",
+    any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
 ))]
 static NATIVE_PAUSED_STACKS: TeardownTls<Vec<NativePausedStack>> = TeardownTls::new(
     &NATIVE_PAUSED_STACKS_PRIMARY,
@@ -730,18 +834,28 @@ static NATIVE_PAUSED_STACKS: TeardownTls<Vec<NativePausedStack>> = TeardownTls::
 );
 
 #[cfg(all(
-    target_os = "linux",
-    target_arch = "x86_64",
-    target_pointer_width = "64"
+    target_pointer_width = "64",
+    any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
 ))]
 struct NativeStackPause<'a> {
     id: u64,
     registers: &'a NativeStackRegisters,
 }
 #[cfg(all(
-    target_os = "linux",
-    target_arch = "x86_64",
-    target_pointer_width = "64"
+    target_pointer_width = "64",
+    any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(
+            target_os = "macos",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    )
 ))]
 impl Drop for NativeStackPause<'_> {
     fn drop(&mut self) {
@@ -763,9 +877,14 @@ impl Drop for NativeStackPause<'_> {
 /// No pointer is dereferenced and no borrow survives the return.
 pub(super) fn native_paused_stack_top(bounds: Option<NativeStackBounds>) -> Option<usize> {
     #[cfg(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        target_pointer_width = "64"
+        target_pointer_width = "64",
+        any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(
+                target_os = "macos",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
     ))]
     {
         NATIVE_PAUSED_STACKS
@@ -780,9 +899,14 @@ pub(super) fn native_paused_stack_top(bounds: Option<NativeStackBounds>) -> Opti
             .flatten()
     }
     #[cfg(not(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        target_pointer_width = "64"
+        target_pointer_width = "64",
+        any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(
+                target_os = "macos",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
     )))]
     {
         let _ = bounds;
@@ -793,20 +917,29 @@ pub(super) fn native_paused_stack_top(bounds: Option<NativeStackBounds>) -> Opti
 #[inline(never)]
 fn with_native_stack_pause<R>(transfer: impl FnOnce() -> R) -> R {
     #[cfg(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        target_pointer_width = "64"
+        target_pointer_width = "64",
+        any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(
+                target_os = "macos",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
     ))]
     {
         let mut registers = NativeStackRegisters::default();
-        // A real external SysV call forces caller-saved live values to their
-        // callers' spill locations; the assembly preserves the six remaining
+        // A real external ABI call forces caller-saved live values to their
+        // callers' spill locations; the assembly preserves the remaining
         // general pointer registers in THIS live record, never its dead frame.
         unsafe { wasmer_native_stack_pause_capture(&mut registers) };
+        // x64 CALL pushes a return address; arm64 BL leaves entry SP unchanged.
+        #[cfg(target_arch = "x86_64")]
         let top = registers
             .entry_sp
             .checked_add(size_of::<usize>())
             .expect("native pause SP overflow");
+        #[cfg(target_arch = "aarch64")]
+        let top = registers.entry_sp;
         let record = &registers as *const NativeStackRegisters as usize;
         assert!(top <= record, "native register record below caller SP");
         let bounds = current_native_stack_bounds();
@@ -837,9 +970,14 @@ fn with_native_stack_pause<R>(transfer: impl FnOnce() -> R) -> R {
         result
     }
     #[cfg(not(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        target_pointer_width = "64"
+        target_pointer_width = "64",
+        any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(
+                target_os = "macos",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
     )))]
     {
         transfer()
@@ -5082,9 +5220,14 @@ mod tests {
 
     #[test]
     #[cfg(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        target_pointer_width = "64"
+        target_pointer_width = "64",
+        any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(
+                target_os = "macos",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            )
+        )
     ))]
     fn paused_native_used_ranges_survive_yield_and_forced_unwind() {
         if !runtime_subprocess(
