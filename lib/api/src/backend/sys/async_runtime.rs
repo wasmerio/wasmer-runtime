@@ -1131,9 +1131,63 @@ pub struct NativeStoreDestructionObserver {
 }
 
 type StoreDestructionAction = Box<dyn FnOnce(Option<DeferredPanic>) -> Option<DeferredPanic>>;
+enum DestructionActionState {
+    Open,
+    Reserved,
+    Installed(StoreDestructionAction),
+    NotificationsDone,
+}
 struct StoreDestructionActionSlot {
-    action: RefCell<Option<StoreDestructionAction>>,
+    state: RefCell<DestructionActionState>,
     notifications_done: Cell<bool>,
+}
+
+/// Exclusive construction-time authority for the SAME actual destruction slot.
+/// Noncloneable and weak: it pins neither backing, slot, Store nor phase.
+#[doc(hidden)]
+pub struct NativeStoreDestructionReservation {
+    slot: Weak<StoreDestructionActionSlot>,
+    armed: bool,
+}
+impl NativeStoreDestructionReservation {
+    /// Only actual notification completion can refuse the exact closure. Other
+    /// receipt callers cannot occupy Reserved; no unfinished phase existed when
+    /// reserve_cleanup first acquired this unique construction authority.
+    pub fn install<F>(mut self, exact: F) -> Result<(), F>
+    where
+        F: FnOnce(Option<DeferredPanic>) -> Option<DeferredPanic> + 'static,
+    {
+        self.armed = false;
+        let Some(slot) = self.slot.upgrade() else {
+            return Err(exact);
+        };
+        let mut state = slot.state.borrow_mut();
+        match &*state {
+            DestructionActionState::Reserved => {
+                *state = DestructionActionState::Installed(Box::new(exact));
+                Ok(())
+            }
+            DestructionActionState::NotificationsDone => Err(exact),
+            // Private state writes are closed: only this nonClone token or
+            // actual guard completion can change Reserved. No legal caller can
+            // create an Occupied failure after phase construction.
+            DestructionActionState::Open | DestructionActionState::Installed(_) => {
+                unreachable!("exclusive destruction reservation changed without its token")
+            }
+        }
+    }
+}
+impl Drop for NativeStoreDestructionReservation {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(slot) = self.slot.upgrade()
+        {
+            let mut state = slot.state.borrow_mut();
+            if matches!(*state, DestructionActionState::Reserved) {
+                *state = DestructionActionState::Open;
+            }
+        }
+    }
 }
 
 pub(crate) struct NativeStoreDestructionGuard {
@@ -1152,11 +1206,32 @@ impl NativeStoreDestruction {
         let Some(action) = self.0.action.upgrade() else {
             return Err(exact);
         };
-        if action.notifications_done.get() || action.action.borrow().is_some() {
+        if !matches!(*action.state.borrow(), DestructionActionState::Open) {
             return Err(exact);
         }
-        *action.action.borrow_mut() = Some(Box::new(exact));
+        *action.state.borrow_mut() = DestructionActionState::Installed(Box::new(exact));
         Ok(())
+    }
+
+    /// Acquire only while construction still owns the concrete backing, before
+    /// publishing any user producer or creating an unfinished finalizer phase.
+    pub fn reserve_cleanup(&self) -> Result<NativeStoreDestructionReservation, RuntimeError> {
+        let slot = self
+            .0
+            .action
+            .upgrade()
+            .ok_or_else(|| RuntimeError::new("Store destruction already returned"))?;
+        let mut state = slot.state.borrow_mut();
+        if !matches!(*state, DestructionActionState::Open) {
+            return Err(RuntimeError::new(
+                "Store destruction action already reserved",
+            ));
+        }
+        *state = DestructionActionState::Reserved;
+        Ok(NativeStoreDestructionReservation {
+            slot: Rc::downgrade(&slot),
+            armed: true,
+        })
     }
 
     /// Pure notification-return certificate, distinct from resource completion.
@@ -1225,7 +1300,7 @@ impl Drop for NativeStoreDestructionObserver {
 impl NativeStoreDestructionGuard {
     fn new(cleanup: Option<&NativeCleanupOwner>) -> Self {
         let action = Rc::new(StoreDestructionActionSlot {
-            action: RefCell::default(),
+            state: RefCell::new(DestructionActionState::Open),
             notifications_done: Cell::new(false),
         });
         Self {
@@ -1270,8 +1345,11 @@ impl Drop for NativeStoreDestructionGuard {
             capture_owner_failure(self.failures.as_ref(), &mut failures, || drop(secondary));
         }
         self.action.notifications_done.set(true);
-        let action = self.action.action.borrow_mut().take();
-        if let Some(action) = action {
+        let state = self
+            .action
+            .state
+            .replace(DestructionActionState::NotificationsDone);
+        if let DestructionActionState::Installed(action) = state {
             let returned =
                 capture_owner_failure(self.failures.as_ref(), &mut failures, || action(first));
             // An already-owned terminal return is NOT a newly caught event.
@@ -5037,6 +5115,92 @@ mod tests {
                 .poll(&mut Context::from_waker(Waker::noop()))
                 .is_ready()
         );
+    }
+
+    #[test]
+    fn native_store_destruction_reservation_excludes_competitors_and_returns_only_after_completion()
+    {
+        let guard = NativeStoreDestructionGuard::new(None);
+        let receipt = guard.receipt.clone();
+        let reservation = receipt.reserve_cleanup().unwrap();
+        assert!(receipt.reserve_cleanup().is_err());
+        struct Probe(Rc<Cell<usize>>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let drops = Rc::new(Cell::new(0));
+        let calls = Rc::new(Cell::new(0));
+        let probe = Probe(drops.clone());
+        let invoked = calls.clone();
+        let exact = Box::new(move |_| {
+            invoked.set(invoked.get() + 1);
+            drop(probe);
+            None
+        });
+        let address = (&*exact) as *const _ as usize;
+        let exact = receipt
+            .try_defer_cleanup(exact)
+            .err()
+            .expect("ordinary caller cannot bypass Reserved");
+        assert_eq!((&*exact) as *const _ as usize, address);
+        assert_eq!(drops.get(), 0);
+        drop(guard);
+        assert!(receipt.is_complete() && receipt.notifications_complete());
+        let exact = reservation
+            .install(exact)
+            .err()
+            .expect("actual notification return is the ONLY typed refusal");
+        assert_eq!((&*exact) as *const _ as usize, address);
+        assert_eq!(calls.get(), 0);
+        assert_eq!(drops.get(), 0);
+        assert!(exact(None).is_none());
+        assert_eq!(calls.get(), 1);
+        assert_eq!(drops.get(), 1);
+    }
+
+    #[test]
+    fn native_store_destruction_reservation_survives_successor_and_into_store_conversion() {
+        let mut store = Store::default();
+        let scope = NativeInvocationScope::bind(&mut store).unwrap();
+        let receipt = scope.store_destruction();
+        let reservation = receipt.reserve_cleanup().unwrap();
+        let asynchronous = store.into_async();
+        scope.close();
+        let mut write = asynchronous.inner.try_write().unwrap();
+        let (next, successor) = scope
+            .successor(&asynchronous, &mut write.as_store_mut())
+            .unwrap();
+        assert!(
+            next.store_destruction().reserve_cleanup().is_err(),
+            "successor cannot reserve the SAME backing twice"
+        );
+        drop(write);
+        drop(successor);
+        drop(scope);
+        let store = asynchronous.into_store().unwrap();
+        assert!(
+            next.store_destruction().reserve_cleanup().is_err(),
+            "conversion preserves SAME reservation"
+        );
+        let called = Rc::new(Cell::new(false));
+        let invoked = called.clone();
+        let observed = receipt.clone();
+        reservation
+            .install(move |_| {
+                assert!(observed.is_complete() && observed.notifications_complete());
+                invoked.set(true);
+                None
+            })
+            .unwrap_or_else(|_| {
+                panic!("exclusive reserved action refused before actual destruction")
+            });
+        assert!(!called.get());
+        drop(store);
+        assert!(called.get());
+        assert!(receipt.notifications_complete());
+        drop(next);
     }
 
     #[test]
