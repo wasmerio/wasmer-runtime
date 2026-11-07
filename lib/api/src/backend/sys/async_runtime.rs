@@ -1233,7 +1233,7 @@ pub struct NativeCleanupExitBoundary {
 
 struct CleanupExitState {
     owner: Weak<NativeCleanupState>,
-    parent: RefCell<Option<Rc<CleanupExitState>>>,
+    parent: RefCell<Option<Rc<Self>>>,
     children: Cell<usize>,
     lexical_done: Cell<bool>,
     draining: Cell<bool>,
@@ -1723,7 +1723,7 @@ impl NativeCleanupOwner {
         let weak = Rc::downgrade(&self.0);
         let callback: Rc<dyn Fn()> = Rc::new(move || {
             if let Some(owner) = weak.upgrade() {
-                NativeCleanupOwner(owner).notify();
+                Self(owner).notify();
             }
         });
         store.inner.observe_unlock(Rc::downgrade(&callback));
@@ -2173,18 +2173,20 @@ struct NativeParent {
     parent: Weak<NativeRootControl>,
 }
 
+type RetainedRootMap = HashMap<StoreId, Weak<NativeRootControl>>;
+
 thread_local! {
     // A retained original write guard makes this a single-owner association.
     // Weak metadata cannot keep a coroutine, Store or cleanup task alive.
-    static RETAINED_ROOTS_PRIMARY: Rc<RefCell<HashMap<StoreId, Weak<NativeRootControl>>>> = Rc::new(RefCell::new(HashMap::new()));
-    static RETAINED_ROOTS_TEARDOWN: Cell<*const Rc<RefCell<HashMap<StoreId, Weak<NativeRootControl>>>>> = const { Cell::new(std::ptr::null()) };
+    static RETAINED_ROOTS_PRIMARY: Rc<RefCell<RetainedRootMap>> = Rc::new(RefCell::new(HashMap::new()));
+    static RETAINED_ROOTS_TEARDOWN: Cell<*const Rc<RefCell<RetainedRootMap>>> = const { Cell::new(std::ptr::null()) };
     static RETIRING_ROOT_PRIMARY: Rc<RefCell<Option<Rc<NativeRootControl>>>> = Rc::new(RefCell::new(None));
     static RETIRING_ROOT_TEARDOWN: Cell<*const Rc<RefCell<Option<Rc<NativeRootControl>>>>> = const { Cell::new(std::ptr::null()) };
 }
 static RETIRING_ROOT: TeardownTls<Option<Rc<NativeRootControl>>> =
     TeardownTls::new(&RETIRING_ROOT_PRIMARY, &RETIRING_ROOT_TEARDOWN);
 
-static RETAINED_ROOTS: TeardownTls<HashMap<StoreId, Weak<NativeRootControl>>> =
+static RETAINED_ROOTS: TeardownTls<RetainedRootMap> =
     TeardownTls::new(&RETAINED_ROOTS_PRIMARY, &RETAINED_ROOTS_TEARDOWN);
 
 // Destructors run without a coroutine yielder or Store authority. Keep only

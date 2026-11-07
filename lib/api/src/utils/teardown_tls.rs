@@ -93,6 +93,10 @@ impl<T: 'static> TeardownTls<T> {
 /// Used only by synchronous teardown frames, never stored in a pending future.
 pub(crate) struct TeardownTlsGuard<T: 'static> {
     key: &'static TeardownTls<T>,
+    #[allow(
+        clippy::redundant_allocation,
+        reason = "The active TLS pointer targets this Rc slot; Box keeps its address stable as the guard moves."
+    )]
     owned: Option<Box<Rc<RefCell<T>>>>,
     late: bool,
     _local: PhantomData<Rc<()>>,
