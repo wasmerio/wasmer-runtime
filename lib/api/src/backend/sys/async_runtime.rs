@@ -1377,9 +1377,11 @@ pub struct NativeCleanupOwner(Rc<NativeCleanupState>);
 #[derive(Clone)]
 pub struct NativeCleanupFailures(Rc<CleanupFailureReceiver>);
 
+type CleanupFailureClaim = dyn Fn(Option<&NativeCleanupOwner>) -> NativeCleanupFailureDisposition;
+
 struct CleanupFailureReceiver {
     record: Box<dyn Fn(DeferredPanic)>,
-    claim_ready: Box<dyn Fn(Option<&NativeCleanupOwner>) -> NativeCleanupFailureDisposition>,
+    claim_ready: Box<CleanupFailureClaim>,
     take_last_owned: Box<dyn Fn() -> Option<DeferredPanic>>,
 }
 
@@ -5142,16 +5144,14 @@ mod tests {
         let address = (&*exact) as *const _ as *const () as usize;
         let exact = receipt
             .try_defer_cleanup(exact)
-            .err()
-            .expect("ordinary caller cannot bypass Reserved");
+            .expect_err("ordinary caller cannot bypass Reserved");
         assert_eq!((&*exact) as *const _ as *const () as usize, address);
         assert_eq!(drops.get(), 0);
         drop(guard);
         assert!(receipt.is_complete() && receipt.notifications_complete());
         let exact = reservation
             .install(exact)
-            .err()
-            .expect("actual notification return is the ONLY typed refusal");
+            .expect_err("actual notification return is the ONLY typed refusal");
         assert_eq!((&*exact) as *const _ as *const () as usize, address);
         assert_eq!(calls.get(), 0);
         assert_eq!(drops.get(), 0);
@@ -5288,8 +5288,7 @@ mod tests {
         let address = (&*exact) as *const _ as *const () as usize;
         let exact = receipt
             .try_defer_cleanup(exact)
-            .err()
-            .expect("one actual continuation slot");
+            .expect_err("one actual continuation slot");
         assert_eq!((&*exact) as *const _ as *const () as usize, address);
         assert_eq!(drops.get(), 0);
         assert_eq!(rejected_calls.get(), 0);
@@ -5298,8 +5297,7 @@ mod tests {
         assert_eq!(called.get(), 1);
         let exact = receipt
             .try_defer_cleanup(exact)
-            .err()
-            .expect("actual notifications have returned");
+            .expect_err("actual notifications have returned");
         assert_eq!((&*exact) as *const _ as *const () as usize, address);
         assert_eq!(drops.get(), 0);
         assert_eq!(rejected_calls.get(), 0);
