@@ -1329,6 +1329,39 @@ impl Drop for NativeCleanupExitBoundary {
     }
 }
 
+/// Unique authority for one Store-bound cleanup cutoff. The managed owner must
+/// first certify actual physical/loader/LocalSet/VM destruction and observer
+/// disposal. This token itself owns no Store, executor or cleanup producer.
+#[doc(hidden)]
+pub struct NativeCleanupSeal {
+    owner: Weak<NativeCleanupState>,
+}
+impl NativeCleanupSeal {
+    /// Pure owner-thread commit: no callback may run between these checks and
+    /// closing fresh admission. Resource certification belongs to the caller.
+    pub fn try_seal(&mut self) -> bool {
+        let Some(owner) = self.owner.upgrade() else {
+            return false;
+        };
+        assert_eq!(owner.owner, std::thread::current().id());
+        if !owner.admission_open.get() {
+            return true;
+        }
+        if owner.running.get()
+            || owner.callbacks_running.get()
+            || !owner.futures.borrow().is_empty()
+            || !owner.after_pump.borrow().is_empty()
+            || owner.idle_waker.borrow().is_some()
+            || !owner.cleanup_fences.borrow().is_empty()
+            || !owner.observers.borrow().is_empty()
+        {
+            return false;
+        }
+        owner.admission_open.set(false);
+        true
+    }
+}
+
 /// Wake custody reported by one observation pass, before the final pure check.
 #[doc(hidden)]
 #[derive(Clone, Copy)]
@@ -1373,6 +1406,7 @@ struct NativeCleanupState {
     cleanup_fences: RefCell<Vec<Rc<NativeCleanupFence>>>,
     store_bound: Cell<bool>,
     admission_open: Cell<bool>,
+    seal_taken: Cell<bool>,
 }
 struct NativeCleanupTask {
     future: Pin<Box<dyn Future<Output = ()>>>,
@@ -1408,6 +1442,7 @@ impl NativeCleanupOwner {
             cleanup_fences: RefCell::default(),
             store_bound: Cell::new(false),
             admission_open: Cell::new(true),
+            seal_taken: Cell::new(false),
         }))
     }
     /// Explicit Store-bound admission plumbing for the managed C API owner.
@@ -1419,6 +1454,42 @@ impl NativeCleanupOwner {
         let owner = Self::new();
         owner.0.store_bound.set(true);
         owner
+    }
+    /// Move the single cutoff authority into the managed Store/finalizer.
+    pub fn take_store_seal(&self) -> Result<NativeCleanupSeal, RuntimeError> {
+        if !self.0.store_bound.get() || self.0.seal_taken.replace(true) {
+            return Err(RuntimeError::new(
+                "native cleanup seal authority unavailable",
+            ));
+        }
+        Ok(NativeCleanupSeal {
+            owner: Rc::downgrade(&self.0),
+        })
+    }
+    pub fn is_sealed(&self) -> bool {
+        self.0.store_bound.get() && !self.0.admission_open.get()
+    }
+    /// Callback-bearing teardown while admission/runtime are still available.
+    /// Snapshot first: reentrant admissions/bindings retain their new custody in
+    /// the live owner and must be drained before try_seal can succeed.
+    pub fn dispose_resource_observers(&self) {
+        let unwinding = std::thread::panicking();
+        let idle = self.0.idle_waker.borrow_mut().take();
+        let fences = std::mem::take(&mut *self.0.cleanup_fences.borrow_mut());
+        let observers = std::mem::take(&mut *self.0.observers.borrow_mut());
+        let mut failures = Vec::new();
+        defer_cleanup(&mut failures, || drop(idle));
+        for fence in fences {
+            defer_cleanup(&mut failures, || drop(fence));
+        }
+        for observer in observers {
+            defer_cleanup(&mut failures, || drop(observer));
+        }
+        resume_guard_cleanup_panics(failures, unwinding);
+    }
+    /// Pure metadata fence, valid only outside this owner's pump/callbacks.
+    pub fn is_quiescent(&self) -> bool {
+        self.is_idle() && !self.0.callbacks_running.get() && self.0.after_pump.borrow().is_empty()
     }
     /// Create before acquiring executor receipts or entering its contexts.
     /// Drop after those receipts, futures and contexts have been destroyed.
@@ -1444,7 +1515,7 @@ impl NativeCleanupOwner {
     }
     /// Admit fresh work, returning the EXACT input before boxing on refusal.
     /// Unbound owners preserve their existing always-open behavior. This slice
-    /// provides admission plumbing; no production final-seal transition exists.
+    /// performs no physical resource certification itself.
     pub fn try_retain<F: Future<Output = ()> + 'static>(&self, exact: F) -> Result<(), F> {
         if self.0.store_bound.get() && !self.0.admission_open.get() {
             return Err(exact);
@@ -1569,7 +1640,23 @@ impl NativeCleanupOwner {
     /// Callbacks run in admission order, outside all owner metadata borrows.
     /// They may drive the owning executor and synchronously enqueue or pump
     /// retained cleanup; recursively admitted callbacks wait their turn.
-    pub fn after_pump(&self, callback: Box<dyn FnOnce()>) {
+    pub fn after_pump(&self, exact: Box<dyn FnOnce()>) -> Result<(), Box<dyn FnOnce()>> {
+        self.try_after_pump(exact)
+    }
+    pub fn try_after_pump<F: FnOnce() + 'static>(&self, exact: F) -> Result<(), F> {
+        if self.is_sealed() {
+            return Err(exact);
+        }
+        self.commit_after_pump(Box::new(exact));
+        Ok(())
+    }
+    /// SAFE trusted transfer of an existing physical/receipt/Store callback.
+    /// Its real resource fences must exclude a valid prior seal. Fresh metadata
+    /// callers must use try_after_pump; this is not a capability enforcement.
+    pub fn after_pump_existing<F: FnOnce() + 'static>(&self, exact: F) {
+        self.commit_after_pump(Box::new(exact));
+    }
+    fn commit_after_pump(&self, callback: Box<dyn FnOnce()>) {
         self.0
             .after_pump
             .borrow_mut()
@@ -1696,7 +1783,7 @@ impl NativeCleanupOwner {
             }
             drop(callbacks_running);
         }
-        if (processed_work || processed_callbacks) && self.is_idle() {
+        if processed_callbacks || (processed_work && self.is_idle()) {
             let waker = self.0.idle_waker.borrow().clone();
             if let Some(waker) = waker {
                 defer_cleanup(&mut failures, || {
@@ -4898,14 +4985,16 @@ mod tests {
         let wake = Arc::new(BackingWake(std::sync::atomic::AtomicUsize::new(0)));
         let callback_owner = owner.clone();
         let callback_wake = wake.clone();
-        owner.after_pump(Box::new(move || {
-            let waker = Waker::from(callback_wake);
-            assert!(
-                callback_owner
-                    .poll_quiescent(&mut Context::from_waker(&waker))
-                    .is_pending()
-            );
-        }));
+        owner
+            .after_pump(Box::new(move || {
+                let waker = Waker::from(callback_wake);
+                assert!(
+                    callback_owner
+                        .poll_quiescent(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+            }))
+            .unwrap_or_else(|_| panic!("test cleanup callback admission was refused"));
         assert_eq!(wake.0.load(std::sync::atomic::Ordering::SeqCst), 1);
         let waker = Waker::from(wake.clone());
         assert!(
@@ -4914,6 +5003,58 @@ mod tests {
                 .is_ready()
         );
         assert_eq!(wake.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn native_cleanup_callback_exit_wakes_a_drain_with_a_pending_delivery_receipt() {
+        let owner = NativeCleanupOwner::new();
+        let released = Rc::new(Cell::new(false));
+        let receipt = released.clone();
+        owner.transfer_existing(std::future::poll_fn(move |_| {
+            if receipt.get() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }));
+        let wake = Arc::new(BackingWake(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(owner.poll_quiescent(&mut cx).is_pending());
+        assert_eq!(wake.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+        for _ in 0..2 {
+            owner.notify();
+            assert!(owner.poll_quiescent(&mut cx).is_pending());
+            assert_eq!(
+                wake.0.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "an ordinary Pending receipt must not self-wake"
+            );
+        }
+        let callback_owner = owner.clone();
+        let callback_waker = waker.clone();
+        owner.after_pump_existing(move || {
+            assert!(
+                callback_owner
+                    .poll_quiescent(&mut Context::from_waker(&callback_waker))
+                    .is_pending()
+            );
+            assert!(
+                !callback_owner.is_idle(),
+                "the same receipt is still retained"
+            );
+        });
+        assert_eq!(
+            wake.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "returning from publication must wake the original drain even while its receipt is Pending"
+        );
+        assert!(owner.poll_quiescent(&mut cx).is_pending());
+        assert_eq!(wake.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        released.set(true);
+        owner.notify();
+        assert_eq!(wake.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(owner.poll_quiescent(&mut cx).is_ready());
     }
 
     #[test]
@@ -5687,30 +5828,37 @@ mod tests {
                     );
                     let callback_owner = task_owner.clone();
                     let callback_events = task_events.clone();
-                    task_owner.after_pump(Box::new(move || {
-                        assert!(!callback_owner.0.running.get());
-                        assert!(callback_owner.0.callbacks_running.get());
-                        assert!(callback_owner.is_idle(), "callbacks are excluded from idle");
-                        drop(callback_owner.0.futures.try_borrow_mut().unwrap());
-                        drop(callback_owner.0.after_pump.try_borrow_mut().unwrap());
-                        drop(callback_owner.0.observers.try_borrow_mut().unwrap());
-                        assert!(StoreContext::is_empty());
-                        assert!(CoroutineContext::get_current().is_none());
-                        assert!(native_cleanup_no_yield());
-                        callback_events.borrow_mut().push(1);
-                        let retained_events = callback_events.clone();
-                        callback_owner
-                            .retain(Box::pin(async move {
-                                retained_events.borrow_mut().push(2);
-                            }))
-                            .unwrap_or_else(|_| panic!("test cleanup admission was refused"));
-                        callback_owner.notify();
-                        let later_events = callback_events.clone();
-                        callback_owner
-                            .after_pump(Box::new(move || later_events.borrow_mut().push(5)));
-                        callback_events.borrow_mut().push(3);
-                    }));
-                    task_owner.after_pump(Box::new(move || task_events.borrow_mut().push(4)));
+                    task_owner
+                        .after_pump(Box::new(move || {
+                            assert!(!callback_owner.0.running.get());
+                            assert!(callback_owner.0.callbacks_running.get());
+                            assert!(callback_owner.is_idle(), "callbacks are excluded from idle");
+                            drop(callback_owner.0.futures.try_borrow_mut().unwrap());
+                            drop(callback_owner.0.after_pump.try_borrow_mut().unwrap());
+                            drop(callback_owner.0.observers.try_borrow_mut().unwrap());
+                            assert!(StoreContext::is_empty());
+                            assert!(CoroutineContext::get_current().is_none());
+                            assert!(native_cleanup_no_yield());
+                            callback_events.borrow_mut().push(1);
+                            let retained_events = callback_events.clone();
+                            callback_owner
+                                .retain(Box::pin(async move {
+                                    retained_events.borrow_mut().push(2);
+                                }))
+                                .unwrap_or_else(|_| panic!("test cleanup admission was refused"));
+                            callback_owner.notify();
+                            let later_events = callback_events.clone();
+                            callback_owner
+                                .after_pump(Box::new(move || later_events.borrow_mut().push(5)))
+                                .unwrap_or_else(|_| {
+                                    panic!("test cleanup callback admission was refused")
+                                });
+                            callback_events.borrow_mut().push(3);
+                        }))
+                        .unwrap_or_else(|_| panic!("test cleanup callback admission was refused"));
+                    task_owner
+                        .after_pump(Box::new(move || task_events.borrow_mut().push(4)))
+                        .unwrap_or_else(|_| panic!("test cleanup callback admission was refused"));
                 }))
                 .is_ok()
         );
@@ -5751,8 +5899,16 @@ mod tests {
             assert!(
                 owner
                     .try_retain(Box::pin(async move {
-                        task_owner.after_pump(Box::new(|| std::panic::panic_any(CallbackPanic)));
-                        task_owner.after_pump(Box::new(move || task_finished.set(true)));
+                        task_owner
+                            .after_pump(Box::new(|| std::panic::panic_any(CallbackPanic)))
+                            .unwrap_or_else(|_| {
+                                panic!("test cleanup callback admission was refused")
+                            });
+                        task_owner
+                            .after_pump(Box::new(move || task_finished.set(true)))
+                            .unwrap_or_else(|_| {
+                                panic!("test cleanup callback admission was refused")
+                            });
                         std::panic::panic_any(PumpPanic);
                     }))
                     .is_ok()
@@ -5769,10 +5925,12 @@ mod tests {
         impl Drop for DuringUnwind {
             fn drop(&mut self) {
                 let finished = self.1.clone();
-                self.0.after_pump(Box::new(move || {
-                    finished.set(true);
-                    std::panic::panic_any(CallbackPanic);
-                }));
+                self.0
+                    .after_pump(Box::new(move || {
+                        finished.set(true);
+                        std::panic::panic_any(CallbackPanic);
+                    }))
+                    .unwrap_or_else(|_| panic!("test cleanup callback admission was refused"));
             }
         }
         finished.set(false);
@@ -5917,48 +6075,52 @@ mod tests {
             owner
                 .try_retain(Box::pin(async move {
                     let callback_owner = task_owner.clone();
-                    task_owner.after_pump(Box::new(move || {
-                        struct IdleRegistration(NativeCleanupOwner);
-                        impl Drop for IdleRegistration {
-                            fn drop(&mut self) {
-                                self.0.clear_idle_waker();
+                    task_owner
+                        .after_pump(Box::new(move || {
+                            struct IdleRegistration(NativeCleanupOwner);
+                            impl Drop for IdleRegistration {
+                                fn drop(&mut self) {
+                                    self.0.clear_idle_waker();
+                                }
                             }
-                        }
-                        let registration = IdleRegistration(callback_owner.clone());
-                        let wake = Arc::new(Wake {
-                            ready: Mutex::new(false),
-                            changed: Condvar::new(),
-                        });
-                        let waker = Waker::from(wake.clone());
-                        let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(5);
-                        loop {
-                            assert!(!callback_owner.0.running.get());
-                            let polled = {
-                                let _entered = runtime.enter();
-                                let mut cx = Context::from_waker(&waker);
-                                let local = Pin::new(&mut local).poll(&mut cx);
-                                let cleanup = callback_owner.poll_idle(&mut cx);
-                                (local, cleanup)
-                            };
-                            if polled.0.is_ready() && polled.1.is_ready() {
-                                break;
+                            let registration = IdleRegistration(callback_owner.clone());
+                            let wake = Arc::new(Wake {
+                                ready: Mutex::new(false),
+                                changed: Condvar::new(),
+                            });
+                            let waker = Waker::from(wake.clone());
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(5);
+                            loop {
+                                assert!(!callback_owner.0.running.get());
+                                let polled = {
+                                    let _entered = runtime.enter();
+                                    let mut cx = Context::from_waker(&waker);
+                                    let local = Pin::new(&mut local).poll(&mut cx);
+                                    let cleanup = callback_owner.poll_idle(&mut cx);
+                                    (local, cleanup)
+                                };
+                                if polled.0.is_ready() && polled.1.is_ready() {
+                                    break;
+                                }
+                                let mut ready = wake.ready.lock().unwrap();
+                                while !*ready {
+                                    let remaining = deadline
+                                        .checked_duration_since(std::time::Instant::now())
+                                        .expect(
+                                            "dependent local cleanup did not wake its real driver",
+                                        );
+                                    ready = wake.changed.wait_timeout(ready, remaining).unwrap().0;
+                                }
+                                *ready = false;
                             }
-                            let mut ready = wake.ready.lock().unwrap();
-                            while !*ready {
-                                let remaining = deadline
-                                    .checked_duration_since(std::time::Instant::now())
-                                    .expect("dependent local cleanup did not wake its real driver");
-                                ready = wake.changed.wait_timeout(ready, remaining).unwrap().0;
-                            }
-                            *ready = false;
-                        }
-                        assert!(callback_owner.is_idle());
-                        assert!(callback_owner.0.idle_waker.borrow().is_none());
-                        drop(registration);
-                        drop(local);
-                        drop(runtime);
-                    }));
+                            assert!(callback_owner.is_idle());
+                            assert!(callback_owner.0.idle_waker.borrow().is_none());
+                            drop(registration);
+                            drop(local);
+                            drop(runtime);
+                        }))
+                        .unwrap_or_else(|_| panic!("test cleanup callback admission was refused"));
                 }))
                 .is_ok()
         );
