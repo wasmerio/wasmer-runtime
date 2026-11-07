@@ -1350,9 +1350,14 @@ fn record_owner_failure(
     panic: DeferredPanic,
     entry_unwinding: bool,
 ) {
+    let Some(receiver) = receiver.and_then(Weak::upgrade) else {
+        // Preserve legacy batching/drop timing for absent AND expired hooks.
+        legacy.push(panic);
+        return;
+    };
     if entry_unwinding {
         resume_guard_cleanup_panics(vec![panic], true);
-    } else if let Some(receiver) = receiver.and_then(Weak::upgrade) {
+    } else {
         let mut next = Some(panic);
         while let Some(panic) = next.take() {
             if let Err(secondary) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1363,8 +1368,6 @@ fn record_owner_failure(
                 next = Some(secondary);
             }
         }
-    } else {
-        legacy.push(panic);
     }
 }
 
@@ -1640,10 +1643,14 @@ impl NativeCleanupOwner {
     }
 
     fn capture<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
+        if self.0.failures.is_none() {
+            return Some(action()); // unchanged direct unbound callback behavior
+        }
         let mut legacy = Vec::new();
-        let unwinding = std::thread::panicking();
         let output = capture_owner_failure(self.0.failures.as_ref(), &mut legacy, action);
-        resume_guard_cleanup_panics(legacy, unwinding);
+        // An expired hook also keeps the old exact Rust transport, rather than
+        // being mistaken for an alive bound receiver's secondary-disposal path.
+        resume_cleanup_panics(legacy);
         output
     }
 
@@ -6210,6 +6217,87 @@ mod tests {
         ready.set(true);
         owner.notify();
         assert!(owner.is_idle());
+    }
+
+    #[test]
+    fn native_cleanup_unbound_and_expired_receivers_preserve_batched_secondary_drop_order() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Secondary {
+            second: Arc<AtomicBool>,
+            dropped: Arc<AtomicBool>,
+            early: Arc<AtomicBool>,
+        }
+        impl Drop for Secondary {
+            fn drop(&mut self) {
+                self.early
+                    .store(!self.second.load(Ordering::SeqCst), Ordering::SeqCst);
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+        struct During {
+            owner: NativeCleanupOwner,
+            second: Arc<AtomicBool>,
+            dropped: Arc<AtomicBool>,
+            early: Arc<AtomicBool>,
+        }
+        impl Drop for During {
+            fn drop(&mut self) {
+                let schedule = self.owner.clone();
+                let second = self.second.clone();
+                let secondary = Secondary {
+                    second: second.clone(),
+                    dropped: self.dropped.clone(),
+                    early: self.early.clone(),
+                };
+                self.owner
+                    .try_retain(async move {
+                        schedule.after_pump_existing(move || {
+                            std::panic::resume_unwind(Box::new(secondary))
+                        });
+                        schedule.after_pump_existing(move || {
+                            second.store(true, Ordering::SeqCst);
+                        });
+                    })
+                    .unwrap_or_else(|_| panic!("legacy owner rejected existing admission"));
+            }
+        }
+        for expired in [false, true] {
+            // Primitive binding control only, no physical Store certificate.
+            let owner = if expired {
+                let receiver = NativeCleanupFailures::new(
+                    |_| panic!("an expired receiver must not consume a raw error"),
+                    |_| NativeCleanupFailureDisposition::Empty,
+                    || None,
+                );
+                let owner = NativeCleanupOwner::new_store_bound_with_failures(&receiver);
+                drop(receiver);
+                owner
+            } else {
+                NativeCleanupOwner::new()
+            };
+            let second = Arc::new(AtomicBool::new(false));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let early = Arc::new(AtomicBool::new(false));
+            let original = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _during = During {
+                    owner,
+                    second: second.clone(),
+                    dropped: dropped.clone(),
+                    early: early.clone(),
+                };
+                std::panic::panic_any("original active legacy primary");
+            }))
+            .unwrap_err();
+            assert_eq!(
+                original.downcast_ref::<&str>(),
+                Some(&"original active legacy primary")
+            );
+            assert!(second.load(Ordering::SeqCst) && dropped.load(Ordering::SeqCst));
+            assert!(
+                !early.load(Ordering::SeqCst),
+                "legacy payload Drop follows ALL callbacks, including expired Weak fallback"
+            );
+        }
     }
 
     #[test]
