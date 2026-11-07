@@ -24,6 +24,11 @@ pub(crate) struct StoreInner {
         Option<std::sync::Arc<crate::backend::sys::async_runtime::NativeInvocationGeneration>>,
     pub(crate) objects: StoreObjects,
     pub(crate) store: BackendStore,
+    pub(crate) on_called: Option<OnCalledHandler>,
+    // Must remain LAST: weak backing expiry precedes actual resource destruction.
+    #[cfg(all(feature = "sys", feature = "experimental-async"))]
+    pub(crate) native_destruction:
+        Option<crate::backend::sys::async_runtime::NativeStoreDestructionGuard>,
 }
 
 impl std::fmt::Debug for StoreInner {

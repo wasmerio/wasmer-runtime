@@ -5,8 +5,9 @@ pub(crate) mod async_runtime;
 #[cfg(feature = "experimental-async")]
 #[doc(hidden)]
 pub use async_runtime::{
-    NativeAncestrySettlement, NativeCleanupExitBoundary, NativeCleanupGuard, NativeCleanupOwner,
-    NativeFrameGuard, NativeInvocationScope, WeakNativeInvocation, call_async_with_local_owner,
+    NativeAncestrySettlement, NativeCleanupExitBoundary, NativeCleanupFence, NativeCleanupGuard,
+    NativeCleanupOwner, NativeFrameGuard, NativeInvocationScope, NativeStoreDestruction,
+    NativeStoreDestructionObserver, WeakNativeInvocation, call_async_with_local_owner,
     call_native_descendant, context_switch_supported, current_native_local_owner,
     current_native_store_loan, enroll_native_ancestry_tail, native_cleanup_owner,
 };
