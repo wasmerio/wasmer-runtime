@@ -5134,17 +5134,17 @@ mod tests {
         let calls = Rc::new(Cell::new(0));
         let probe = Probe(drops.clone());
         let invoked = calls.clone();
-        let exact = Box::new(move |_| {
+        let exact: StoreDestructionAction = Box::new(move |_| {
             invoked.set(invoked.get() + 1);
             drop(probe);
             None
         });
-        let address = (&*exact) as *const _ as usize;
+        let address = (&*exact) as *const _ as *const () as usize;
         let exact = receipt
             .try_defer_cleanup(exact)
             .err()
             .expect("ordinary caller cannot bypass Reserved");
-        assert_eq!((&*exact) as *const _ as usize, address);
+        assert_eq!((&*exact) as *const _ as *const () as usize, address);
         assert_eq!(drops.get(), 0);
         drop(guard);
         assert!(receipt.is_complete() && receipt.notifications_complete());
@@ -5152,7 +5152,7 @@ mod tests {
             .install(exact)
             .err()
             .expect("actual notification return is the ONLY typed refusal");
-        assert_eq!((&*exact) as *const _ as usize, address);
+        assert_eq!((&*exact) as *const _ as *const () as usize, address);
         assert_eq!(calls.get(), 0);
         assert_eq!(drops.get(), 0);
         assert!(exact(None).is_none());
@@ -5274,17 +5274,17 @@ mod tests {
         let probe = Probe(drops.clone());
         let rejected_calls = Rc::new(Cell::new(0));
         let reject = rejected_calls.clone();
-        let exact = Box::new(move |_| {
+        let exact: StoreDestructionAction = Box::new(move |_| {
             reject.set(reject.get() + 1);
             drop(probe);
             None
         });
-        let address = (&*exact) as *const _ as usize;
+        let address = (&*exact) as *const _ as *const () as usize;
         let exact = receipt
             .try_defer_cleanup(exact)
             .err()
             .expect("one actual continuation slot");
-        assert_eq!((&*exact) as *const _ as usize, address);
+        assert_eq!((&*exact) as *const _ as *const () as usize, address);
         assert_eq!(drops.get(), 0);
         assert_eq!(rejected_calls.get(), 0);
         assert!(!receipt.is_complete() && !receipt.notifications_complete());
@@ -5294,7 +5294,7 @@ mod tests {
             .try_defer_cleanup(exact)
             .err()
             .expect("actual notifications have returned");
-        assert_eq!((&*exact) as *const _ as usize, address);
+        assert_eq!((&*exact) as *const _ as *const () as usize, address);
         assert_eq!(drops.get(), 0);
         assert_eq!(rejected_calls.get(), 0);
         assert!(exact(None).is_none());
