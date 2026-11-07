@@ -5039,11 +5039,56 @@ mod tests {
         let receipt = guard.receipt.clone();
         let called = Rc::new(Cell::new(0));
         let calls = called.clone();
+        // RawWaker data is Send+Sync Arc metadata. Every clone has a real
+        // destructor callback even while the original caller Waker survives.
+        unsafe fn clone_notification(data: *const ()) -> std::task::RawWaker {
+            unsafe { Arc::increment_strong_count(data.cast::<std::sync::atomic::AtomicUsize>()) };
+            std::task::RawWaker::new(data, &NOTIFICATION)
+        }
+        unsafe fn wake_notification(data: *const ()) {
+            unsafe {
+                wake_notification_ref(data);
+                drop_notification(data);
+            }
+        }
+        unsafe fn wake_notification_ref(data: *const ()) {
+            let counter = unsafe { &*data.cast::<std::sync::atomic::AtomicUsize>() };
+            counter.store(2, std::sync::atomic::Ordering::SeqCst);
+        }
+        unsafe fn drop_notification(data: *const ()) {
+            let counter = unsafe { Arc::from_raw(data.cast::<std::sync::atomic::AtomicUsize>()) };
+            counter.store(3, std::sync::atomic::Ordering::SeqCst);
+        }
+        static NOTIFICATION: std::task::RawWakerVTable = std::task::RawWakerVTable::new(
+            clone_notification,
+            wake_notification,
+            wake_notification_ref,
+            drop_notification,
+        );
+        let notifications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observe = unsafe {
+            Waker::from_raw(std::task::RawWaker::new(
+                Arc::into_raw(notifications.clone()).cast(),
+                &NOTIFICATION,
+            ))
+        };
+        let mut observer = receipt.observer();
+        assert!(
+            Pin::new(&mut observer)
+                .poll(&mut Context::from_waker(&observe))
+                .is_pending()
+        );
+        let action_notifications = notifications.clone();
         let action_receipt = receipt.clone();
         receipt
             .try_defer_cleanup(move |_| {
                 assert!(action_receipt.is_complete());
                 assert!(action_receipt.notifications_complete());
+                assert_eq!(
+                    action_notifications.load(std::sync::atomic::Ordering::SeqCst),
+                    3,
+                    "ordinary observer wake AND actual caller-Waker Drop precede the continuation"
+                );
                 calls.set(calls.get() + 1);
                 None
             })
