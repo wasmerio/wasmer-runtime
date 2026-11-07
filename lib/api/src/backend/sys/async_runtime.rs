@@ -1117,6 +1117,7 @@ pub struct NativeStoreDestruction(Rc<StoreDestructionState>);
 struct StoreDestructionState {
     completed: Cell<bool>,
     waiters: RefCell<Vec<Weak<StoreDestructionWaiter>>>,
+    action: Weak<StoreDestructionActionSlot>,
 }
 struct StoreDestructionWaiter {
     waker: RefCell<Option<Arc<Waker>>>,
@@ -1129,14 +1130,43 @@ pub struct NativeStoreDestructionObserver {
     waiter: Rc<StoreDestructionWaiter>,
 }
 
-pub(crate) struct NativeStoreDestructionGuard(NativeStoreDestruction);
+type StoreDestructionAction = Box<dyn FnOnce(Option<DeferredPanic>) -> Option<DeferredPanic>>;
+struct StoreDestructionActionSlot {
+    action: RefCell<Option<StoreDestructionAction>>,
+    notifications_done: Cell<bool>,
+}
+
+pub(crate) struct NativeStoreDestructionGuard {
+    receipt: NativeStoreDestruction,
+    failures: Option<Weak<CleanupFailureReceiver>>,
+    action: Rc<StoreDestructionActionSlot>, // actual guard owns action, LAST
+}
 
 impl NativeStoreDestruction {
-    fn new() -> Self {
-        Self(Rc::new(StoreDestructionState {
-            completed: Cell::new(false),
-            waiters: RefCell::default(),
-        }))
+    /// Return the EXACT uncalled input if notifications already completed or
+    /// the one actual phase is already installed. No boxing before admission.
+    pub fn try_defer_cleanup<F>(&self, exact: F) -> Result<(), F>
+    where
+        F: FnOnce(Option<DeferredPanic>) -> Option<DeferredPanic> + 'static,
+    {
+        let Some(action) = self.0.action.upgrade() else {
+            return Err(exact);
+        };
+        if action.notifications_done.get() || action.action.borrow().is_some() {
+            return Err(exact);
+        }
+        *action.action.borrow_mut() = Some(Box::new(exact));
+        Ok(())
+    }
+
+    /// Pure notification-return certificate, distinct from resource completion.
+    pub fn notifications_complete(&self) -> bool {
+        self.0.completed.get()
+            && self
+                .0
+                .action
+                .upgrade()
+                .is_none_or(|action| action.notifications_done.get())
     }
 
     pub fn observer(&self) -> NativeStoreDestructionObserver {
@@ -1192,23 +1222,64 @@ impl Drop for NativeStoreDestructionObserver {
     }
 }
 
+impl NativeStoreDestructionGuard {
+    fn new(cleanup: Option<&NativeCleanupOwner>) -> Self {
+        let action = Rc::new(StoreDestructionActionSlot {
+            action: RefCell::default(),
+            notifications_done: Cell::new(false),
+        });
+        Self {
+            receipt: NativeStoreDestruction(Rc::new(StoreDestructionState {
+                completed: Cell::new(false),
+                waiters: RefCell::default(),
+                action: Rc::downgrade(&action),
+            })),
+            failures: cleanup.and_then(|owner| owner.0.failures.clone()),
+            action,
+        }
+    }
+}
+
 impl Drop for NativeStoreDestructionGuard {
     fn drop(&mut self) {
         let unwinding = std::thread::panicking();
-        // This is the LAST StoreInner field. All actual resource fields have
-        // returned or unwound before completion can be observed reentrantly.
-        self.0.0.completed.set(true);
-        let waiters = std::mem::take(&mut *self.0.0.waiters.borrow_mut());
+        // LAST StoreInner field: actual resources have returned or unwound.
+        self.receipt.0.completed.set(true);
+        let waiters = std::mem::take(&mut *self.receipt.0.waiters.borrow_mut());
         let mut failures = Vec::new();
         for waiter in waiters {
             if let Some(waiter) = waiter.upgrade() {
                 let waker = waiter.waker.borrow_mut().take();
                 if let Some(waker) = waker {
-                    defer_cleanup(&mut failures, || waker.wake_by_ref());
-                    defer_cleanup(&mut failures, || drop(waker));
+                    capture_owner_failure(self.failures.as_ref(), &mut failures, || {
+                        waker.wake_by_ref()
+                    });
+                    capture_owner_failure(self.failures.as_ref(), &mut failures, || drop(waker));
                 }
-                defer_cleanup(&mut failures, || drop(waiter));
+                capture_owner_failure(self.failures.as_ref(), &mut failures, || drop(waiter));
             }
+        }
+        // For bound CAPI receipts each original notification catch already
+        // reconciled its error. Legacy unbound actions receive the exact first.
+        let first = if failures.is_empty() {
+            None
+        } else {
+            Some(failures.remove(0))
+        };
+        for secondary in std::mem::take(&mut failures) {
+            capture_owner_failure(self.failures.as_ref(), &mut failures, || drop(secondary));
+        }
+        self.action.notifications_done.set(true);
+        let action = self.action.action.borrow_mut().take();
+        if let Some(action) = action {
+            let returned =
+                capture_owner_failure(self.failures.as_ref(), &mut failures, || action(first));
+            // An already-owned terminal return is NOT a newly caught event.
+            if let Some(Some(exact)) = returned {
+                failures.push(exact);
+            }
+        } else if let Some(first) = first {
+            failures.insert(0, first);
         }
         resume_guard_cleanup_panics(failures, unwinding);
     }
@@ -1221,6 +1292,96 @@ impl Drop for NativeStoreDestructionGuard {
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct NativeCleanupOwner(Rc<NativeCleanupState>);
+
+/// One audited Store's canonical cleanup-error bridge. All closures retain
+/// metadata only; the owner and actual destruction guard keep only Weak edges.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct NativeCleanupFailures(Rc<CleanupFailureReceiver>);
+
+struct CleanupFailureReceiver {
+    record: Box<dyn Fn(DeferredPanic)>,
+    claim_ready: Box<dyn Fn(Option<&NativeCleanupOwner>) -> NativeCleanupFailureDisposition>,
+    take_last_owned: Box<dyn Fn() -> Option<DeferredPanic>>,
+}
+
+#[doc(hidden)]
+pub enum NativeCleanupFailureDisposition {
+    Empty,
+    Deferred,
+    Deliver(DeferredPanic),
+}
+
+impl NativeCleanupFailures {
+    /// SAFE trusted internal contract: record publishes exact ownership before
+    /// user payload Drop; claim is callback-free; last-owned extraction is empty
+    /// or actually terminal. ManagedStore/unfinished phase must retain this
+    /// strong handle until actual completion. No Store/Driver/owner strong edge.
+    pub fn new(
+        record: impl Fn(DeferredPanic) + 'static,
+        claim_ready: impl Fn(Option<&NativeCleanupOwner>) -> NativeCleanupFailureDisposition + 'static,
+        take_last_owned: impl Fn() -> Option<DeferredPanic> + 'static,
+    ) -> Self {
+        Self(Rc::new(CleanupFailureReceiver {
+            record: Box::new(record),
+            claim_ready: Box::new(claim_ready),
+            take_last_owned: Box::new(take_last_owned),
+        }))
+    }
+}
+
+impl Drop for CleanupFailureReceiver {
+    fn drop(&mut self) {
+        let unwinding = std::thread::panicking();
+        if let Some(exact) = (self.take_last_owned)() {
+            // Ordinary ordered claim can remain Deferred after exhaustion.
+            // LAST actual terminal ownership is an explicit Rust panic boundary.
+            resume_guard_cleanup_panics(vec![exact], unwinding);
+        }
+    }
+}
+
+// Upgrade ONLY AFTER the wrapped callback returned/unwound. In particular a
+// strong receiver across a C destruction action would re-capture terminal
+// delivery instead of allowing its exact existing Rust transport to escape.
+fn record_owner_failure(
+    receiver: Option<&Weak<CleanupFailureReceiver>>,
+    legacy: &mut Vec<DeferredPanic>,
+    panic: DeferredPanic,
+    entry_unwinding: bool,
+) {
+    if entry_unwinding {
+        resume_guard_cleanup_panics(vec![panic], true);
+    } else if let Some(receiver) = receiver.and_then(Weak::upgrade) {
+        let mut next = Some(panic);
+        while let Some(panic) = next.take() {
+            if let Err(secondary) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (receiver.record)(panic);
+            })) {
+                // The trusted recorder already published its original first
+                // value before finite secondary payload disposal could panic.
+                next = Some(secondary);
+            }
+        }
+    } else {
+        legacy.push(panic);
+    }
+}
+
+fn capture_owner_failure<T>(
+    receiver: Option<&Weak<CleanupFailureReceiver>>,
+    legacy: &mut Vec<DeferredPanic>,
+    action: impl FnOnce() -> T,
+) -> Option<T> {
+    let unwinding = std::thread::panicking();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)) {
+        Ok(value) => Some(value),
+        Err(panic) => {
+            record_owner_failure(receiver, legacy, panic, unwinding);
+            None
+        }
+    }
+}
 
 type CleanupExitAction = Box<dyn FnOnce() -> Option<DeferredPanic>>;
 
@@ -1240,6 +1401,7 @@ struct CleanupExitState {
     complete: Cell<bool>,
     actions: RefCell<Vec<CleanupExitAction>>,
     failures: RefCell<Vec<DeferredPanic>>,
+    failures_receiver: Option<NativeCleanupFailures>, // LAST finite metadata custody
 }
 
 impl NativeCleanupExitBoundary {
@@ -1291,7 +1453,11 @@ impl CleanupExitState {
                 let mut actions = actions.into_iter();
                 while let Some(action) = actions.next() {
                     let mut returned = None;
-                    defer_cleanup(failures, || {
+                    let receiver = self
+                        .failures_receiver
+                        .as_ref()
+                        .map(|receiver| Rc::downgrade(&receiver.0));
+                    capture_owner_failure(receiver.as_ref(), failures, || {
                         returned = action();
                     });
                     if let Some(panic) = returned {
@@ -1311,6 +1477,14 @@ impl CleanupExitState {
                 self.failures.borrow_mut().append(failures);
                 self.draining.set(false);
                 return;
+            }
+            if let Some(receiver) = &self.failures_receiver {
+                let owner = self.owner.upgrade().map(NativeCleanupOwner);
+                match (receiver.0.claim_ready)(owner.as_ref()) {
+                    NativeCleanupFailureDisposition::Deliver(exact) => failures.push(exact),
+                    NativeCleanupFailureDisposition::Empty
+                    | NativeCleanupFailureDisposition::Deferred => (),
+                }
             }
             self.restore();
             self.complete.set(true);
@@ -1407,6 +1581,7 @@ struct NativeCleanupState {
     store_bound: Cell<bool>,
     admission_open: Cell<bool>,
     seal_taken: Cell<bool>,
+    failures: Option<Weak<CleanupFailureReceiver>>,
 }
 struct NativeCleanupTask {
     future: Pin<Box<dyn Future<Output = ()>>>,
@@ -1443,6 +1618,7 @@ impl NativeCleanupOwner {
             store_bound: Cell::new(false),
             admission_open: Cell::new(true),
             seal_taken: Cell::new(false),
+            failures: None,
         }))
     }
     /// Explicit Store-bound admission plumbing for the managed C API owner.
@@ -1455,6 +1631,22 @@ impl NativeCleanupOwner {
         owner.0.store_bound.set(true);
         owner
     }
+    /// Bind before any producer/observer publication. The constructor retains
+    /// only Weak metadata; the managed Store/actual phase owns the receiver.
+    pub fn new_store_bound_with_failures(receiver: &NativeCleanupFailures) -> Self {
+        let mut owner = Self::new_store_bound();
+        Rc::get_mut(&mut owner.0).unwrap().failures = Some(Rc::downgrade(&receiver.0));
+        owner
+    }
+
+    fn capture<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
+        let mut legacy = Vec::new();
+        let unwinding = std::thread::panicking();
+        let output = capture_owner_failure(self.0.failures.as_ref(), &mut legacy, action);
+        resume_guard_cleanup_panics(legacy, unwinding);
+        output
+    }
+
     /// Move the single cutoff authority into the managed Store/finalizer.
     pub fn take_store_seal(&self) -> Result<NativeCleanupSeal, RuntimeError> {
         if !self.0.store_bound.get() || self.0.seal_taken.replace(true) {
@@ -1478,12 +1670,12 @@ impl NativeCleanupOwner {
         let fences = std::mem::take(&mut *self.0.cleanup_fences.borrow_mut());
         let observers = std::mem::take(&mut *self.0.observers.borrow_mut());
         let mut failures = Vec::new();
-        defer_cleanup(&mut failures, || drop(idle));
+        capture_owner_failure(self.0.failures.as_ref(), &mut failures, || drop(idle));
         for fence in fences {
-            defer_cleanup(&mut failures, || drop(fence));
+            capture_owner_failure(self.0.failures.as_ref(), &mut failures, || drop(fence));
         }
         for observer in observers {
-            defer_cleanup(&mut failures, || drop(observer));
+            capture_owner_failure(self.0.failures.as_ref(), &mut failures, || drop(observer));
         }
         resume_guard_cleanup_panics(failures, unwinding);
     }
@@ -1509,6 +1701,12 @@ impl NativeCleanupOwner {
             complete: Cell::new(false),
             actions: RefCell::default(),
             failures: RefCell::default(),
+            failures_receiver: self
+                .0
+                .failures
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .map(NativeCleanupFailures),
         });
         *self.0.exit.borrow_mut() = Rc::downgrade(&state);
         NativeCleanupExitBoundary { state }
@@ -1558,8 +1756,10 @@ impl NativeCleanupOwner {
         if let Some(waker) = waker {
             let unwinding = std::thread::panicking();
             let mut failures = Vec::new();
-            defer_cleanup(&mut failures, || waker.wake_by_ref());
-            defer_cleanup(&mut failures, || drop(waker));
+            capture_owner_failure(self.0.failures.as_ref(), &mut failures, || {
+                waker.wake_by_ref()
+            });
+            capture_owner_failure(self.0.failures.as_ref(), &mut failures, || drop(waker));
             resume_guard_cleanup_panics(failures, unwinding);
         }
     }
@@ -1582,7 +1782,14 @@ impl NativeCleanupOwner {
             // Waker clone/drop callbacks may bind more fences. Observe those
             // exact appended entries before querying the current collection.
             for fence in fences {
-                let wake = (fence.observe)(cx.waker());
+                let wake = self.capture(|| (fence.observe)(cx.waker()));
+                let wake = match wake {
+                    Some(wake) => wake,
+                    None => {
+                        self.capture(|| cx.waker().wake_by_ref());
+                        NativeCleanupFenceObservation::Unarmed
+                    }
+                };
                 observed.push((fence, wake));
             }
         }
@@ -1600,7 +1807,9 @@ impl NativeCleanupOwner {
             // fence alongside another already-armed Pending fence.
             let unwinding = std::thread::panicking();
             let mut failures = Vec::new();
-            defer_cleanup(&mut failures, || cx.waker().wake_by_ref());
+            capture_owner_failure(self.0.failures.as_ref(), &mut failures, || {
+                cx.waker().wake_by_ref()
+            });
             resume_guard_cleanup_panics(failures, unwinding);
         }
         if pending {
@@ -1614,9 +1823,12 @@ impl NativeCleanupOwner {
     /// self-join. Does not seal admission or certify physical Store destruction.
     pub fn poll_quiescent(&self, cx: &mut Context<'_>) -> Poll<()> {
         loop {
-            let next = Arc::new(cx.waker().clone());
+            let Some(next) = self.capture(|| Arc::new(cx.waker().clone())) else {
+                self.capture(|| cx.waker().wake_by_ref());
+                return Poll::Pending;
+            };
             let previous = self.0.idle_waker.borrow_mut().replace(next);
-            drop(previous);
+            self.capture(|| drop(previous));
             self.notify();
             let fences = self.poll_cleanup_fences(cx).is_ready();
             if !fences
@@ -1689,11 +1901,14 @@ impl NativeCleanupOwner {
                 .as_ref()
                 .is_some_and(|current| current.will_wake(cx.waker()))
             {
-                let next = Arc::new(cx.waker().clone());
+                let Some(next) = self.capture(|| Arc::new(cx.waker().clone())) else {
+                    self.capture(|| cx.waker().wake_by_ref());
+                    return Poll::Pending;
+                };
                 let previous = self.0.idle_waker.borrow_mut().replace(next);
-                drop(previous);
+                self.capture(|| drop(previous));
             }
-            drop(current);
+            self.capture(|| drop(current));
             self.notify();
             if !self.is_idle() {
                 return Poll::Pending;
@@ -1709,7 +1924,7 @@ impl NativeCleanupOwner {
     /// Waker destruction runs outside all owner metadata borrows.
     pub fn clear_idle_waker(&self) {
         let previous = self.0.idle_waker.borrow_mut().take();
-        drop(previous);
+        self.capture(|| drop(previous));
     }
     /// Pump from an owning-thread physical-unlock or completion event.
     pub fn notify(&self) {
@@ -1741,7 +1956,7 @@ impl NativeCleanupOwner {
                 processed_work = true;
                 // Remove before polling: unlock/settlement callbacks can notify
                 // or enqueue another exact owner while this continuation runs.
-                let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let polled = capture_owner_failure(self.0.failures.as_ref(), &mut failures, || {
                     let _caller = DetachedCoroutineContext::new();
                     let _stores = StoreContext::detach_current();
                     let _logical = DetachedRootMetadata::new();
@@ -1750,15 +1965,14 @@ impl NativeCleanupOwner {
                     task.future.as_mut().poll(&mut Context::from_waker(
                         waker.as_deref().unwrap_or(Waker::noop()),
                     ))
-                }));
+                });
                 match polled {
-                    Ok(Poll::Pending) => self.0.futures.borrow_mut().push_back(task),
-                    Ok(Poll::Ready(())) => defer_cleanup(&mut failures, || drop(task)),
-                    Err(panic) => {
-                        failures.push(panic);
-                        // A panicked cleanup orchestration releases its concrete
-                        // owner into this same queue; physical roots are unchanged.
-                        defer_cleanup(&mut failures, || drop(task));
+                    Some(Poll::Pending) => self.0.futures.borrow_mut().push_back(task),
+                    Some(Poll::Ready(())) | None => {
+                        // The original poll error was recorded BEFORE task Drop.
+                        capture_owner_failure(self.0.failures.as_ref(), &mut failures, || {
+                            drop(task)
+                        });
                     }
                 }
             }
@@ -1772,13 +1986,15 @@ impl NativeCleanupOwner {
                     break;
                 };
                 processed_callbacks = true;
-                defer_cleanup(&mut failures, || {
+                capture_owner_failure(self.0.failures.as_ref(), &mut failures, || {
                     let _caller = DetachedCoroutineContext::new();
                     let _stores = StoreContext::detach_current();
                     let _logical = DetachedRootMetadata::new();
                     let _host_cleanup = NativeCleanupNoYield::enter();
                     (callback.callback)();
-                    drop(callback._owner);
+                });
+                capture_owner_failure(self.0.failures.as_ref(), &mut failures, || {
+                    drop(callback._owner)
                 });
             }
             drop(callbacks_running);
@@ -1786,14 +2002,14 @@ impl NativeCleanupOwner {
         if processed_callbacks || (processed_work && self.is_idle()) {
             let waker = self.0.idle_waker.borrow().clone();
             if let Some(waker) = waker {
-                defer_cleanup(&mut failures, || {
+                capture_owner_failure(self.0.failures.as_ref(), &mut failures, || {
                     let _caller = DetachedCoroutineContext::new();
                     let _stores = StoreContext::detach_current();
                     let _logical = DetachedRootMetadata::new();
                     let _host_cleanup = NativeCleanupNoYield::enter();
                     waker.wake_by_ref();
-                    drop(waker);
                 });
+                capture_owner_failure(self.0.failures.as_ref(), &mut failures, || drop(waker));
             }
         }
         resume_guard_cleanup_panics(failures, already_unwinding);
@@ -1922,8 +2138,8 @@ impl NativeInvocationScope {
         let destruction = store
             .inner
             .native_destruction
-            .get_or_insert_with(|| NativeStoreDestructionGuard(NativeStoreDestruction::new()))
-            .0
+            .get_or_insert_with(|| NativeStoreDestructionGuard::new(cleanup.as_ref()))
+            .receipt
             .clone();
         let scope = Self::new_with_cleanup(store.id(), cleanup, destruction);
         store.inner.native_invocation = Some(scope.local.generation.clone());
@@ -4211,12 +4427,23 @@ pub(super) fn defer_cleanup(failures: &mut Vec<DeferredPanic>, cleanup: impl FnO
     }
 }
 
+// Keep each newly caught payload owned while a finite destructor-panic chain
+// unwinds. The Err payload must never be implicitly dropped outside a catch.
+fn discard_cleanup_panic(mut payload: DeferredPanic) {
+    loop {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload))) {
+            Ok(()) => return,
+            Err(next) => payload = next,
+        }
+    }
+}
+
 // Safe guard disposal also runs while another Rust failure is unwinding.
 // Settle every owned phase first, then preserve that already-active failure.
 pub(super) fn resume_guard_cleanup_panics(failures: Vec<DeferredPanic>, already_unwinding: bool) {
     if already_unwinding {
         for payload in failures {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)));
+            discard_cleanup_panic(payload);
         }
     } else {
         resume_cleanup_panics(failures);
@@ -4231,7 +4458,7 @@ fn resume_cleanup_panics(mut failures: Vec<DeferredPanic>) {
         // Repeatedly panicking payload destructors have ordinary Rust behavior;
         // no payload is intentionally leaked.
         for payload in failures {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(payload)));
+            discard_cleanup_panic(payload);
         }
         std::panic::resume_unwind(first);
     }
@@ -4803,6 +5030,60 @@ mod tests {
                 .poll(&mut Context::from_waker(Waker::noop()))
                 .is_ready()
         );
+    }
+
+    #[test]
+    fn native_store_destruction_action_returns_exact_unadmitted_closure_and_waits_for_notifications()
+     {
+        let guard = NativeStoreDestructionGuard::new(None);
+        let receipt = guard.receipt.clone();
+        let called = Rc::new(Cell::new(0));
+        let calls = called.clone();
+        let action_receipt = receipt.clone();
+        receipt
+            .try_defer_cleanup(move |_| {
+                assert!(action_receipt.is_complete());
+                assert!(action_receipt.notifications_complete());
+                calls.set(calls.get() + 1);
+                None
+            })
+            .unwrap_or_else(|_| panic!("first actual continuation refused"));
+        struct Probe(Rc<Cell<usize>>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let drops = Rc::new(Cell::new(0));
+        let probe = Probe(drops.clone());
+        let rejected_calls = Rc::new(Cell::new(0));
+        let reject = rejected_calls.clone();
+        let exact = Box::new(move |_| {
+            reject.set(reject.get() + 1);
+            drop(probe);
+            None
+        });
+        let address = (&*exact) as *const _ as usize;
+        let exact = receipt
+            .try_defer_cleanup(exact)
+            .err()
+            .expect("one actual continuation slot");
+        assert_eq!((&*exact) as *const _ as usize, address);
+        assert_eq!(drops.get(), 0);
+        assert_eq!(rejected_calls.get(), 0);
+        assert!(!receipt.is_complete() && !receipt.notifications_complete());
+        drop(guard);
+        assert_eq!(called.get(), 1);
+        let exact = receipt
+            .try_defer_cleanup(exact)
+            .err()
+            .expect("actual notifications have returned");
+        assert_eq!((&*exact) as *const _ as usize, address);
+        assert_eq!(drops.get(), 0);
+        assert_eq!(rejected_calls.get(), 0);
+        assert!(exact(None).is_none());
+        assert_eq!(drops.get(), 1);
+        assert_eq!(rejected_calls.get(), 1);
     }
 
     #[test]
