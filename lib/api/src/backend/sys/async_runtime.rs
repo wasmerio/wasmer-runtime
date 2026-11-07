@@ -1115,6 +1115,114 @@ pub struct NativeInvocationScope {
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct NativeCleanupOwner(Rc<NativeCleanupState>);
+
+type CleanupExitAction = Box<dyn FnOnce() -> Option<DeferredPanic>>;
+
+/// Lexical custody outside the cleanup queue and its executor. Child leases
+/// keep an exited parent alive until the child's actual resources are released.
+#[doc(hidden)]
+pub struct NativeCleanupExitBoundary {
+    state: Rc<CleanupExitState>,
+}
+
+struct CleanupExitState {
+    owner: Weak<NativeCleanupState>,
+    parent: RefCell<Option<Rc<CleanupExitState>>>,
+    children: Cell<usize>,
+    lexical_done: Cell<bool>,
+    draining: Cell<bool>,
+    complete: Cell<bool>,
+    actions: RefCell<Vec<CleanupExitAction>>,
+    failures: RefCell<Vec<DeferredPanic>>,
+}
+
+impl NativeCleanupExitBoundary {
+    /// Move exact unfinished custody into this live lexical scope.
+    pub fn defer(&self, action: Box<dyn FnOnce() -> Option<Box<dyn std::any::Any + Send>>>) {
+        assert!(!self.state.lexical_done.get());
+        self.state.actions.borrow_mut().push(action);
+    }
+}
+
+impl CleanupExitState {
+    fn restore(self: &Rc<Self>) {
+        if let Some(owner) = self.owner.upgrade() {
+            let mut current = owner.exit.borrow_mut();
+            if current.ptr_eq(&Rc::downgrade(self)) {
+                *current = self
+                    .parent
+                    .borrow()
+                    .as_ref()
+                    .map(Rc::downgrade)
+                    .unwrap_or_default();
+            }
+        }
+    }
+
+    fn finish(self: &Rc<Self>, failures: &mut Vec<DeferredPanic>) {
+        if !self.lexical_done.get() || self.children.get() != 0 || self.draining.replace(true) {
+            return;
+        }
+        let parent = self.parent.borrow().as_ref().cloned();
+        if let Some(parent) = parent {
+            let actions = std::mem::take(&mut *self.actions.borrow_mut());
+            parent.actions.borrow_mut().extend(actions);
+            self.restore();
+            self.complete.set(true);
+            self.parent.borrow_mut().take();
+            parent.children.set(parent.children.get() - 1);
+            parent.finish(failures);
+        } else {
+            let mut retained = std::mem::take(&mut *self.failures.borrow_mut());
+            retained.append(failures);
+            *failures = retained;
+            // Keep the weak root installed while callbacks can admit children.
+            loop {
+                let actions = std::mem::take(&mut *self.actions.borrow_mut());
+                if actions.is_empty() {
+                    break;
+                }
+                let mut actions = actions.into_iter();
+                while let Some(action) = actions.next() {
+                    let mut returned = None;
+                    defer_cleanup(failures, || {
+                        returned = action();
+                    });
+                    if let Some(panic) = returned {
+                        failures.push(panic);
+                    }
+                    if self.children.get() != 0 {
+                        let mut remaining = actions.collect::<Vec<_>>();
+                        remaining.append(&mut *self.actions.borrow_mut());
+                        *self.actions.borrow_mut() = remaining;
+                        self.failures.borrow_mut().append(failures);
+                        self.draining.set(false);
+                        return;
+                    }
+                }
+            }
+            if self.children.get() != 0 {
+                self.failures.borrow_mut().append(failures);
+                self.draining.set(false);
+                return;
+            }
+            self.restore();
+            self.complete.set(true);
+        }
+        self.draining.set(false);
+    }
+}
+
+impl Drop for NativeCleanupExitBoundary {
+    fn drop(&mut self) {
+        let unwinding = std::thread::panicking();
+        self.state.lexical_done.set(true);
+        let mut failures = Vec::new();
+        self.state.finish(&mut failures);
+        resume_guard_cleanup_panics(failures, unwinding);
+    }
+}
+
 struct NativeCleanupState {
     owner: std::thread::ThreadId,
     futures: RefCell<std::collections::VecDeque<NativeCleanupTask>>,
@@ -1125,6 +1233,7 @@ struct NativeCleanupState {
     idle_waker: RefCell<Option<Arc<Waker>>>,
     observers: RefCell<Vec<NativeUnlockObserver>>,
     thread_state: RuntimeThreadState,
+    exit: RefCell<Weak<CleanupExitState>>,
 }
 struct NativeCleanupTask {
     future: Pin<Box<dyn Future<Output = ()>>>,
@@ -1156,7 +1265,30 @@ impl NativeCleanupOwner {
             idle_waker: RefCell::default(),
             observers: RefCell::default(),
             thread_state: RuntimeThreadState::capture(),
+            exit: RefCell::default(),
         }))
+    }
+    /// Create before acquiring executor receipts or entering its contexts.
+    /// Drop after those receipts, futures and contexts have been destroyed.
+    #[doc(hidden)]
+    pub fn enter_exit_boundary(&self) -> NativeCleanupExitBoundary {
+        let parent = self.0.exit.borrow().upgrade();
+        if let Some(parent) = &parent {
+            assert!(!parent.complete.get());
+            parent.children.set(parent.children.get() + 1);
+        }
+        let state = Rc::new(CleanupExitState {
+            owner: Rc::downgrade(&self.0),
+            parent: RefCell::new(parent),
+            children: Cell::new(0),
+            lexical_done: Cell::new(false),
+            draining: Cell::new(false),
+            complete: Cell::new(false),
+            actions: RefCell::default(),
+            failures: RefCell::default(),
+        });
+        *self.0.exit.borrow_mut() = Rc::downgrade(&state);
+        NativeCleanupExitBoundary { state }
     }
     /// Commit exact continuation custody before the first host-only poll.
     pub fn retain(&self, future: Pin<Box<dyn Future<Output = ()>>>) {
@@ -1232,6 +1364,7 @@ impl NativeCleanupOwner {
             std::thread::current().id(),
             "native cleanup moved threads"
         );
+        let _exit = self.enter_exit_boundary();
         let _state = self.0.thread_state.enter();
         let already_unwinding = std::thread::panicking();
         self.0.ready.set(true);
@@ -4658,6 +4791,169 @@ mod tests {
             drop(futures::executor::block_on(target.write_lock()));
             assert!(StoreContext::is_empty());
         }
+    }
+
+    #[test]
+    fn cleanup_exit_pins_a_cancelled_parent_until_the_last_child_releases() {
+        let owner = NativeCleanupOwner::new();
+        let first = owner.enter_exit_boundary();
+        let second = owner.enter_exit_boundary();
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let outer = events.clone();
+        first.defer(Box::new(move || {
+            outer.borrow_mut().push(1);
+            None
+        }));
+        let inner = events.clone();
+        second.defer(Box::new(move || {
+            inner.borrow_mut().push(2);
+            None
+        }));
+        drop(first);
+        assert!(events.borrow().is_empty());
+        assert!(owner.0.exit.borrow().upgrade().is_some());
+        drop(second);
+        assert_eq!(*events.borrow(), [1, 2]);
+        assert!(owner.0.exit.borrow().upgrade().is_none());
+    }
+
+    #[test]
+    fn cleanup_exit_pauses_remaining_actions_and_first_panic_until_a_retained_child_exits() {
+        let owner = NativeCleanupOwner::new();
+        let boundary = owner.enter_exit_boundary();
+        let child = Rc::new(RefCell::new(None));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let keep_child = child.clone();
+        let first_events = events.clone();
+        let nested_owner = owner.clone();
+        boundary.defer(Box::new(move || {
+            first_events.borrow_mut().push(1);
+            *keep_child.borrow_mut() = Some(nested_owner.enter_exit_boundary());
+            Some(Box::new("first action"))
+        }));
+        let second_events = events.clone();
+        boundary.defer(Box::new(move || {
+            second_events.borrow_mut().push(2);
+            Some(Box::new("second action"))
+        }));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(boundary))).is_ok());
+        assert_eq!(*events.borrow(), [1]);
+        let child = child.borrow_mut().take().unwrap();
+        let first =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(child))).unwrap_err();
+        assert_eq!(first.downcast_ref::<&str>(), Some(&"first action"));
+        assert_eq!(*events.borrow(), [1, 2]);
+        assert!(owner.0.exit.borrow().upgrade().is_none());
+    }
+
+    #[test]
+    fn cleanup_exit_waits_for_notify_task_receipts_and_both_running_guards() {
+        struct Receipt {
+            owner: NativeCleanupOwner,
+            value: Rc<()>,
+            completed: Rc<Cell<bool>>,
+        }
+        impl Drop for Receipt {
+            fn drop(&mut self) {
+                let boundary = self.owner.enter_exit_boundary();
+                let weak = Rc::downgrade(&self.value);
+                let owner = self.owner.clone();
+                let completed = self.completed.clone();
+                boundary.defer(Box::new(move || {
+                    assert!(weak.upgrade().is_none());
+                    assert!(!owner.0.running.get());
+                    assert!(!owner.0.callbacks_running.get());
+                    completed.set(true);
+                    None
+                }));
+            }
+        }
+        let owner = NativeCleanupOwner::new();
+        let completed = Rc::new(Cell::new(false));
+        let receipt = Receipt {
+            owner: owner.clone(),
+            value: Rc::new(()),
+            completed: completed.clone(),
+        };
+        owner.retain(Box::pin(async move {
+            drop(receipt);
+        }));
+        assert!(completed.get());
+        assert!(owner.is_idle());
+    }
+
+    #[test]
+    fn cleanup_exit_keeps_pending_receipts_as_real_drain_obligations() {
+        let owner = NativeCleanupOwner::new();
+        let gate = Rc::new(Cell::new(false));
+        let finished = Rc::new(Cell::new(false));
+        let task_gate = gate.clone();
+        let task_finished = finished.clone();
+        owner.retain(Box::pin(std::future::poll_fn(move |_| {
+            if !task_gate.get() {
+                return Poll::Pending;
+            }
+            task_finished.set(true);
+            Poll::Ready(())
+        })));
+        let boundary = owner.enter_exit_boundary();
+        let drain = owner.clone();
+        boundary.defer(Box::new(move || {
+            assert!(!drain.is_idle());
+            assert!(!finished.get());
+            gate.set(true);
+            drain.notify();
+            assert!(finished.get());
+            assert!(drain.is_idle());
+            None
+        }));
+        drop(boundary);
+    }
+
+    #[test]
+    fn cleanup_exit_reentrant_admission_keeps_the_first_owned_panic() {
+        let owner = NativeCleanupOwner::new();
+        let boundary = owner.enter_exit_boundary();
+        let finished = Rc::new(Cell::new(false));
+        let reentrant = owner.clone();
+        let observation = finished.clone();
+        boundary.defer(Box::new(move || {
+            let nested = reentrant.enter_exit_boundary();
+            nested.defer(Box::new(move || {
+                observation.set(true);
+                Some(Box::new("second"))
+            }));
+            drop(nested);
+            Some(Box::new("first"))
+        }));
+        let panic =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(boundary))).unwrap_err();
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"first"));
+        assert!(finished.get());
+        assert!(owner.0.exit.borrow().upgrade().is_none());
+    }
+
+    #[test]
+    fn cleanup_exit_preserves_an_active_unwind_and_consumes_every_action() {
+        struct DuringUnwind {
+            _boundary: Option<NativeCleanupExitBoundary>,
+        }
+        let owner = NativeCleanupOwner::new();
+        let completed = Rc::new(Cell::new(false));
+        let observation = completed.clone();
+        let boundary = owner.enter_exit_boundary();
+        boundary.defer(Box::new(move || {
+            observation.set(true);
+            Some(Box::new("cleanup"))
+        }));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = DuringUnwind {
+                _boundary: Some(boundary),
+            };
+            panic!("active");
+        }));
+        assert_eq!(result.unwrap_err().downcast_ref::<&str>(), Some(&"active"));
+        assert!(completed.get());
     }
 
     #[test]
