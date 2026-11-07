@@ -5176,10 +5176,16 @@ mod tests {
             next.store_destruction().reserve_cleanup().is_err(),
             "successor cannot reserve the SAME backing twice"
         );
+        let backing = std::ptr::from_ref::<StoreInner>(&write);
+        assert!(Rc::ptr_eq(&receipt.0, &next.store_destruction().0));
         drop(write);
-        drop(successor);
+        let old = asynchronous
+            .into_store()
+            .expect_err("superseded generation must not regain Store consumption authority");
+        drop(old); // release every old backing alias before consuming the current successor
         drop(scope);
-        let store = asynchronous.into_store().unwrap();
+        let store = successor.into_store().unwrap();
+        assert_eq!(std::ptr::from_ref::<StoreInner>(&store.inner), backing);
         assert!(
             next.store_destruction().reserve_cleanup().is_err(),
             "conversion preserves SAME reservation"
