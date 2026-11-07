@@ -1464,7 +1464,17 @@ impl NativeCleanupOwner {
     /// Register while actual Store construction authority is retained, before
     /// publishing any producer for this concrete resource scope.
     pub fn bind_store_cleanup_fence(&self, exact: NativeCleanupFence) {
+        // Commit metadata before notification can reenter or unwind through the
+        // constructor, whose actual Store/scope custody remains with its caller.
         self.0.cleanup_fences.borrow_mut().push(Rc::new(exact));
+        let waker = self.0.idle_waker.borrow().clone();
+        if let Some(waker) = waker {
+            let unwinding = std::thread::panicking();
+            let mut failures = Vec::new();
+            defer_cleanup(&mut failures, || waker.wake_by_ref());
+            defer_cleanup(&mut failures, || drop(waker));
+            resume_guard_cleanup_panics(failures, unwinding);
+        }
     }
     /// The SAME canonical collection formerly owned by the C API ManagedStore.
     /// This read must stay callback-free; it is only one part of a seal proof.
@@ -1476,9 +1486,18 @@ impl NativeCleanupOwner {
             .all(|fence| (fence.ready)())
     }
     pub fn poll_cleanup_fences(&self, cx: &mut Context<'_>) -> Poll<()> {
-        let fences = self.0.cleanup_fences.borrow().clone();
-        for fence in &fences {
-            (fence.observe)(cx.waker());
+        let mut observed = 0;
+        loop {
+            let fences = self.0.cleanup_fences.borrow()[observed..].to_vec();
+            if fences.is_empty() {
+                break;
+            }
+            observed += fences.len();
+            // Waker clone/drop callbacks may bind more fences. Observe those
+            // exact appended entries before querying the current collection.
+            for fence in &fences {
+                (fence.observe)(cx.waker());
+            }
         }
         if self.cleanup_fences_ready() {
             Poll::Ready(())
@@ -4681,6 +4700,95 @@ mod tests {
         assert!(!receipt.is_complete());
         drop(successor);
         assert!(receipt.is_complete());
+    }
+
+    #[test]
+    fn native_cleanup_reentrant_fence_binding_observes_and_wakes_the_original_drain() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        struct BindWake {
+            wakes: AtomicUsize,
+            panic_once: AtomicBool,
+        }
+        impl std::task::Wake for BindWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.wakes.fetch_add(1, Ordering::SeqCst);
+                if self.panic_once.swap(false, Ordering::SeqCst) {
+                    panic!("binding notification");
+                }
+            }
+        }
+        for panic in [false, true] {
+            let owner = NativeCleanupOwner::new_store_bound();
+            let ready = Rc::new(Cell::new(false));
+            let waiter = Rc::new(RefCell::new(None::<Waker>));
+            let b_ready = ready.clone();
+            let b_waiter = waiter.clone();
+            let b = NativeCleanupFence::new(
+                Rc::new(move |waker| {
+                    let next = waker.clone();
+                    let previous = b_waiter.borrow_mut().replace(next);
+                    drop(previous);
+                }),
+                Rc::new(move || b_ready.get()),
+            );
+            let pending_binding = Rc::new(RefCell::new(Some(b)));
+            let binding_owner = Rc::downgrade(&owner.0);
+            owner.bind_store_cleanup_fence(NativeCleanupFence::new(
+                Rc::new(move |_| {
+                    let b = pending_binding.borrow_mut().take();
+                    if let Some(b) = b {
+                        NativeCleanupOwner(binding_owner.upgrade().unwrap())
+                            .bind_store_cleanup_fence(b);
+                    }
+                }),
+                Rc::new(|| true),
+            ));
+            let wake = Arc::new(BindWake {
+                wakes: AtomicUsize::new(0),
+                panic_once: AtomicBool::new(panic),
+            });
+            let waker = Waker::from(wake.clone());
+            let mut cx = Context::from_waker(&waker);
+            let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                owner.poll_quiescent(&mut cx)
+            }));
+            if panic {
+                assert_eq!(
+                    first.unwrap_err().downcast_ref::<&str>(),
+                    Some(&"binding notification")
+                );
+            } else {
+                assert!(first.unwrap().is_pending());
+            }
+            // The same B remains committed even if binding notification unwound.
+            assert!(!owner.cleanup_fences_ready());
+            assert!(owner.poll_quiescent(&mut cx).is_pending());
+            assert!(
+                waiter.borrow().is_some(),
+                "B must be observed before Pending"
+            );
+            assert_eq!(wake.wakes.load(Ordering::SeqCst), 1);
+            assert!(owner.poll_quiescent(&mut cx).is_pending());
+            owner.notify(); // an empty pump does not fabricate readiness
+            assert_eq!(
+                wake.wakes.load(Ordering::SeqCst),
+                1,
+                "ordinary Pending must not spin"
+            );
+            ready.set(true);
+            let completed = waiter.borrow_mut().take().unwrap();
+            completed.wake();
+            assert_eq!(
+                wake.wakes.load(Ordering::SeqCst),
+                2,
+                "B completion wakes the actual original drain"
+            );
+            assert!(owner.poll_quiescent(&mut cx).is_ready());
+            assert_eq!(wake.wakes.load(Ordering::SeqCst), 2);
+        }
     }
 
     #[test]
