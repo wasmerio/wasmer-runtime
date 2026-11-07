@@ -1329,16 +1329,32 @@ impl Drop for NativeCleanupExitBoundary {
     }
 }
 
+/// Wake custody reported by one observation pass, before the final pure check.
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub enum NativeCleanupFenceObservation {
+    /// An incomplete observer registered the caller's real completion wake.
+    Armed,
+    /// Ready unregistered, or reentry found the observer temporarily taken.
+    /// If THIS fence is incomplete at final check, the caller must retry.
+    Unarmed,
+    /// Legacy passive predicates rely on their existing external signal.
+    Passive,
+}
+
 /// Pure completion facts and one independently cancellable wake registration.
 /// Neither closure may own the Store or its resource graph. ready must invoke
 /// no callbacks; observe performs callback-bearing registration before recheck.
 #[doc(hidden)]
 pub struct NativeCleanupFence {
-    observe: Rc<dyn Fn(&Waker)>,
+    observe: Rc<dyn Fn(&Waker) -> NativeCleanupFenceObservation>,
     ready: Rc<dyn Fn() -> bool>,
 }
 impl NativeCleanupFence {
-    pub fn new(observe: Rc<dyn Fn(&Waker)>, ready: Rc<dyn Fn() -> bool>) -> Self {
+    pub fn new(
+        observe: Rc<dyn Fn(&Waker) -> NativeCleanupFenceObservation>,
+        ready: Rc<dyn Fn() -> bool>,
+    ) -> Self {
         Self { observe, ready }
     }
 }
@@ -1486,23 +1502,40 @@ impl NativeCleanupOwner {
             .all(|fence| (fence.ready)())
     }
     pub fn poll_cleanup_fences(&self, cx: &mut Context<'_>) -> Poll<()> {
-        let mut observed = 0;
+        let mut observed = Vec::new();
         loop {
-            let fences = self.0.cleanup_fences.borrow()[observed..].to_vec();
+            let fences = self.0.cleanup_fences.borrow()[observed.len()..].to_vec();
             if fences.is_empty() {
                 break;
             }
-            observed += fences.len();
             // Waker clone/drop callbacks may bind more fences. Observe those
             // exact appended entries before querying the current collection.
-            for fence in &fences {
-                (fence.observe)(cx.waker());
+            for fence in fences {
+                let wake = (fence.observe)(cx.waker());
+                observed.push((fence, wake));
             }
         }
-        if self.cleanup_fences_ready() {
-            Poll::Ready(())
-        } else {
+        let mut pending = false;
+        let mut retry = false;
+        for (fence, wake) in &observed {
+            if !(fence.ready)() {
+                pending = true;
+                retry |= matches!(wake, NativeCleanupFenceObservation::Unarmed);
+            }
+        }
+        if retry {
+            // Readiness can become incomplete AFTER Ready removed its Waker.
+            // Retry only that unarmed fence's interval, never a stable Ready
+            // fence alongside another already-armed Pending fence.
+            let unwinding = std::thread::panicking();
+            let mut failures = Vec::new();
+            defer_cleanup(&mut failures, || cx.waker().wake_by_ref());
+            resume_guard_cleanup_panics(failures, unwinding);
+        }
+        if pending {
             Poll::Pending
+        } else {
+            Poll::Ready(())
         }
     }
     /// Unlike poll_idle, also waits for callback queues and bound resource
@@ -4703,6 +4736,70 @@ mod tests {
     }
 
     #[test]
+    fn native_cleanup_fence_interval_retries_only_unarmed_incomplete_entries() {
+        let owner = NativeCleanupOwner::new_store_bound();
+        owner.bind_store_cleanup_fence(NativeCleanupFence::new(
+            Rc::new(|_| NativeCleanupFenceObservation::Unarmed),
+            Rc::new(|| true),
+        ));
+        // Passive legacy predicates keep their existing external-signal contract.
+        let passive = Rc::new(Cell::new(false));
+        let passive_ready = passive.clone();
+        owner.bind_store_cleanup_fence(NativeCleanupFence::new(
+            Rc::new(|_| NativeCleanupFenceObservation::Passive),
+            Rc::new(move || passive_ready.get()),
+        ));
+        let first = Rc::new(Cell::new(true));
+        let ready = Rc::new(Cell::new(true));
+        let waiter = Rc::new(RefCell::new(None::<Waker>));
+        let b_ready = ready.clone();
+        let b_waiter = waiter.clone();
+        let queried = ready.clone();
+        owner.bind_store_cleanup_fence(NativeCleanupFence::new(
+            Rc::new(move |waker| {
+                if first.replace(false) {
+                    // Primitive handshake: observed Ready, then a real resource
+                    // may become busy before the final pure readiness query.
+                    b_ready.set(false);
+                    NativeCleanupFenceObservation::Unarmed
+                } else {
+                    let next = waker.clone();
+                    let previous = b_waiter.borrow_mut().replace(next);
+                    drop(previous);
+                    NativeCleanupFenceObservation::Armed
+                }
+            }),
+            Rc::new(move || queried.get()),
+        ));
+        let wake = Arc::new(BackingWake(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(owner.poll_quiescent(&mut cx).is_pending());
+        assert_eq!(wake.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        for _ in 0..2 {
+            assert!(owner.poll_quiescent(&mut cx).is_pending());
+            assert_eq!(
+                wake.0.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "stable Ready A, armed Pending B and passive Pending must not spin"
+            );
+        }
+        ready.set(true);
+        let completion = waiter.borrow_mut().take().unwrap();
+        completion.wake();
+        assert_eq!(wake.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(owner.poll_quiescent(&mut cx).is_pending());
+        assert_eq!(
+            wake.0.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a passive legacy predicate does not acquire an automatic wake"
+        );
+        passive.set(true); // its existing external producer schedules the next poll
+        assert!(owner.poll_quiescent(&mut cx).is_ready());
+        assert_eq!(wake.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn native_cleanup_reentrant_fence_binding_observes_and_wakes_the_original_drain() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         struct BindWake {
@@ -4731,6 +4828,7 @@ mod tests {
                     let next = waker.clone();
                     let previous = b_waiter.borrow_mut().replace(next);
                     drop(previous);
+                    NativeCleanupFenceObservation::Armed
                 }),
                 Rc::new(move || b_ready.get()),
             );
@@ -4743,6 +4841,7 @@ mod tests {
                         NativeCleanupOwner(binding_owner.upgrade().unwrap())
                             .bind_store_cleanup_fence(b);
                     }
+                    NativeCleanupFenceObservation::Unarmed
                 }),
                 Rc::new(|| true),
             ));
