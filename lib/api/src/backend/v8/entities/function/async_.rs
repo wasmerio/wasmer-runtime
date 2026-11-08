@@ -19,7 +19,6 @@ use crate::{
         async_runtime::AsyncBinding,
         bindings::*,
         entities::function::env,
-        error::Trap,
         origin::{Handle, Origin},
         references::{OwnedValue, Values as CallValues},
         utils::convert::{IntoCApiType, IntoCApiValue, IntoWasmerValue},
@@ -34,6 +33,8 @@ type ImportCapture<T> = fn(&T) -> Option<Arc<dyn Any + Send + Sync>>;
 struct AsyncCallback<T, F> {
     binding: Rc<AsyncBinding>,
     raw_store: *mut wasm_store_t,
+    backing: usize,
+    trap_calls: std::rc::Weak<crate::backend::v8::error::TrapCallState>,
     origin: Origin,
     environment: env::FunctionEnv<T>,
     signature: FunctionType,
@@ -81,9 +82,11 @@ impl Function {
                 .clone();
             binding.check_async_entry()?;
             let owner = binding.selected_executor()?;
-            let frame = binding.enter()?;
+            let mut frame = binding.enter()?;
+            frame.attach_traps(locked.as_ref().unwrap())?;
             let mut arguments = None;
             let mut results = None;
+            let mut pending_trap = None;
             let entry_unwinding = std::thread::panicking();
             let outcome = catch_unwind(AssertUnwindSafe(
                 || -> Result<Box<[Value]>, RuntimeError> {
@@ -126,10 +129,18 @@ impl Function {
                         let raw_arguments = arguments.take().unwrap().into_call_arguments();
                         let trap =
                             unsafe { wasm_func_call(raw_function, &raw_arguments, raw_results) };
+                        pending_trap = if trap.is_null() {
+                            None
+                        } else {
+                            Some(OwnedValue::reference(
+                                unsafe { wasm_trap_as_ref(trap) },
+                                false,
+                            ))
+                        };
                         // A host callback already caught the original panic.
                         // Never run on_called or replay the guest under it.
                         if frame.has_panic() {
-                            discard_trap(&frame, trap);
+                            discard_trap(&frame, take_trap(&mut pending_trap));
                             return Err(RuntimeError::new("V8 call panicked"));
                         }
                         let mut guard =
@@ -141,13 +152,13 @@ impl Function {
                         let action = callback.map(|callback| callback(guard.as_store_mut()));
                         drop(guard);
                         if frame.has_panic() {
-                            discard_trap(&frame, trap);
+                            discard_trap(&frame, take_trap(&mut pending_trap));
                             guarded_dispose(&frame, || drop(action));
                             return Err(RuntimeError::new("V8 call panicked"));
                         }
                         match action {
                             Some(Ok(wasmer_types::OnCalledAction::InvokeAgain)) => {
-                                discard_trap(&frame, trap);
+                                discard_trap(&frame, take_trap(&mut pending_trap));
                                 if frame.has_panic() {
                                     return Err(RuntimeError::new("V8 call panicked"));
                                 }
@@ -155,13 +166,13 @@ impl Function {
                             }
                             Some(Ok(wasmer_types::OnCalledAction::Trap(error)))
                             | Some(Err(error)) => {
-                                discard_trap(&frame, trap);
+                                discard_trap(&frame, take_trap(&mut pending_trap));
                                 return Err(RuntimeError::user(error));
                             }
                             Some(Ok(wasmer_types::OnCalledAction::Finish)) | None => {}
                         }
-                        if !trap.is_null() {
-                            return Err(Trap::from(trap).into());
+                        if pending_trap.is_some() {
+                            return Err(frame.decode_trap(take_trap(&mut pending_trap)).into());
                         }
                         let guard = StoreAsyncWriteLock::try_acquire(&store).ok_or_else(|| {
                             RuntimeError::new("V8 result Store is still borrowed")
@@ -193,9 +204,11 @@ impl Function {
             // Capture original failure before its subsequent destructor can run.
             guarded_dispose(&frame, || drop(locked.take()));
             guarded_dispose(&frame, || drop(arguments.take()));
+            guarded_dispose(&frame, || drop(pending_trap.take()));
             guarded_dispose(&frame, || drop(results.take()));
             guarded_dispose(&frame, || drop(parameters));
             guarded_dispose(&frame, || drop(owner));
+            frame.finish_traps();
             if frame.has_panic() {
                 let unwinding = std::thread::panicking();
                 if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(outcome.take()))) {
@@ -258,6 +271,8 @@ impl Function {
         let callback = Box::new(AsyncCallback {
             binding: binding.clone(),
             raw_store,
+            backing: view.inner as *mut crate::StoreInner as usize,
+            trap_calls: Rc::downgrade(&view.inner.store.as_v8().trap_calls),
             origin: Origin::of(&view).expect("actual V8 constructor Store"),
             environment: environment.as_v8().clone(),
             signature: signature.clone(),
@@ -408,6 +423,28 @@ where
     // This Box is owned by the actual Store's Rust callback arena. The outer
     // guard-free call retains that actual Store through every callback.
     let callback = unsafe { &*pointer.cast::<AsyncCallback<T, F>>() };
+    let publisher = match crate::backend::v8::error::TrapCallState::publisher(
+        &callback.trap_calls,
+        &callback.origin,
+        callback.backing,
+        callback.raw_store,
+    ) {
+        Ok(publisher) => publisher,
+        Err(error) => {
+            return crate::backend::v8::error::checked_message(
+                &callback.origin,
+                callback.raw_store,
+                &error.to_string(),
+            );
+        }
+    };
+    if publisher.mode() != crate::backend::v8::error::TrapMode::GuardFreeAsync {
+        return crate::backend::v8::error::checked_message(
+            &callback.origin,
+            callback.raw_store,
+            "V8 async imports require their actual guard-free call",
+        );
+    }
     let binding = &callback.binding;
     let unwinding = std::thread::panicking();
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), RuntimeError> {
@@ -482,17 +519,17 @@ where
         Ok(())
     }));
     let error = match outcome {
-        Ok(Ok(())) if !binding.current_has_panic() => return std::ptr::null_mut(),
+        Ok(Ok(())) if !publisher.has_panic() => return std::ptr::null_mut(),
         Ok(Ok(())) => RuntimeError::new("V8 host cleanup panicked"),
         Ok(Err(error)) => error,
         Err(panic) => {
-            binding.record(panic, unwinding);
+            publisher.record(panic, unwinding);
             RuntimeError::new("V8 host callback panicked")
         }
     };
     // Never resume a Rust panic through wee8's C callback. The outer actual
     // call receives its trap, disposes its fields, then claims the same value.
-    unsafe { Trap::user(Box::new(error)).into_wasm_trap_raw(callback.raw_store) }
+    publisher.emit_user(Box::new(error))
 }
 
 fn typed_arguments<Args: WasmTypeList>(
@@ -533,20 +570,27 @@ fn guarded_dispose(frame: &crate::backend::v8::async_runtime::CallGuard, cleanup
     }
 }
 
-// A discarded trap can own an encoded Rust error as well as the C wrapper.
+// Transfer this exact temporary OWN trap, without leaving a duplicate owner.
+fn take_trap(owner: &mut Option<OwnedValue>) -> *mut wasm_trap_t {
+    owner
+        .take()
+        .map(|mut owner| unsafe { wasm_ref_as_trap(owner.take().of.ref_) })
+        .unwrap_or(std::ptr::null_mut())
+}
+
+// A discarded trap owns its finite typed error and the actual C++ reference.
 // Catch the decode before later destruction and retain the same first carrier.
 fn discard_trap(frame: &crate::backend::v8::async_runtime::CallGuard, raw: *mut wasm_trap_t) {
     if raw.is_null() {
         return;
     }
     let unwinding = std::thread::panicking();
-    let decoded = match catch_unwind(AssertUnwindSafe(|| Trap::from(raw))) {
+    let decoded = match catch_unwind(AssertUnwindSafe(|| frame.decode_trap(raw))) {
         Ok(trap) => Some(trap),
         Err(panic) => {
             frame.record(panic, unwinding);
             None
         }
     };
-    guarded_dispose(frame, || unsafe { wasm_trap_delete(raw) });
     guarded_dispose(frame, || drop(decoded));
 }

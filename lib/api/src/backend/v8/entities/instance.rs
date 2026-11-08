@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use crate::{
     AsStoreMut, AsStoreRef, Exports, Extern, Imports, InstantiationError, Module,
-    backend::v8::bindings::*, v8::error::Trap, vm::VMExtern,
+    backend::v8::bindings::*,
+    v8::error::{TrapCallScope, TrapMode},
+    vm::VMExtern,
 };
 
 use super::check_isolate;
@@ -24,6 +26,7 @@ impl InstanceHandle {
         store: *mut wasm_store_t,
         module: *mut wasm_shared_module_t,
         mut externs: Vec<VMExtern>,
+        traps: &TrapCallScope,
     ) -> Result<Self, InstantiationError> {
         let mut trap: *mut wasm_trap_t = std::ptr::null_mut() as _;
 
@@ -39,7 +42,7 @@ impl InstanceHandle {
         let instance = unsafe { wasm_instance_new(store, obtained, &imports, &mut trap) };
 
         if instance.is_null() {
-            let trap = Trap::from(trap);
+            let trap = traps.from_owned(trap);
             return Err(InstantiationError::Start(trap.into()));
         }
 
@@ -118,7 +121,6 @@ impl Instance {
         externs: &[Extern],
     ) -> Result<(Self, Exports), InstantiationError> {
         check_isolate(store);
-        let store_ref = store.as_store_ref();
         if externs.iter().any(|value| {
             // Sys handles may share a numeric StoreId; that is not V8 origin.
             let is_v8 = match value {
@@ -136,19 +138,29 @@ impl Instance {
             .iter()
             .map(|extern_| extern_.to_vm_extern())
             .collect::<Vec<_>>();
-        let instance = InstanceHandle::new(
-            store_ref.inner.store.as_v8().inner,
-            module.as_v8().handle.v8_shared_module_handle,
-            externs,
-        )?;
-        let exports = instance.get_exports(store, module);
+        let traps = TrapCallScope::enter(store, TrapMode::BorrowedSync, None)
+            .map_err(InstantiationError::Start)?;
+        let outcome = traps.catch(|| {
+            let instance = InstanceHandle::new(
+                store.as_store_ref().inner.store.as_v8().inner,
+                module.as_v8().handle.v8_shared_module_handle,
+                externs,
+                &traps,
+            )?;
+            let exports = instance.get_exports(store, module);
 
-        Ok((
-            Self {
-                handle: Arc::new(instance),
-            },
-            exports,
-        ))
+            Ok((
+                Self {
+                    handle: Arc::new(instance),
+                },
+                exports,
+            ))
+        });
+        traps.finish_outcome(outcome.unwrap_or_else(|| {
+            Err(InstantiationError::Start(crate::RuntimeError::new(
+                "V8 instance start panicked",
+            )))
+        }))
     }
 }
 

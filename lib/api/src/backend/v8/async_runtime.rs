@@ -113,6 +113,7 @@ impl AsyncBinding {
     pub(crate) fn has_active_call(&self) -> bool {
         self.active.borrow().upgrade().is_some()
     }
+    #[cfg(test)]
     pub(crate) fn current_has_panic(&self) -> bool {
         let current = self.active.borrow().upgrade();
         current.is_some_and(|frame| frame.panic.borrow().is_some())
@@ -123,13 +124,14 @@ impl AsyncBinding {
         let frame = Rc::new(CallFrame {
             live: std::cell::Cell::new(true),
             sync_borrows: Default::default(),
-            panic: RefCell::new(None),
+            panic: Default::default(),
         });
         let previous = self.active.replace(Rc::downgrade(&frame));
         Ok(CallGuard {
             binding: self.clone(),
             frame,
             previous,
+            traps: None,
         })
     }
 
@@ -223,16 +225,40 @@ impl AsyncBinding {
 struct CallFrame {
     live: std::cell::Cell<bool>,
     sync_borrows: std::cell::Cell<usize>,
-    panic: RefCell<Option<Panic>>,
+    panic: super::error::FailureCell,
 }
 
 pub(crate) struct CallGuard {
     binding: Rc<AsyncBinding>,
     frame: Rc<CallFrame>,
     previous: Weak<CallFrame>,
+    traps: Option<super::error::TrapCallScope>,
 }
 
 impl CallGuard {
+    pub(crate) fn attach_traps(
+        &mut self,
+        store: &impl crate::AsStoreRef,
+    ) -> Result<(), RuntimeError> {
+        self.traps = Some(super::error::TrapCallScope::enter(
+            store,
+            super::error::TrapMode::GuardFreeAsync,
+            Some(self.frame.panic.clone()),
+        )?);
+        Ok(())
+    }
+    pub(crate) fn decode_trap(&self, raw: *mut super::bindings::wasm_trap_t) -> super::error::Trap {
+        self.traps
+            .as_ref()
+            .expect("actual V8 call scope")
+            .from_owned(raw)
+    }
+    pub(crate) fn finish_traps(&self) {
+        if let Some(scope) = &self.traps {
+            scope.finish();
+        }
+    }
+
     pub(crate) fn has_panic(&self) -> bool {
         self.frame.panic.borrow().is_some()
     }
@@ -246,6 +272,7 @@ impl CallGuard {
 
 impl Drop for CallGuard {
     fn drop(&mut self) {
+        self.finish_traps();
         self.frame.live.set(false);
         let mut current = self.binding.active.borrow_mut();
         debug_assert!(current.ptr_eq(&Rc::downgrade(&self.frame)));
@@ -360,22 +387,7 @@ impl Drop for HostCallbacks {
 }
 
 fn record_first(slot: &RefCell<Option<Panic>>, panic: Panic, unwinding: bool) {
-    if unwinding {
-        discard_panic(panic);
-        return;
-    }
-    let secondary = {
-        let mut first = slot.borrow_mut();
-        if first.is_none() {
-            *first = Some(panic);
-            None
-        } else {
-            Some(panic)
-        }
-    };
-    if let Some(secondary) = secondary {
-        discard_panic(secondary);
-    }
+    super::error::record_failure(slot, panic, unwinding);
 }
 
 pub(crate) fn discard_panic(mut panic: Panic) {

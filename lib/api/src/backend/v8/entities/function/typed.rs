@@ -15,7 +15,12 @@ use crate::{AsStoreAsync, StoreAsync};
 use crate::{
     AsStoreMut, FromToNativeWasmType, NativeWasmType, NativeWasmTypeInto, RuntimeError,
     TypedFunction, Value, WasmTypeList,
-    backend::v8::{bindings::*, error::Trap, function::Function, utils::convert::*},
+    backend::v8::{
+        bindings::*,
+        error::{TrapCallScope, TrapMode},
+        function::Function,
+        utils::convert::*,
+    },
 };
 #[cfg(feature = "experimental-async")]
 use std::future::Future;
@@ -79,6 +84,9 @@ macro_rules! impl_native_traits {
                      } ),* ]
                  };
 
+                 let traps = TrapCallScope::enter(store, TrapMode::BorrowedSync, None)?;
+                 let mut decoded = None;
+                 let outcome = traps.catch(|| {
                  let mut results = crate::backend::v8::references::Values::empty(Rets::wasm_types().len());
 
 
@@ -94,10 +102,16 @@ macro_rules! impl_native_traits {
                     let raw_arguments = arguments.into_call_arguments();
                     trap = unsafe { wasm_func_call(func, &raw_arguments, raw_results) };
 
+                    decoded = if trap.is_null() { None } else { Some(traps.from_owned(trap)) };
+                    if traps.has_panic() { return Err(RuntimeError::new("V8 typed call panicked")); }
                     let store_mut = store.as_store_mut();
                     if let Some(callback) = store_mut.inner.on_called.take() {
                         match callback(store_mut) {
-                            Ok(wasmer_types::OnCalledAction::InvokeAgain) => { continue; }
+                            Ok(wasmer_types::OnCalledAction::InvokeAgain) => {
+                                traps.dispose(|| drop(decoded.take()));
+                                if traps.has_panic() { return Err(RuntimeError::new("V8 typed replay panicked")); }
+                                continue;
+                            }
                             Ok(wasmer_types::OnCalledAction::Finish) => { break; }
                             Ok(wasmer_types::OnCalledAction::Trap(trap)) => { return Err(RuntimeError::user(trap)) },
                             Err(trap) => { return Err(RuntimeError::user(trap)) },
@@ -108,12 +122,7 @@ macro_rules! impl_native_traits {
 
 
 
-                 if !trap.is_null() {
-                     unsafe {
-                        let trap: Trap = trap.into();
-                        return Err(RuntimeError::from(trap));
-                     }
-                }
+                 if let Some(trap) = decoded.take() { return Err(RuntimeError::from(trap)); }
 
                 crate::backend::v8::utils::convert::validate_raw_values(results.as_slice(), &Rets::wasm_types())?;
                 unsafe {
@@ -139,6 +148,9 @@ macro_rules! impl_native_traits {
 
                     Ok(unsafe { Rets::from_array(store, rets_list_array) })
                 }
+                 });
+                 traps.dispose(|| drop(decoded.take()));
+                 traps.finish_outcome(outcome.unwrap_or_else(|| Err(RuntimeError::new("V8 typed call panicked"))))
             }
 
             #[doc(hidden)]

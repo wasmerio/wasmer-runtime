@@ -18,11 +18,12 @@ use crate::{
 };
 
 use crate::backend::v8::{
+    error::{TrapCallScope, TrapCallState, TrapMode, TrapPublisher, checked_message},
     origin::{Handle, Origin},
     references::{OwnedValue, Values},
 };
 
-use super::{super::error::Trap, check_isolate, store::StoreHandle};
+use super::{check_isolate, store::StoreHandle};
 use itertools::Itertools;
 use wasmer_types::{FunctionType, RawValue};
 
@@ -63,6 +64,7 @@ pub(crate) struct FunctionCallbackEnv<'a, F> {
     pub(crate) env_identity: Option<std::sync::Weak<()>>,
     pub(crate) origin: Origin,
     pub(crate) signature: FunctionType,
+    pub(crate) trap_calls: std::rc::Weak<TrapCallState>,
 }
 
 impl<'a, F> std::fmt::Debug for FunctionCallbackEnv<'a, F> {
@@ -152,6 +154,7 @@ impl Function {
                 #[cfg(feature = "experimental-async")]
                 binding: std::rc::Rc::downgrade(&store.inner.store.as_v8().async_binding),
                 raw_store: inner,
+                trap_calls: std::rc::Rc::downgrade(&store.inner.store.as_v8().trap_calls),
                 func,
                 env_handle: Some(env.as_v8().handle.clone()),
                 env_identity: Some(env.as_v8().identity.clone()),
@@ -240,6 +243,7 @@ impl Function {
                 #[cfg(feature = "experimental-async")]
                 binding: std::rc::Rc::downgrade(&store.inner.store.as_v8().async_binding),
                 raw_store: inner,
+                trap_calls: std::rc::Rc::downgrade(&store.inner.store.as_v8().trap_calls),
                 func,
                 env_handle: None,
                 env_identity: None,
@@ -339,6 +343,7 @@ impl Function {
                 #[cfg(feature = "experimental-async")]
                 binding: std::rc::Rc::downgrade(&store.inner.store.as_v8().async_binding),
                 raw_store: inner,
+                trap_calls: std::rc::Rc::downgrade(&store.inner.store.as_v8().trap_calls),
                 func,
                 env_handle: Some(env.as_v8().handle.clone()),
                 env_identity: Some(env.as_v8().identity.clone()),
@@ -451,51 +456,71 @@ impl Function {
 
         // let wasm_func_param_arity(self.handle)
 
-        let mut results = Values::empty(signature.results().len());
+        let traps = TrapCallScope::enter(store, TrapMode::BorrowedSync, None)?;
+        let mut decoded = None;
+        let outcome = traps.catch(|| {
+            let mut results = Values::empty(signature.results().len());
 
-        let mut trap;
+            let mut trap;
 
-        loop {
-            results.clear();
-            let arguments = Values::from_values(params, signature.params())?;
-            let function = self.handle.raw();
-            let raw_results = &mut results.0;
-            let raw_arguments = arguments.into_call_arguments();
-            trap = unsafe { wasm_func_call(function, &raw_arguments, raw_results) };
-            let store_mut = store.as_store_mut();
-            if let Some(callback) = store_mut.inner.on_called.take() {
-                match callback(store_mut) {
-                    Ok(wasmer_types::OnCalledAction::InvokeAgain) => {
-                        continue;
-                    }
-                    Ok(wasmer_types::OnCalledAction::Finish) => {
-                        break;
-                    }
-                    Ok(wasmer_types::OnCalledAction::Trap(trap)) => {
-                        return Err(RuntimeError::user(trap));
-                    }
-                    Err(trap) => return Err(RuntimeError::user(trap)),
+            loop {
+                results.clear();
+                let arguments = Values::from_values(params, signature.params())?;
+                let function = self.handle.raw();
+                let raw_results = &mut results.0;
+                let raw_arguments = arguments.into_call_arguments();
+                trap = unsafe { wasm_func_call(function, &raw_arguments, raw_results) };
+                decoded = if trap.is_null() {
+                    None
+                } else {
+                    Some(traps.from_owned(trap))
+                };
+                if traps.has_panic() {
+                    return Err(RuntimeError::new("V8 synchronous call panicked"));
                 }
+                let store_mut = store.as_store_mut();
+                if let Some(callback) = store_mut.inner.on_called.take() {
+                    match callback(store_mut) {
+                        Ok(wasmer_types::OnCalledAction::InvokeAgain) => {
+                            traps.dispose(|| drop(decoded.take()));
+                            if traps.has_panic() {
+                                return Err(RuntimeError::new("V8 replay cleanup panicked"));
+                            }
+                            continue;
+                        }
+                        Ok(wasmer_types::OnCalledAction::Finish) => {
+                            break;
+                        }
+                        Ok(wasmer_types::OnCalledAction::Trap(trap)) => {
+                            return Err(RuntimeError::user(trap));
+                        }
+                        Err(trap) => return Err(RuntimeError::user(trap)),
+                    }
+                }
+                break;
             }
-            break;
-        }
 
-        if !trap.is_null() {
-            return Err(Into::<Trap>::into(trap).into());
-        }
+            if let Some(trap) = decoded.take() {
+                return Err(trap.into());
+            }
 
-        crate::backend::v8::utils::convert::validate_raw_values(
-            results.as_slice(),
-            signature.results(),
-        )?;
-        let values = results
-            .as_slice()
-            .iter()
-            .zip(signature.results())
-            .map(|(value, ty)| (*value).into_wv(*ty, store))
-            .collect::<Result<Vec<_>, RuntimeError>>()?
-            .into_boxed_slice();
-        Ok(values)
+            crate::backend::v8::utils::convert::validate_raw_values(
+                results.as_slice(),
+                signature.results(),
+            )?;
+            let values = results
+                .as_slice()
+                .iter()
+                .zip(signature.results())
+                .map(|(value, ty)| (*value).into_wv(*ty, store))
+                .collect::<Result<Vec<_>, RuntimeError>>()?
+                .into_boxed_slice();
+            Ok(values)
+        });
+        traps.dispose(|| drop(decoded.take()));
+        traps.finish_outcome(
+            outcome.unwrap_or_else(|| Err(RuntimeError::new("V8 synchronous call panicked"))),
+        )
     }
 
     pub(crate) fn from_vm_extern(store: &mut impl AsStoreMut, internal: VMExternFunction) -> Self {
@@ -666,20 +691,26 @@ fn sync_typed_results<Rets: WasmTypeList>(
 
 struct SyncCallbackScope<'a> {
     legacy: Option<StoreMut<'a>>,
+    publisher: TrapPublisher,
     #[cfg(feature = "experimental-async")]
     actual: Option<crate::StoreAsyncWriteLock>,
-    #[cfg(feature = "experimental-async")]
-    binding: Option<std::rc::Rc<crate::backend::v8::async_runtime::AsyncBinding>>,
     #[cfg(feature = "experimental-async")]
     borrow: Option<crate::backend::v8::async_runtime::SyncBorrow>,
 }
 impl<'a> SyncCallbackScope<'a> {
     unsafe fn enter<F>(callback: &FunctionCallbackEnv<'_, F>) -> Result<Self, RuntimeError> {
-        callback.origin.check_alive()?;
+        let publisher = TrapCallState::publisher(
+            &callback.trap_calls,
+            &callback.origin,
+            callback.store as usize,
+            callback.raw_store,
+        )?;
         #[cfg(feature = "experimental-async")]
-        if let Some(binding) = callback.binding.upgrade()
-            && binding.has_active_call()
-        {
+        if publisher.mode() == TrapMode::GuardFreeAsync {
+            let binding = callback
+                .binding
+                .upgrade()
+                .ok_or_else(|| RuntimeError::new("V8 call binding expired"))?;
             let store = binding.store()?;
             let actual = crate::StoreAsyncWriteLock::try_acquire(&store)
                 .ok_or_else(|| RuntimeError::new("V8 synchronous callback Store is busy"))?;
@@ -687,19 +718,23 @@ impl<'a> SyncCallbackScope<'a> {
             let borrow = binding.sync_borrow();
             return Ok(Self {
                 legacy: None,
+                publisher,
                 actual: Some(actual),
-                binding: Some(binding),
                 borrow,
             });
+        }
+        if publisher.mode() != TrapMode::BorrowedSync {
+            return Err(RuntimeError::new(
+                "V8 callback needs its actual guard-free binding",
+            ));
         }
         let legacy = unsafe { StoreMut::from_raw(callback.store) };
         callback.origin.check_store(&legacy)?;
         Ok(Self {
             legacy: Some(legacy),
+            publisher,
             #[cfg(feature = "experimental-async")]
             actual: None,
-            #[cfg(feature = "experimental-async")]
-            binding: None,
             #[cfg(feature = "experimental-async")]
             borrow: None,
         })
@@ -721,11 +756,7 @@ impl Drop for SyncCallbackScope<'_> {
             drop(self.borrow.take());
             let unwinding = std::thread::panicking();
             if let Err(panic) = panic::catch_unwind(AssertUnwindSafe(|| drop(self.actual.take()))) {
-                if let Some(binding) = &self.binding {
-                    binding.record(panic, unwinding);
-                } else {
-                    crate::backend::v8::async_runtime::discard_panic(panic);
-                }
+                self.publisher.record(panic, unwinding);
             }
         }
     }
@@ -741,9 +772,10 @@ unsafe fn invoke_sync_callback<F>(
     let mut scope = match unsafe { SyncCallbackScope::enter(descriptor) } {
         Ok(scope) => scope,
         Err(error) => {
-            return unsafe { Trap::user(Box::new(error)).into_wasm_trap_raw(descriptor.raw_store) };
+            return checked_message(&descriptor.origin, descriptor.raw_store, &error.to_string());
         }
     };
+    let publisher = scope.publisher.clone();
     let unwinding = std::thread::panicking();
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| -> Result<(), RuntimeError> {
         let mut store = scope.store();
@@ -787,34 +819,19 @@ unsafe fn invoke_sync_callback<F>(
     let result = match outcome {
         Ok(value) => value,
         Err(panic) => {
-            #[cfg(feature = "experimental-async")]
-            if let Some(binding) = &scope.binding {
-                binding.record(panic, unwinding);
-            } else {
-                unimplemented!("host function panicked");
-            }
-            #[cfg(not(feature = "experimental-async"))]
-            unimplemented!("host function panicked");
+            publisher.record(panic, unwinding);
             Err(RuntimeError::new("V8 synchronous host callback panicked"))
         }
     };
-    #[cfg(feature = "experimental-async")]
-    let binding = scope.binding.clone();
     drop(scope); // all real guard/destructor callbacks settle before C return
-    #[cfg(feature = "experimental-async")]
-    let result = if binding
-        .as_ref()
-        .is_some_and(|binding| binding.current_has_panic())
-    {
+    let result = if publisher.has_panic() {
         Err(RuntimeError::new("V8 synchronous host cleanup panicked"))
     } else {
         result
     };
     match result {
         Ok(()) => std::ptr::null_mut(),
-        Err(error) => unsafe {
-            Trap::user(Box::new(error)).into_wasm_trap_raw(descriptor.raw_store)
-        },
+        Err(error) => publisher.emit_user(Box::new(error)),
     }
 }
 
