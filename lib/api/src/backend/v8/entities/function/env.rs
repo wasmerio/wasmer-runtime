@@ -654,7 +654,7 @@ mod tests {
             let mut store = crate::Store::new(crate::v8::V8::new());
             let function = crate::Function::new_typed_async(&mut store, || async { 37i32 });
             let store = store.into_async();
-            let mut future = function.call_async(&store, vec![]);
+            let mut future = Box::pin(function.call_async(&store, vec![]));
             let result = future
                 .as_mut()
                 .poll(&mut Context::from_waker(Waker::noop()));

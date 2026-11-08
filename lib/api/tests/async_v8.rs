@@ -18,8 +18,8 @@ use std::{
     time::{Duration, Instant},
 };
 use wasmer::{
-    AsStoreMut, AsyncFunctionEnvMut, Function, FunctionEnv, FunctionEnvMut, FunctionType, Instance,
-    Module, RuntimeError, Store, Type, Value, imports,
+    AsStoreAsync, AsStoreMut, AsyncFunctionEnvMut, Function, FunctionEnv, FunctionEnvMut,
+    FunctionType, Instance, Module, RuntimeError, Store, Type, Value, imports,
 };
 
 fn store() -> Store {
@@ -235,7 +235,7 @@ fn v8_async_construction_is_inert_and_first_poll_busy_preserves_reuse() {
     let store = store.into_async();
     let held = futures::executor::block_on(store.write_lock());
     drop(function.call_async(&store, vec![]));
-    let mut busy = function.call_async(&store, vec![]);
+    let mut busy = Box::pin(function.call_async(&store, vec![]));
     assert_eq!((factories.get(), polled.get()), (0, 0));
     let Poll::Ready(Err(error)) = poll_once(busy.as_mut()) else {
         panic!("busy first poll must finish with an error")
@@ -245,14 +245,14 @@ fn v8_async_construction_is_inert_and_first_poll_busy_preserves_reuse() {
     drop(busy);
     let mut other = self::store();
     let wrong = Function::new_typed(&mut other, || 99i32);
-    let mut rejected = wrong.call_async(&store, vec![]);
+    let mut rejected = Box::pin(wrong.call_async(&store, vec![]));
     let Poll::Ready(Err(error)) = poll_once(rejected.as_mut()) else {
         panic!("busy wrong-origin first poll must finish")
     };
     assert!(error.to_string().contains("Store is busy"));
     drop(rejected);
     drop(held);
-    let mut rejected = wrong.call_async(&store, vec![]);
+    let mut rejected = Box::pin(wrong.call_async(&store, vec![]));
     let Poll::Ready(Err(error)) = poll_once(rejected.as_mut()) else {
         panic!("wrong origin must finish before guest work")
     };
@@ -284,7 +284,7 @@ fn v8_async_mixed_sync_callbacks_reject_same_store_and_allow_different_store() {
                 .as_async_mut()
                 .expect("actual V8 callback has its checked async cap");
             let cap = asynchronous.as_store_async();
-            let mut same = target.call_async(&cap, vec![]);
+            let mut same = Box::pin(target.call_async(&cap, vec![]));
             let Poll::Ready(Err(error)) = poll_once(same.as_mut()) else {
                 panic!("same-Store sync callback cannot retain its parent guard")
             };
@@ -293,7 +293,7 @@ fn v8_async_mixed_sync_callbacks_reject_same_store_and_allow_different_store() {
             let mut other = self::store();
             let ready = Function::new_typed_async(&mut other, || async { 29i32 });
             let cap = other.into_async();
-            let mut different = ready.call_async(&cap, vec![]);
+            let mut different = Box::pin(ready.call_async(&cap, vec![]));
             let Poll::Ready(Ok(result)) = poll_once(different.as_mut()) else {
                 panic!("different Store Ready call must complete")
             };

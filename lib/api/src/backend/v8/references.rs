@@ -275,7 +275,8 @@ pub(crate) fn borrowed_values_mut(raw: &mut wasm_val_vec_t) -> &mut [wasm_val_t]
 mod tests {
     use super::*;
     use crate::{
-        AsStoreRef, Function, FunctionType, Instance, Module, Store, StoreAsync, Type, Value,
+        AsStoreAsync, AsStoreRef, Function, FunctionType, Instance, Module, Store, StoreAsync,
+        Type, Value,
     };
     use std::{
         cell::RefCell,
