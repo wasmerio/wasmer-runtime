@@ -5227,6 +5227,224 @@ mod tests {
         );
     }
 
+    fn borrowed_test_access<R>(
+        store: &StoreAsync,
+        action: impl FnOnce(&mut StoreMut<'_>) -> R,
+    ) -> R {
+        let mut action = Some(action);
+        if let Some(result) =
+            with_borrowed_native_store(store, |view| action.take().unwrap()(view)).unwrap()
+        {
+            return result;
+        }
+        let mut guard = crate::StoreAsyncWriteLock::try_acquire(store).unwrap();
+        guard.as_store_mut().parked(|| {
+            with_borrowed_native_store(store, |view| action.take().unwrap()(view))
+                .unwrap()
+                .unwrap()
+        })
+    }
+    fn borrowed_test_store() -> (NativeInvocationScope, StoreAsync) {
+        let mut store = Store::default();
+        let scope = NativeInvocationScope::bind(&mut store).unwrap();
+        (scope, store.into_async())
+    }
+    #[test]
+    fn borrowed_native_reselection_restores_foreign_parked_chain_on_return_and_unwind() {
+        let mut a = Store::default();
+        let value = crate::FunctionEnv::new(&mut a, 0usize);
+        let _a_scope = NativeInvocationScope::bind(&mut a).unwrap();
+        let a = a.into_async();
+        let (_b_scope, b) = borrowed_test_store();
+        let (_c_scope, c) = borrowed_test_store();
+        for unwind in [false, true] {
+            borrowed_test_access(&a, |outer| {
+                let address = std::ptr::from_ref(&*outer.inner);
+                *value.as_mut(outer) += 1;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    outer.parked(|| {
+                        borrowed_test_access(&b, |middle| {
+                            let b_address = std::ptr::from_ref(&*middle.inner);
+                            middle.parked(|| {
+                                borrowed_test_access(&c, |foreign| {
+                                    foreign.parked(|| {
+                                        borrowed_test_access(&a, |child| {
+                                            assert_eq!(std::ptr::from_ref(&*child.inner), address);
+                                            *value.as_mut(child) += 10;
+                                            assert!(!native_invocation_active());
+                                            if unwind {
+                                                std::panic::resume_unwind(Box::new(
+                                                    "inner borrowed panic",
+                                                ));
+                                            }
+                                        })
+                                    });
+                                })
+                            });
+                            assert_eq!(std::ptr::from_ref(&*middle.inner), b_address);
+                        })
+                    });
+                }));
+                if unwind {
+                    assert_eq!(
+                        result.unwrap_err().downcast_ref::<&str>(),
+                        Some(&"inner borrowed panic")
+                    );
+                } else {
+                    assert!(result.is_ok());
+                }
+                // The ORIGINAL parent borrow remains usable after the CHILD.
+                assert_eq!(std::ptr::from_ref(&*outer.inner), address);
+                *value.as_mut(outer) += 100;
+            });
+            assert!(StoreContext::is_empty());
+            assert_eq!(
+                borrowed_test_access(&a, |view| value.as_ref(view).to_owned()),
+                if unwind { 222 } else { 111 }
+            );
+        }
+    }
+    #[test]
+    fn borrowed_native_access_distinguishes_absent_blocked_wrong_identity_and_stale() {
+        let (_a_scope, a) = borrowed_test_store();
+        let actions = Cell::new(0);
+        assert!(
+            with_borrowed_native_store(&a, |_| actions.set(1))
+                .unwrap()
+                .is_none()
+        );
+        borrowed_test_access(&a, |outer| {
+            assert!(
+                with_borrowed_native_store(&a, |_| actions.set(2)).is_err(),
+                "deepest borrowed row must never fall through to older parked row"
+            );
+            outer.parked(|| {
+                let mut wrong = Store::default();
+                wrong.objects_mut().as_sys_mut().set_id(a.id);
+                let _wrong_scope = NativeInvocationScope::bind(&mut wrong).unwrap();
+                let wrong = wrong.into_async();
+                assert!(
+                    with_borrowed_native_store(&wrong, |_| actions.set(3)).is_err(),
+                    "same public ID does not authorize another backing/generation"
+                );
+                // A correctly parked target can still be used after rejection.
+                assert!(with_borrowed_native_store(&a, |_| ()).unwrap().is_some());
+            });
+        });
+        assert_eq!(actions.get(), 0);
+        let (stale_scope, stale) = borrowed_test_store();
+        stale_scope.close();
+        assert!(with_borrowed_native_store(&stale, |_| actions.set(4)).is_err());
+        drop(stale_scope);
+        let (_b_scope, b) = borrowed_test_store();
+        borrowed_test_access(&a, |outer| {
+            outer.parked(|| {
+                Store::with_current(|view| view.objects_mut().as_sys_mut().set_id(b.id)).unwrap();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    with_borrowed_native_store(&a, |_| actions.set(5))
+                }));
+                // Restore the intentionally corrupted object through its still-live
+                // exact top borrow, BEFORE checking controlled-error disposition.
+                Store::with_current(|view| view.objects_mut().as_sys_mut().set_id(a.id)).unwrap();
+                assert!(
+                    result.unwrap().is_err(),
+                    "changed object ID must reject without debug panic"
+                );
+            })
+        });
+        assert_eq!(actions.get(), 0);
+        assert!(StoreContext::is_empty());
+    }
+    #[test]
+    fn borrowed_native_access_rejects_duplicate_id_addresses_and_shadowed_async_context() {
+        let (_a_scope, a) = borrowed_test_store();
+        let mut b = Store::default();
+        b.objects_mut().as_sys_mut().set_id(a.id);
+        let _b_scope = NativeInvocationScope::bind(&mut b).unwrap();
+        let b = b.into_async();
+        borrowed_test_access(&a, |outer| {
+            outer.parked(|| {
+                let mut guard = crate::StoreAsyncWriteLock::try_acquire(&b).unwrap();
+                let pointer = &mut *guard.as_store_mut().inner as *mut StoreInner;
+                // Exact negative fixture: two real boxes deliberately share a public
+                // ID. Avoid general install's debug assertion; the helper must reject.
+                let _child = unsafe { StoreContext::install_borrowed(pointer) };
+                assert!(with_borrowed_native_store(&a, |_| panic!("aliased guest entry")).is_err());
+            })
+        });
+        let actual = a.inner.try_write().unwrap();
+        let _asynchronous = unsafe { StoreContext::install_async(actual) };
+        Store::with_current(|view| {
+            let pointer = &mut *view.inner as *mut StoreInner;
+            let _shadow = unsafe { StoreContext::install_borrowed(pointer) };
+            assert!(with_borrowed_native_store(&a, |_| panic!("shadowed Async entry")).is_err());
+        })
+        .unwrap();
+        drop(_asynchronous);
+        assert!(StoreContext::is_empty());
+        borrowed_test_access(&a, |_| ());
+    }
+    #[test]
+    fn borrowed_native_access_rejects_shadowed_real_loan_and_preserves_native_presence() {
+        let captured = Rc::new(RefCell::new(None));
+        let mut raw = Store::default();
+        let _scope = NativeInvocationScope::bind(&mut raw).unwrap();
+        let saved = captured.clone();
+        // The ordinary new_async factory is owner-local and needs no Send data
+        // wrapper. Suspend INSIDE the real parked synchronous borrow so the
+        // captured loan's exact installation/epoch remains physically alive.
+        let bridge = Function::new_async(&mut raw, crate::FunctionType::new([], []), move |_| {
+            let result = Store::with_current(|store| {
+                let id = store.objects_mut().id();
+                store.parked(|| {
+                    assert!(native_invocation_active());
+                    let cap = current_store_loan(id).unwrap();
+                    assert!(
+                        with_borrowed_native_store(&cap, |_| panic!(
+                            "actual Native entry bypassed"
+                        ))
+                        .is_err()
+                    );
+                    *saved.borrow_mut() = cap.loan;
+                    block_on_host_future(std::future::pending()).map_err(|error| match error {
+                        AsyncRuntimeError::RuntimeError(error) => error,
+                        AsyncRuntimeError::YieldOutsideAsyncContext => {
+                            RuntimeError::new("proof lost actual root")
+                        }
+                    })
+                })
+            })
+            .unwrap();
+            std::future::ready(result)
+        });
+        let cap = raw.into_async();
+        let mut original = Box::pin(bridge.call_async(&cap, vec![]));
+        assert!(
+            original
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert!(!native_invocation_active());
+        let loan = captured.borrow_mut().take().unwrap();
+        let actual = loan
+            .try_write()
+            .expect("actual suspended source supplies exact loan");
+        let _installed =
+            StoreContext::install_loan(actual, StoreContext::new_installation_id(), cap.id);
+        Store::with_current(|view| {
+            let pointer = &mut *view.inner as *mut StoreInner;
+            let _shadow = unsafe { StoreContext::install_borrowed(pointer) };
+            assert!(with_borrowed_native_store(&cap, |_| panic!("shadowed Loan entry")).is_err());
+        })
+        .unwrap();
+        drop(_installed);
+        drop(loan);
+        drop(original);
+        assert!(StoreContext::is_empty());
+        borrowed_test_access(&cap, |_| ());
+    }
+
     #[test]
     fn native_tail_enrollment_commits_owned_job_before_saved_waker_panic() {
         use std::sync::{
