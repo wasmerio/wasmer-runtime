@@ -1,0 +1,73 @@
+name: CAPI V8 Linux archive candidate (manual, uncertified)
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_ref:
+        description: Full reviewed private Next workflow commit SHA
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x64:
+    if: github.repository == 'wasmerio/wasmer-next' && github.event.repository.private
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      REQUESTED_CANDIDATE: ${{ inputs.candidate_ref }}
+    steps:
+      - name: Validate the reviewed source identity
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, re
+          if not re.fullmatch(r"[0-9a-f]{40}", os.environ["REQUESTED_CANDIDATE"]):
+              raise SystemExit("candidate_ref must be a complete reviewed commit SHA")
+          PY
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        timeout-minutes: 3
+        with:
+          ref: ${{ inputs.candidate_ref }}
+          path: candidate
+          submodules: false
+          persist-credentials: false
+      - name: Build and inspect only the private candidate archive
+        timeout-minutes: 165
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/candidate/.github/capi-v8-linux-producer.py"
+      - name: Retain uncertified artifact and exact evidence, including failures
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        timeout-minutes: 5
+        with:
+          name: UNCERTIFIED-capi-v8-linux-x64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/capi-v8-evidence
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove only this job's source, tools and build tree
+        if: always()
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, shutil
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]).resolve()
+          owned = root / "capi-v8-producer"
+          if owned.is_symlink() or owned.parent != root:
+              raise SystemExit("refusing an unexpected cleanup path")
+          if owned.exists():
+              expected = {"run_id": os.environ["GITHUB_RUN_ID"],
+                          "attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+                          "candidate": os.environ["REQUESTED_CANDIDATE"]}
+              if json.loads((owned / "ownership.json").read_text()) != expected:
+                  raise SystemExit("refusing another task's source/build state")
+              shutil.rmtree(owned, ignore_errors=False)
+          PY
