@@ -430,3 +430,363 @@ impl From<Trap> for RuntimeError {
         Self::new_from_source(crate::BackendTrap::V8(trap), vec![], None)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AsStoreMut, Function, FunctionType, Instance, Module, Store};
+    use std::{
+        collections::VecDeque,
+        fmt,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    #[derive(Debug)]
+    struct TypedFailure {
+        id: usize,
+        drops: Arc<AtomicUsize>,
+    }
+    impl fmt::Display for TypedFailure {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "typed failure {}", self.id)
+        }
+    }
+    impl Error for TypedFailure {}
+    impl Drop for TypedFailure {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn store() -> Store {
+        Store::new(crate::v8::V8::new())
+    }
+    fn publisher(store: &Store) -> TrapPublisher {
+        let view = store.as_store_ref();
+        let backend = view.inner.store.as_v8();
+        TrapCallState::publisher(
+            &Rc::downgrade(&backend.trap_calls),
+            &backend.origin.capture(),
+            view.inner as *const crate::StoreInner as usize,
+            backend.inner,
+        )
+        .unwrap()
+    }
+    fn copy_raw(raw: *mut wasm_trap_t) -> *mut wasm_trap_t {
+        let borrowed = wasm_val_t {
+            kind: wasm_valkind_enum_WASM_EXTERNREF as _,
+            of: wasm_val_t__bindgen_ty_1 {
+                ref_: unsafe { wasm_trap_as_ref(raw) },
+            },
+        };
+        let mut copied = OwnedValue::copy(&borrowed);
+        unsafe { wasm_ref_as_trap(copied.take().of.ref_) }
+    }
+
+    #[test]
+    fn trap_keys_claim_once_and_never_cross_a_nested_owning_scope() {
+        let store = store();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let parent = TrapCallScope::enter(&store, TrapMode::BorrowedSync, None).unwrap();
+        let error = Box::new(TypedFailure {
+            id: 7,
+            drops: drops.clone(),
+        });
+        let address = (&*error) as *const TypedFailure as usize;
+        let raw = publisher(&store).emit_user(error);
+        let child_copy = copy_raw(raw);
+        let duplicate = copy_raw(raw);
+        let child = TrapCallScope::enter(&store, TrapMode::BorrowedSync, None).unwrap();
+        let child_result = child.from_owned(child_copy);
+        assert!(
+            !child_result.is::<TypedFailure>(),
+            "a child cannot steal its live parent's Box"
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        child.finish_outcome(());
+        let actual = parent.from_owned(raw);
+        let value = actual.downcast_ref::<TypedFailure>().unwrap();
+        assert_eq!(value.id, 7);
+        assert_eq!(value as *const TypedFailure as usize, address);
+        let duplicate = parent.from_owned(duplicate);
+        assert!(
+            !duplicate.is::<TypedFailure>(),
+            "independent exception copies claim only once"
+        );
+        drop(actual);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        parent.finish_outcome(());
+    }
+
+    #[test]
+    fn forged_and_unscoped_traps_escape_as_owned_messages_after_store_drop() {
+        let store = store();
+        let origin = Origin::of(&store).unwrap();
+        let raw_store = store.as_v8().inner;
+        let forged = Trap::from(checked_message(
+            &origin,
+            raw_store,
+            "🐛0x1234 is ordinary text",
+        ));
+        assert!(forged.to_string().contains("🐛0x1234 is ordinary text"));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let scope = TrapCallScope::enter(&store, TrapMode::BorrowedSync, None).unwrap();
+        let raw = publisher(&store).emit_user(Box::new(TypedFailure {
+            id: 8,
+            drops: drops.clone(),
+        }));
+        let unscoped = Trap::from(raw);
+        assert!(!unscoped.is::<TypedFailure>());
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        scope.finish_outcome(());
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        drop(scope);
+        drop(store);
+        // Only Rust Strings move here; no V8 operation or owner-thread access.
+        let text = std::thread::spawn(move || (forged.to_string(), unscoped.to_string()))
+            .join()
+            .unwrap();
+        assert!(text.0.contains("🐛0x1234"));
+        assert!(text.1.contains("V8 host function returned an error"));
+    }
+
+    #[test]
+    fn no_call_user_trap_returns_exact_custody_before_unsafe_precondition_panic() {
+        let mut store = store();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let error = Box::new(TypedFailure {
+            id: 1,
+            drops: drops.clone(),
+        });
+        let address = (&*error) as *const TypedFailure as usize;
+        let refused = Trap::user(error)
+            .try_into_wasm_trap(&mut store)
+            .unwrap_err();
+        assert_eq!(
+            refused.downcast_ref::<TypedFailure>().unwrap() as *const TypedFailure as usize,
+            address
+        );
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(refused);
+        let panic = catch_unwind(AssertUnwindSafe(|| unsafe {
+            Trap::user(Box::new(TypedFailure {
+                id: 2,
+                drops: drops.clone(),
+            }))
+            .into_wasm_trap(&mut store)
+        }))
+        .unwrap_err();
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        drop(panic);
+        let raw = Trap {
+            inner: InnerTrap::Message("message outside a call".into()),
+        }
+        .try_into_wasm_trap(&mut store)
+        .unwrap();
+        assert!(
+            Trap::from(raw)
+                .to_string()
+                .contains("message outside a call")
+        );
+    }
+
+    #[test]
+    fn sync_typed_guest_and_instance_start_preserve_the_same_host_error_boxes() {
+        let mut store = store();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut expected = Vec::new();
+        let mut errors = VecDeque::new();
+        for id in 0..3 {
+            let error = Box::new(TypedFailure {
+                id,
+                drops: drops.clone(),
+            });
+            expected.push((&*error) as *const TypedFailure as usize);
+            errors.push_back(error);
+        }
+        let errors = Arc::new(Mutex::new(errors));
+        let callback_errors = errors.clone();
+        let fail = Function::new(&mut store, FunctionType::new([], []), move |_| {
+            Err(RuntimeError::user(
+                callback_errors.lock().unwrap().pop_front().unwrap(),
+            ))
+        });
+        let direct = fail.call(&mut store, &[]).unwrap_err();
+        assert_eq!(
+            direct.downcast_ref::<TypedFailure>().unwrap() as *const TypedFailure as usize,
+            expected[0]
+        );
+        drop(direct);
+        let typed = fail.typed::<(), ()>(&store).unwrap();
+        let direct = typed.call(&mut store).unwrap_err();
+        assert_eq!(
+            direct.downcast_ref::<TypedFailure>().unwrap() as *const TypedFailure as usize,
+            expected[1]
+        );
+        drop(direct);
+        let module = Module::new(&store, wat::parse_str(
+            "(module (import \"env\" \"fail\" (func $fail)) (func $start call $fail) (start $start))"
+        ).unwrap()).unwrap();
+        let imports = crate::imports! { "env" => { "fail" => fail.clone() } };
+        let error = match Instance::new(&mut store, &module, &imports) {
+            Err(crate::InstantiationError::Start(error)) => error,
+            other => panic!("expected the actual start error: {other:?}"),
+        };
+        assert_eq!(
+            error.downcast_ref::<TypedFailure>().unwrap() as *const TypedFailure as usize,
+            expected[2]
+        );
+        drop(error);
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
+        assert!(errors.lock().unwrap().is_empty());
+        let ready = Function::new_typed(&mut store, || 29i32);
+        assert_eq!(ready.call(&mut store, &[]).unwrap()[0].i32(), Some(29));
+    }
+
+    #[cfg(feature = "experimental-async")]
+    #[test]
+    fn borrowed_scope_beneath_async_uses_current_mode_without_reacquiring_its_guard() {
+        use crate::Value;
+        let mut store = store();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let error = Box::new(TypedFailure {
+            id: 19,
+            drops: drops.clone(),
+        });
+        let address = (&*error) as *const TypedFailure as usize;
+        let input = Arc::new(Mutex::new(Some(error)));
+        let fail = Function::new(&mut store, FunctionType::new([], []), move |_| {
+            Err(RuntimeError::user(input.lock().unwrap().take().unwrap()))
+        });
+        let environment = crate::FunctionEnv::new(&mut store, ());
+        let outer = Function::new_with_env_async(
+            &mut store,
+            &environment,
+            FunctionType::new([], []),
+            move |env: crate::AsyncFunctionEnvMut<()>, _| {
+                let fail = fail.clone();
+                async move {
+                    let mut guard = env.write().await;
+                    fail.call(&mut guard, &[])?;
+                    Ok(Vec::<Value>::new())
+                }
+            },
+        );
+        let store = store.into_async();
+        let error = futures::executor::block_on(outer.call_async(&store, vec![])).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<TypedFailure>().unwrap() as *const TypedFailure as usize,
+            address
+        );
+        drop(error);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[derive(Debug)]
+    struct Payload {
+        name: &'static str,
+        drops: Arc<AtomicUsize>,
+        next: Option<Box<Payload>>,
+    }
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            if let Some(next) = self.next.take() {
+                resume_unwind(next);
+            }
+        }
+    }
+    #[derive(Debug)]
+    struct ReenterOnDrop {
+        target: Function,
+        reentries: Arc<AtomicUsize>,
+        panic: Option<Box<Payload>>,
+    }
+    impl fmt::Display for ReenterOnDrop {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("unclaimed typed error")
+        }
+    }
+    impl Error for ReenterOnDrop {}
+    impl Drop for ReenterOnDrop {
+        fn drop(&mut self) {
+            let result = Store::with_current(|source| self.target.call(source, &[]).unwrap())
+                .expect("the original live S is actually parked during T row teardown");
+            assert_eq!(result[0].i32(), Some(31));
+            self.reentries.fetch_add(1, Ordering::SeqCst);
+            resume_unwind(self.panic.take().unwrap());
+        }
+    }
+    #[test]
+    fn unclaimed_trap_rows_reenter_live_s_and_preserve_first_or_active_panic() {
+        for active in [false, true] {
+            let mut source = store();
+            let target = Function::new_typed(&mut source, || 31i32);
+            let target_store = store();
+            let reentries = Arc::new(AtomicUsize::new(0));
+            let p = Arc::new(AtomicUsize::new(0));
+            let q = Arc::new(AtomicUsize::new(0));
+            let n = Arc::new(AtomicUsize::new(0));
+            let g = Arc::new(AtomicUsize::new(0));
+            let first = Box::new(Payload {
+                name: "P",
+                drops: p.clone(),
+                next: None,
+            });
+            let first_address = (&*first) as *const Payload as usize;
+            let primary = active.then(|| {
+                Box::new(Payload {
+                    name: "G",
+                    drops: g.clone(),
+                    next: None,
+                })
+            });
+            let address = primary
+                .as_ref()
+                .map(|value| (&**value) as *const Payload as usize)
+                .unwrap_or(first_address);
+            let second = Box::new(Payload {
+                name: "Q",
+                drops: q.clone(),
+                next: Some(Box::new(Payload {
+                    name: "N",
+                    drops: n.clone(),
+                    next: None,
+                })),
+            });
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                source.as_store_mut().parked(|| {
+                    let scope =
+                        TrapCallScope::enter(&target_store, TrapMode::BorrowedSync, None).unwrap();
+                    for panic in [first, second] {
+                        let raw = publisher(&target_store).emit_user(Box::new(ReenterOnDrop {
+                            target: target.clone(),
+                            reentries: reentries.clone(),
+                            panic: Some(panic),
+                        }));
+                        // Explicit unscoped conversion cannot claim the typed
+                        // row; the real exception key stays owned by scope.
+                        drop(Trap::from(raw));
+                    }
+                    if let Some(primary) = primary {
+                        resume_unwind(primary);
+                    }
+                    scope.finish_outcome(());
+                });
+            }))
+            .unwrap_err();
+            assert_eq!(reentries.load(Ordering::SeqCst), 2);
+            assert_eq!(q.load(Ordering::SeqCst), 1);
+            assert_eq!(n.load(Ordering::SeqCst), 1);
+            assert_eq!(p.load(Ordering::SeqCst), usize::from(active));
+            let actual = result.downcast::<Payload>().unwrap();
+            assert_eq!((&*actual) as *const Payload as usize, address);
+            assert_eq!(actual.name, if active { "G" } else { "P" });
+            drop(actual);
+            assert_eq!(p.load(Ordering::SeqCst), 1);
+            assert_eq!(g.load(Ordering::SeqCst), usize::from(active));
+        }
+    }
+}
