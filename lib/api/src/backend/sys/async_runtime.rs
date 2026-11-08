@@ -5464,7 +5464,11 @@ mod tests {
         let mut raw = Store::default();
         let _scope = NativeInvocationScope::bind(&mut raw).unwrap();
         let function = Function::new_async(&mut raw, crate::FunctionType::new([], []), move |_| {
-            let expected = captured.borrow().as_ref().map(AsStoreAsync::store).unwrap();
+            let expected = captured
+                .borrow()
+                .as_ref()
+                .and_then(crate::WeakStoreAsync::upgrade)
+                .unwrap();
             let observed = observed.clone();
             std::future::poll_fn(move |_| {
                 // This is the REAL host future polled outside its suspended
@@ -5478,7 +5482,7 @@ mod tests {
             })
         });
         let cap = raw.into_async();
-        *expected.borrow_mut() = Some(cap.store());
+        *expected.borrow_mut() = Some(cap.downgrade());
         let mut original = Box::pin(function.call_async(&cap, vec![]));
         let Poll::Ready(result) = original
             .as_mut()
