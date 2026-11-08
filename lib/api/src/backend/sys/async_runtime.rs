@@ -10298,7 +10298,7 @@ mod tests {
             move |mut env: crate::AsyncFunctionEnvMut<()>| {
                 let original = env.native_local_owner().unwrap();
                 let snapshot = env.native_import_snapshot().unwrap();
-                let cloned = env.clone();
+                let cloned = env.as_mut();
                 let reborrowed = env.as_mut();
                 assert!(Weak::ptr_eq(
                     &original,
