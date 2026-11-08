@@ -17,6 +17,8 @@ import sys
 import tarfile
 import time
 
+import capi_v8_recipe_phase as recipe_phase
+
 
 PRODUCER = "844d01dc10edaa0461715f484e06b004f1fd023e"
 V8 = "b0a55a7dad7f536cce1f9aaddba89894c8533946"
@@ -87,27 +89,56 @@ def main():
 
     def run(name, args, cwd, growth, seconds):
         initial = shutil.disk_usage(root).free
-        if initial < growth + 2 * GIB:
+        phase_config = None
+        if name == "upstream-recipe":
+            phase_config = recipe_phase.begin({
+                "root": str(root), "state": str(root / "recipe-state.json"),
+                "source": str(source.resolve()), "ninja": str(ninja),
+                "nonce": os.urandom(16).hex(),
+            })
+            initial = phase_config["source_baseline"]
+            (launchers / "ninja").write_text(recipe_phase.launcher(phase_config))
+            (launchers / "ninja").chmod(0o700)
+        elif initial < growth + 2 * GIB:
             raise RuntimeError(f"{name}: free={initial}, growth ceiling={growth}, reserve={2 * GIB}")
         started = time.monotonic()
         child = None
         status = None
+        ready_read = ready_write = None
         try:
             with (evidence / (name + ".log")).open("wb") as log:
-                child = subprocess.Popen(args, cwd=cwd, env=env, stdout=log,
-                                         stderr=subprocess.STDOUT, start_new_session=True)
+                command = args
+                pass_fds = ()
+                if phase_config is not None:
+                    ready_read, ready_write = os.pipe()
+                    pass_fds = (ready_read,)
+                    command = [sys.executable, "-c", recipe_phase.START_GATE, str(ready_read), *args]
+                child = subprocess.Popen(command, cwd=cwd, env=env, stdout=log,
+                    stderr=subprocess.STDOUT, start_new_session=True, pass_fds=pass_fds)
+                if phase_config is not None:
+                    os.close(ready_read)
+                    ready_read = None
+                    recipe_phase.release_process(phase_config, child.pid, ready_write)
+                    os.close(ready_write)
+                    ready_write = None
                 while True:
                     try:
                         status = child.wait(timeout=10)
                         break
                     except subprocess.TimeoutExpired:
                         free = shutil.disk_usage(root).free
+                        if phase_config is not None:
+                            state = recipe_phase.load(phase_config)
+                            sample = recipe_phase.usage(phase_config, state, free)
+                            (evidence / "recipe-current.json").write_text(json.dumps(sample, indent=2) + "\n")
                         if (time.monotonic() >= min(deadline, started + seconds)
                                 or free < 2 * GIB or initial - free > growth):
                             raise RuntimeError(name + ": deadline or measured disk guard exceeded")
                 if status:
                     raise RuntimeError(f"{name} exited {status}; exact log retained")
         finally:
+            primary_active = sys.exc_info()[0] is not None
+            fd_failures = recipe_phase.close_startup_fds(ready_read, ready_write)
             if child is not None:
                 # Retire this command's process group, including a surviving descendant.
                 try:
@@ -130,6 +161,27 @@ def main():
                                      final_free=final, measured_growth=max(0, initial - final),
                                      growth_ceiling=growth, reserve=2 * GIB))
             (evidence / "phases.json").write_text(json.dumps(measurements, indent=2) + "\n")
+            if fd_failures:
+                (evidence / "startup-fd-errors.txt").write_text("\n".join(map(str, fd_failures)) + "\n")
+                if not primary_active:
+                    raise fd_failures[0]
+            if phase_config is not None:
+                try:
+                    state = recipe_phase.load(phase_config)
+                    shutil.copyfile(root / "recipe-state.json", evidence / "recipe-state.json")
+                    if state["stage"] == "build":
+                        shutil.copyfile(root / "ninja-transition.lock", evidence / "ninja-transition.json")
+                    sample = recipe_phase.usage(phase_config, state, final)
+                    sample.update(source_cap=recipe_phase.SOURCE_CAP,
+                                  build_cap=recipe_phase.BUILD_CAP,
+                                  aggregate_cap=recipe_phase.TOTAL_CAP, reserve=recipe_phase.RESERVE)
+                    (evidence / "recipe-final.json").write_text(json.dumps(sample, indent=2) + "\n")
+                    if status == 0 and state["stage"] != "build":
+                        raise RuntimeError("recipe returned without its admitted Ninja transition")
+                except Exception as error:
+                    (evidence / "recipe-guard-error.txt").write_text(str(error) + "\n")
+                    if not primary_active:
+                        raise
             if final < 2 * GIB or initial - final > growth:
                 # Record every failure, but retain an already-active primary error.
                 if sys.exc_info()[0] is None:
@@ -159,8 +211,8 @@ def main():
     launchers = root / "bin"
     launchers.mkdir()
     ninja = Path(shutil.which("ninja")).resolve()
-    (launchers / "ninja").write_text(f'#!/bin/sh\nexec "{ninja}" -j2 "$@"\n')
-    (launchers / "ninja").chmod(0o700)
+    # The exact phased launcher is installed at source admission, before any
+    # original recipe command. Version/command inspections never advance it.
     env["PATH"] = str(launchers) + os.pathsep + str(depot) + os.pathsep + env["PATH"]
     tls = producer / "patches/0009-Use-library-safe-TLS-on-Linux.patch"
     run("fetch-authoritative-tls-patch", ["curl", "--fail", "--location", "--proto", "=https",
@@ -192,7 +244,11 @@ def main():
                     host=platform.platform(), deps_sha256=DEPS_SHA, patches_sha256=patches,
                     invocation_environment={key: env.get(key) for key in
                         ("CC", "CXX", "CFLAGS", "CXXFLAGS", "LDFLAGS", "LD_LIBRARY_PATH")},
-                    lock_sha256=digest(candidate / "Cargo.lock"), jobs=2)
+                    lock_sha256=digest(candidate / "Cargo.lock"), jobs=2,
+                    phase_module_sha256=digest(Path(recipe_phase.__file__)),
+                    source_growth_cap=8 * GIB, build_growth_cap=4 * GIB,
+                    aggregate_growth_cap=12 * GIB, reserve=2 * GIB,
+                    phase_estimates="new guarded estimates, not historical measured peaks; GN may invoke compiler checks")
     (evidence / "identity.json").write_text(json.dumps(identity, indent=2) + "\n")
     # The original script syncs exact DEPS and applies the original eight patches plus TLS9.
     run("upstream-recipe", ["bash", "candidate-build.sh", "x64", "linux"], producer, 12 * GIB, 135 * 60)
