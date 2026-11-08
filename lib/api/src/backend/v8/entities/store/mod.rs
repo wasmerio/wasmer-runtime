@@ -15,6 +15,7 @@ pub struct Store {
     pub(crate) engine: Engine,
     pub(crate) inner: *mut wasm_store_t,
     pub(crate) thread_id: ThreadId,
+    pub(crate) origin: crate::backend::v8::origin::OriginOwner,
     #[cfg(feature = "experimental-async")]
     pub(crate) async_binding: std::rc::Rc<crate::backend::v8::async_runtime::AsyncBinding>,
 }
@@ -35,6 +36,7 @@ impl Store {
             inner,
             engine,
             thread_id,
+            origin: crate::backend::v8::origin::OriginOwner::new(),
             #[cfg(feature = "experimental-async")]
             async_binding: crate::backend::v8::async_runtime::AsyncBinding::new(),
         }
@@ -51,6 +53,7 @@ impl Store {
 
 impl Drop for Store {
     fn drop(&mut self) {
+        self.origin.invalidate();
         unsafe { wasm_store_delete(self.inner) }
     }
 }

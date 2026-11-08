@@ -1,3 +1,4 @@
+use crate::backend::v8::origin::{Handle, Origin};
 use wasmer_types::{ExternType, FunctionType, Mutability, Type};
 
 /// Utilities to convert between `v8` and `wasmer` values
@@ -36,7 +37,7 @@ impl IntoCApiValue for Value {
             Self::FuncRef(Some(val)) => wasm_val_t {
                 kind: bindings::wasm_valkind_enum_WASM_FUNCREF as _,
                 of: wasm_val_t__bindgen_ty_1 {
-                    ref_: unsafe { wasm_func_as_ref(val.as_v8().handle) },
+                    ref_: unsafe { wasm_func_as_ref(val.as_v8().handle.raw()) },
                 },
             },
             Self::FuncRef(None) => wasm_val_t {
@@ -67,11 +68,12 @@ impl IntoCApiValue for Value {
 
 pub trait IntoWasmerValue {
     /// Consume [`self`] to produce a [`Value`].
-    fn into_wv(self) -> Value;
+    fn into_wv(self, origin: &Origin) -> Value;
 }
 
 impl IntoWasmerValue for wasm_val_t {
-    fn into_wv(self) -> Value {
+    fn into_wv(self, origin: &Origin) -> Value {
+        origin.check_alive().expect("invalid V8 value source");
         match self.kind as _ {
             bindings::wasm_valkind_enum_WASM_I32 => Value::I32(unsafe { self.of.i32_ }),
             bindings::wasm_valkind_enum_WASM_I64 => Value::I64(unsafe { self.of.i64_ }),
@@ -80,11 +82,17 @@ impl IntoWasmerValue for wasm_val_t {
             bindings::wasm_valkind_enum_WASM_V128 => {
                 Value::V128(u128::from_le_bytes(unsafe { self.of.v128.bytes }))
             }
-            bindings::wasm_valkind_enum_WASM_FUNCREF => Value::FuncRef(Some(Function(
-                BackendFunction::V8(crate::backend::v8::function::Function {
-                    handle: unsafe { self.of.ref_ as _ },
-                }),
-            ))),
+            bindings::wasm_valkind_enum_WASM_FUNCREF => {
+                let raw = unsafe { self.of.ref_ };
+                if raw.is_null() { Value::FuncRef(None) } else {
+                    let function = unsafe { wasm_ref_as_func(raw) };
+                    Value::FuncRef(Some(Function(BackendFunction::V8(
+                        crate::backend::v8::function::Function {
+                            handle: Handle::new(function, origin.clone()),
+                        }
+                    ))))
+                }
+            },
             bindings::wasm_valkind_enum_WASM_EXTERNREF => {
                 panic!("ExternRefs are not currently supported through wasm_c_api")
             }

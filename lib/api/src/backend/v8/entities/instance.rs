@@ -7,6 +7,7 @@ use crate::{
 };
 
 use super::check_isolate;
+use crate::backend::v8::origin::{Handle, Origin};
 
 #[derive(PartialEq, Eq)]
 pub(crate) struct InstanceHandle(pub(crate) *mut wasm_instance_t);
@@ -23,7 +24,7 @@ impl InstanceHandle {
     ) -> Result<Self, InstantiationError> {
         let mut trap: *mut wasm_trap_t = std::ptr::null_mut() as _;
 
-        let externs: Vec<_> = externs.into_iter().map(|v| v.unwrap_v_8()).collect();
+        let externs: Vec<_> = externs.into_iter().map(|v| v.unwrap_v_8().raw()).collect();
 
         let instance = unsafe {
             let mut imports = unsafe {
@@ -74,7 +75,11 @@ impl InstanceHandle {
                 let _extern_type = export_type.ty();
                 // Annotation is here to prevent spurious IDE warnings.
 
-                let extern_ = Extern::from_vm_extern(&mut store, VMExtern::V8(*wasm_export));
+                let origin = Origin::of(&store).expect("actual V8 instance Store");
+                let extern_ = Extern::from_vm_extern(
+                    &mut store,
+                    VMExtern::V8(Handle::new(*wasm_export, origin)),
+                );
                 (name.to_string(), extern_)
             })
             .collect::<Exports>()
@@ -117,6 +122,9 @@ impl Instance {
     ) -> Result<(Self, Exports), InstantiationError> {
         check_isolate(store);
         let store_ref = store.as_store_ref();
+        if externs.iter().any(|value| !value.is_from_store(store)) {
+            return Err(InstantiationError::DifferentStores);
+        }
         let externs: Vec<VMExtern> = externs
             .iter()
             .map(|extern_| extern_.to_vm_extern())

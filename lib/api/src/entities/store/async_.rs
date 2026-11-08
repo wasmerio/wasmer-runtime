@@ -280,6 +280,8 @@ enum StoreWriteGuard {
 // It adds no Store access beyond that lock and performs no callbacks while held.
 struct OwnedStoreWriteGuard {
     guard: Option<LocalRwLockWriteGuard<Box<StoreInner>>>,
+    #[cfg(feature = "v8")]
+    v8_retirement: Option<std::rc::Rc<crate::backend::v8::async_runtime::WriteRetirement>>,
     #[cfg(feature = "sys")]
     origin: Option<std::sync::Arc<crate::backend::sys::async_runtime::NativeInvocationGeneration>>,
 }
@@ -298,9 +300,19 @@ impl OwnedStoreWriteGuard {
             guard
         };
         // Keep the ordinary JS path's parameter used without changing its data.
+        #[cfg(feature = "v8")]
+        let v8_retirement = {
+            let mut view = guard;
+            let retirement = crate::backend::v8::async_runtime::WriteRetirement::install(&mut view);
+            (view, retirement)
+        };
+        #[cfg(feature = "v8")]
+        let (guard, v8_retirement) = v8_retirement;
         let guard = Some(guard);
         Self {
             guard,
+            #[cfg(feature = "v8")]
+            v8_retirement,
             #[cfg(feature = "sys")]
             origin,
         }
@@ -325,6 +337,11 @@ impl OwnedStoreWriteGuard {
     }
     #[cfg(feature = "js")]
     fn into_inner(mut self) -> LocalRwLockWriteGuard<Box<StoreInner>> {
+        #[cfg(feature = "v8")]
+        assert!(
+            self.v8_retirement.is_none(),
+            "V8 write custody cannot enter a JS context"
+        );
         self.clear_origin();
         self.guard.take().unwrap()
     }
@@ -332,6 +349,17 @@ impl OwnedStoreWriteGuard {
 impl Drop for OwnedStoreWriteGuard {
     fn drop(&mut self) {
         self.clear_origin();
+        #[cfg(feature = "v8")]
+        if let Some(retirement) = self.v8_retirement.take() {
+            retirement.unregister();
+            let unwinding = std::thread::panicking();
+            let actual = self.guard.take();
+            let first =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(actual))).err();
+            // No actual Store/context/lock access survives. Keep exact holder
+            // through unlock callbacks, then dispose its finite actual Boxes.
+            retirement.finish(first, unwinding);
+        }
     }
 }
 

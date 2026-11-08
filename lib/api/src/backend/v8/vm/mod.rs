@@ -1,4 +1,5 @@
 mod env;
+use super::origin::{Handle, Origin};
 use std::sync::Arc;
 
 pub use env::*;
@@ -15,91 +16,84 @@ use wasmer_types::{MemoryError, RawValue};
 
 pub use super::error::Trap;
 
-pub(crate) type VMExtern = *mut wasm_extern_t;
+pub(crate) type VMExtern = Handle<wasm_extern_t>;
 
 // No EH for now.
 pub(crate) type VMException = ();
-pub(crate) type VMTag = *mut wasm_tag_t;
-pub(crate) type VMExternTag = *mut wasm_tag_t;
+pub(crate) type VMTag = Handle<wasm_tag_t>;
+pub(crate) type VMExternTag = Handle<wasm_tag_t>;
 
-pub(crate) type VMFunction = *mut wasm_func_t;
+pub(crate) type VMFunction = Handle<wasm_func_t>;
 pub(crate) type VMFunctionBody = ();
 pub(crate) type VMFunctionCallback = *mut ::std::os::raw::c_void;
 pub(crate) type VMTrampoline = *mut ::std::os::raw::c_void;
-pub(crate) type VMExternFunction = *mut wasm_func_t;
+pub(crate) type VMExternFunction = Handle<wasm_func_t>;
 
-pub(crate) type VMGlobal = *mut wasm_global_t;
-pub(crate) type VMExternGlobal = *mut wasm_global_t;
+pub(crate) type VMGlobal = Handle<wasm_global_t>;
+pub(crate) type VMExternGlobal = Handle<wasm_global_t>;
 
-pub(crate) type VMTable = *mut wasm_table_t;
-pub(crate) type VMExternTable = *mut wasm_table_t;
+pub(crate) type VMTable = Handle<wasm_table_t>;
+pub(crate) type VMExternTable = Handle<wasm_table_t>;
 
 pub(crate) type VMInstance = *mut wasm_instance_t;
 
 pub(crate) type VMExternObj = ();
 pub(crate) type VMConfig = ();
 
-#[allow(clippy::not_unsafe_ptr_arg_deref, clippy::unnecessary_mut_passed)]
-#[allow(nonstandard_style)]
-impl crate::VMExternToExtern for VMExtern {
-    fn to_extern(self, store: &mut impl AsStoreMut) -> Extern {
-        let kind = unsafe { wasm_extern_kind(&mut *self) };
-
-        match kind as wasm_valkind_enum {
+impl VMExtern {
+    pub(crate) fn try_to_extern(
+        self,
+        store: &mut impl AsStoreMut,
+    ) -> Result<Extern, crate::RuntimeError> {
+        let mut actual = store.as_store_mut();
+        let raw = self.checked_raw(&actual)?;
+        // Provenance is checked BEFORE querying even the raw kind.
+        let kind = unsafe { wasm_extern_kind(raw) };
+        let origin = self.origin.clone();
+        Ok(match kind as wasm_valkind_enum {
             wasm_externkind_enum_WASM_EXTERN_FUNC => {
-                let func = unsafe { wasm_extern_as_func(&mut *self) };
-                if func.is_null() {
-                    panic!("V8 reported extern as function, but is not");
-                }
+                let raw = unsafe { wasm_extern_as_func(raw) };
                 Extern::Function(crate::Function::from_vm_extern(
-                    store,
-                    crate::vm::VMExternFunction::V8(func),
+                    &mut actual,
+                    crate::vm::VMExternFunction::V8(Handle::new(raw, origin)),
                 ))
             }
             wasm_externkind_enum_WASM_EXTERN_GLOBAL => {
-                let global = unsafe { wasm_extern_as_global(&mut *self) };
-                if global.is_null() {
-                    panic!("V8 reported extern as a global, but is not");
-                }
+                let raw = unsafe { wasm_extern_as_global(raw) };
                 Extern::Global(crate::Global::from_vm_extern(
-                    store,
-                    crate::vm::VMExternGlobal::V8(global),
+                    &mut actual,
+                    crate::vm::VMExternGlobal::V8(Handle::new(raw, origin)),
                 ))
             }
             wasm_externkind_enum_WASM_EXTERN_TABLE => {
-                let table = unsafe { wasm_extern_as_table(&mut *self) };
-                if table.is_null() {
-                    panic!("V8 reported extern as a table, but is not");
-                }
+                let raw = unsafe { wasm_extern_as_table(raw) };
                 Extern::Table(crate::Table::from_vm_extern(
-                    store,
-                    crate::vm::VMExternTable::V8(table),
+                    &mut actual,
+                    crate::vm::VMExternTable::V8(Handle::new(raw, origin)),
                 ))
             }
             wasm_externkind_enum_WASM_EXTERN_MEMORY => {
-                let memory = unsafe { wasm_extern_as_memory(&mut *self) };
-                if memory.is_null() {
-                    panic!("V8 reported extern as a memory, but is not");
-                }
+                let raw = unsafe { wasm_extern_as_memory(raw) };
                 Extern::Memory(crate::Memory::from_vm_extern(
-                    store,
-                    crate::vm::VMExternMemory::V8(memory),
+                    &mut actual,
+                    crate::vm::VMExternMemory::V8(Handle::new(raw, origin)),
                 ))
             }
             wasm_externkind_enum_WASM_EXTERN_TAG => {
-                let tag = unsafe { wasm_extern_as_tag(&mut *self) };
-                if tag.is_null() {
-                    panic!("V8 reported extern as a tag, but is not");
-                }
+                let raw = unsafe { wasm_extern_as_tag(raw) };
                 Extern::Tag(crate::Tag::from_vm_extern(
-                    store,
-                    crate::vm::VMExternTag::V8(tag),
+                    &mut actual,
+                    crate::vm::VMExternTag::V8(Handle::new(raw, origin)),
                 ))
             }
-            _ => {
-                unimplemented!()
-            }
-        }
+            _ => return Err(crate::RuntimeError::new("unknown V8 extern kind")),
+        })
+    }
+}
+impl crate::VMExternToExtern for VMExtern {
+    fn to_extern(self, store: &mut impl AsStoreMut) -> Extern {
+        self.try_to_extern(store)
+            .expect("VMExtern must belong to the supplied live V8 Store")
     }
 }
 
@@ -152,10 +146,10 @@ impl VMExceptionRef {
 }
 
 #[derive(Debug, Clone)]
-pub struct VMMemory(pub(super) *mut wasm_memory_t);
+pub struct VMMemory(pub(super) Handle<wasm_memory_t>);
 struct SharedMemoryPointer(*mut wasm_shared_memory_t);
 pub struct VMSharedMemory(Arc<SharedMemoryPointer>);
-pub(crate) type VMExternMemory = *mut wasm_memory_t;
+pub(crate) type VMExternMemory = Handle<wasm_memory_t>;
 
 impl SharedMemoryPointer {
     fn new(ptr: *mut wasm_shared_memory_t) -> Self {
@@ -183,7 +177,7 @@ unsafe impl Sync for SharedMemoryPointer {}
 impl VMMemory {
     /// Created a shared detached memory that can be attached in another Store.
     pub(crate) fn as_shared(&self) -> Result<VMSharedMemory, MemoryError> {
-        let memory_type = unsafe { wasm_memory_type(self.0) };
+        let memory_type = unsafe { wasm_memory_type(self.0.raw()) };
         let limits = unsafe { wasm_memorytype_limits(memory_type) };
         if !unsafe { (*limits).shared } {
             unsafe {
@@ -195,7 +189,7 @@ impl VMMemory {
             wasm_memorytype_delete(memory_type);
         }
 
-        let shared = unsafe { wasm_memory_share(self.0) };
+        let shared = unsafe { wasm_memory_share(self.0.raw()) };
         if shared.is_null() {
             return Err(MemoryError::Generic(
                 "Failed to clone the memory".to_string(),
@@ -219,6 +213,6 @@ impl VMSharedMemory {
             !memory.is_null(),
             "Failed to obtain V8 shared memory: wasm_memory_obtain returned null"
         );
-        VMMemory(memory)
+        VMMemory(Handle::new(memory, store.origin.capture()))
     }
 }

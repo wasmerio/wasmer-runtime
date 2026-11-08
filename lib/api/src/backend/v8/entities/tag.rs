@@ -12,6 +12,7 @@ use crate::{
 };
 
 use super::check_isolate;
+use crate::backend::v8::origin::{Handle, Origin};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A WebAssembly `tag` in the `v8` runtime.
@@ -53,12 +54,18 @@ impl Tag {
             panic!("failed to create new tag: returned tag is null");
         }
 
-        Self { handle }
+        Self {
+            handle: Handle::new(handle, v8_store.origin.capture()),
+        }
     }
 
     pub fn ty(&self, store: &impl AsStoreRef) -> TagType {
         check_isolate(store);
-        let type_ = unsafe { wasm_tag_type(self.handle) };
+        self.handle
+            .origin
+            .check_store(store)
+            .expect("foreign V8 tag");
+        let type_ = unsafe { wasm_tag_type(self.handle.raw()) };
         let params: *const wasm_valtype_vec_t = unsafe { wasm_tagtype_params(type_) };
 
         let params: Vec<wasmer_types::Type> = unsafe {
@@ -74,23 +81,25 @@ impl Tag {
 
     pub(crate) fn from_vm_extern(store: &mut impl AsStoreMut, vm_tag: VMExternTag) -> Self {
         check_isolate(store);
-        Self {
-            handle: vm_tag.unwrap_v_8(),
-        }
+        let handle = vm_tag.unwrap_v_8();
+        handle
+            .origin
+            .check_store(store)
+            .expect("foreign V8 tag export");
+        Self { handle }
     }
 
     pub fn is_from_store(&self, store: &impl AsStoreRef) -> bool {
-        check_isolate(store);
-        true
+        self.handle.origin.check_store(store).is_ok()
     }
 
     pub(crate) fn to_vm_extern(&self) -> VMExtern {
-        let extern_ = unsafe { wasm_tag_as_extern(self.handle) };
+        let extern_ = unsafe { wasm_tag_as_extern(self.handle.raw()) };
         assert!(
             !extern_.is_null(),
             "Returned null Tag extern from wasm-c-api"
         );
 
-        VMExtern::V8(extern_)
+        VMExtern::V8(Handle::new(extern_, self.handle.origin.clone()))
     }
 }

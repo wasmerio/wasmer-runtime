@@ -23,7 +23,13 @@ pub struct MemoryView<'a> {
 
 impl<'a> MemoryView<'a> {
     pub(crate) fn new(memory: &Memory, store: &'a (impl AsStoreRef + ?Sized)) -> Self {
-        let c_memory: *mut wasm_memory_t = memory.handle.0;
+        memory
+            .handle
+            .0
+            .origin
+            .check_store(store)
+            .expect("foreign V8 memory view");
+        let c_memory: *mut wasm_memory_t = memory.handle.0.raw();
 
         let len = unsafe { wasm_memory_data_size(c_memory as _) };
         let base: *mut u8 = unsafe { wasm_memory_data(c_memory as _) as _ };
@@ -197,8 +203,10 @@ impl<'a> MemoryView<'a> {
         amount: u64,
         new_memory: &Self,
     ) -> Result<(), MemoryAccessError> {
-        let source_offset = usize::try_from(source_offset).map_err(|_| MemoryAccessError::Overflow)?;
-        let target_offset = usize::try_from(target_offset).map_err(|_| MemoryAccessError::Overflow)?;
+        let source_offset =
+            usize::try_from(source_offset).map_err(|_| MemoryAccessError::Overflow)?;
+        let target_offset =
+            usize::try_from(target_offset).map_err(|_| MemoryAccessError::Overflow)?;
         let amount = usize::try_from(amount).map_err(|_| MemoryAccessError::Overflow)?;
         let source_end = source_offset
             .checked_add(amount)

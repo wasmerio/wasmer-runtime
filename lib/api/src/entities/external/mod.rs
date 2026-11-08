@@ -10,7 +10,9 @@ use crate::{
 
 /// Trait convert a VMExtern to a Extern
 pub trait VMExternToExtern {
-    /// Convert to [`Extern`]
+    /// Convert to [`Extern`]. A V8 handle must belong to this actual live Store
+    /// and owner thread; violation panics before any raw handle query. Use
+    /// [`Extern::try_from_vm_extern`] for a fallible conversion.
     fn to_extern(self, store: &mut impl AsStoreMut) -> Extern;
 }
 
@@ -45,9 +47,28 @@ impl Extern {
         }
     }
 
-    /// Create an `Extern` from an `wasmer_engine::Export`.
+    /// Create an `Extern` from a VM export.
+    ///
+    /// # Panics
+    /// A V8 export must have live provenance for this actual Store and owner
+    /// thread. Use [`Self::try_from_vm_extern`] to handle a mismatch as an error.
     pub fn from_vm_extern(store: &mut impl AsStoreMut, vm_extern: VMExtern) -> Self {
-        vm_extern.to_extern(store)
+        Self::try_from_vm_extern(store, vm_extern)
+            .expect("VM export belongs to another Store or thread")
+    }
+
+    /// Checked conversion of a VM export, before any backend raw-handle query.
+    #[doc(hidden)]
+    pub fn try_from_vm_extern(
+        store: &mut impl AsStoreMut,
+        vm_extern: VMExtern,
+    ) -> Result<Self, crate::RuntimeError> {
+        match vm_extern {
+            #[cfg(feature = "v8")]
+            VMExtern::V8(value) => value.try_to_extern(store),
+            #[cfg(any(feature = "sys", feature = "js"))]
+            value => Ok(value.to_extern(store)),
+        }
     }
 
     /// Checks whether this `Extern` can be used with the given context.

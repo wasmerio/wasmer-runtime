@@ -12,6 +12,7 @@ use crate::{
 };
 
 use super::check_isolate;
+use crate::backend::v8::origin::{Handle, Origin};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A WebAssembly `table` in the `v8` runtime.
@@ -41,6 +42,9 @@ impl Table {
         init: Value,
     ) -> Result<Self, RuntimeError> {
         check_isolate(store);
+        if !init.is_from_store(store) {
+            return Err(RuntimeError::new("foreign V8 table initializer"));
+        }
         let store_mut = store.as_store_mut();
         let v8_store = store_mut.inner.store.as_v8();
 
@@ -50,20 +54,30 @@ impl Table {
         let init: wasm_val_t = init.into_cv();
 
         Ok(Self {
-            handle: unsafe { wasm_table_new(v8_store.inner, wasm_tablety, init.of.ref_) },
+            handle: Handle::new(
+                unsafe { wasm_table_new(v8_store.inner, wasm_tablety, init.of.ref_) },
+                v8_store.origin.capture(),
+            ),
         })
     }
 
     pub fn to_vm_extern(&self) -> VMExtern {
-        VMExtern::V8(unsafe { wasm_table_as_extern(self.handle) })
+        VMExtern::V8(Handle::new(
+            unsafe { wasm_table_as_extern(self.handle.raw()) },
+            self.handle.origin.clone(),
+        ))
     }
 
     pub fn ty(&self, store: &impl AsStoreRef) -> TableType {
         check_isolate(store);
+        self.handle
+            .origin
+            .check_store(store)
+            .expect("foreign V8 table");
 
         let store = store.as_store_ref();
 
-        let table_type: *mut wasm_tabletype_t = unsafe { wasm_table_type(self.handle) };
+        let table_type: *mut wasm_tabletype_t = unsafe { wasm_table_type(self.handle.raw()) };
         let table_limits = unsafe { wasm_tabletype_limits(table_type) };
         let table_type = unsafe { wasm_tabletype_element(table_type) };
 
@@ -82,7 +96,9 @@ impl Table {
     }
 
     pub fn get(&self, store: &mut impl AsStoreMut, index: u32) -> Option<Value> {
-        check_isolate(store);
+        if self.handle.origin.check_store(store).is_err() {
+            return None;
+        }
         let store_mut = store.as_store_mut();
 
         if index >= self.size(store) {
@@ -90,7 +106,7 @@ impl Table {
         }
 
         unsafe {
-            let ref_ = wasm_table_get(self.handle, index);
+            let ref_ = wasm_table_get(self.handle.raw(), index);
 
             if ref_.is_null() {
                 return match self.ty(store).ty {
@@ -111,7 +127,7 @@ impl Table {
                 of: bindings::wasm_val_t__bindgen_ty_1 { ref_ },
             };
 
-            Some(value.into_wv())
+            Some(value.into_wv(&self.handle.origin))
         }
     }
 
@@ -121,13 +137,16 @@ impl Table {
         index: u32,
         val: Value,
     ) -> Result<(), RuntimeError> {
-        check_isolate(store);
+        self.handle.origin.check_store(store)?;
+        if !val.is_from_store(store) {
+            return Err(RuntimeError::new("foreign V8 table value"));
+        }
         let store_mut = store.as_store_mut();
 
         unsafe {
             let init = match val {
                 Value::ExternRef(None) | Value::FuncRef(None) => std::ptr::null_mut(),
-                Value::FuncRef(Some(ref r)) => wasm_func_as_ref(r.as_v8().handle),
+                Value::FuncRef(Some(ref r)) => wasm_func_as_ref(r.as_v8().handle.raw()),
                 _ => {
                     return Err(RuntimeError::new(format!(
                         "Could not grow table due to unsupported init value type: {val:?} "
@@ -135,7 +154,7 @@ impl Table {
                 }
             };
 
-            if !wasm_table_set(self.handle, index, init) {
+            if !wasm_table_set(self.handle.raw(), index, init) {
                 return Err(RuntimeError::new(format!(
                     "Could not set value {val:?} table at index {index}"
                 )));
@@ -147,8 +166,12 @@ impl Table {
 
     pub fn size(&self, store: &impl AsStoreRef) -> u32 {
         check_isolate(store);
+        self.handle
+            .origin
+            .check_store(store)
+            .expect("foreign V8 handle");
         let store = store.as_store_ref();
-        unsafe { wasm_table_size(self.handle) }
+        unsafe { wasm_table_size(self.handle.raw()) }
     }
 
     pub fn grow(
@@ -157,21 +180,24 @@ impl Table {
         delta: u32,
         init: Value,
     ) -> Result<u32, RuntimeError> {
-        check_isolate(store);
+        self.handle.origin.check_store(store)?;
+        if !init.is_from_store(store) {
+            return Err(RuntimeError::new("foreign V8 table grow value"));
+        }
         let store_mut = store.as_store_mut();
 
         unsafe {
-            let size = wasm_table_size(self.handle);
+            let size = wasm_table_size(self.handle.raw());
             let init = match init {
                 Value::ExternRef(None) | Value::FuncRef(None) => std::ptr::null_mut(),
-                Value::FuncRef(Some(r)) => wasm_func_as_ref(r.as_v8().handle),
+                Value::FuncRef(Some(r)) => wasm_func_as_ref(r.as_v8().handle.raw()),
                 _ => {
                     return Err(RuntimeError::new(format!(
                         "Could not grow table due to unsupported init value type: {init:?} "
                     )));
                 }
             };
-            if !wasm_table_grow(self.handle, delta, init) {
+            if !wasm_table_grow(self.handle.raw(), delta, init) {
                 return Err(RuntimeError::new("Could not grow table"));
             }
 
@@ -196,14 +222,16 @@ impl Table {
         check_isolate(store);
         let store_mut = store.as_store_mut();
 
-        Self {
-            handle: vm_extern.unwrap_v_8(),
-        }
+        let handle = vm_extern.unwrap_v_8();
+        handle
+            .origin
+            .check_store(store)
+            .expect("foreign V8 table export");
+        Self { handle }
     }
 
     pub fn is_from_store(&self, store: &impl AsStoreRef) -> bool {
-        check_isolate(store);
-        true
+        self.handle.origin.check_store(store).is_ok()
     }
 }
 

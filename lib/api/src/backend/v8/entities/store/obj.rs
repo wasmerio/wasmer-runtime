@@ -197,6 +197,20 @@ impl<T: StoreObject> StoreHandle<T> {
         self.internal.get_mut(store)
     }
 
+    pub(crate) fn try_get<'a>(&self, store: &'a StoreObjects) -> Option<&'a T> {
+        if self.id != store.id {
+            return None;
+        }
+        T::list(store).get(self.internal.idx.get() - 1)
+    }
+
+    pub(crate) fn try_get_mut<'a>(&self, store: &'a mut StoreObjects) -> Option<&'a mut T> {
+        if self.id != store.id {
+            return None;
+        }
+        T::list_mut(store).get_mut(self.internal.idx.get() - 1)
+    }
+
     /// Returns the internal handle contains within this handle.
     pub fn internal_handle(&self) -> InternalStoreHandle<T> {
         self.internal

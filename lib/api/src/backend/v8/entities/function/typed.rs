@@ -10,12 +10,16 @@
 
 use std::iter::FromIterator;
 
+#[cfg(feature = "experimental-async")]
+use crate::{AsStoreAsync, StoreAsync};
 use crate::{
     AsStoreMut, CallWrapper, FromToNativeWasmType, NativeWasmType, NativeWasmTypeInto,
     RuntimeError, TypedFunction, Value, WasmTypeList,
     backend::v8::{bindings::*, error::Trap, function::Function, utils::convert::*},
     entities::function::call_wrapper::call_wrapped,
 };
+#[cfg(feature = "experimental-async")]
+use std::future::Future;
 use wasmer_types::RawValue;
 
 macro_rules! impl_native_traits {
@@ -26,7 +30,37 @@ macro_rules! impl_native_traits {
              $( $x: FromToNativeWasmType, )*
              Rets: WasmTypeList,
          {
-             /// Call the typed func and return results.
+             #[cfg(feature = "experimental-async")]
+            pub(crate) fn call_async_v8(
+                function: crate::Function, store: StoreAsync, arguments: ( $( $x, )* )
+            ) -> impl Future<Output = Result<Rets, RuntimeError>> + 'static
+            where $( $x: FromToNativeWasmType + 'static, )*
+            {
+                async move {
+                    let ( $( $x, )* ) = arguments;
+                    let mut write = crate::StoreAsyncWriteLock::try_acquire(&store)
+                        .ok_or_else(|| RuntimeError::new("V8 typed call Store is busy"))?;
+                    if !function.is_from_store(&write) {
+                        return Err(RuntimeError::new("V8 typed function belongs to another Store"));
+                    }
+                    let signature = function.ty(&write);
+                    let raw = [ $( $x.to_native().into_raw(&mut write) ),* ];
+                    let values = raw.iter().zip(signature.params()).map(|(raw, ty)| {
+                        unsafe { Value::from_raw(&mut write, *ty, *raw) }
+                    }).collect();
+                    drop(write);
+                    let values = function.call_async(&store, values).await?;
+                    let mut write = crate::StoreAsyncWriteLock::try_acquire(&store)
+                        .ok_or_else(|| RuntimeError::new("V8 typed call Store is busy"))?;
+                    let mut raw = Rets::empty_array();
+                    for (slot, value) in raw.as_mut().iter_mut().zip(values.iter()) {
+                        *slot = value.as_raw(&mut write);
+                    }
+                    Ok(unsafe { Rets::from_array(&mut write, raw) })
+                }
+            }
+
+            /// Call the typed func and return results.
             #[allow(clippy::too_many_arguments)]
             pub fn call_v8(&self, store: &mut impl AsStoreMut, $( $x: $x, )* ) -> Result<Rets, RuntimeError> where
             $( $x: FromToNativeWasmType, )*
@@ -40,6 +74,10 @@ macro_rules! impl_native_traits {
             $( $x: FromToNativeWasmType, )*
             {
 
+                 if !self.func.is_from_store(store) {
+                     return Err(RuntimeError::new("V8 typed function belongs to another Store"));
+                 }
+                 let origin = crate::backend::v8::origin::Origin::of(store)?;
                  // // let store_ptr = Value::I64(store.as_store_mut().as_raw() as _).as_jsvalue(store);
                  #[allow(unused_unsafe)]
                  let params_list: Vec<_> = unsafe {
@@ -59,7 +97,7 @@ macro_rules! impl_native_traits {
                 };
 
 
-                 let func = unsafe { wasm_extern_as_func(self.func.to_vm_extern().unwrap_v_8()) };
+                 let func = unsafe { wasm_extern_as_func(self.func.to_vm_extern().unwrap_v_8().raw()) };
 
                  call_wrapped(store, wrapper, |_| {
                     // `wasm_func_call` takes the arguments, so every entry gets its own.
@@ -83,13 +121,18 @@ macro_rules! impl_native_traits {
                         0 => {},
                         1 => {
                             let val = (*results.data.wrapping_add(0)).clone();
+<<<<<<< HEAD
                             let val = val.into_wv();
                             *mut_rets = val.as_raw(store);
+=======
+                            let val = val.into_wv(&origin);
+                            *mut_rets = val.as_raw(&mut store);
+>>>>>>> feat(api): add checked same-stack V8 async calls
                         }
                         _n => {
                             for (i, ret_type) in Rets::wasm_types().iter().enumerate() {
                                     let val = (*results.data.wrapping_add(i)).clone();
-                                    let val = val.into_wv();
+                                    let val = val.into_wv(&origin);
                                     let slot = mut_rets.add(i);
                                     *slot = val.as_raw(store);
                             }

@@ -114,6 +114,10 @@ impl<T: Send + 'static> FunctionEnvMut<'_, T> {
                     },
                 )))
             }
+            #[cfg(feature = "v8")]
+            BackendFunctionEnvMut::V8(env) => env
+                .checked_async()
+                .map(|env| AsyncFunctionEnvMut(BackendAsyncFunctionEnvMut::V8(env))),
             #[allow(unreachable_patterns)]
             _ => None,
         }

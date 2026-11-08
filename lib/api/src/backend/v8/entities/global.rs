@@ -16,6 +16,7 @@ use crate::{
 };
 
 use super::check_isolate;
+use crate::backend::v8::origin::{Handle, Origin};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A WebAssembly `global` in the `v8` runtime.
@@ -32,12 +33,12 @@ unsafe impl Sync for Global {}
 
 impl Global {
     pub(crate) fn to_vm_extern(&self) -> VMExtern {
-        let extern_ = unsafe { wasm_global_as_extern(self.handle) };
+        let extern_ = unsafe { wasm_global_as_extern(self.handle.raw()) };
         assert!(
             !extern_.is_null(),
             "Returned null Global extern from wasm-c-api"
         );
-        VMExtern::V8(extern_)
+        VMExtern::V8(Handle::new(extern_, self.handle.origin.clone()))
     }
 
     /// Create a `Global` with the initial value [`Value`] and the provided [`Mutability`].
@@ -47,6 +48,9 @@ impl Global {
         mutability: Mutability,
     ) -> Result<Self, RuntimeError> {
         check_isolate(store);
+        if !val.is_from_store(store) {
+            return Err(RuntimeError::new("foreign V8 global initializer"));
+        }
         let store = store.as_store_mut();
         let v8_store = store.inner.store.as_v8();
         let v8_type = val.ty().into_ct();
@@ -61,14 +65,21 @@ impl Global {
             unsafe { wasm_globaltype_new(wasm_valtype_new(v8_type), v8_mutability) };
 
         Ok(Self {
-            handle: unsafe { wasm_global_new(v8_store.inner, v8_global_type, &v8_value) },
+            handle: Handle::new(
+                unsafe { wasm_global_new(v8_store.inner, v8_global_type, &v8_value) },
+                v8_store.origin.capture(),
+            ),
         })
     }
 
     pub fn ty(&self, store: &impl AsStoreRef) -> GlobalType {
         check_isolate(store);
+        self.handle
+            .origin
+            .check_store(store)
+            .expect("foreign V8 handle");
         let store = store.as_store_ref();
-        let r#type = unsafe { wasm_global_type(self.handle) };
+        let r#type = unsafe { wasm_global_type(self.handle.raw()) };
         let mutability = unsafe { wasm_globaltype_mutability(&*r#type) };
         let valtype = unsafe { wasm_globaltype_content(r#type) };
         let wasmer_type = valtype.into_wt();
@@ -85,14 +96,22 @@ impl Global {
 
     pub fn get(&self, store: &mut impl AsStoreMut) -> Value {
         check_isolate(store);
+        self.handle
+            .origin
+            .check_store(store)
+            .expect("foreign V8 handle");
         let store = store.as_store_ref();
         let mut out = unsafe { std::mem::zeroed() };
-        unsafe { wasm_global_get(self.handle, &mut out) };
-        out.into_wv()
+        unsafe { wasm_global_get(self.handle.raw(), &mut out) };
+        out.into_wv(&self.handle.origin)
     }
 
     pub fn set(&self, store: &mut impl AsStoreMut, val: Value) -> Result<(), RuntimeError> {
         check_isolate(store);
+        self.handle.origin.check_store(store)?;
+        if !val.is_from_store(store) {
+            return Err(RuntimeError::new("foreign V8 global value"));
+        }
 
         if val.ty() != self.ty(store).ty {
             return Err(RuntimeError::new(format!(
@@ -108,20 +127,22 @@ impl Global {
 
         let value = val.into_cv();
 
-        unsafe { wasm_global_set(self.handle, &value) };
+        unsafe { wasm_global_set(self.handle.raw(), &value) };
 
         Ok(())
     }
 
     pub(crate) fn from_vm_extern(store: &mut impl AsStoreMut, vm_global: VMExternGlobal) -> Self {
         check_isolate(store);
-        Self {
-            handle: vm_global.unwrap_v_8(),
-        }
+        let handle = vm_global.unwrap_v_8();
+        handle
+            .origin
+            .check_store(store)
+            .expect("foreign V8 global export");
+        Self { handle }
     }
 
     pub fn is_from_store(&self, store: &impl AsStoreRef) -> bool {
-        check_isolate(store);
-        true
+        self.handle.origin.check_store(store).is_ok()
     }
 }

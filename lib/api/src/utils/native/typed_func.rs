@@ -111,6 +111,10 @@ macro_rules! impl_native_traits {
                 let store = store.store();
                 let func = self.func.clone();
                 async move {
+                    #[cfg(feature = "v8")]
+                    if matches!(&func.0, crate::BackendFunction::V8(_)) {
+                        return Self::call_async_v8(func, store, ($([<p_ $x>],)*)).await;
+                    }
                     #[cfg(feature = "sys")]
                     if matches!(&func.0, crate::BackendFunction::Sys(_)) {
                         // Native admission must precede even the backend-selection
@@ -125,7 +129,10 @@ macro_rules! impl_native_traits {
                             Self::call_async_sys(func, store, $([<p_ $x>]),*).await
                         }
                         #[cfg(feature = "v8")]
-                        BackendStore::V8(_) => async_backend_error(),
+                        BackendStore::V8(_) => {
+                            drop(read_lock);
+                            Self::call_async_v8(func, store, ($([<p_ $x>],)*)).await
+                        },
                         #[cfg(feature = "js")]
                         BackendStore::Js(_) => {
                             drop(read_lock);

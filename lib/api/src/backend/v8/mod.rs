@@ -12,3 +12,5 @@ pub use entities::{engine::Engine as V8, *};
 pub(crate) mod async_runtime;
 #[cfg(feature = "experimental-async")]
 pub use async_runtime::{BlockingExecutor, set_blocking_executor};
+
+pub(crate) mod origin;

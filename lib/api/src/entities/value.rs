@@ -208,8 +208,30 @@ impl Value {
             | Self::ExternRef(None)
             | Self::ExceptionRef(None)
             | Self::FuncRef(None) => true,
-            Self::ExternRef(Some(e)) => e.is_from_store(store),
-            Self::ExceptionRef(Some(e)) => e.is_from_store(store),
+            Self::ExternRef(Some(e)) => {
+                #[cfg(feature = "v8")]
+                {
+                    let view = store.as_store_ref();
+                    if view.inner.store.is_v8() {
+                        return false;
+                    }
+                    return e.is_from_store(&view);
+                }
+                #[cfg(not(feature = "v8"))]
+                e.is_from_store(store)
+            }
+            Self::ExceptionRef(Some(e)) => {
+                #[cfg(feature = "v8")]
+                {
+                    let view = store.as_store_ref();
+                    if view.inner.store.is_v8() {
+                        return false;
+                    }
+                    return e.is_from_store(&view);
+                }
+                #[cfg(not(feature = "v8"))]
+                e.is_from_store(store)
+            }
             Self::FuncRef(Some(f)) => f.is_from_store(store),
         }
     }

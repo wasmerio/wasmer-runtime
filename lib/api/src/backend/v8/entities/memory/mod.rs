@@ -15,6 +15,7 @@ pub(crate) mod view;
 pub use view::*;
 
 use super::check_isolate;
+use crate::backend::v8::origin::Handle;
 
 #[derive(Debug, Clone)]
 /// A WebAssembly `memory` in the `v8` runtime.
@@ -63,25 +64,37 @@ impl Memory {
         let c_memory = unsafe { wasm_memory_new(v8_store.inner, memorytype) };
 
         Ok(Self {
-            handle: VMMemory(c_memory),
+            handle: VMMemory(Handle::new(c_memory, v8_store.origin.capture())),
         })
     }
 
     pub fn new_from_existing(new_store: &mut impl AsStoreMut, memory: VMMemory) -> Self {
         check_isolate(new_store);
-        let store_mut = new_store.as_store_mut();
+        memory
+            .0
+            .origin
+            .check_store(new_store)
+            .expect("existing V8 memory belongs to another Store");
         Self { handle: memory }
     }
 
     pub(crate) fn to_vm_extern(&self) -> VMExtern {
-        VMExtern::V8(unsafe { wasm_memory_as_extern(self.handle.0) })
+        VMExtern::V8(Handle::new(
+            unsafe { wasm_memory_as_extern(self.handle.0.raw()) },
+            self.handle.0.origin.clone(),
+        ))
     }
 
     pub fn ty(&self, store: &impl AsStoreRef) -> MemoryType {
         check_isolate(store);
+        self.handle
+            .0
+            .origin
+            .check_store(store)
+            .expect("foreign V8 memory");
         let store = store.as_store_ref();
 
-        let memory_type: *mut wasm_memorytype_t = unsafe { wasm_memory_type(self.handle.0) };
+        let memory_type: *mut wasm_memorytype_t = unsafe { wasm_memory_type(self.handle.0.raw()) };
         let limits: *const wasm_limits_t = unsafe { wasm_memorytype_limits(memory_type) };
 
         MemoryType {
@@ -99,7 +112,12 @@ impl Memory {
 
     pub fn size(&self, store: &impl AsStoreRef) -> Pages {
         check_isolate(store);
-        let size = unsafe { wasm_memory_size(self.handle.0) };
+        self.handle
+            .0
+            .origin
+            .check_store(store)
+            .expect("foreign V8 memory");
+        let size = unsafe { wasm_memory_size(self.handle.0.raw()) };
         Pages(size)
     }
 
@@ -118,13 +136,17 @@ impl Memory {
     where
         IntoPages: Into<Pages>,
     {
-        check_isolate(store);
+        self.handle
+            .0
+            .origin
+            .check_store(store)
+            .map_err(|error| MemoryError::Generic(error.to_string()))?;
         let store_mut = store.as_store_mut();
         unsafe {
             let delta: Pages = delta.into();
-            let current = Pages(wasm_memory_size(self.handle.0));
+            let current = Pages(wasm_memory_size(self.handle.0.raw()));
 
-            if !wasm_memory_grow(self.handle.0, delta.0) {
+            if !wasm_memory_grow(self.handle.0.raw(), delta.0) {
                 Err(MemoryError::CouldNotGrow {
                     current,
                     attempted_delta: delta,
@@ -141,13 +163,18 @@ impl Memory {
         min_size: u64,
     ) -> Result<(), MemoryError> {
         check_isolate(store);
+        self.handle
+            .0
+            .origin
+            .check_store(store)
+            .expect("foreign V8 memory");
         let store_mut = store.as_store_mut();
         let min_size = Pages::from_bytes_rounded_up(min_size).ok_or_else(|| {
             MemoryError::Generic("could not represent {min_size} in Pages".to_owned())
         })?;
 
         unsafe {
-            let current_pages = wasm_memory_size(self.handle.0);
+            let current_pages = wasm_memory_size(self.handle.0.raw());
             if min_size.0 > current_pages {
                 self.grow(store, Pages(min_size.0 - current_pages))?;
             }
@@ -158,6 +185,11 @@ impl Memory {
 
     pub fn reset(&self, store: &mut impl AsStoreMut) -> Result<(), MemoryError> {
         check_isolate(store);
+        self.handle
+            .0
+            .origin
+            .check_store(store)
+            .expect("foreign V8 memory");
         Err(MemoryError::UnsupportedOperation {
             message: "reset not supported for V8 memory".to_owned(),
         })
@@ -165,13 +197,23 @@ impl Memory {
 
     pub(crate) fn from_vm_extern(store: &mut impl AsStoreMut, internal: VMExternMemory) -> Self {
         check_isolate(store);
+        let handle = internal.unwrap_v_8();
+        handle
+            .origin
+            .check_store(store)
+            .expect("foreign V8 memory export");
         Self {
-            handle: VMMemory(internal.unwrap_v_8()),
+            handle: VMMemory(handle),
         }
     }
 
     pub fn copy(&self, store: &impl AsStoreRef) -> Result<SharedMemory, MemoryError> {
         check_isolate(store);
+        self.handle
+            .0
+            .origin
+            .check_store(store)
+            .expect("foreign V8 memory");
 
         let ty = self.ty(store);
         if !ty.shared {
@@ -199,7 +241,7 @@ impl Memory {
         }
 
         let copied = Self {
-            handle: VMMemory(copied_memory),
+            handle: VMMemory(Handle::new(copied_memory, v8_store.origin.capture())),
         };
 
         let src_view = self.view(store);
@@ -212,7 +254,7 @@ impl Memory {
                 MemoryError::Generic("failed to calculate V8 memory copy growth".to_owned())
             })?;
 
-            if !unsafe { wasm_memory_grow(copied.handle.0, delta) } {
+            if !unsafe { wasm_memory_grow(copied.handle.0.raw(), delta) } {
                 return Err(MemoryError::CouldNotGrow {
                     current: dst_pages,
                     attempted_delta: Pages(delta),
@@ -232,12 +274,16 @@ impl Memory {
     }
 
     pub fn is_from_store(&self, store: &impl AsStoreRef) -> bool {
-        check_isolate(store);
-        true
+        self.handle.0.origin.check_store(store).is_ok()
     }
 
     pub fn as_shared(&self, store: &impl AsStoreRef) -> Result<SharedMemory, MemoryError> {
         check_isolate(store);
+        self.handle
+            .0
+            .origin
+            .check_store(store)
+            .expect("foreign V8 memory");
         Ok(SharedMemory::new(crate::vm::VMSharedMemory::V8(
             self.handle.as_shared()?,
         )))

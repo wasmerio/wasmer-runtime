@@ -49,6 +49,7 @@ pub(crate) struct AsyncBinding {
     executor: RefCell<Option<Weak<dyn BlockingExecutor>>>,
     active: RefCell<Weak<CallFrame>>,
     panic: RefCell<Option<Panic>>,
+    write_guard: RefCell<Option<Weak<WriteRetirement>>>,
 }
 
 impl std::fmt::Debug for AsyncBinding {
@@ -67,6 +68,7 @@ impl AsyncBinding {
             executor: RefCell::new(None),
             active: RefCell::new(Weak::new()),
             panic: RefCell::new(None),
+            write_guard: RefCell::new(None),
         })
     }
 
@@ -111,11 +113,16 @@ impl AsyncBinding {
     pub(crate) fn has_active_call(&self) -> bool {
         self.active.borrow().upgrade().is_some()
     }
+    pub(crate) fn current_has_panic(&self) -> bool {
+        let current = self.active.borrow().upgrade();
+        current.is_some_and(|frame| frame.panic.borrow().is_some())
+    }
 
     pub(crate) fn enter(self: &Rc<Self>) -> Result<CallGuard, RuntimeError> {
         self.check_async_entry()?;
         let frame = Rc::new(CallFrame {
             sync_borrows: Default::default(),
+            panic: RefCell::new(None),
         });
         let previous = self.active.replace(Rc::downgrade(&frame));
         Ok(CallGuard {
@@ -132,22 +139,24 @@ impl AsyncBinding {
     }
 
     pub(crate) fn record(&self, panic: Panic, entry_unwinding: bool) {
-        if entry_unwinding {
-            discard_panic(panic);
-            return;
+        let active = self.active.borrow().upgrade();
+        match active {
+            Some(frame) => record_first(&frame.panic, panic, entry_unwinding),
+            None => record_first(&self.panic, panic, entry_unwinding),
         }
-        let secondary = {
-            let mut first = self.panic.borrow_mut();
-            if first.is_none() {
-                *first = Some(panic);
-                None
-            } else {
-                Some(panic)
-            }
-        };
-        if let Some(secondary) = secondary {
-            discard_panic(secondary);
-        }
+    }
+
+    pub(crate) fn selected_executor(
+        &self,
+    ) -> Result<Option<Rc<dyn BlockingExecutor>>, RuntimeError> {
+        let selected = self.executor.borrow().clone();
+        selected
+            .map(|executor| {
+                executor
+                    .upgrade()
+                    .ok_or_else(|| RuntimeError::new("V8 Store's bound executor has expired"))
+            })
+            .transpose()
     }
 
     pub(crate) fn run_host_future<T>(
@@ -212,6 +221,7 @@ impl AsyncBinding {
 
 struct CallFrame {
     sync_borrows: std::cell::Cell<usize>,
+    panic: RefCell<Option<Panic>>,
 }
 
 pub(crate) struct CallGuard {
@@ -221,8 +231,14 @@ pub(crate) struct CallGuard {
 }
 
 impl CallGuard {
-    pub(crate) fn is_outermost(&self) -> bool {
-        self.previous.upgrade().is_none()
+    pub(crate) fn has_panic(&self) -> bool {
+        self.frame.panic.borrow().is_some()
+    }
+    pub(crate) fn take_panic(&self) -> Option<Panic> {
+        self.frame.panic.borrow_mut().take()
+    }
+    pub(crate) fn record(&self, panic: Panic, unwinding: bool) {
+        record_first(&self.frame.panic, panic, unwinding);
     }
 }
 
@@ -231,6 +247,15 @@ impl Drop for CallGuard {
         let mut current = self.binding.active.borrow_mut();
         debug_assert!(current.ptr_eq(&Rc::downgrade(&self.frame)));
         *current = self.previous.clone();
+        drop(current);
+        let panic = self.frame.panic.borrow_mut().take();
+        if let Some(panic) = panic {
+            if std::thread::panicking() {
+                discard_panic(panic);
+            } else {
+                resume_unwind(panic);
+            }
+        }
     }
 }
 
@@ -305,6 +330,25 @@ impl Drop for HostCallbacks {
     }
 }
 
+fn record_first(slot: &RefCell<Option<Panic>>, panic: Panic, unwinding: bool) {
+    if unwinding {
+        discard_panic(panic);
+        return;
+    }
+    let secondary = {
+        let mut first = slot.borrow_mut();
+        if first.is_none() {
+            *first = Some(panic);
+            None
+        } else {
+            Some(panic)
+        }
+    };
+    if let Some(secondary) = secondary {
+        discard_panic(secondary);
+    }
+}
+
 pub(crate) fn discard_panic(mut panic: Panic) {
     loop {
         match catch_unwind(AssertUnwindSafe(|| drop(panic))) {
@@ -323,7 +367,7 @@ impl Wake for Parker {
     fn wake(self: Arc<Self>) {
         self.wake_by_ref();
     }
-    fn wake_by_ref(self: &Rc<Self>) {
+    fn wake_by_ref(self: &Arc<Self>) {
         *self.notified.lock().unwrap_or_else(|e| e.into_inner()) = true;
         self.ready.notify_one();
     }
@@ -344,5 +388,115 @@ fn park_on_thread(mut future: Pin<&mut dyn Future<Output = ()>>) {
                 .unwrap_or_else(|e| e.into_inner());
         }
         *notified = false;
+    }
+}
+
+/// Actual still-undropped environment allocations owned by ONE real write
+/// guard. The Store/binding keeps only Weak metadata, never this value.
+pub(crate) struct WriteRetirement {
+    address: usize,
+    origin: super::origin::Origin,
+    binding: Weak<AsyncBinding>,
+    released: std::cell::Cell<bool>,
+    displaced: RefCell<Vec<Box<dyn Any + Send>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RetirementCap(Weak<WriteRetirement>);
+
+impl WriteRetirement {
+    pub(crate) fn install(store: &mut crate::StoreInner) -> Option<Rc<Self>> {
+        let address = store as *mut crate::StoreInner as usize;
+        let crate::BackendStore::V8(backend) = &store.store else {
+            return None;
+        };
+        let binding = &backend.async_binding;
+        let state = Rc::new(Self {
+            address,
+            origin: backend.origin.capture(),
+            binding: Rc::downgrade(binding),
+            released: std::cell::Cell::new(false),
+            displaced: RefCell::new(Vec::new()),
+        });
+        let previous = binding
+            .write_guard
+            .borrow_mut()
+            .replace(Rc::downgrade(&state));
+        debug_assert!(previous.is_none(), "V8 write guard registration overlapped");
+        Some(state)
+    }
+
+    pub(crate) fn unregister(self: &Rc<Self>) {
+        if let Some(binding) = self.binding.upgrade() {
+            let mut current = binding.write_guard.borrow_mut();
+            if current
+                .as_ref()
+                .is_some_and(|current| current.ptr_eq(&Rc::downgrade(self)))
+            {
+                *current = None;
+            }
+        }
+    }
+
+    pub(crate) fn finish(&self, mut first: Option<Panic>, unwinding: bool) {
+        self.released.set(true);
+        let values = std::mem::take(&mut *self.displaced.borrow_mut());
+        for value in values {
+            if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(value))) {
+                if first.is_none() && !unwinding {
+                    first = Some(panic);
+                } else {
+                    discard_panic(panic);
+                }
+            }
+        }
+        if let Some(first) = first {
+            if unwinding {
+                discard_panic(first);
+            } else {
+                resume_unwind(first);
+            }
+        }
+    }
+}
+
+impl RetirementCap {
+    /// Capture BEFORE a frame exposes mutable data/Store. Once captured, the
+    /// immutable weak allocation identity can only upgrade this original guard.
+    pub(crate) fn capture(store: &crate::StoreMut<'_>) -> Result<Option<Self>, RuntimeError> {
+        let crate::BackendStore::V8(backend) = &store.inner.store else {
+            return Ok(None);
+        };
+        let current = backend.async_binding.write_guard.borrow().clone();
+        let Some(current) = current else {
+            return Ok(None);
+        };
+        let owner = current
+            .upgrade()
+            .ok_or_else(|| RuntimeError::new("expired V8 write guard"))?;
+        let actual = store.inner as *const crate::StoreInner as usize;
+        if owner.address != actual
+            || !owner.origin.same(&backend.origin.capture())
+            || owner.released.get()
+        {
+            return Err(RuntimeError::new(
+                "V8 write guard belongs to another actual scope",
+            ));
+        }
+        Ok(Some(Self(current)))
+    }
+
+    pub(crate) fn try_retain(&self, value: Box<dyn Any + Send>) -> Result<(), Box<dyn Any + Send>> {
+        let Some(owner) = self.0.upgrade() else {
+            return Err(value);
+        };
+        if owner.released.get() {
+            return Err(value);
+        }
+        // Capture validated original address/token before lending. Weak upgrade
+        // preserves that exact immutable guard identity; never query a current
+        // Store or upgrade the unit token during resource destruction.
+        owner.displaced.borrow_mut().push(value);
+        Ok(())
     }
 }

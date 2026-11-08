@@ -155,6 +155,10 @@ impl<T: Send + 'static> BackendFunctionEnvMut<'_, T> {
     /// context is async.
     #[cfg(feature = "experimental-async")]
     pub fn as_store_async(&self) -> Option<impl AsStoreAsync + 'static> {
+        #[cfg(feature = "v8")]
+        if let Self::V8(env) = self {
+            return env.checked_async().map(|env| env.store);
+        }
         let view = self.as_store_ref();
         let id = view.inner.objects.id();
         // Copy metadata through this caller's existing reference. Resolving a
