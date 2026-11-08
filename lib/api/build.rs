@@ -187,6 +187,30 @@ fn build_v8() {
         );
     }
 
+    // Use the paired public C++ destroyer for the actual Store owner. Keep
+    // this archive before v8prefixed so Store::destroy resolves there; retain
+    // the existing target C++ standard-library selection above.
+    for file in [
+        "owned-store.cc",
+        "wasm.hh",
+        "wasm.h",
+        "LICENSE",
+        "SOURCE.md",
+    ] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            v8_header_path.join(file).display()
+        );
+    }
+    cc::Build::new()
+        .cpp(true)
+        .cpp_link_stdlib(None)
+        .std("c++11")
+        .define("LIBWASM_STATIC", None)
+        .include(&v8_header_path)
+        .file(v8_header_path.join("owned-store.cc"))
+        .compile("wasmer_v8_store_owner");
+
     println!("cargo:rustc-link-lib=static=v8prefixed");
 
     // Static link dependencies must follow the archive that references them.

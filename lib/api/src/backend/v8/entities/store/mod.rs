@@ -3,9 +3,14 @@ use std::thread::ThreadId;
 
 use crate::{
     AsStoreRef, BackendStore, StoreRef,
-    backend::v8::bindings::{wasm_store_delete, wasm_store_new, wasm_store_t},
+    backend::v8::bindings::{wasm_store_new, wasm_store_t},
     engine::{AsEngineRef, Engine, EngineRef},
 };
+
+// Private adapter compiled against the exact paired pinned C++ public header.
+unsafe extern "C" {
+    fn wasmer_v8_owned_store_delete(actual_store: *mut wasm_store_t);
+}
 
 mod obj;
 pub use obj::*;
@@ -72,7 +77,9 @@ impl Drop for Store {
         #[cfg(feature = "experimental-async")]
         retire_step(&mut first, unwinding, || drop(callbacks));
         retire_step(&mut first, unwinding, || roots.drain());
-        retire_step(&mut first, unwinding, || unsafe { wasm_store_delete(raw) });
+        retire_step(&mut first, unwinding, || unsafe {
+            wasmer_v8_owned_store_delete(raw)
+        });
         if let Some(first) = first {
             std::panic::resume_unwind(first);
         }
@@ -193,6 +200,77 @@ mod tests {
             self.reentries.fetch_add(1, Ordering::SeqCst);
             std::panic::resume_unwind(self.payload.take().unwrap());
         }
+    }
+
+    #[test]
+    fn owned_cpp_store_drop_runs_actual_host_info_finalizer_after_rust_captures() {
+        use crate::backend::v8::bindings::wasm_func_set_host_info_with_finalizer;
+        use std::sync::atomic::AtomicBool;
+
+        struct RustCapture(Arc<AtomicUsize>);
+        impl RustCapture {
+            fn touch(&self) {
+                let _ = self.0.load(Ordering::SeqCst);
+            }
+        }
+        impl Drop for RustCapture {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct Finalizer {
+            rust_drops: Arc<AtomicUsize>,
+            cpp_calls: Arc<AtomicUsize>,
+            rust_before_cpp: Arc<AtomicBool>,
+        }
+        unsafe extern "C" fn finalize(data: *mut std::ffi::c_void) {
+            // Sole actual C++ managed-data owner; never panic across C ABI.
+            let data = unsafe { Box::from_raw(data.cast::<Finalizer>()) };
+            data.rust_before_cpp.store(
+                data.rust_drops.load(Ordering::SeqCst) == 1,
+                Ordering::SeqCst,
+            );
+            data.cpp_calls.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let rust_drops = Arc::new(AtomicUsize::new(0));
+        let cpp_calls = Arc::new(AtomicUsize::new(0));
+        let rust_before_cpp = Arc::new(AtomicBool::new(false));
+        let mut store = crate::Store::new(crate::v8::V8::new());
+        let capture = RustCapture(rust_drops.clone());
+        let function = Function::new_async(&mut store, FunctionType::new([], []), move |_| {
+            capture.touch();
+            async { Ok(Vec::<Value>::new()) }
+        });
+        let finalizer = Box::new(Finalizer {
+            rust_drops: rust_drops.clone(),
+            cpp_calls: cpp_calls.clone(),
+            rust_before_cpp: rust_before_cpp.clone(),
+        });
+        unsafe {
+            wasm_func_set_host_info_with_finalizer(
+                function.as_v8().handle.raw(),
+                Box::into_raw(finalizer).cast(),
+                Some(finalize),
+            );
+        }
+        // This finite source-backed discriminator releases real reference
+        // roots first. Merely invalidating a weak token or returning from the
+        // C facade delete cannot satisfy its actual C++ finalizer assertion.
+        store.as_v8_mut().reference_roots.drain();
+        assert_eq!(cpp_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(rust_drops.load(Ordering::SeqCst), 0);
+        drop(store);
+        assert_eq!(cpp_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(rust_drops.load(Ordering::SeqCst), 1);
+        assert!(rust_before_cpp.load(Ordering::SeqCst));
+        // Expired Function destruction remains inert metadata-only.
+        drop(function);
+        let mut source = crate::Store::new(crate::v8::V8::new());
+        let target = Function::new_typed_async(&mut source, || async { 31i32 });
+        let source = source.into_async();
+        let values = futures::executor::block_on(target.call_async(&source, vec![])).unwrap();
+        assert_eq!(values[0].i32(), Some(31));
     }
 
     #[test]
