@@ -5377,7 +5377,12 @@ mod tests {
         Store::with_current(|view| {
             let pointer = &mut *view.inner as *mut StoreInner;
             let _shadow = unsafe { StoreContext::install_borrowed(pointer) };
-            assert!(with_borrowed_native_store(&a, |_| panic!("shadowed Async entry")).is_err());
+            let error =
+                with_borrowed_native_store(&a, |_| panic!("shadowed Async entry")).unwrap_err();
+            assert_eq!(
+                error.message(),
+                "borrowed Store ancestry is not synchronous"
+            );
         })
         .unwrap();
         drop(_asynchronous);
@@ -5435,7 +5440,12 @@ mod tests {
         Store::with_current(|view| {
             let pointer = &mut *view.inner as *mut StoreInner;
             let _shadow = unsafe { StoreContext::install_borrowed(pointer) };
-            assert!(with_borrowed_native_store(&cap, |_| panic!("shadowed Loan entry")).is_err());
+            let error =
+                with_borrowed_native_store(&cap, |_| panic!("shadowed Loan entry")).unwrap_err();
+            assert_eq!(
+                error.message(),
+                "borrowed Store ancestry is not synchronous"
+            );
         })
         .unwrap();
         drop(_installed);
