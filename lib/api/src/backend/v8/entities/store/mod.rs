@@ -15,6 +15,8 @@ pub struct Store {
     pub(crate) engine: Engine,
     pub(crate) inner: *mut wasm_store_t,
     pub(crate) thread_id: ThreadId,
+    #[cfg(feature = "experimental-async")]
+    pub(crate) async_binding: std::rc::Rc<crate::backend::v8::async_runtime::AsyncBinding>,
 }
 
 impl std::fmt::Debug for Store {
@@ -33,6 +35,8 @@ impl Store {
             inner,
             engine,
             thread_id,
+            #[cfg(feature = "experimental-async")]
+            async_binding: crate::backend::v8::async_runtime::AsyncBinding::new(),
         }
     }
 

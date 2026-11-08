@@ -204,14 +204,25 @@ impl Store {
     /// Transforms this store into a [`StoreAsync`] which can be used
     /// to invoke [`Function::call_async`](crate::Function::call_async).
     pub fn into_async(self) -> StoreAsync {
-        StoreAsync {
+        #[cfg(feature = "v8")]
+        let v8_binding = match &self.inner.store {
+            BackendStore::V8(store) => Some(store.async_binding.clone()),
+            #[cfg(any(feature = "sys", feature = "js"))]
+            _ => None,
+        };
+        let asynchronous = StoreAsync {
             #[cfg(feature = "sys")]
             native_invocation: self.inner.native_invocation.clone(),
             id: self.id(),
             inner: LocalRwLock::new(self.inner),
             #[cfg(feature = "sys")]
             loan: None,
+        };
+        #[cfg(feature = "v8")]
+        if let Some(binding) = v8_binding {
+            binding.bind(&asynchronous);
         }
+        asynchronous
     }
 }
 

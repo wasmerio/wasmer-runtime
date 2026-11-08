@@ -157,7 +157,7 @@ pub struct WeakAsyncFunctionEnvMut<T> {
     env: FunctionEnv<T>,
     #[cfg(feature = "sys")]
     local_owner: Option<std::rc::Weak<dyn std::any::Any>>,
-    #[cfg(feature = "sys")]
+    #[cfg(any(feature = "sys", feature = "v8"))]
     import_snapshot: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
@@ -169,7 +169,7 @@ impl<T> Clone for WeakAsyncFunctionEnvMut<T> {
             env: self.env.clone(),
             #[cfg(feature = "sys")]
             local_owner: self.local_owner.clone(),
-            #[cfg(feature = "sys")]
+            #[cfg(any(feature = "sys", feature = "v8"))]
             import_snapshot: self.import_snapshot.clone(),
         }
     }
@@ -201,7 +201,13 @@ impl<T: 'static> WeakAsyncFunctionEnvMut<T> {
                 },
             ),
             #[cfg(feature = "v8")]
-            _ => return None,
+            BackendFunctionEnv::V8(env) => BackendAsyncFunctionEnvMut::V8(
+                crate::backend::v8::function::env::AsyncFunctionEnvMut {
+                    store,
+                    func_env: env.clone(),
+                    import_snapshot: self.import_snapshot.clone(),
+                },
+            ),
         };
         Some(AsyncFunctionEnvMut(env))
     }
@@ -231,14 +237,14 @@ impl<T: 'static> AsyncFunctionEnvMut<T> {
             #[cfg(feature = "js")]
             BackendAsyncFunctionEnvMut::Js(env) => &env.store,
             #[cfg(feature = "v8")]
-            _ => return None,
+            BackendAsyncFunctionEnvMut::V8(env) => &env.store,
         };
         Some(WeakAsyncFunctionEnvMut {
             store: store.downgrade(),
             env: self.as_ref(),
             #[cfg(feature = "sys")]
             local_owner: self.native_local_owner(),
-            #[cfg(feature = "sys")]
+            #[cfg(any(feature = "sys", feature = "v8"))]
             import_snapshot: self.native_import_snapshot(),
         })
     }
@@ -264,7 +270,9 @@ impl<T: 'static> AsyncFunctionEnvMut<T> {
         match &self.0 {
             #[cfg(feature = "sys")]
             BackendAsyncFunctionEnvMut::Sys(env) => env.import_snapshot.clone(),
-            #[cfg(any(feature = "js", feature = "v8"))]
+            #[cfg(feature = "v8")]
+            BackendAsyncFunctionEnvMut::V8(env) => env.import_snapshot.clone(),
+            #[cfg(feature = "js")]
             _ => None,
         }
     }

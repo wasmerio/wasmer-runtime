@@ -68,6 +68,11 @@ impl Trap {
 
     #[allow(clippy::unnecessary_mut_passed)]
     pub unsafe fn into_wasm_trap(self, store: &mut impl AsStoreMut) -> *mut wasm_trap_t {
+        let raw = store.as_store_mut().inner.store.as_v8().inner;
+        unsafe { self.into_wasm_trap_raw(raw) }
+    }
+
+    pub(crate) unsafe fn into_wasm_trap_raw(self, raw: *mut wasm_store_t) -> *mut wasm_trap_t {
         match self.inner {
             InnerTrap::CApi(t) => t,
             InnerTrap::User(err) => {
@@ -79,8 +84,7 @@ impl Trap {
                 unsafe {
                     wasm_byte_vec_new(&mut data, error_message.len(), error_message.as_ptr() as _)
                 };
-                let store = store.as_store_mut();
-                let trap = unsafe { wasm_trap_new(store.inner.store.as_v8().inner, &mut data) };
+                let trap = unsafe { wasm_trap_new(raw, &mut data) };
                 unsafe { wasm_byte_vec_delete(&mut data) };
                 trap
             }

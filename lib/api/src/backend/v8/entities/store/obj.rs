@@ -72,6 +72,8 @@ impl_store_object! {
 #[derive(Default, Debug)]
 pub struct StoreObjects {
     id: StoreId,
+    #[cfg(feature = "experimental-async")]
+    pub(crate) host_callbacks: crate::backend::v8::async_runtime::HostCallbacks,
     globals: Vec<VMGlobal>,
     function_environments: Vec<VMFunctionEnvironment>,
 }
