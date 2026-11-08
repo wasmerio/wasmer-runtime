@@ -1,4 +1,4 @@
-use crate::backend::v8::origin::{Handle, Origin};
+use crate::backend::v8::origin::Handle;
 use wasmer_types::{ExternType, FunctionType, Mutability, Type};
 
 /// Utilities to convert between `v8` and `wasmer` values
@@ -43,10 +43,16 @@ impl IntoCApiValue for Value {
             Self::FuncRef(None) => wasm_val_t {
                 kind: bindings::wasm_valkind_enum_WASM_FUNCREF as _,
                 of: wasm_val_t__bindgen_ty_1 {
-                    ref_: unsafe { wasm_func_as_ref(std::ptr::null_mut()) },
+                    ref_: std::ptr::null_mut(),
                 },
             },
-            Self::ExternRef(_) => panic!(
+            Self::ExternRef(None) => wasm_val_t {
+                kind: bindings::wasm_valkind_enum_WASM_EXTERNREF as _,
+                of: wasm_val_t__bindgen_ty_1 {
+                    ref_: std::ptr::null_mut(),
+                },
+            },
+            Self::ExternRef(Some(_)) => panic!(
                 "Creating host values from guest ExternRefs is not currently supported in V8."
             ),
             Self::ExceptionRef(_) => {
@@ -68,11 +74,14 @@ impl IntoCApiValue for Value {
 
 pub trait IntoWasmerValue {
     /// Consume [`self`] to produce a [`Value`].
-    fn into_wv(self, origin: &Origin) -> Value;
+    fn into_wv(self, store: &impl crate::AsStoreRef) -> Value;
 }
 
 impl IntoWasmerValue for wasm_val_t {
-    fn into_wv(self, origin: &Origin) -> Value {
+    fn into_wv(self, store: &impl crate::AsStoreRef) -> Value {
+        let view = store.as_store_ref();
+        let backend = view.inner.store.as_v8();
+        let origin = backend.origin.capture();
         origin.check_alive().expect("invalid V8 value source");
         match self.kind as _ {
             bindings::wasm_valkind_enum_WASM_I32 => Value::I32(unsafe { self.of.i32_ }),
@@ -84,17 +93,24 @@ impl IntoWasmerValue for wasm_val_t {
             }
             bindings::wasm_valkind_enum_WASM_FUNCREF => {
                 let raw = unsafe { self.of.ref_ };
-                if raw.is_null() { Value::FuncRef(None) } else {
-                    let function = unsafe { wasm_ref_as_func(raw) };
+                if raw.is_null() {
+                    Value::FuncRef(None)
+                } else {
+                    let retained = backend.reference_roots.copy(raw, true);
+                    let function = unsafe { wasm_ref_as_func(retained) };
                     Value::FuncRef(Some(Function(BackendFunction::V8(
                         crate::backend::v8::function::Function {
                             handle: Handle::new(function, origin.clone()),
-                        }
+                        },
                     ))))
                 }
-            },
+            }
             bindings::wasm_valkind_enum_WASM_EXTERNREF => {
-                panic!("ExternRefs are not currently supported through wasm_c_api")
+                if unsafe { self.of.ref_ }.is_null() {
+                    Value::ExternRef(None)
+                } else {
+                    panic!("ExternRefs are not currently supported through wasm_c_api")
+                }
             }
             _ => unreachable!("v8 kind {} has no matching wasmer type", self.kind),
         }

@@ -64,7 +64,10 @@ impl Memory {
         let c_memory = unsafe { wasm_memory_new(v8_store.inner, memorytype) };
 
         Ok(Self {
-            handle: VMMemory(Handle::new(c_memory, v8_store.origin.capture())),
+            handle: VMMemory(Handle::new(
+                v8_store.reference_roots.memory(c_memory),
+                v8_store.origin.capture(),
+            )),
         })
     }
 
@@ -241,7 +244,10 @@ impl Memory {
         }
 
         let copied = Self {
-            handle: VMMemory(Handle::new(copied_memory, v8_store.origin.capture())),
+            handle: VMMemory(Handle::new(
+                v8_store.reference_roots.memory(copied_memory),
+                v8_store.origin.capture(),
+            )),
         };
 
         let src_view = self.view(store);

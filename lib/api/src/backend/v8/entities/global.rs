@@ -16,7 +16,7 @@ use crate::{
 };
 
 use super::check_isolate;
-use crate::backend::v8::origin::{Handle, Origin};
+use crate::backend::v8::{origin::Handle, references::OwnedValue};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A WebAssembly `global` in the `v8` runtime.
@@ -66,7 +66,9 @@ impl Global {
 
         Ok(Self {
             handle: Handle::new(
-                unsafe { wasm_global_new(v8_store.inner, v8_global_type, &v8_value) },
+                v8_store
+                    .reference_roots
+                    .global(unsafe { wasm_global_new(v8_store.inner, v8_global_type, &v8_value) }),
                 v8_store.origin.capture(),
             ),
         })
@@ -103,7 +105,8 @@ impl Global {
         let store = store.as_store_ref();
         let mut out = unsafe { std::mem::zeroed() };
         unsafe { wasm_global_get(self.handle.raw(), &mut out) };
-        out.into_wv(&self.handle.origin)
+        let owned = OwnedValue::adopt(out);
+        (*owned.value()).into_wv(&store)
     }
 
     pub fn set(&self, store: &mut impl AsStoreMut, val: Value) -> Result<(), RuntimeError> {

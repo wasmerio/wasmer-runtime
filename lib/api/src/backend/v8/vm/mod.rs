@@ -47,6 +47,11 @@ impl VMExtern {
     ) -> Result<Extern, crate::RuntimeError> {
         let mut actual = store.as_store_mut();
         let raw = self.checked_raw(&actual)?;
+        let backend = actual.inner.store.as_v8();
+        let retained = backend
+            .reference_roots
+            .copy(unsafe { wasm_extern_as_ref(raw) }, false);
+        let raw = unsafe { wasm_ref_as_extern(retained) };
         // Provenance is checked BEFORE querying even the raw kind.
         let kind = unsafe { wasm_extern_kind(raw) };
         let origin = self.origin.clone();
@@ -213,6 +218,9 @@ impl VMSharedMemory {
             !memory.is_null(),
             "Failed to obtain V8 shared memory: wasm_memory_obtain returned null"
         );
-        VMMemory(Handle::new(memory, store.origin.capture()))
+        VMMemory(Handle::new(
+            store.reference_roots.memory(memory),
+            store.origin.capture(),
+        ))
     }
 }

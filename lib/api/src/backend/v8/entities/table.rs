@@ -12,7 +12,7 @@ use crate::{
 };
 
 use super::check_isolate;
-use crate::backend::v8::origin::{Handle, Origin};
+use crate::backend::v8::{origin::Handle, references::OwnedValue};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A WebAssembly `table` in the `v8` runtime.
@@ -55,7 +55,9 @@ impl Table {
 
         Ok(Self {
             handle: Handle::new(
-                unsafe { wasm_table_new(v8_store.inner, wasm_tablety, init.of.ref_) },
+                v8_store
+                    .reference_roots
+                    .table(unsafe { wasm_table_new(v8_store.inner, wasm_tablety, init.of.ref_) }),
                 v8_store.origin.capture(),
             ),
         })
@@ -110,7 +112,7 @@ impl Table {
 
             if ref_.is_null() {
                 return match self.ty(store).ty {
-                    wasmer_types::Type::ExternRef => Some(Value::ExceptionRef(None)),
+                    wasmer_types::Type::ExternRef => Some(Value::ExternRef(None)),
                     wasmer_types::Type::FuncRef => Some(Value::FuncRef(None)),
                     ty => panic!("unsupported table type: {ty:?}"),
                 };
@@ -122,12 +124,12 @@ impl Table {
                 ty => panic!("unsupported table type: {ty:?}"),
             } as u8;
 
-            let value = wasm_val_t {
+            let value = OwnedValue::adopt(wasm_val_t {
                 kind,
                 of: bindings::wasm_val_t__bindgen_ty_1 { ref_ },
-            };
+            });
 
-            Some(value.into_wv(&self.handle.origin))
+            Some((*value.value()).into_wv(store))
         }
     }
 

@@ -14,3 +14,5 @@ pub(crate) mod async_runtime;
 pub use async_runtime::{BlockingExecutor, set_blocking_executor};
 
 pub(crate) mod origin;
+
+pub(crate) mod references;

@@ -21,6 +21,7 @@ use crate::{
         entities::function::env,
         error::Trap,
         origin::{Handle, Origin},
+        references::{OwnedValue, Values as CallValues},
         utils::convert::{IntoCApiType, IntoCApiValue, IntoWasmerValue},
     },
     entities::function::async_host::{AsyncFunctionEnv, AsyncHostFunction},
@@ -99,11 +100,15 @@ impl Function {
                         ));
                     }
                     arguments = Some(CallValues::from_values(&parameters));
-                    results = Some(CallValues::uninitialized(signature.results().len()));
+                    results = Some(CallValues::empty(signature.results().len()));
                     // Actual backing remains strongly owned, but NO StoreMut or
                     // LocalRwLock guard remains across wee8 or any host factory.
                     drop(locked.take());
                     loop {
+                        results.as_mut().unwrap().clear();
+                        if frame.has_panic() {
+                            return Err(RuntimeError::new("V8 call cleanup panicked"));
+                        }
                         let trap = unsafe {
                             wasm_func_call(
                                 function.handle.raw(),
@@ -148,16 +153,18 @@ impl Function {
                         if !trap.is_null() {
                             return Err(Trap::from(trap).into());
                         }
-                        let values = unsafe {
-                            std::slice::from_raw_parts(
-                                results.as_ref().unwrap().0.data,
-                                results.as_ref().unwrap().0.size,
-                            )
-                        }
-                        .iter()
-                        .map(|value| (*value).into_wv(&function.handle.origin))
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice();
+                        let guard = StoreAsyncWriteLock::try_acquire(&store).ok_or_else(|| {
+                            RuntimeError::new("V8 result Store is still borrowed")
+                        })?;
+                        function.handle.origin.check_store(&guard)?;
+                        let values = results
+                            .as_ref()
+                            .unwrap()
+                            .as_slice()
+                            .iter()
+                            .map(|value| (*value).into_wv(&guard))
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice();
                         return Ok(values);
                     }
                 },
@@ -281,7 +288,7 @@ impl Function {
         assert!(!handle.is_null(), "failed to create V8 async host function");
         Self {
             handle: Handle::new(
-                handle,
+                view.inner.store.as_v8().reference_roots.function(handle),
                 Origin::of(&view).expect("actual V8 constructor Store"),
             ),
         }
@@ -416,9 +423,9 @@ where
                     import_snapshot: snapshot,
                 }));
             let arguments = unsafe { &*arguments };
-            let values = unsafe { std::slice::from_raw_parts(arguments.data, arguments.size) }
+            let values = crate::backend::v8::references::borrowed_values(arguments)
                 .iter()
-                .map(|value| (*value).into_wv(&callback.origin))
+                .map(|value| (*value).into_wv(&guard))
                 .collect::<Vec<_>>();
             (environment, values)
         }; // no actual Store/context guard survives the factory or its future
@@ -443,14 +450,15 @@ where
         if output.iter().any(|value| !value.is_from_store(&_guard)) {
             return Err(RuntimeError::new("V8 host result belongs to another Store"));
         }
-        let destination = unsafe { std::slice::from_raw_parts_mut(results.data, results.size) };
+        let destination = crate::backend::v8::references::borrowed_values_mut(results);
         for (slot, value) in destination.iter_mut().zip(output) {
-            *slot = value.into_cv();
+            OwnedValue::copy(&value.into_cv()).replace(slot);
         }
         Ok(())
     }));
     let error = match outcome {
-        Ok(Ok(())) => return std::ptr::null_mut(),
+        Ok(Ok(())) if !binding.current_has_panic() => return std::ptr::null_mut(),
+        Ok(Ok(())) => RuntimeError::new("V8 host cleanup panicked"),
         Ok(Err(error)) => error,
         Err(panic) => {
             binding.record(panic, unwinding);
@@ -491,30 +499,6 @@ fn typed_results<Rets: WasmTypeList>(
         .zip(signature.results())
         .map(|(value, ty)| unsafe { Value::from_raw(store, *ty, *value) })
         .collect())
-}
-
-struct CallValues(wasm_val_vec_t);
-impl CallValues {
-    fn from_values(values: &[Value]) -> Self {
-        let raw = values
-            .iter()
-            .cloned()
-            .map(IntoCApiValue::into_cv)
-            .collect::<Vec<_>>();
-        let mut vector = Default::default();
-        unsafe { wasm_val_vec_new(&mut vector, raw.len(), raw.as_ptr()) };
-        Self(vector)
-    }
-    fn uninitialized(length: usize) -> Self {
-        let mut vector = Default::default();
-        unsafe { wasm_val_vec_new_uninitialized(&mut vector, length) };
-        Self(vector)
-    }
-}
-impl Drop for CallValues {
-    fn drop(&mut self) {
-        unsafe { wasm_val_vec_delete(&mut self.0) };
-    }
 }
 
 fn guarded_dispose(frame: &crate::backend::v8::async_runtime::CallGuard, cleanup: impl FnOnce()) {

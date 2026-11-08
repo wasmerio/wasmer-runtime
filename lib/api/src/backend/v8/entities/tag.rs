@@ -55,7 +55,10 @@ impl Tag {
         }
 
         Self {
-            handle: Handle::new(handle, v8_store.origin.capture()),
+            handle: Handle::new(
+                v8_store.reference_roots.tag(handle),
+                v8_store.origin.capture(),
+            ),
         }
     }
 

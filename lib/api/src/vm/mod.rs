@@ -59,9 +59,17 @@ impl VMExtern {
         if raw.is_null() {
             return Err(crate::RuntimeError::new("null V8 extern"));
         }
+        let view = store.as_store_ref();
+        let reference = unsafe { crate::backend::v8::bindings::wasm_extern_as_ref(raw.cast()) };
+        let retained = view
+            .inner
+            .store
+            .as_v8()
+            .reference_roots
+            .copy(reference, false);
+        let raw = unsafe { crate::backend::v8::bindings::wasm_ref_as_extern(retained) };
         Ok(Self::V8(crate::backend::v8::origin::Handle::new(
-            raw.cast(),
-            origin,
+            raw, origin,
         )))
     }
 }

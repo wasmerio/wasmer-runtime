@@ -1,0 +1,474 @@
+//! Actual C++ reference owners. Transferable handles retain only inert metadata;
+//! these roots move with their one real backend Store and die before its isolate.
+
+use super::bindings::*;
+use std::cell::RefCell;
+
+pub(crate) struct OwnedValue(Option<wasm_val_t>);
+impl OwnedValue {
+    /// Takes the caller's actual owned value, never a borrowed callback value.
+    pub(crate) fn adopt(value: wasm_val_t) -> Self {
+        Self(Some(value))
+    }
+    pub(crate) fn reference(raw: *mut wasm_ref_t, function: bool) -> Self {
+        Self::adopt(wasm_val_t {
+            kind: if function {
+                wasm_valkind_enum_WASM_FUNCREF
+            } else {
+                wasm_valkind_enum_WASM_EXTERNREF
+            } as _,
+            of: wasm_val_t__bindgen_ty_1 { ref_: raw },
+        })
+    }
+    pub(crate) fn copy(value: &wasm_val_t) -> Self {
+        let mut copied = zero();
+        unsafe { wasm_val_copy(&mut copied, value) };
+        let owned = Self::adopt(copied);
+        if matches!(
+            value.kind as _,
+            wasm_valkind_enum_WASM_FUNCREF | wasm_valkind_enum_WASM_EXTERNREF
+        ) && !unsafe { value.of.ref_ }.is_null()
+        {
+            assert!(
+                !owned.reference_ptr().is_null(),
+                "V8 reference copy returned null"
+            );
+        }
+        owned
+    }
+    pub(crate) fn value(&self) -> &wasm_val_t {
+        self.0.as_ref().unwrap()
+    }
+    pub(crate) fn take(&mut self) -> wasm_val_t {
+        self.0
+            .take()
+            .expect("V8 owned value was already transferred")
+    }
+    fn reference_ptr(&self) -> *mut wasm_ref_t {
+        unsafe { self.0.as_ref().unwrap().of.ref_ }
+    }
+    pub(crate) fn replace(mut self, destination: &mut wasm_val_t) {
+        // Publish the SAME owner before disposing any previous owned value.
+        let old = std::mem::replace(destination, self.take());
+        drop(Self::adopt(old));
+    }
+}
+impl Drop for OwnedValue {
+    fn drop(&mut self) {
+        if let Some(mut value) = self.0.take() {
+            // The generated ref_delete uses C++ delete x. The verified Val
+            // route instead invokes own<Ref> -> Ref::destroy -> RefImpl dtor.
+            // wasm_val_delete does not clear its input: disarm FIRST.
+            unsafe { wasm_val_delete(&mut value) };
+        }
+    }
+}
+
+fn zero() -> wasm_val_t {
+    wasm_val_t {
+        kind: wasm_valkind_enum_WASM_I32 as _,
+        of: wasm_val_t__bindgen_ty_1 { i32_: 0 },
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ReferenceRoots(RefCell<Vec<OwnedValue>>);
+impl ReferenceRoots {
+    fn existing(&self, raw: *mut wasm_ref_t) -> Option<*mut wasm_ref_t> {
+        // Never hold a RefCell borrow across C++ operations or finalizers.
+        let candidates = self
+            .0
+            .borrow()
+            .iter()
+            .map(OwnedValue::reference_ptr)
+            .collect::<Vec<_>>();
+        candidates
+            .into_iter()
+            .find(|candidate| unsafe { wasm_ref_same(*candidate, raw) })
+    }
+    pub(crate) fn adopt(&self, value: OwnedValue) -> *mut wasm_ref_t {
+        let raw = value.reference_ptr();
+        assert!(!raw.is_null(), "cannot retain a null V8 reference");
+        if let Some(existing) = self.existing(raw) {
+            return existing;
+        }
+        self.0.borrow_mut().push(value);
+        raw
+    }
+    pub(crate) fn copy(&self, raw: *mut wasm_ref_t, function: bool) -> *mut wasm_ref_t {
+        assert!(!raw.is_null(), "cannot copy a null V8 reference");
+        if let Some(existing) = self.existing(raw) {
+            return existing;
+        }
+        // Copy before publication; the actual copy remains RAII-owned through
+        // deduplication, including any finite reentry while C++ runs.
+        let borrowed = wasm_val_t {
+            kind: if function {
+                wasm_valkind_enum_WASM_FUNCREF
+            } else {
+                wasm_valkind_enum_WASM_EXTERNREF
+            } as _,
+            of: wasm_val_t__bindgen_ty_1 { ref_: raw },
+        };
+        self.adopt(OwnedValue::copy(&borrowed))
+    }
+    pub(crate) fn drain(&mut self) {
+        let values = std::mem::take(self.0.get_mut());
+        for value in values {
+            drop(value);
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+}
+
+macro_rules! owned_handle {
+    ($($method:ident, $ty:ty, $as_ref:ident, $from_ref:ident, $function:expr;)*) => { $(
+        impl ReferenceRoots {
+            pub(crate) fn $method(&self, owned: *mut $ty) -> *mut $ty {
+                assert!(!owned.is_null(), "V8 owned constructor returned null");
+                let reference = unsafe { $as_ref(owned) };
+                let retained = self.adopt(OwnedValue::reference(reference, $function));
+                unsafe { $from_ref(retained) }
+            }
+        }
+    )* };
+}
+owned_handle! {
+    function, wasm_func_t, wasm_func_as_ref, wasm_ref_as_func, true;
+    global, wasm_global_t, wasm_global_as_ref, wasm_ref_as_global, false;
+    table, wasm_table_t, wasm_table_as_ref, wasm_ref_as_table, false;
+    memory, wasm_memory_t, wasm_memory_as_ref, wasm_ref_as_memory, false;
+    tag, wasm_tag_t, wasm_tag_as_ref, wasm_ref_as_tag, false;
+}
+
+/// Owns its actual vector and every contained value, with explicit safe empty
+/// slots before a trap/panic or an InvokeAgain can leave partial results.
+pub(crate) struct Values(pub(crate) wasm_val_vec_t);
+impl Values {
+    pub(crate) fn empty(length: usize) -> Self {
+        let mut raw = Default::default();
+        unsafe { wasm_val_vec_new_uninitialized(&mut raw, length) };
+        let mut values = Self(raw);
+        for slot in values.as_mut_slice() {
+            *slot = zero();
+        }
+        values
+    }
+    pub(crate) fn from_values(values: &[crate::Value]) -> Self {
+        use super::utils::convert::IntoCApiValue;
+        let mut result = Self::empty(values.len());
+        for (slot, value) in result.as_mut_slice().iter_mut().zip(values) {
+            OwnedValue::copy(&value.clone().into_cv()).replace(slot);
+        }
+        result
+    }
+    pub(crate) fn as_slice(&self) -> &[wasm_val_t] {
+        if self.0.size == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.0.data, self.0.size) }
+        }
+    }
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [wasm_val_t] {
+        if self.0.size == 0 {
+            &mut []
+        } else {
+            unsafe { std::slice::from_raw_parts_mut(self.0.data, self.0.size) }
+        }
+    }
+    pub(crate) fn clear(&mut self) {
+        for slot in self.as_mut_slice() {
+            let old = std::mem::replace(slot, zero());
+            drop(OwnedValue::adopt(old));
+        }
+    }
+}
+impl Drop for Values {
+    fn drop(&mut self) {
+        // The verified vec<Val> destruction also uses Val::reset/Ref::destroy.
+        unsafe { wasm_val_vec_delete(&mut self.0) };
+    }
+}
+
+pub(crate) struct Exports(pub(crate) wasm_extern_vec_t);
+impl Exports {
+    pub(crate) fn take(&mut self, index: usize) -> OwnedValue {
+        let slot = unsafe { &mut *self.0.data.add(index) };
+        let raw = std::mem::replace(slot, std::ptr::null_mut());
+        assert!(!raw.is_null(), "V8 export was already transferred");
+        OwnedValue::reference(unsafe { wasm_extern_as_ref(raw) }, false)
+    }
+}
+impl Drop for Exports {
+    fn drop(&mut self) {
+        for index in 0..self.0.size {
+            let slot = unsafe { &mut *self.0.data.add(index) };
+            let raw = std::mem::replace(slot, std::ptr::null_mut());
+            if !raw.is_null() {
+                drop(OwnedValue::reference(
+                    unsafe { wasm_extern_as_ref(raw) },
+                    false,
+                ));
+            }
+        }
+        // Every element has been disarmed; only vector storage remains.
+        unsafe { wasm_extern_vec_delete(&mut self.0) };
+    }
+}
+
+// C++ represents an empty vector with a null data pointer. Rust slices still
+// require a nonnull aligned pointer at length zero, so preserve that boundary.
+pub(crate) fn borrowed_values(raw: &wasm_val_vec_t) -> &[wasm_val_t] {
+    if raw.size == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(raw.data, raw.size) }
+    }
+}
+pub(crate) fn borrowed_values_mut(raw: &mut wasm_val_vec_t) -> &mut [wasm_val_t] {
+    if raw.size == 0 {
+        &mut []
+    } else {
+        unsafe { std::slice::from_raw_parts_mut(raw.data, raw.size) }
+    }
+}
+
+#[cfg(all(test, feature = "experimental-async"))]
+mod tests {
+    use super::*;
+    use crate::{
+        AsStoreRef, Function, FunctionType, Instance, Module, Store, StoreAsync, Type, Value,
+    };
+    use std::{
+        cell::RefCell,
+        rc::Rc,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    fn roots(store: &StoreAsync) -> usize {
+        let guard = futures::executor::block_on(store.read_lock());
+        guard
+            .as_store_ref()
+            .inner
+            .store
+            .as_v8()
+            .reference_roots
+            .len()
+    }
+    fn call(function: &Function, store: &StoreAsync, values: Vec<Value>) -> Box<[Value]> {
+        futures::executor::block_on(function.call_async(store, values)).unwrap()
+    }
+    fn fixture() -> (Store, Instance) {
+        let mut store = Store::new(crate::v8::V8::new());
+        let module = Module::new(
+            &store,
+            wat::parse_str(
+                r#"(module
+            (func $target (export "target") (result i32) i32.const 37)
+            (table (export "table") 1 funcref)
+            (elem (i32.const 0) $target)
+            (global (export "global") (mut funcref) (ref.func $target))
+            (func (export "get") (result funcref) ref.func $target)
+            (func (export "pass") (param funcref) (result funcref) local.get 0)
+            (func (export "none") (result funcref) ref.null func)
+            (func (export "multi") (result funcref i32 funcref)
+                ref.func $target i32.const 42 ref.func $target)
+            (func (export "trap") (param funcref) (result funcref) unreachable))"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let instance = Instance::new(&mut store, &module, &crate::Imports::new()).unwrap();
+        (store, instance)
+    }
+
+    #[test]
+    fn returned_table_global_and_argument_funcrefs_keep_one_canonical_owned_root() {
+        let (store, instance) = fixture();
+        let target = instance.exports.get_function("target").unwrap().clone();
+        let get = instance.exports.get_function("get").unwrap().clone();
+        let pass = instance.exports.get_function("pass").unwrap().clone();
+        let none = instance.exports.get_function("none").unwrap().clone();
+        let multi = instance.exports.get_function("multi").unwrap().clone();
+        let table = instance.exports.get_table("table").unwrap().clone();
+        let global = instance.exports.get_global("global").unwrap().clone();
+        let store = store.into_async();
+        let baseline = roots(&store);
+        for _ in 0..32 {
+            let returned = call(&get, &store, vec![])[0]
+                .unwrap_funcref()
+                .as_ref()
+                .unwrap()
+                .clone();
+            // The result vector has already been destroyed at this point.
+            assert_eq!(returned, target);
+            assert_eq!(call(&returned, &store, vec![])[0].i32(), Some(37));
+            let passed = call(&pass, &store, vec![Value::FuncRef(Some(target.clone()))]);
+            assert_eq!(passed[0].unwrap_funcref().as_ref().unwrap(), &target);
+            // Argument vector destruction must not delete target's own wrapper.
+            assert_eq!(call(&target, &store, vec![])[0].i32(), Some(37));
+            assert!(call(&none, &store, vec![])[0].unwrap_funcref().is_none());
+            let multiple = call(&multi, &store, vec![]);
+            assert_eq!(multiple[1].i32(), Some(42));
+            assert_eq!(multiple[0].unwrap_funcref(), multiple[2].unwrap_funcref());
+            {
+                let mut guard = futures::executor::block_on(store.write_lock());
+                let entry = table.get(&mut guard, 0).unwrap();
+                let current = global.get(&mut guard);
+                assert_eq!(entry.unwrap_funcref().as_ref().unwrap(), &target);
+                assert_eq!(current.unwrap_funcref().as_ref().unwrap(), &target);
+            }
+            assert_eq!(
+                roots(&store),
+                baseline,
+                "no per-call/return reference history"
+            );
+        }
+        drop(instance);
+        let origin = target.as_v8().handle.origin.clone();
+        drop(store);
+        assert!(origin.check_alive().is_err());
+        // Metadata may still move/clone/drop; no C++ operation occurs here.
+        let stale = std::thread::spawn(move || target.clone()).join().unwrap();
+        let _copy = stale.clone();
+    }
+
+    #[test]
+    fn callback_argument_escape_survives_input_cleanup_and_trap_and_first_panic() {
+        let (mut store, instance) = fixture();
+        let target = instance.exports.get_function("target").unwrap().clone();
+        let trapped = instance.exports.get_function("trap").unwrap().clone();
+        let saved = Rc::new(RefCell::new(None));
+        let destination = saved.clone();
+        let capture = Function::new_async(
+            &mut store,
+            FunctionType::new([Type::FuncRef], []),
+            move |values| {
+                *destination.borrow_mut() = values[0].unwrap_funcref().clone();
+                async { Ok(vec![]) }
+            },
+        );
+        struct Payload(Arc<AtomicUsize>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let payload = Box::new(Payload(drops.clone()));
+        let address = (&*payload) as *const Payload as usize;
+        let pending = Rc::new(RefCell::new(Some(payload)));
+        let failing = Function::new_async(
+            &mut store,
+            FunctionType::new([Type::FuncRef], [Type::FuncRef]),
+            move |_| {
+                let mut payload = pending.borrow_mut().take();
+                std::future::poll_fn(
+                    move |_| -> std::task::Poll<Result<Vec<Value>, crate::RuntimeError>> {
+                        std::panic::resume_unwind(payload.take().unwrap())
+                    },
+                )
+            },
+        );
+        let store = store.into_async();
+        let baseline = roots(&store);
+        call(&capture, &store, vec![Value::FuncRef(Some(target.clone()))]);
+        let escaped = saved.borrow().as_ref().unwrap().clone();
+        assert_eq!(call(&escaped, &store, vec![])[0].i32(), Some(37));
+        assert!(
+            futures::executor::block_on(
+                trapped.call_async(&store, vec![Value::FuncRef(Some(target.clone()))])
+            )
+            .is_err()
+        );
+        assert_eq!(call(&target, &store, vec![])[0].i32(), Some(37));
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            futures::executor::block_on(
+                failing.call_async(&store, vec![Value::FuncRef(Some(target.clone()))]),
+            )
+        }))
+        .unwrap_err();
+        let payload = panic.downcast::<Payload>().unwrap();
+        assert_eq!((&*payload) as *const Payload as usize, address);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        drop(payload);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(call(&escaped, &store, vec![])[0].i32(), Some(37));
+        assert_eq!(roots(&store), baseline);
+        drop(instance);
+    }
+
+    #[test]
+    fn checked_origins_reject_wrong_backings_before_raw_conversions_and_imports() {
+        use crate::{
+            AsStoreMut, Extern, Global, Memory, MemoryType, Table, TableType, Tag, VMExternToExtern,
+        };
+        let mut a = Store::new(crate::v8::V8::new());
+        let mut b = Store::new(crate::v8::V8::new());
+        let function = Function::new_typed(&mut a, || 17i32);
+        let table = Table::new(
+            &mut a,
+            TableType::new(Type::FuncRef, 1, Some(1)),
+            Value::FuncRef(Some(function.clone())),
+        )
+        .unwrap();
+        let global = Global::new_mut(&mut a, Value::FuncRef(Some(function.clone())));
+        let memory = Memory::new(&mut a, MemoryType::new(1, Some(1), false)).unwrap();
+        let tag = Tag::new(&mut a, [Type::I32]);
+        let copied = Extern::Function(function.clone());
+        let foreign = copied.to_vm_extern();
+        assert!(Extern::try_from_vm_extern(&mut b, foreign).is_err());
+        // A duplicate StoreId cannot make this an actual V8 backing match.
+        let id = a.id();
+        b.as_store_mut().objects_mut().as_v8_mut().set_id(id);
+        assert!(Extern::try_from_vm_extern(&mut b, copied.to_vm_extern()).is_err());
+        let legitimate = copied.to_vm_extern().to_extern(&mut a);
+        assert_eq!(legitimate, Extern::Function(function.clone()));
+        let raw = Extern::Function(function.clone())
+            .to_vm_extern()
+            .unwrap_v_8();
+        let imported =
+            unsafe { crate::vm::VMExtern::from_raw_v8_unchecked(&a, raw.raw().cast()) }.unwrap();
+        assert_eq!(
+            Extern::try_from_vm_extern(&mut a, imported).unwrap(),
+            legitimate
+        );
+        assert!(
+            table
+                .set(&mut b, 0, Value::FuncRef(Some(function.clone())))
+                .is_err()
+        );
+        assert!(
+            global
+                .set(&mut b, Value::FuncRef(Some(function.clone())))
+                .is_err()
+        );
+        assert!(memory.grow_at_least(&mut b, 0).is_err());
+        assert!(memory.reset(&mut b).is_err());
+        assert!(memory.copy(&b).is_err());
+        assert!(memory.as_shared(&b).is_none());
+        for value in [
+            Extern::Function(function),
+            Extern::Table(table),
+            Extern::Global(global),
+            Extern::Memory(memory),
+            Extern::Tag(tag),
+        ] {
+            assert!(!value.is_from_store(&b));
+            let module = Module::new(
+                &b,
+                wat::parse_str("(module (import \"host\" \"target\" (func)))").unwrap(),
+            )
+            .unwrap();
+            // Import origin rejection precedes even kind/signature conversion.
+            let imports = crate::imports! { "host" => { "target" => value } };
+            assert!(Instance::new(&mut b, &module, &imports).is_err());
+        }
+    }
+}

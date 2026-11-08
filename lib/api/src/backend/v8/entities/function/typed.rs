@@ -13,10 +13,9 @@ use std::iter::FromIterator;
 #[cfg(feature = "experimental-async")]
 use crate::{AsStoreAsync, StoreAsync};
 use crate::{
-    AsStoreMut, CallWrapper, FromToNativeWasmType, NativeWasmType, NativeWasmTypeInto,
-    RuntimeError, TypedFunction, Value, WasmTypeList,
+    AsStoreMut, FromToNativeWasmType, NativeWasmType, NativeWasmTypeInto, RuntimeError,
+    TypedFunction, Value, WasmTypeList,
     backend::v8::{bindings::*, error::Trap, function::Function, utils::convert::*},
-    entities::function::call_wrapper::call_wrapped,
 };
 #[cfg(feature = "experimental-async")]
 use std::future::Future;
@@ -62,56 +61,57 @@ macro_rules! impl_native_traits {
 
             /// Call the typed func and return results.
             #[allow(clippy::too_many_arguments)]
-            pub fn call_v8(&self, store: &mut impl AsStoreMut, $( $x: $x, )* ) -> Result<Rets, RuntimeError> where
-            $( $x: FromToNativeWasmType, )*
-            {
-                self.call_wrapped_v8(store, None, $( $x, )*)
-            }
-
-            /// Call the typed func through `wrapper` and return results.
-            #[allow(clippy::too_many_arguments)]
-            pub(crate) fn call_wrapped_v8(&self, mut store: &mut impl AsStoreMut, wrapper: Option<&mut dyn CallWrapper>, $( $x: $x, )* ) -> Result<Rets, RuntimeError> where
+            pub fn call_v8(&self, mut store: &mut impl AsStoreMut, $( $x: $x, )* ) -> Result<Rets, RuntimeError> where
             $( $x: FromToNativeWasmType, )*
             {
 
                  if !self.func.is_from_store(store) {
                      return Err(RuntimeError::new("V8 typed function belongs to another Store"));
                  }
-                 let origin = crate::backend::v8::origin::Origin::of(store)?;
+
                  // // let store_ptr = Value::I64(store.as_store_mut().as_raw() as _).as_jsvalue(store);
                  #[allow(unused_unsafe)]
                  let params_list: Vec<_> = unsafe {
                      vec![ $( {
                          let raw = $x.to_native().into_raw(store);
-                         let value = Value::from_raw(&mut *store, <$x::Native as NativeWasmType>::WASM_TYPE, raw);
-                         value.into_cv()
+                         let value = Value::from_raw(&mut store, <$x::Native as NativeWasmType>::WASM_TYPE, raw);
+                         value
                      } ),* ]
                  };
 
-                 let mut results = {
-                    unsafe {
-                        let mut ret = std::mem::zeroed();
-                        wasm_val_vec_new_uninitialized(&mut ret, Rets::wasm_types().len());
-                        ret
-                    }
-                };
+                 let mut results = crate::backend::v8::references::Values::empty(Rets::wasm_types().len());
 
 
                  let func = unsafe { wasm_extern_as_func(self.func.to_vm_extern().unwrap_v_8().raw()) };
 
-                 call_wrapped(store, wrapper, |_| {
-                    // `wasm_func_call` takes the arguments, so every entry gets its own.
-                    let mut params = unsafe { std::mem::zeroed() };
-                    let trap = unsafe {
-                        wasm_val_vec_new(&mut params, params_list.len(), params_list.as_ptr());
-                        wasm_func_call(func, &params, &mut results)
-                    };
-                    if trap.is_null() {
-                        Ok(())
-                    } else {
-                        Err(RuntimeError::from(Trap::from(trap)))
+                let params = crate::backend::v8::references::Values::from_values(&params_list);
+
+                 let mut trap;
+
+                 loop {
+                    results.clear();
+                    trap = unsafe { wasm_func_call(func, &params.0, &mut results.0) };
+
+                    let store_mut = store.as_store_mut();
+                    if let Some(callback) = store_mut.inner.on_called.take() {
+                        match callback(store_mut) {
+                            Ok(wasmer_types::OnCalledAction::InvokeAgain) => { continue; }
+                            Ok(wasmer_types::OnCalledAction::Finish) => { break; }
+                            Ok(wasmer_types::OnCalledAction::Trap(trap)) => { return Err(RuntimeError::user(trap)) },
+                            Err(trap) => { return Err(RuntimeError::user(trap)) },
+                        }
                     }
-                 })?;
+                    break;
+                };
+
+
+
+                 if !trap.is_null() {
+                     unsafe {
+                        let trap: Trap = trap.into();
+                        return Err(RuntimeError::from(trap));
+                     }
+                }
 
                 unsafe {
                     let mut rets_list_array = Rets::empty_array();
@@ -120,21 +120,16 @@ macro_rules! impl_native_traits {
                     match Rets::size() {
                         0 => {},
                         1 => {
-                            let val = (*results.data.wrapping_add(0)).clone();
-<<<<<<< HEAD
-                            let val = val.into_wv();
-                            *mut_rets = val.as_raw(store);
-=======
-                            let val = val.into_wv(&origin);
+                            let val = (*results.0.data.wrapping_add(0)).clone();
+                            let val = val.into_wv(store);
                             *mut_rets = val.as_raw(&mut store);
->>>>>>> feat(api): add checked same-stack V8 async calls
                         }
                         _n => {
                             for (i, ret_type) in Rets::wasm_types().iter().enumerate() {
-                                    let val = (*results.data.wrapping_add(i)).clone();
-                                    let val = val.into_wv(&origin);
+                                    let val = (*results.0.data.wrapping_add(i)).clone();
+                                    let val = val.into_wv(store);
                                     let slot = mut_rets.add(i);
-                                    *slot = val.as_raw(store);
+                                    *slot = val.as_raw(&mut store);
                             }
                         }
                     }
