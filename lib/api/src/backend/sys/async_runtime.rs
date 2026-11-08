@@ -27,6 +27,7 @@ use crate::{
 use wasmer_types::StoreId;
 
 type HostFuture = Pin<Box<dyn Future<Output = Result<Vec<Value>, RuntimeError>> + 'static>>;
+type OwnedNativeCallFuture = Pin<Box<dyn Future<Output = Result<Box<[Value]>, RuntimeError>>>>;
 
 pub(crate) fn call_function_async(
     function: SysFunction,
@@ -66,20 +67,13 @@ pub fn call_async_with_local_owner(
 /// Constructs the same owned call and observes only its new physical root.
 /// The observer is registered before either value is published or polled.
 #[doc(hidden)]
-#[allow(clippy::type_complexity)]
 pub fn call_async_with_local_owner_observed(
     function: &crate::Function,
     store: &StoreAsync,
     params: Vec<Value>,
     owner: std::rc::Weak<dyn std::any::Any>,
     cleanup: Option<&NativeCleanupOwner>,
-) -> Result<
-    (
-        Pin<Box<dyn Future<Output = Result<Box<[Value]>, RuntimeError>>>>,
-        NativeAncestrySettlement,
-    ),
-    RuntimeError,
-> {
+) -> Result<(OwnedNativeCallFuture, NativeAncestrySettlement), RuntimeError> {
     match &function.0 {
         crate::BackendFunction::Sys(function) => {
             let future = AsyncCallFuture::new_with_local_owner(
