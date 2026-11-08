@@ -215,7 +215,7 @@ impl Value {
                     if view.inner.store.is_v8() {
                         return false;
                     }
-                    return e.is_from_store(&view);
+                    e.is_from_store(&view)
                 }
                 #[cfg(not(feature = "v8"))]
                 e.is_from_store(store)
@@ -227,7 +227,7 @@ impl Value {
                     if view.inner.store.is_v8() {
                         return false;
                     }
-                    return e.is_from_store(&view);
+                    e.is_from_store(&view)
                 }
                 #[cfg(not(feature = "v8"))]
                 e.is_from_store(store)

@@ -29,6 +29,7 @@ use crate::{
 use super::Function;
 
 type ImportCapture<T> = fn(&T) -> Option<Arc<dyn Any + Send + Sync>>;
+type OwnedCallFuture = Pin<Box<dyn Future<Output = Result<Box<[Value]>, RuntimeError>>>>;
 
 struct AsyncCallback<T, F> {
     binding: Rc<AsyncBinding>,
@@ -50,7 +51,7 @@ impl Function {
         &self,
         asynchronous: &impl AsStoreAsync,
         parameters: Vec<Value>,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<[Value]>, RuntimeError>>>> {
+    ) -> OwnedCallFuture {
         // Clone/Drop are opaque pointer + inert atomic metadata only, including
         // expiration and foreign-thread metadata destruction. No wee8 query.
         let function = self.clone();

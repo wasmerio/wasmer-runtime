@@ -298,7 +298,9 @@ impl<T> Drop for FunctionEnvMut<'_, T> {
             // End this frame's real Store subborrow BEFORE any disposition.
             // Original write-cap transfer is metadata-only; it never resolves
             // a then-current/new guard or queries a dying Store's live token.
-            drop(self.store_mut.take());
+            {
+                let _store_subborrow = self.store_mut.take();
+            }
             #[cfg(feature = "experimental-async")]
             let value = match &self.retirement {
                 Some(cap) => match cap.try_retain(value) {

@@ -251,7 +251,7 @@ impl CallGuard {
         self.traps
             .as_ref()
             .expect("actual V8 call scope")
-            .from_owned(raw)
+            .decode_owned(raw)
     }
     pub(crate) fn finish_traps(&self) {
         if let Some(scope) = &self.traps {
@@ -483,10 +483,10 @@ impl WriteRetirement {
         self.released.set(true);
         // Capture the applicable call once. Later T destructors may enter B,
         // but must observe A's already-published original P in A's carrier.
-        let frame = self.binding.upgrade().and_then(|binding| {
-            let frame = binding.active.borrow().upgrade();
-            frame
-        });
+        let frame = self
+            .binding
+            .upgrade()
+            .and_then(|binding| binding.active.borrow().upgrade());
         let local = RefCell::new(None);
         let carrier = frame
             .as_ref()

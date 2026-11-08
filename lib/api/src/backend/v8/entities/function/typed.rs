@@ -102,7 +102,7 @@ macro_rules! impl_native_traits {
                     let raw_arguments = arguments.into_call_arguments();
                     trap = unsafe { wasm_func_call(func, &raw_arguments, raw_results) };
 
-                    decoded = if trap.is_null() { None } else { Some(traps.from_owned(trap)) };
+                    decoded = if trap.is_null() { None } else { Some(traps.decode_owned(trap)) };
                     if traps.has_panic() { return Err(RuntimeError::new("V8 typed call panicked")); }
                     let store_mut = store.as_store_mut();
                     if let Some(callback) = store_mut.inner.on_called.take() {

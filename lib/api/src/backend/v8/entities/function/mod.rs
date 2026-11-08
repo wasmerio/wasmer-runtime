@@ -473,7 +473,7 @@ impl Function {
                 decoded = if trap.is_null() {
                     None
                 } else {
-                    Some(traps.from_owned(trap))
+                    Some(traps.decode_owned(trap))
                 };
                 if traps.has_panic() {
                     return Err(RuntimeError::new("V8 synchronous call panicked"));

@@ -181,7 +181,7 @@ impl TrapCallScope {
             owns_failure,
         })
     }
-    pub(crate) fn from_owned(&self, raw: *mut wasm_trap_t) -> Trap {
+    pub(crate) fn decode_owned(&self, raw: *mut wasm_trap_t) -> Trap {
         if raw.is_null() {
             return Trap {
                 inner: InnerTrap::Message("V8 call failed without an exception".into()),
@@ -499,18 +499,18 @@ mod tests {
         let child_copy = copy_raw(raw);
         let duplicate = copy_raw(raw);
         let child = TrapCallScope::enter(&store, TrapMode::BorrowedSync, None).unwrap();
-        let child_result = child.from_owned(child_copy);
+        let child_result = child.decode_owned(child_copy);
         assert!(
             !child_result.is::<TypedFailure>(),
             "a child cannot steal its live parent's Box"
         );
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         child.finish_outcome(());
-        let actual = parent.from_owned(raw);
+        let actual = parent.decode_owned(raw);
         let value = actual.downcast_ref::<TypedFailure>().unwrap();
         assert_eq!(value.id, 7);
         assert_eq!(value as *const TypedFailure as usize, address);
-        let duplicate = parent.from_owned(duplicate);
+        let duplicate = parent.decode_owned(duplicate);
         assert!(
             !duplicate.is::<TypedFailure>(),
             "independent exception copies claim only once"

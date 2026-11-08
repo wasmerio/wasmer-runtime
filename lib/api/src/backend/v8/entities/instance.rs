@@ -42,7 +42,7 @@ impl InstanceHandle {
         let instance = unsafe { wasm_instance_new(store, obtained, &imports, &mut trap) };
 
         if instance.is_null() {
-            let trap = traps.from_owned(trap);
+            let trap = traps.decode_owned(trap);
             return Err(InstantiationError::Start(trap.into()));
         }
 
