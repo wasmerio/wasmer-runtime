@@ -767,7 +767,9 @@ mod tests {
         let observed = saw_original.clone();
         let second_count = second_drops.clone();
         let receiver = binding.clone();
-        a.as_store_mut().on_called(move |_| {
+        // Unit injection uses the existing canonical local handler type;
+        // the public setter additionally requires Send+Sync for its clients.
+        a.inner.on_called = Some(Box::new(move |_| {
             observed.set(receiver.current_has_panic());
             receiver.record(
                 Box::new(PanicValue {
@@ -777,7 +779,7 @@ mod tests {
                 false,
             );
             Ok(wasmer_types::OnCalledAction::Finish)
-        });
+        }));
         let a = a.into_async();
         let b = crate::Store::new(crate::v8::V8::new()).into_async();
         let environment = AsyncFunctionEnvMut {

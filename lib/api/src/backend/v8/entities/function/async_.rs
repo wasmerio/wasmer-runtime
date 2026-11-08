@@ -254,7 +254,8 @@ impl Function {
         // The Store owns the SAME stable Box before any V8 publication. Its
         // Rust arena catches capture Drop; wee8 receives no Rust finalizer.
         let pointer = view
-            .objects_mut()
+            .inner
+            .store
             .as_v8_mut()
             .host_callbacks
             .insert(callback, binding);

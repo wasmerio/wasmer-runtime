@@ -342,3 +342,51 @@ fn v8_async_first_panic_prevents_on_called_replay() {
     assert_eq!(observed.get(), 1);
     assert_eq!(callbacks.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn v8_async_callback_userdata_survives_public_store_objects_replacement() {
+    if !run_in_subprocess("v8_async_callback_userdata_survives_public_store_objects_replacement") {
+        return;
+    }
+    struct Capture {
+        drops: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+    }
+    impl Capture {
+        fn invoke(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let drops = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let capture = Capture {
+        drops: drops.clone(),
+        calls: calls.clone(),
+    };
+    let mut store = store();
+    let function = Function::new_async(&mut store, FunctionType::new([], [Type::I32]), move |_| {
+        capture.invoke();
+        async { Ok(vec![Value::I32(31)]) }
+    });
+    // This is real public mutable StoreObjects access. C++ still holds the
+    // original callback userdata; it must not own the factory's Rust lifetime.
+    let displaced = std::mem::take(store.objects_mut().as_v8_mut());
+    drop(displaced);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    let store = store.into_async();
+    assert_eq!(
+        futures::executor::block_on(function.call_async(&store, vec![])).unwrap()[0].i32(),
+        Some(31)
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let weak = store.downgrade();
+    drop(store);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    let _stale_copy = function.clone();
+}

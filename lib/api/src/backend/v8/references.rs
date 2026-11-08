@@ -114,8 +114,13 @@ impl ReferenceRoots {
     }
     pub(crate) fn drain(&mut self) {
         let values = std::mem::take(self.0.get_mut());
+        let unwinding = std::thread::panicking();
+        let mut first = None;
         for value in values {
-            drop(value);
+            retire_step(&mut first, unwinding, || drop(value));
+        }
+        if let Some(first) = first {
+            std::panic::resume_unwind(first);
         }
     }
     #[cfg(test)]
@@ -142,6 +147,27 @@ owned_handle! {
     table, wasm_table_t, wasm_table_as_ref, wasm_ref_as_table, false;
     memory, wasm_memory_t, wasm_memory_as_ref, wasm_ref_as_memory, false;
     tag, wasm_tag_t, wasm_tag_as_ref, wasm_ref_as_tag, false;
+}
+
+// A finite owner teardown keeps its exact first value outside each subsequent
+// callback. It is not a Store-wide receiver and cannot be consumed by reentry.
+pub(crate) fn retire_step(
+    first: &mut Option<Box<dyn std::any::Any + Send>>,
+    unwinding: bool,
+    step: impl FnOnce(),
+) {
+    if let Err(mut panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(step)) {
+        if first.is_none() && !unwinding {
+            *first = Some(panic);
+        } else {
+            loop {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(panic))) {
+                    Ok(()) => break,
+                    Err(next) => panic = next,
+                }
+            }
+        }
+    }
 }
 
 /// Owns its actual vector and every contained value, with explicit safe empty
