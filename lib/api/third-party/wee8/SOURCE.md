@@ -37,3 +37,24 @@ Its archive precedes `v8prefixed`; the existing C++ standard-library selection
 is unchanged. It does not modify the provider, GN flags, Engine destruction,
 public C ABI, or header declarations. Actual C++ finalizer timing is a runtime
 validation gate, not established by a wrapper return or weak-origin expiry.
+
+## Private candidate canonical-reference patch
+
+`canonical-references.patch` is an OpenAI Codex authored source patch for the
+private V8 provider candidate. Apply it only to V8
+`b0a55a7dad7f536cce1f9aaddba89894c8533946`, after the original eight patches
+from producer `844d01dc10edaa0461715f484e06b004f1fd023e` and the authoritative
+library-TLS patch9. Its SHA-256 is
+`d51568aa5e8e782515fe92c22ec1c9e2f9d9be926ebeaab9effbf0b41596088d`.
+It uses V8's existing canonical callable-reference conversions and rooting;
+it changes only `src/wasm/c-api.cc` and `third_party/wasm-api/wasm.hh`.
+
+The candidate C++ header SHA-256 is
+`67eae9b38696c2620e797e3c96c30441ea5dfdfa62957d1f635040c010429729`;
+the public C header remains
+`97f49de5418f02c55633dbcdc96b72fb404659c9275e9a47a3b4d6bdce384b96`.
+The active vendored `wasm.hh` above remains unchanged. The candidate helper
+records the actual patched C++ header separately; using it for the Store shim
+requires explicit adoption of that exact archive/header source tuple. Source
+review and patch applicability do not establish compilation, reference fidelity,
+shared C API acceptance or provider adoption.

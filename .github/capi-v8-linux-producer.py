@@ -1,7 +1,7 @@
 """Private packaging experiment; this does not certify the Wasmer C API.
 
 The upstream recipe, its eight existing patches and GN arguments stay fixed.
-Only the upstream library-TLS patch changes V8 source. A task-local depot path
+Only the upstream library-TLS and reviewed canonical-reference patches change V8 source. A task-local depot path
 and a two-job Ninja launcher replace the recipe's shared /tmp and unbounded jobs.
 """
 
@@ -28,6 +28,11 @@ TLS_PATCH_SHA = "ac7f245e80788ac2b32a5453216d37f2ad165d6a598fac943d723a063cbfc11
 BUILD_SCRIPT_SHA = "8c0140c953f0eae74453facc5083cb209470c3f818833c9dd40411b772077875"
 HEADERS_SHA = "9eb4e6bfa1f9a849f82bdeb7c485646621631e9ed1136c34b052c2ef641cfb41"
 DEPS_SHA = "75967c8cdbf3d5c999a050ca2556019693a43067e0e31c68a8693be0f7dc94c7"
+REF_PATCH_NAME = "0010-Canonicalize-callable-references-at-C-API-boundaries.patch"
+REF_PATCH_SHA = "d51568aa5e8e782515fe92c22ec1c9e2f9d9be926ebeaab9effbf0b41596088d"
+REF_CC_SHA = "8fe3e7e08f3488743b8a386ae434427d4e87996a4ef6a50705e0a4d118d3e822"
+REF_HH_SHA = "67eae9b38696c2620e797e3c96c30441ea5dfdfa62957d1f635040c010429729"
+C_HEADER_SHA = "97f49de5418f02c55633dbcdc96b72fb404659c9275e9a47a3b4d6bdce384b96"
 GIB = 1024**3
 
 
@@ -224,6 +229,14 @@ def main():
         producer, GIB, 90)
     if digest(tls) != TLS_PATCH_SHA:
         raise RuntimeError("authoritative TLS patch checksum mismatch")
+    reference_input = candidate / "lib/api/third-party/wee8/canonical-references.patch"
+    if digest(reference_input) != REF_PATCH_SHA:
+        raise RuntimeError("reviewed canonical-reference patch checksum mismatch")
+    references = producer / "patches" / REF_PATCH_NAME
+    shutil.copyfile(reference_input, references)
+    if digest(references) != REF_PATCH_SHA:
+        raise RuntimeError("canonical-reference patch copy changed")
+    shutil.copyfile(references, evidence / REF_PATCH_NAME)
     original = (producer / "build.sh").read_bytes()
     if hashlib.sha256(original).hexdigest() != BUILD_SCRIPT_SHA:
         raise RuntimeError("original producer recipe checksum mismatch")
@@ -237,10 +250,12 @@ def main():
     shutil.copyfile(tls, evidence / tls.name)
     tools = {name: checked_text([name, "--version"]) for name in ("cc", "c++", "gcc", "g++", "ninja", "readelf", "git", "ldd")}
     patches = {p.name: digest(p) for p in sorted((producer / "patches").glob("*.patch"))}
-    if len(patches) != 9:
-        raise RuntimeError("expected the original eight patches and exactly one TLS patch")
+    if len(patches) != 10 or list(patches)[-2:] != [tls.name, REF_PATCH_NAME]:
+        raise RuntimeError("expected original eight patches, TLS9, then reviewed canonical refs10")
     identity = dict(candidate=os.environ["REQUESTED_CANDIDATE"], producer=PRODUCER, v8=V8,
                     depot=DEPOT, tls_source=TLS_SOURCE, tls_sha256=TLS_PATCH_SHA,
+                    canonical_refs_patch_sha256=REF_PATCH_SHA,
+                    candidate_wasm_hh_sha256=REF_HH_SHA, unchanged_wasm_h_sha256=C_HEADER_SHA,
                     original_build_sha256=BUILD_SCRIPT_SHA, original_compiler="unrecorded; no ELF .comment",
                     original_runner="ubuntu-22.04; system GCC and depot_tools were unpinned",
                     compiler_equivalence="not established; no bit-reproducibility claim", tools=tools,
@@ -255,11 +270,22 @@ def main():
                     phase_estimates="new guarded estimates, not historical measured peaks; GN may invoke compiler checks")
     (evidence / "identity.json").write_text(json.dumps(identity, indent=2) + "\n")
     # Bootstrap/preflight is inside the SAME admitted source phase and deadline.
-    # It execs the unchanged original recipe, which applies the eight patches plus TLS9.
+    # It execs the unchanged original recipe, which applies the eight patches, TLS9, then reviewed refs10 with plain git apply.
     run("upstream-recipe", [sys.executable, str(Path(__file__).with_name("capi_v8_depot_bootstrap.py")),
         str(root)], producer, 12 * GIB, 230 * 60)
     if checked_text(["git", "rev-parse", "HEAD"], source) != V8:
         raise RuntimeError("V8 source moved")
+    expected_sources = {
+        "src/wasm/c-api.cc": REF_CC_SHA,
+        "third_party/wasm-api/wasm.hh": REF_HH_SHA,
+        "third_party/wasm-api/wasm.h": C_HEADER_SHA,
+    }
+    for relative, expected_sha in expected_sources.items():
+        if digest(source / relative) != expected_sha:
+            raise RuntimeError("canonical candidate source/header mismatch: " + relative)
+    shutil.copyfile(source / "third_party/wasm-api/wasm.hh", evidence / "candidate-wasm.hh")
+    (evidence / "canonical-ref-sources.json").write_text(
+        json.dumps(expected_sources, indent=2) + "\n")
     shutil.copyfile(source / "DEPS", evidence / "DEPS")
     shutil.copyfile(source / "out/release/args.gn", evidence / "args.gn")
     run("actual-dependencies", [str(depot / "gclient"), "revinfo", "--actual"], producer, GIB, 120)

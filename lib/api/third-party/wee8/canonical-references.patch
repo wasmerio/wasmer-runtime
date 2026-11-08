@@ -1,0 +1,574 @@
+# Authored and committed by OpenAI Codex.
+# Source-only candidate against V8 b0a55a7dad7f536cce1f9aaddba89894c8533946 plus original producer eight patches and TLS9.
+# Combined source tuple c491fd2bb2f17dfcb014dc2b3ee9649e21cacabd..41542fd8b4fbf8c7c95b0e1c2759939449b67a59.
+# No compiler/provider adoption or build acceptance is implied.
+diff --git a/src/wasm/c-api.cc b/src/wasm/c-api.cc
+index 4ccb673..4f47de1 100644
+--- a/src/wasm/c-api.cc
++++ b/src/wasm/c-api.cc
+@@ -1744,6 +1744,89 @@ i::DirectHandle<i::Object> WasmRefToV8(i::Isolate* isolate, const Ref* ref) {
+   return impl(ref)->v8_object();
+ }
+ 
++
++own<Trap> RefConversionTrap(StoreImpl* store, const char* message) {
++  CHECK_NOT_NULL(message);
++  auto text = Message::make_nt(std::string(message));
++  CHECK(text);
++  auto trap = Trap::make(seal<Store>(store), text);
++  // Allocation failure must never become the null/success return channel.
++  CHECK(trap);
++  return trap;
++}
++
++template <typename T>
++bool CapiValueKind(T type, ValKind* kind) {
++  switch (type.kind()) {
++    case i::wasm::kI32: *kind = ValKind::I32; return true;
++    case i::wasm::kI64: *kind = ValKind::I64; return true;
++    case i::wasm::kF32: *kind = ValKind::F32; return true;
++    case i::wasm::kF64: *kind = ValKind::F64; return true;
++    case i::wasm::kS128: *kind = ValKind::V128; return true;
++    case i::wasm::kRef:
++    case i::wasm::kRefNull:
++      if (type.has_index()) return false;
++      switch (type.heap_representation()) {
++        case i::wasm::HeapType::kFunc: *kind = ValKind::FUNCREF; return true;
++        case i::wasm::HeapType::kExtern: *kind = ValKind::EXTERNREF; return true;
++        default: return false;
++      }
++    default: return false;
++  }
++}
++
++bool CapiValueKind(ValKind kind) {
++  switch (kind) {
++    case ValKind::I32:
++    case ValKind::I64:
++    case ValKind::F32:
++    case ValKind::F64:
++    case ValKind::V128:
++    case ValKind::FUNCREF:
++    case ValKind::EXTERNREF:
++      return true;
++    default:
++      return false;
++  }
++}
++
++bool CapiValuesMatch(const vec<Val>& values, const ownvec<ValType>& types) {
++  if (values.size() != types.size()) return false;
++  for (size_t index = 0; index < types.size(); ++index) {
++    if (!CapiValueKind(types[index]->kind()) ||
++        values[index].kind() != types[index]->kind()) return false;
++  }
++  return true;
++}
++
++
++
++// Tags alone do not prove that a FUNCREF actually holds a function object.
++// Keep this direct-host path external-to-external; conversion only validates.
++const char* CapiReferenceError(StoreImpl* store, const vec<Val>& values,
++                               const ownvec<ValType>& types) {
++  for (size_t index = 0; index < types.size(); ++index) {
++    auto kind = types[index]->kind();
++    if (!is_ref(kind)) continue;
++    const char* error_message;
++    i::DirectHandle<i::Object> internal;
++    if (!i::wasm::JSToWasmObject(store->i_isolate(), nullptr,
++                                 WasmRefToV8(store->i_isolate(), values[index].ref()),
++                                 WasmValKindToV8(kind), &error_message)
++             .ToHandle(&internal)) {
++      return error_message;
++    }
++  }
++  return nullptr;
++}
++
++i::Address ThrowCapiTrap(i::Isolate* isolate, own<Trap> trap) {
++  isolate->Throw(*impl(trap.get())->v8_object());
++  i::Tagged<i::Object> exception = isolate->exception();
++  isolate->clear_exception();
++  return exception.ptr();
++}
++
+ void PrepareFunctionData(
+     i::Isolate* isolate,
+     i::DirectHandle<i::WasmExportedFunctionData> function_data,
+@@ -1765,92 +1848,124 @@ void PrepareFunctionData(
+       i::wasm::CWasmArgumentsPacker::TotalSize(sig));
+ }
+ 
+-void PushArgs(const i::wasm::CanonicalSig* sig, const vec<Val>& args,
+-              i::wasm::CWasmArgumentsPacker* packer, StoreImpl* store) {
+-  for (size_t i = 0; i < sig->parameter_count(); i++) {
+-    i::wasm::CanonicalValueType type = sig->GetParam(i);
+-    switch (type.kind()) {
+-      case i::wasm::kI32:
+-        packer->Push(args[i].i32());
+-        break;
+-      case i::wasm::kI64:
+-        packer->Push(args[i].i64());
+-        break;
+-      case i::wasm::kF32:
+-        packer->Push(args[i].f32());
+-        break;
+-      case i::wasm::kF64:
+-        packer->Push(args[i].f64());
+-        break;
++own<Trap> PushArgs(const i::wasm::CanonicalSig* sig, const vec<Val>& args,
++                   i::wasm::CWasmArgumentsPacker* packer, StoreImpl* store,
++                   i::DirectHandleVector<i::Object>* references) {
++  if (args.size() != sig->parameter_count()) {
++    return RefConversionTrap(store, "C API argument count mismatch");
++  }
++  for (size_t index = 0; index < sig->parameter_count(); ++index) {
++    ValKind kind;
++    if (!CapiValueKind(sig->GetParam(index), &kind) ||
++        args[index].kind() != kind) {
++      return RefConversionTrap(store, "C API argument type mismatch");
++    }
++  }
++  references->reserve(sig->parameter_count());
++  for (size_t index = 0; index < sig->parameter_count(); ++index) {
++    auto type = sig->GetParam(index);
++    if (!type.is_object_reference()) continue;
++    const char* error_message;
++    i::DirectHandle<i::Object> internal;
++    if (!i::wasm::JSToWasmObject(store->i_isolate(),
++                                 WasmRefToV8(store->i_isolate(), args[index].ref()),
++                                 type, &error_message).ToHandle(&internal)) {
++      return RefConversionTrap(store, error_message);
++    }
++    references->push_back(internal);
++  }
++  size_t reference = 0;
++  for (size_t index = 0; index < sig->parameter_count(); ++index) {
++    switch (sig->GetParam(index).kind()) {
++      case i::wasm::kI32: packer->Push(args[index].i32()); break;
++      case i::wasm::kI64: packer->Push(args[index].i64()); break;
++      case i::wasm::kF32: packer->Push(args[index].f32()); break;
++      case i::wasm::kF64: packer->Push(args[index].f64()); break;
++      case i::wasm::kS128: packer->Push(args[index].v128()); break;
+       case i::wasm::kRef:
+       case i::wasm::kRefNull:
+-        // TODO(14034): Make sure this works for all heap types.
+-        packer->Push((*WasmRefToV8(store->i_isolate(), args[i].ref())).ptr());
+-        break;
+-      case i::wasm::kS128:
+-        packer->Push(args[i].v128());
++        packer->Push((*(*references)[reference++]).ptr());
+         break;
+-      case i::wasm::kI8:
+-      case i::wasm::kI16:
+-      case i::wasm::kF16:
+-      case i::wasm::kVoid:
+-      case i::wasm::kTop:
+-      case i::wasm::kBottom:
+-        UNREACHABLE();
++      default: UNREACHABLE();  // Preflight above validated every type.
+     }
+   }
++  return nullptr;
+ }
+ 
+ void PopArgs(const i::wasm::CanonicalSig* sig, vec<Val>& results,
+              i::wasm::CWasmArgumentsPacker* packer, StoreImpl* store) {
+-  packer->Reset();
+-  for (size_t i = 0; i < sig->return_count(); i++) {
+-    i::wasm::CanonicalValueType type = sig->GetReturn(i);
+-    switch (type.kind()) {
+-      case i::wasm::kI32:
+-        results[i] = Val(packer->Pop<int32_t>());
+-        break;
+-      case i::wasm::kI64:
+-        results[i] = Val(packer->Pop<int64_t>());
+-        break;
+-      case i::wasm::kF32:
+-        results[i] = Val(packer->Pop<float>());
+-        break;
+-      case i::wasm::kF64:
+-        results[i] = Val(packer->Pop<double>());
+-        break;
+-      case i::wasm::kRef:
+-      case i::wasm::kRefNull: {
+-        // TODO(14034): Make sure this works for all heap types.
+-        i::Address raw = packer->Pop<i::Address>();
+-        i::DirectHandle<i::Object> obj(i::Tagged<i::Object>(raw),
+-                                       store->i_isolate());
+-        results[i] = Val(V8RefValueToWasm(store, obj));
+-        break;
++  auto staged = vec<Val>::make();
++  i::DirectHandleVector<i::Object> references(store->i_isolate());
++  {
++    // No allocating externalization may precede the LAST raw ref capture.
++    i::DisallowGarbageCollection no_gc;
++    staged = vec<Val>::make_uninitialized(sig->return_count());
++    references.reserve(sig->return_count());
++    packer->Reset();
++    for (size_t index = 0; index < sig->return_count(); ++index) {
++      switch (sig->GetReturn(index).kind()) {
++        case i::wasm::kI32: staged[index] = Val(packer->Pop<int32_t>()); break;
++        case i::wasm::kI64: staged[index] = Val(packer->Pop<int64_t>()); break;
++        case i::wasm::kF32: staged[index] = Val(packer->Pop<float>()); break;
++        case i::wasm::kF64: staged[index] = Val(packer->Pop<double>()); break;
++        case i::wasm::kS128: staged[index] = Val(packer->Pop<v128_t>()); break;
++        case i::wasm::kRef:
++        case i::wasm::kRefNull: {
++          i::Address raw = packer->Pop<i::Address>();
++          references.push_back(i::DirectHandle<i::Object>(
++              i::Tagged<i::Object>(raw), store->i_isolate()));
++          break;
++        }
++        default: UNREACHABLE();  // Func::call validated the result types.
+       }
+-      case i::wasm::kS128:
+-        results[i] = Val(packer->Pop<v128_t>());
+-        break;
+-      case i::wasm::kI8:
+-      case i::wasm::kI16:
+-      case i::wasm::kF16:
+-      case i::wasm::kVoid:
+-      case i::wasm::kTop:
+-      case i::wasm::kBottom:
+-        UNREACHABLE();
+     }
+   }
++  size_t reference = 0;
++  for (size_t index = 0; index < sig->return_count(); ++index) {
++    if (sig->GetReturn(index).is_object_reference()) {
++      auto external = i::wasm::WasmToJSObject(store->i_isolate(),
++                                               references[reference++]);
++      staged[index] = Val(V8RefValueToWasm(store, external),
++                            V8ValueTypeToWasm(sig->GetReturn(index)));
++    }
++  }
++  for (size_t index = 0; index < sig->return_count(); ++index) {
++    results[index] = std::move(staged[index]);
++  }
+ }
+ 
+ own<Trap> CallWasmCapiFunction(i::Tagged<i::WasmCapiFunctionData> data,
+                                const vec<Val>& args, vec<Val>& results) {
+   FuncData* func_data =
+       i::Cast<i::Managed<FuncData>>(data->embedder_data())->raw();
++  auto store = impl(func_data->store);
++  if (!CapiValuesMatch(args, func_data->type->params()) ||
++      results.size() != func_data->type->results().size()) {
++    return RefConversionTrap(store, "C API callback argument/count mismatch");
++  }
++  for (size_t index = 0; index < func_data->type->results().size(); ++index) {
++    if (!CapiValueKind(func_data->type->results()[index]->kind())) {
++      return RefConversionTrap(store, "C API unsupported callback result type");
++    }
++  }
++  if (auto error = CapiReferenceError(store, args, func_data->type->params())) {
++    return RefConversionTrap(store, error);
++  }
++  own<Trap> trap;
+   if (func_data->kind == FuncData::kCallback) {
+-    return (func_data->callback)(args, results);
++    trap = (func_data->callback)(args, results);
++  } else {
++    DCHECK(func_data->kind == FuncData::kCallbackWithEnv);
++    trap = (func_data->callback_with_env)(func_data->env, args, results);
++  }
++  if (trap) return trap;
++  if (!CapiValuesMatch(results, func_data->type->results())) {
++    return RefConversionTrap(store, "C API callback result mismatch");
++  }
++  if (auto error = CapiReferenceError(store, results, func_data->type->results())) {
++    return RefConversionTrap(store, error);
+   }
+-  DCHECK(func_data->kind == FuncData::kCallbackWithEnv);
+-  return (func_data->callback_with_env)(func_data->env, args, results);
++  return nullptr;
+ }
+ 
+ i::DirectHandle<i::JSReceiver> GetProperException(
+@@ -1907,13 +2022,33 @@ WASM_EXPORT auto Func::call(const vec<Val>& args, vec<Val>& results) const
+       i::wasm::GetTypeCanonicalizer()->LookupFunctionSignature(
+           module->canonical_sig_id(
+               module->functions[function_index].sig_index));
++  if (args.size() != sig->parameter_count() ||
++      results.size() != sig->return_count()) {
++    return RefConversionTrap(store, "C API call arity mismatch");
++  }
++  for (size_t index = 0; index < sig->parameter_count(); ++index) {
++    ValKind kind;
++    if (!CapiValueKind(sig->GetParam(index), &kind) || args[index].kind() != kind) {
++      return RefConversionTrap(store, "C API call argument type mismatch");
++    }
++  }
++  for (size_t index = 0; index < sig->return_count(); ++index) {
++    ValKind kind;
++    if (!CapiValueKind(sig->GetReturn(index), &kind)) {
++      return RefConversionTrap(store, "C API unsupported result type");
++    }
++  }
+   PrepareFunctionData(isolate, function_data, sig);
+   i::DirectHandle<i::Code> wrapper_code(function_data->c_wrapper_code(isolate),
+                                         isolate);
+   i::WasmCodePointer call_target = function_data->internal()->call_target();
+ 
+   i::wasm::CWasmArgumentsPacker packer(function_data->packed_args_size());
+-  PushArgs(sig, args, &packer, store);
++  // These actual roots outlive the packed call, not only PushArgs.
++  i::DirectHandleVector<i::Object> argument_references(isolate);
++  if (auto trap = PushArgs(sig, args, &packer, store, &argument_references)) {
++    return trap;
++  }
+ 
+   i::DirectHandle<i::Object> object_ref;
+   if (function_index < static_cast<int>(module->num_imported_functions)) {
+@@ -1972,44 +2107,65 @@ i::Address FuncData::v8_callback(i::Address host_data_foreign,
+   const ownvec<ValType>& param_types = self->type->params();
+   const ownvec<ValType>& result_types = self->type->results();
+ 
+-  int num_param_types = static_cast<int>(param_types.size());
+-  int num_result_types = static_cast<int>(result_types.size());
+-
+-  auto params = vec<Val>::make_uninitialized(num_param_types);
+-  auto results = vec<Val>::make_uninitialized(num_result_types);
++  size_t num_param_types = param_types.size();
++  size_t num_result_types = result_types.size();
++  for (size_t index = 0; index < num_param_types; ++index) {
++    if (!CapiValueKind(param_types[index]->kind())) {
++      return ThrowCapiTrap(isolate, RefConversionTrap(store,
++                                                     "C API unsupported parameter type"));
++    }
++  }
++  for (size_t index = 0; index < num_result_types; ++index) {
++    if (!CapiValueKind(result_types[index]->kind())) {
++      return ThrowCapiTrap(isolate, RefConversionTrap(store,
++                                                     "C API unsupported result type"));
++    }
++  }
++  auto params = vec<Val>::make();
++  auto results = vec<Val>::make();
++  i::DirectHandleVector<i::Object> parameter_references(isolate);
+   i::Address p = argv;
+-  for (int i = 0; i < num_param_types; ++i) {
+-    switch (param_types[i]->kind()) {
+-      case ValKind::I32:
+-        params[i] = Val(v8::base::ReadUnalignedValue<int32_t>(p));
+-        p += 4;
+-        break;
+-      case ValKind::I64:
+-        params[i] = Val(v8::base::ReadUnalignedValue<int64_t>(p));
+-        p += 8;
+-        break;
+-      case ValKind::F32:
+-        params[i] = Val(v8::base::ReadUnalignedValue<float32_t>(p));
+-        p += 4;
+-        break;
+-      case ValKind::F64:
+-        params[i] = Val(v8::base::ReadUnalignedValue<float64_t>(p));
+-        p += 8;
+-        break;
+-      case ValKind::V128:
+-        params[i] = Val(v8::base::ReadUnalignedValue<v128_t>(p));
+-        p += 16;
+-        break;
+-      case ValKind::EXTERNREF:
+-      case ValKind::FUNCREF: {
+-        i::Address raw = v8::base::ReadUnalignedValue<i::Address>(p);
+-        p += sizeof(raw);
+-        i::DirectHandle<i::Object> obj(i::Tagged<i::Object>(raw), isolate);
+-        params[i] = Val(V8RefValueToWasm(store, obj));
+-        break;
++  {
++    i::DisallowGarbageCollection no_gc;
++    params = vec<Val>::make_uninitialized(num_param_types);
++    results = vec<Val>::make_uninitialized(num_result_types);
++    parameter_references.reserve(num_param_types);
++    for (size_t index = 0; index < num_param_types; ++index) {
++      switch (param_types[index]->kind()) {
++        case ValKind::I32:
++          params[index] = Val(v8::base::ReadUnalignedValue<int32_t>(p)); p += 4;
++          break;
++        case ValKind::I64:
++          params[index] = Val(v8::base::ReadUnalignedValue<int64_t>(p)); p += 8;
++          break;
++        case ValKind::F32:
++          params[index] = Val(v8::base::ReadUnalignedValue<float32_t>(p)); p += 4;
++          break;
++        case ValKind::F64:
++          params[index] = Val(v8::base::ReadUnalignedValue<float64_t>(p)); p += 8;
++          break;
++        case ValKind::V128:
++          params[index] = Val(v8::base::ReadUnalignedValue<v128_t>(p)); p += 16;
++          break;
++        case ValKind::EXTERNREF:
++        case ValKind::FUNCREF: {
++          i::Address raw = v8::base::ReadUnalignedValue<i::Address>(p);
++          p += sizeof(raw);
++          parameter_references.push_back(i::DirectHandle<i::Object>(
++              i::Tagged<i::Object>(raw), isolate));
++          break;
++        }
+       }
+     }
+   }
++  size_t reference = 0;
++  for (size_t index = 0; index < num_param_types; ++index) {
++    auto kind = param_types[index]->kind();
++    if (!is_ref(kind)) continue;
++    auto external = i::wasm::WasmToJSObject(isolate,
++                                             parameter_references[reference++]);
++    params[index] = Val(V8RefValueToWasm(store, external), kind);
++  }
+ 
+   own<Trap> trap;
+   if (self->kind == kCallbackWithEnv) {
+@@ -2017,43 +2173,54 @@ i::Address FuncData::v8_callback(i::Address host_data_foreign,
+   } else {
+     trap = self->callback(params, results);
+   }
+-
+-  if (trap) {
+-    isolate->Throw(*impl(trap.get())->v8_object());
+-    i::Tagged<i::Object> ex = isolate->exception();
+-    isolate->clear_exception();
+-    return ex.ptr();
++  if (trap) return ThrowCapiTrap(isolate, std::move(trap));
++  if (!CapiValuesMatch(results, result_types)) {
++    return ThrowCapiTrap(isolate,
++                        RefConversionTrap(store, "C API callback result mismatch"));
++  }
++
++  i::DirectHandleVector<i::Object> result_references(isolate);
++  result_references.reserve(num_result_types);
++  for (size_t index = 0; index < num_result_types; ++index) {
++    auto kind = result_types[index]->kind();
++    if (!is_ref(kind)) continue;
++    const char* error_message;
++    i::DirectHandle<i::Object> internal;
++    if (!i::wasm::JSToWasmObject(isolate, nullptr,
++                                 WasmRefToV8(isolate, results[index].ref()),
++                                 WasmValKindToV8(kind), &error_message)
++             .ToHandle(&internal)) {
++      return ThrowCapiTrap(isolate, RefConversionTrap(store, error_message));
++    }
++    result_references.push_back(internal);
+   }
+-
+   p = argv;
+-  for (int i = 0; i < num_result_types; ++i) {
+-    switch (result_types[i]->kind()) {
+-      case ValKind::I32:
+-        v8::base::WriteUnalignedValue(p, results[i].i32());
+-        p += 4;
+-        break;
+-      case ValKind::I64:
+-        v8::base::WriteUnalignedValue(p, results[i].i64());
+-        p += 8;
+-        break;
+-      case ValKind::F32:
+-        v8::base::WriteUnalignedValue(p, results[i].f32());
+-        p += 4;
+-        break;
+-      case ValKind::F64:
+-        v8::base::WriteUnalignedValue(p, results[i].f64());
+-        p += 8;
+-        break;
+-      case ValKind::V128:
+-        v8::base::WriteUnalignedValue(p, results[i].v128());
+-        p += 16;
+-        break;
+-      case ValKind::EXTERNREF:
+-      case ValKind::FUNCREF: {
+-        v8::base::WriteUnalignedValue(
+-            p, (*WasmRefToV8(isolate, results[i].ref())).ptr());
+-        p += sizeof(i::Address);
+-        break;
++  reference = 0;
++  {
++    i::DisallowGarbageCollection no_gc;
++    for (size_t index = 0; index < num_result_types; ++index) {
++      switch (result_types[index]->kind()) {
++        case ValKind::I32:
++          v8::base::WriteUnalignedValue(p, results[index].i32()); p += 4;
++          break;
++        case ValKind::I64:
++          v8::base::WriteUnalignedValue(p, results[index].i64()); p += 8;
++          break;
++        case ValKind::F32:
++          v8::base::WriteUnalignedValue(p, results[index].f32()); p += 4;
++          break;
++        case ValKind::F64:
++          v8::base::WriteUnalignedValue(p, results[index].f64()); p += 8;
++          break;
++        case ValKind::V128:
++          v8::base::WriteUnalignedValue(p, results[index].v128()); p += 16;
++          break;
++        case ValKind::EXTERNREF:
++        case ValKind::FUNCREF:
++          v8::base::WriteUnalignedValue(p,
++                                          (*result_references[reference++]).ptr());
++          p += sizeof(i::Address);
++          break;
+       }
+     }
+   }
+@@ -2135,7 +2302,8 @@ WASM_EXPORT auto Global::get() const -> Val {
+       if (IsWasmNull(*result)) {
+         result = v8_global->GetIsolate()->factory()->null_value();
+       }
+-      return Val(V8RefValueToWasm(store, result));
++      return Val(V8RefValueToWasm(store, result),
++                 V8ValueTypeToWasm(v8_global->type()));
+     }
+     case i::wasm::kS128: {
+       v128_t value;
+@@ -2306,7 +2474,13 @@ WASM_EXPORT auto Table::make(Store* store_abs, const TableType* type,
+       i::wasm::AddressType::kI32);
+ 
+   if (ref) {
+-    i::DirectHandle<i::JSReceiver> init = impl(ref)->v8_object();
++    const char* error_message;
++    i::DirectHandle<i::Object> init;
++    if (!i::wasm::JSToWasmObject(isolate, WasmRefToV8(isolate, ref),
++                                 canonical_type, &error_message)
++             .ToHandle(&init)) {
++      return nullptr;
++    }
+     for (uint32_t i = 0; i < minimum; i++) {
+       table_obj->Set(isolate, table_obj, i, init);
+     }
+@@ -3348,7 +3522,7 @@ inline auto adopt_val(wasm_val_t v) -> wasm::Val {
+     }
+     case wasm::ValKind::EXTERNREF:
+     case wasm::ValKind::FUNCREF:
+-      return wasm::Val(adopt_ref(v.of.ref));
++      return wasm::Val(adopt_ref(v.of.ref), reveal_valkind(v.kind));
+     default:
+       UNREACHABLE();
+   }
+@@ -3386,7 +3560,7 @@ inline auto borrow_val(const wasm_val_t* v) -> borrowed_val {
+     }
+     case wasm::ValKind::EXTERNREF:
+     case wasm::ValKind::FUNCREF:
+-      v2 = wasm::Val(adopt_ref(v->of.ref));
++      v2 = wasm::Val(adopt_ref(v->of.ref), reveal_valkind(v->kind));
+       break;
+     default:
+       UNREACHABLE();
+diff --git a/third_party/wasm-api/wasm.hh b/third_party/wasm-api/wasm.hh
+index 41533bc..96d50ca 100644
+--- a/third_party/wasm-api/wasm.hh
++++ b/third_party/wasm-api/wasm.hh
+@@ -519,7 +519,11 @@ public:
+   explicit Val(float32_t z) : kind_(ValKind::F32) { impl_.f32 = z; }
+   explicit Val(float64_t z) : kind_(ValKind::F64) { impl_.f64 = z; }
+   explicit Val(v128_t v) : kind_(ValKind::V128) { impl_.v128 = v; }
+-  explicit Val(own<Ref>&& r) : kind_(ValKind::EXTERNREF) { impl_.ref = r.release(); }
++  // The declared reference kind is required even when the reference is null.
++  explicit Val(own<Ref>&& r, ValKind kind = ValKind::EXTERNREF) : kind_(kind) {
++    assert(wasm::is_ref(kind));
++    impl_.ref = r.release();
++  }
+ 
+   Val(Val&& that) : kind_(that.kind_), impl_(that.impl_) {
+     if (is_ref()) that.impl_.ref = nullptr;
