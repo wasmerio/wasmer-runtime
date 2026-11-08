@@ -570,6 +570,7 @@ impl StoreContext {
         validate: impl Fn(StoreId, &StoreMut<'_>) -> Result<(), crate::RuntimeError>,
         action: impl FnOnce(&mut StoreMut<'_>) -> Result<R, crate::RuntimeError>,
     ) -> Result<Option<R>, crate::RuntimeError> {
+        #[cfg(feature = "sys")]
         if HIDDEN_STORE_CONTEXT_DEPTH.with(|depth| depth.get() != 0) {
             return Err(crate::RuntimeError::new(
                 "borrowed Store contexts are hidden",

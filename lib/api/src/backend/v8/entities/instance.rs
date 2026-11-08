@@ -156,6 +156,7 @@ impl Instance {
         }))
     }
 
+    #[allow(clippy::result_large_err)]
     fn checked_imports(
         store: &impl AsStoreRef,
         externs: &[Extern],
@@ -189,6 +190,7 @@ type OwnedInstanceFuture = std::pin::Pin<
 /// Construction is inert; the checked first poll blocks through exact imports.
 #[cfg(feature = "experimental-async")]
 #[doc(hidden)]
+#[allow(clippy::result_large_err)]
 pub fn instantiate_async(
     asynchronous: &impl crate::AsStoreAsync,
     module: Module,

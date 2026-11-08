@@ -659,7 +659,11 @@ fn v8_checked_borrow_reenters_exact_lock_and_restores_plain_foreign_store() {
     let mut foreign = store();
     let foreign_id = foreign.id();
     let mut wrong = store();
-    wrong.as_store_mut().objects_mut().set_id(first_id);
+    wrong
+        .as_store_mut()
+        .objects_mut()
+        .as_v8_mut()
+        .set_id(first_id);
     let wrong = wrong.into_async();
     assert!(
         wasmer::v8::with_borrowed_store(&first, |_| ())
