@@ -34,6 +34,14 @@ jobs:
         with:
           ref: ${{ inputs.candidate_ref }}
           path: candidate
+          fetch-depth: 1
+          # Pinned checkout automatically fetches blob:none for sparse inputs.
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /.github/capi-v8-linux-producer.py
+            /Cargo.lock
+            /Cargo.toml
+            /lib/api/build.rs
           submodules: false
           persist-credentials: false
       - name: Build and inspect only the private candidate archive
