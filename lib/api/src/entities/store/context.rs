@@ -562,6 +562,70 @@ impl StoreContext {
         })
     }
 
+    /// Scoped reborrow of a deepest parked synchronous installation. Physical
+    /// identity validation and all callbacks run outside the context borrow.
+    #[cfg(all(feature = "experimental-async", feature = "sys"))]
+    pub(crate) fn with_parked_sync<R>(
+        target: StoreId,
+        validate: impl Fn(StoreId, &StoreMut<'_>) -> Result<(), crate::RuntimeError>,
+        action: impl FnOnce(&mut StoreMut<'_>) -> Result<R, crate::RuntimeError>,
+    ) -> Result<Option<R>, crate::RuntimeError> {
+        if HIDDEN_STORE_CONTEXT_DEPTH.with(|depth| depth.get() != 0) {
+            return Err(crate::RuntimeError::new(
+                "borrowed Store contexts are hidden",
+            ));
+        }
+        let rows = STORE_CONTEXT_STACK.with(|cell| {
+            let stack = cell.borrow();
+            for (index, row) in stack.iter().enumerate() {
+                for previous in &stack[..index] {
+                    if (row.id == previous.id) != (row.address == previous.address) {
+                        return Err(crate::RuntimeError::new("borrowed Store identity alias"));
+                    }
+                }
+            }
+            let mut rows = Vec::new();
+            for row in stack.iter().rev() {
+                if rows
+                    .iter()
+                    .any(|(_, pointer)| *pointer as usize == row.address)
+                {
+                    continue;
+                }
+                let StoreContextEntry::Sync(pointer) = (unsafe { &*row.entry.get() }) else {
+                    return Err(crate::RuntimeError::new(
+                        "borrowed Store ancestry is not synchronous",
+                    ));
+                };
+                if row.borrow_count != 0 || row.paused_borrows != 0 || pointer.is_null() {
+                    return Err(crate::RuntimeError::new(
+                        "borrowed Store ancestry is not parked",
+                    ));
+                }
+                rows.push((row.id, *pointer));
+            }
+            Ok(rows)
+        })?;
+        fn reborrow<R>(pointer: *mut StoreInner, action: impl FnOnce(&mut StoreMut<'_>) -> R) -> R {
+            // SAFETY: preflight selected each deepest derived Sync pointer only
+            // after every live backing's deepest borrow was explicitly parked.
+            // The parent's frames stay inaccessible until this child returns.
+            let mut parent = unsafe { StoreMut::from_raw(pointer) };
+            parent.parked(|| {
+                crate::Store::with_current(action).expect("derived Sync child installed")
+            })
+        }
+        // Validate bound foreign rows too: set_id cannot hide the target under
+        // another Store's ID and turn a present wrong backing into base retry.
+        for (id, pointer) in &rows {
+            reborrow(*pointer, |store| validate(*id, store))?;
+        }
+        let Some((_, pointer)) = rows.iter().find(|(id, _)| *id == target) else {
+            return Ok(None);
+        };
+        reborrow(*pointer, action).map(Some)
+    }
+
     /// The active entry's store, if no frame on this thread's stack is holding
     /// a borrow of it.
     ///

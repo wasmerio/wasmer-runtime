@@ -223,6 +223,112 @@ pub fn current_native_store_loan(
     Ok(Some(candidate))
 }
 
+/// Whether a real physical coroutine or logical Native lineage is installed.
+/// This is presence, not whether that lineage currently permits suspension.
+#[doc(hidden)]
+pub fn native_invocation_active() -> bool {
+    CoroutineContext::get_current().is_some() || current_retirement_control().is_some()
+}
+
+fn borrowed_scope(
+    generation: &Arc<NativeInvocationGeneration>,
+    id: StoreId,
+) -> Result<Rc<InvocationScopeLocal>, RuntimeError> {
+    generation.check()?;
+    if generation.store_id != id
+        || generation
+            .superseded
+            .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(RuntimeError::new("borrowed Store generation changed"));
+    }
+    let scope = INVOCATION_SCOPES
+        .with(|scopes| scopes.borrow().get(&generation.id).and_then(Weak::upgrade))
+        .ok_or_else(|| RuntimeError::new("borrowed Store has no bound invocation scope"))?;
+    if !Arc::ptr_eq(&scope.generation, generation) || scope.destruction.is_complete() {
+        return Err(RuntimeError::new("borrowed Store scope identity changed"));
+    }
+    Ok(scope)
+}
+
+fn validate_borrowed_context(id: StoreId, store: &StoreMut<'_>) -> Result<(), RuntimeError> {
+    let view = store.as_store_ref();
+    if view.objects().id() != id {
+        return Err(RuntimeError::new("borrowed Store installation changed"));
+    }
+    let Some(generation) = &view.inner.native_invocation else {
+        // An ordinary unbound Rust Sync caller supplies no target authority.
+        return if view.inner.native_destruction.is_none()
+            && view.inner.native_access_origin.is_none()
+        {
+            Ok(())
+        } else {
+            Err(RuntimeError::new("borrowed Store lost its generation"))
+        };
+    };
+    let scope = borrowed_scope(generation, id)?;
+    if view
+        .inner
+        .native_access_origin
+        .as_ref()
+        .is_some_and(|origin| !Arc::ptr_eq(origin, generation))
+        || !view
+            .inner
+            .native_destruction
+            .as_ref()
+            .is_some_and(|guard| Rc::ptr_eq(&guard.receipt.0, &scope.destruction.0))
+    {
+        return Err(RuntimeError::new(
+            "borrowed Store backing or origin changed",
+        ));
+    }
+    Ok(())
+}
+
+/// Lend only a deepest parked Sync child of the exact bound backing. None means
+/// truly absent; a present incompatible installation never permits base retry.
+/// No Store reference, guard, native loan or token may escape the callback.
+#[doc(hidden)]
+pub fn with_borrowed_native_store<R>(
+    expected: &StoreAsync,
+    action: impl FnOnce(&mut StoreMut<'_>) -> R,
+) -> Result<Option<R>, RuntimeError> {
+    if native_invocation_active() || expected.loan.is_some() {
+        return Err(RuntimeError::new(
+            "borrowed entry cannot replace Native ancestry",
+        ));
+    }
+    let generation = expected
+        .native_invocation
+        .as_ref()
+        .ok_or_else(|| RuntimeError::new("borrowed target is not bound"))?;
+    let scope = borrowed_scope(generation, expected.id)?;
+    StoreContext::with_parked_sync(expected.id, validate_borrowed_context, |store| {
+        let view = store.as_store_ref();
+        if !view
+            .inner
+            .native_invocation
+            .as_ref()
+            .is_some_and(|actual| Arc::ptr_eq(actual, generation))
+            || !view
+                .inner
+                .native_destruction
+                .as_ref()
+                .is_some_and(|guard| Rc::ptr_eq(&guard.receipt.0, &scope.destruction.0))
+            || !view
+                .inner
+                .native_access_origin
+                .as_ref()
+                .is_some_and(|origin| Arc::ptr_eq(origin, generation))
+        {
+            return Err(RuntimeError::new(
+                "borrowed target backing or generation changed",
+            ));
+        }
+        Ok(action(store))
+    })
+}
+
 /// Enrolls owner-local retirement on the outermost actual invocation's future.
 /// The tail is polled after native custody is released, including while escaped
 /// physical frames remain. It must observe its own exact completion fences.
