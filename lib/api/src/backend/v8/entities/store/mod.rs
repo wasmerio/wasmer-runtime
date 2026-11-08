@@ -159,6 +159,108 @@ mod tests {
         },
     };
 
+    #[cfg(not(target_arch = "wasm32"))]
+    mod callback_userdata_lifetime {
+        use super::*;
+        use crate::{AsStoreMut, Type};
+        use std::{
+            process::{Child, Command},
+            time::{Duration, Instant},
+        };
+
+        fn store() -> Store {
+            Store::new(crate::v8::V8::new())
+        }
+
+        fn run_in_subprocess(test_name: &str) -> bool {
+            const CHILD: &str = "WASMER_V8_CALLBACK_USERDATA_CHILD";
+            if std::env::var_os(CHILD).is_some() {
+                return true;
+            }
+            struct OwnedChild(Child);
+            impl Drop for OwnedChild {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let test_name = format!(
+                "backend::v8::entities::store::tests::callback_userdata_lifetime::{test_name}"
+            );
+            let mut child = OwnedChild(
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", test_name.as_str(), "--nocapture"])
+                    .env(CHILD, "1")
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                match child.0.try_wait() {
+                    Ok(Some(status)) => {
+                        assert!(status.success(), "V8 proof failed: {status}");
+                        return false;
+                    }
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    result => panic!("V8 proof did not finish: {result:?}"),
+                }
+            }
+        }
+
+        #[test]
+        fn v8_async_callback_userdata_survives_public_store_objects_replacement() {
+            if !run_in_subprocess(
+                "v8_async_callback_userdata_survives_public_store_objects_replacement",
+            ) {
+                return;
+            }
+            struct Capture {
+                drops: Arc<AtomicUsize>,
+                calls: Arc<AtomicUsize>,
+            }
+            impl Capture {
+                fn invoke(&self) {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            impl Drop for Capture {
+                fn drop(&mut self) {
+                    self.drops.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            let drops = Arc::new(AtomicUsize::new(0));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let capture = Capture {
+                drops: drops.clone(),
+                calls: calls.clone(),
+            };
+            let mut store = store();
+            let function =
+                Function::new_async(&mut store, FunctionType::new([], [Type::I32]), move |_| {
+                    capture.invoke();
+                    async { Ok(vec![Value::I32(31)]) }
+                });
+            // This is real public mutable StoreObjects access. C++ still holds the
+            // original callback userdata; it must not own the factory's Rust lifetime.
+            let displaced = std::mem::take(store.objects_mut().as_v8_mut());
+            drop(displaced);
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            let store = store.into_async();
+            assert_eq!(
+                futures::executor::block_on(function.call_async(&store, vec![])).unwrap()[0].i32(),
+                Some(31)
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let weak = store.downgrade();
+            drop(store);
+            assert!(weak.upgrade().is_none());
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            let _stale_copy = function.clone();
+        }
+    }
+
     struct Payload {
         name: &'static str,
         drops: Arc<AtomicUsize>,
