@@ -199,6 +199,9 @@ def main():
 
     producer = clone("producer", "https://github.com/wasmerio/v8-custom-builds.git", PRODUCER)
     depot = clone("depot_tools", "https://chromium.googlesource.com/chromium/tools/depot_tools.git", DEPOT)
+    env.update(DEPOT_TOOLS_DIR=str(depot), DEPOT_TOOLS_BOOTSTRAP_PYTHON3="1")
+    for override in ("CUSTOM_CIPD_CLIENT", "VPYTHON_BYPASS", "CHROMIUM_BUILDTOOLS_PATH"):
+        env.pop(override, None)
     source = clone("source-v8", "https://chromium.googlesource.com/v8/v8.git", V8)
     source.rename(producer / "v8")
     source = producer / "v8"
@@ -246,12 +249,15 @@ def main():
                         ("CC", "CXX", "CFLAGS", "CXXFLAGS", "LDFLAGS", "LD_LIBRARY_PATH")},
                     lock_sha256=digest(candidate / "Cargo.lock"), jobs=2,
                     phase_module_sha256=digest(Path(recipe_phase.__file__)),
+                    bootstrap_module_sha256=digest(Path(__file__).with_name("capi_v8_depot_bootstrap.py")),
                     source_growth_cap=8 * GIB, build_growth_cap=4 * GIB,
                     aggregate_growth_cap=12 * GIB, reserve=2 * GIB,
                     phase_estimates="new guarded estimates, not historical measured peaks; GN may invoke compiler checks")
     (evidence / "identity.json").write_text(json.dumps(identity, indent=2) + "\n")
-    # The original script syncs exact DEPS and applies the original eight patches plus TLS9.
-    run("upstream-recipe", ["bash", "candidate-build.sh", "x64", "linux"], producer, 12 * GIB, 135 * 60)
+    # Bootstrap/preflight is inside the SAME admitted source phase and deadline.
+    # It execs the unchanged original recipe, which applies the eight patches plus TLS9.
+    run("upstream-recipe", [sys.executable, str(Path(__file__).with_name("capi_v8_depot_bootstrap.py")),
+        str(root)], producer, 12 * GIB, 135 * 60)
     if checked_text(["git", "rev-parse", "HEAD"], source) != V8:
         raise RuntimeError("V8 source moved")
     shutil.copyfile(source / "DEPS", evidence / "DEPS")

@@ -145,6 +145,7 @@ jobs:
             /.gitmodules
             /.github/capi-v8-linux-producer.py
             /.github/capi_v8_recipe_phase.py
+            /.github/capi_v8_depot_bootstrap.py
             /Cargo.lock
             /Cargo.toml
             /lib/api/build.rs
