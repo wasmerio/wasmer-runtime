@@ -89,7 +89,7 @@ macro_rules! impl_native_traits {
 
                  loop {
                     results.clear();
-                    let arguments = crate::backend::v8::references::Values::from_values(&params_list, &Args::wasm_types())?;
+                    let arguments = crate::backend::v8::references::Values::from_values(&params_list, &<( $( $x, )* ) as WasmTypeList>::wasm_types())?;
                     let raw_results = &mut results.0;
                     let raw_arguments = arguments.into_call_arguments();
                     trap = unsafe { wasm_func_call(func, &raw_arguments, raw_results) };
