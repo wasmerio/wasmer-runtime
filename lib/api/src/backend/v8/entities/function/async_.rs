@@ -99,23 +99,33 @@ impl Function {
                             "V8 call parameters do not match signature",
                         ));
                     }
-                    arguments = Some(CallValues::from_values(&parameters));
                     results = Some(CallValues::empty(signature.results().len()));
-                    // Actual backing remains strongly owned, but NO StoreMut or
-                    // LocalRwLock guard remains across wee8 or any host factory.
-                    drop(locked.take());
                     loop {
                         results.as_mut().unwrap().clear();
                         if frame.has_panic() {
                             return Err(RuntimeError::new("V8 call cleanup panicked"));
                         }
-                        let trap = unsafe {
-                            wasm_func_call(
-                                function.handle.raw(),
-                                &arguments.as_ref().unwrap().0,
-                                &mut results.as_mut().unwrap().0,
-                            )
+                        let guard = match locked.take() {
+                            Some(guard) => guard,
+                            None => StoreAsyncWriteLock::try_acquire(&store).ok_or_else(|| {
+                                RuntimeError::new("V8 replay Store is still borrowed")
+                            })?,
                         };
+                        function.handle.origin.check_store(&guard)?;
+                        // C++ consumes each physical argument vector. Keep the
+                        // SAME Rust Values for a requested InvokeAgain instead.
+                        arguments = Some(CallValues::from_values(&parameters));
+                        let raw_function = function.handle.raw();
+                        let raw_results = &mut results.as_mut().unwrap().0;
+                        drop(guard);
+                        if frame.has_panic() {
+                            return Err(RuntimeError::new("V8 call cleanup panicked"));
+                        }
+                        // No fallible query, guard or callback between disarm
+                        // and transfer. No Rust owner deletes this vector later.
+                        let raw_arguments = arguments.take().unwrap().into_call_arguments();
+                        let trap =
+                            unsafe { wasm_func_call(raw_function, &raw_arguments, raw_results) };
                         // A host callback already caught the original panic.
                         // Never run on_called or replay the guest under it.
                         if frame.has_panic() {

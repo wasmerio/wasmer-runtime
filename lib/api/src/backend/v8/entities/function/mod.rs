@@ -441,14 +441,17 @@ impl Function {
 
         // let wasm_func_param_arity(self.handle)
 
-        let args = Values::from_values(params);
         let mut results = Values::empty(signature.results().len());
 
         let mut trap;
 
         loop {
             results.clear();
-            trap = unsafe { wasm_func_call(self.handle.raw(), &args.0, &mut results.0) };
+            let arguments = Values::from_values(params);
+            let function = self.handle.raw();
+            let raw_results = &mut results.0;
+            let raw_arguments = arguments.into_call_arguments();
+            trap = unsafe { wasm_func_call(function, &raw_arguments, raw_results) };
             let store_mut = store.as_store_mut();
             if let Some(callback) = store_mut.inner.on_called.take() {
                 match callback(store_mut) {

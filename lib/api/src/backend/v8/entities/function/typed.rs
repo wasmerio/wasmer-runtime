@@ -84,13 +84,15 @@ macro_rules! impl_native_traits {
 
                  let func = unsafe { wasm_extern_as_func(self.func.to_vm_extern().unwrap_v_8().raw()) };
 
-                let params = crate::backend::v8::references::Values::from_values(&params_list);
 
                  let mut trap;
 
                  loop {
                     results.clear();
-                    trap = unsafe { wasm_func_call(func, &params.0, &mut results.0) };
+                    let arguments = crate::backend::v8::references::Values::from_values(&params_list);
+                    let raw_results = &mut results.0;
+                    let raw_arguments = arguments.into_call_arguments();
+                    trap = unsafe { wasm_func_call(func, &raw_arguments, raw_results) };
 
                     let store_mut = store.as_store_mut();
                     if let Some(callback) = store_mut.inner.on_called.take() {

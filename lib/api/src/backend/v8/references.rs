@@ -205,6 +205,15 @@ impl Values {
             unsafe { std::slice::from_raw_parts_mut(self.0.data, self.0.size) }
         }
     }
+    /// Pin-specific: b0a's wasm_func_call adopts even its const input vector.
+    /// Finish all fallible work first, then transfer immediately to that call.
+    pub(crate) fn into_call_arguments(self) -> wasm_val_vec_t {
+        let owner = std::mem::ManuallyDrop::new(self);
+        wasm_val_vec_t {
+            size: owner.0.size,
+            data: owner.0.data,
+        }
+    }
     pub(crate) fn clear(&mut self) {
         for slot in self.as_mut_slice() {
             let old = std::mem::replace(slot, zero());
@@ -427,6 +436,89 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert_eq!(call(&escaped, &store, vec![])[0].i32(), Some(37));
         assert_eq!(roots(&store), baseline);
+        drop(instance);
+    }
+
+    fn replay_once(store: &mut impl crate::AsStoreMut, callbacks: Arc<AtomicUsize>) {
+        store.as_store_mut().on_called(move |mut current| {
+            callbacks.fetch_add(1, Ordering::SeqCst);
+            current.on_called(move |_| {
+                callbacks.fetch_add(1, Ordering::SeqCst);
+                Ok(wasmer_types::OnCalledAction::Finish)
+            });
+            Ok(wasmer_types::OnCalledAction::InvokeAgain)
+        });
+    }
+
+    #[test]
+    fn each_physical_sync_typed_and_async_replay_transfers_fresh_owned_arguments() {
+        use crate::AsStoreMut;
+        let mut store = Store::new(crate::v8::V8::new());
+        let module = Module::new(
+            &store,
+            wat::parse_str(
+                r#"(module
+            (global $runs (export "runs") (mut i32) (i32.const 0))
+            (func $tick global.get $runs i32.const 1 i32.add global.set $runs)
+            (func $target (export "target") (result i32) i32.const 37)
+            (elem declare func $target)
+            (func (export "scalar") (param i32) (result i32) call $tick local.get 0)
+            (func (export "reference") (param funcref) (result funcref) call $tick local.get 0)
+            (func (export "multiple") (param i32 funcref funcref) (result i32 funcref funcref)
+                call $tick local.get 0 local.get 1 local.get 2)
+            (func (export "typed") (param i32 i32) (result i32 i32)
+                call $tick local.get 1 local.get 0))"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let instance = Instance::new(&mut store, &module, &crate::Imports::new()).unwrap();
+        let scalar = instance.exports.get_function("scalar").unwrap().clone();
+        let reference = instance.exports.get_function("reference").unwrap().clone();
+        let multiple = instance.exports.get_function("multiple").unwrap().clone();
+        let target = instance.exports.get_function("target").unwrap().clone();
+        let runs = instance.exports.get_global("runs").unwrap().clone();
+        let typed = instance
+            .exports
+            .get_typed_function::<(i32, i32), (i32, i32)>(&store, "typed")
+            .unwrap();
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        replay_once(&mut store, callbacks.clone());
+        assert_eq!(
+            scalar.call(&mut store, &[Value::I32(12)]).unwrap()[0].i32(),
+            Some(12)
+        );
+        assert_eq!(runs.get(&mut store).i32(), Some(2));
+        replay_once(&mut store, callbacks.clone());
+        assert_eq!(typed.call(&mut store, 11, 17).unwrap(), (17, 11));
+        assert_eq!(runs.get(&mut store).i32(), Some(4));
+        let store = store.into_async();
+        let baseline = roots(&store);
+        for (function, arguments) in [
+            (&reference, vec![Value::FuncRef(None)]),
+            (&reference, vec![Value::FuncRef(Some(target.clone()))]),
+            (
+                &multiple,
+                vec![
+                    Value::I32(7),
+                    Value::FuncRef(None),
+                    Value::FuncRef(Some(target.clone())),
+                ],
+            ),
+        ] {
+            {
+                let mut guard = futures::executor::block_on(store.write_lock());
+                replay_once(&mut guard, callbacks.clone());
+            }
+            let result = call(function, &store, arguments.clone());
+            assert_eq!(result.as_ref(), arguments.as_slice());
+            assert_eq!(roots(&store), baseline);
+            assert_eq!(call(&target, &store, vec![])[0].i32(), Some(37));
+        }
+        let mut guard = futures::executor::block_on(store.write_lock());
+        assert_eq!(runs.get(&mut guard).i32(), Some(10));
+        assert_eq!(callbacks.load(Ordering::SeqCst), 10);
+        drop(guard);
         drop(instance);
     }
 
