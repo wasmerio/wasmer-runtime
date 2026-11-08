@@ -155,6 +155,10 @@ pub struct AsyncFunctionEnvMut<T>(pub(crate) BackendAsyncFunctionEnvMut<T>);
 pub struct WeakAsyncFunctionEnvMut<T> {
     store: crate::WeakStoreAsync,
     env: FunctionEnv<T>,
+    #[cfg(feature = "sys")]
+    local_owner: Option<std::rc::Weak<dyn std::any::Any>>,
+    #[cfg(feature = "sys")]
+    import_snapshot: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 #[cfg(feature = "experimental-async")]
@@ -163,6 +167,10 @@ impl<T> Clone for WeakAsyncFunctionEnvMut<T> {
         Self {
             store: self.store.clone(),
             env: self.env.clone(),
+            #[cfg(feature = "sys")]
+            local_owner: self.local_owner.clone(),
+            #[cfg(feature = "sys")]
+            import_snapshot: self.import_snapshot.clone(),
         }
     }
 }
@@ -181,6 +189,8 @@ impl<T: 'static> WeakAsyncFunctionEnvMut<T> {
                         store,
                     ),
                     func_env: env.clone(),
+                    local_owner: self.local_owner.clone(),
+                    import_snapshot: self.import_snapshot.clone(),
                 },
             ),
             #[cfg(feature = "js")]
@@ -226,7 +236,37 @@ impl<T: 'static> AsyncFunctionEnvMut<T> {
         Some(WeakAsyncFunctionEnvMut {
             store: store.downgrade(),
             env: self.as_ref(),
+            #[cfg(feature = "sys")]
+            local_owner: self.native_local_owner(),
+            #[cfg(feature = "sys")]
+            import_snapshot: self.native_import_snapshot(),
         })
+    }
+
+    /// Weak owner metadata captured at the original native import factory.
+    /// This conveys no Store access or invocation authority.
+    #[doc(hidden)]
+    pub fn native_local_owner(&self) -> Option<std::rc::Weak<dyn std::any::Any>> {
+        match &self.0 {
+            #[cfg(feature = "sys")]
+            BackendAsyncFunctionEnvMut::Sys(env) => env.local_owner.clone(),
+            #[cfg(any(feature = "js", feature = "v8"))]
+            _ => None,
+        }
+    }
+
+    /// Immutable metadata captured in this import's ORIGINAL factory borrow.
+    /// Deferred clones and weak upgrades preserve it without ambient recapture.
+    #[doc(hidden)]
+    pub fn native_import_snapshot(
+        &self,
+    ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+        match &self.0 {
+            #[cfg(feature = "sys")]
+            BackendAsyncFunctionEnvMut::Sys(env) => env.import_snapshot.clone(),
+            #[cfg(any(feature = "js", feature = "v8"))]
+            _ => None,
+        }
     }
 
     /// Waits for a store lock and returns a read-only handle to the

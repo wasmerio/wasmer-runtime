@@ -63,6 +63,58 @@ pub fn call_async_with_local_owner(
     }
 }
 
+/// Constructs the same owned call and observes only its new physical root.
+/// The observer is registered before either value is published or polled.
+#[doc(hidden)]
+#[allow(clippy::type_complexity)]
+pub fn call_async_with_local_owner_observed(
+    function: &crate::Function,
+    store: &StoreAsync,
+    params: Vec<Value>,
+    owner: std::rc::Weak<dyn std::any::Any>,
+    cleanup: Option<&NativeCleanupOwner>,
+) -> Result<
+    (
+        Pin<Box<dyn Future<Output = Result<Box<[Value]>, RuntimeError>>>>,
+        NativeAncestrySettlement,
+    ),
+    RuntimeError,
+> {
+    match &function.0 {
+        crate::BackendFunction::Sys(function) => {
+            let future = AsyncCallFuture::new_with_local_owner(
+                function.clone(),
+                store.store(),
+                params,
+                Some(owner),
+            );
+            let root = future
+                .root
+                .as_ref()
+                .expect("new call owns its root")
+                .control
+                .settlement
+                .clone();
+            let waiter = Rc::new(NativeSettlementWaiter {
+                waker: RefCell::new(None),
+                cleanup: cleanup.map(|owner| Rc::downgrade(&owner.0)),
+            });
+            root.subscribe(&waiter);
+            Ok((
+                Box::pin(future),
+                NativeAncestrySettlement {
+                    roots: vec![root],
+                    waiter,
+                },
+            ))
+        }
+        #[cfg(any(feature = "v8", feature = "js"))]
+        _ => Err(RuntimeError::new(
+            "local call owners require the native backend",
+        )),
+    }
+}
+
 /// Calls a foreign native Store after yielding the current parked invocation.
 /// The driver is constructed only on the outside host-future poll. Its future
 /// must retain the supplied child until completion or ordinary cancellation.
@@ -405,6 +457,13 @@ pub fn current_native_local_owner<T: 'static>() -> Option<Rc<T>> {
         .upgrade()?
         .downcast::<T>()
         .ok()
+}
+
+// Capture while the import factory still has its actual physical coroutine.
+// Deferred environment handles preserve this exact weak metadata, never recapture it.
+pub(crate) fn current_native_local_owner_weak() -> Option<std::rc::Weak<dyn std::any::Any>> {
+    let current = CoroutineContext::current_root()?;
+    outermost_local_owner(&current.control)
 }
 
 fn outermost_local_owner(
@@ -10161,6 +10220,178 @@ mod tests {
                 .as_mut()
                 .poll(&mut Context::from_waker(&noop))
                 .is_ready()
+        );
+    }
+
+    #[test]
+    fn observed_local_call_certifies_never_polled_and_cancelled_physical_roots() {
+        if !runtime_subprocess(
+            "backend::sys::async_runtime::tests::observed_local_call_certifies_never_polled_and_cancelled_physical_roots",
+        ) {
+            return;
+        }
+        let mut raw = Store::default();
+        let _scope = NativeInvocationScope::bind(&mut raw).unwrap();
+        let ready = Function::new_typed(&mut raw, || 37_i32);
+        let captured = Rc::new(RefCell::new(None));
+        let capture = captured.clone();
+        let pending = Function::new_async(&mut raw, crate::FunctionType::new([], []), move |_| {
+            *capture.borrow_mut() = WeakNativeInvocation::current();
+            std::future::pending::<Result<Vec<Value>, RuntimeError>>()
+        });
+        let cap = raw.into_async();
+        let owner: Rc<dyn std::any::Any> = Rc::new(());
+        let mut cx = Context::from_waker(Waker::noop());
+        let (future, mut observer) =
+            call_async_with_local_owner_observed(&ready, &cap, vec![], Rc::downgrade(&owner), None)
+                .unwrap();
+        assert!(Pin::new(&mut observer).poll(&mut cx).is_pending());
+        drop(future);
+        assert!(Pin::new(&mut observer).poll(&mut cx).is_ready());
+        drop(observer);
+        let (mut future, mut observer) =
+            call_async_with_local_owner_observed(&ready, &cap, vec![], Rc::downgrade(&owner), None)
+                .unwrap();
+        let Poll::Ready(result) = future.as_mut().poll(&mut cx) else {
+            panic!("ready root must return");
+        };
+        assert_eq!(result.unwrap().as_ref(), &[Value::I32(37)]);
+        drop(future);
+        assert!(Pin::new(&mut observer).poll(&mut cx).is_ready());
+        drop(observer);
+
+        let (mut future, mut observer) = call_async_with_local_owner_observed(
+            &pending,
+            &cap,
+            vec![],
+            Rc::downgrade(&owner),
+            None,
+        )
+        .unwrap();
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        let invocation = captured.borrow().clone().unwrap();
+        // SAFETY: this exact root is suspended by the just-observed Pending;
+        // the frame is held only on its original owner thread.
+        let frame = unsafe { invocation.enter_descendant_frame().unwrap() };
+        drop(future);
+        assert!(Pin::new(&mut observer).poll(&mut cx).is_pending());
+        drop(frame);
+        assert!(Pin::new(&mut observer).poll(&mut cx).is_ready());
+        drop(observer);
+        drop(futures::executor::block_on(cap.write_lock()));
+        assert!(StoreContext::is_empty());
+    }
+
+    #[test]
+    fn native_async_import_owner_capture_survives_local_handle_conversions() {
+        let mut raw = Store::default();
+        let _scope = NativeInvocationScope::bind(&mut raw).unwrap();
+        let saved = Rc::new(RefCell::new(None));
+        let save_handle = saved.clone();
+        let env = crate::FunctionEnv::new(&mut raw, ());
+        fn capture(_: &()) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+            Some(Arc::new(55_u32))
+        }
+        let function = Function::new_typed_with_env_async_captured(
+            &mut raw,
+            &env,
+            move |mut env: crate::AsyncFunctionEnvMut<()>| {
+                let original = env.native_local_owner().unwrap();
+                let snapshot = env.native_import_snapshot().unwrap();
+                let cloned = env.clone();
+                let reborrowed = env.as_mut();
+                assert!(Weak::ptr_eq(
+                    &original,
+                    &cloned.native_local_owner().unwrap()
+                ));
+                assert!(Weak::ptr_eq(
+                    &original,
+                    &reborrowed.native_local_owner().unwrap()
+                ));
+                assert!(Arc::ptr_eq(
+                    &snapshot,
+                    &cloned.native_import_snapshot().unwrap()
+                ));
+                assert!(Arc::ptr_eq(
+                    &snapshot,
+                    &reborrowed.native_import_snapshot().unwrap()
+                ));
+                *save_handle.borrow_mut() = Some(env.downgrade().unwrap());
+                async { Ok::<i32, RuntimeError>(42) }
+            },
+            capture,
+        );
+        let cap = raw.into_async();
+        let owner: Rc<dyn std::any::Any> = Rc::new(37_u32);
+        let weak = Rc::downgrade(&owner);
+        assert_eq!(
+            futures::executor::block_on(call_async_with_local_owner(
+                &function,
+                &cap,
+                vec![],
+                weak.clone(),
+            ))
+            .unwrap()
+            .as_ref(),
+            &[Value::I32(42)]
+        );
+        assert!(CoroutineContext::current_root().is_none());
+        let original = saved.borrow_mut().take().unwrap();
+        let cloned = original.clone();
+        let upgraded = cloned.upgrade().unwrap();
+        let snapshot = upgraded.native_import_snapshot().unwrap();
+        assert_eq!(snapshot.downcast_ref::<u32>(), Some(&55));
+        assert!(Arc::ptr_eq(
+            &snapshot,
+            &original
+                .upgrade()
+                .unwrap()
+                .native_import_snapshot()
+                .unwrap()
+        ));
+        assert!(Weak::ptr_eq(&weak, &upgraded.native_local_owner().unwrap()));
+        assert_eq!(
+            Rc::strong_count(&owner),
+            1,
+            "environment metadata never pins the owner"
+        );
+        drop(owner);
+        assert!(upgraded.native_local_owner().unwrap().upgrade().is_none());
+        assert!(
+            original
+                .upgrade()
+                .unwrap()
+                .native_local_owner()
+                .unwrap()
+                .upgrade()
+                .is_none()
+        );
+        drop(upgraded);
+        drop(original);
+        drop(cloned);
+    }
+
+    #[test]
+    fn native_backing_identity_requires_actual_backing_and_bound_generation() {
+        let mut raw = Store::default();
+        let _scope = NativeInvocationScope::bind(&mut raw).unwrap();
+        let cap = raw.into_async();
+        let same = cap.store();
+        assert!(cap.same_native_backing(&same));
+        let mut other = Store::default().into_async();
+        other.id = cap.id;
+        other.native_invocation = cap.native_invocation.clone();
+        assert!(
+            !cap.same_native_backing(&other),
+            "duplicate ID/generation is not a backing proof"
+        );
+        let mut missing = cap.store();
+        missing.native_invocation = None;
+        assert!(!cap.same_native_backing(&missing));
+        let plain = Store::default().into_async();
+        assert!(
+            !plain.same_native_backing(&plain.store()),
+            "missing native generation never matches"
         );
     }
 

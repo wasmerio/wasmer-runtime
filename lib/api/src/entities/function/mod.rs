@@ -231,6 +231,27 @@ impl Function {
         Self(BackendFunction::new_typed_with_env_async(store, env, func))
     }
 
+    /// Native-only trusted pure metadata capture at the original checked import
+    /// factory. Other backends use their unchanged ordinary typed constructor.
+    /// The snapshot must contain no Store, root, local owner or resource custody.
+    #[doc(hidden)]
+    #[cfg(feature = "experimental-async")]
+    pub fn new_typed_with_env_async_captured<T: 'static, F, Args, Rets>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        func: F,
+        capture: fn(&T) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Self
+    where
+        Rets: WasmTypeList + 'static,
+        Args: WasmTypeList + 'static,
+        F: AsyncHostFunction<T, Args, Rets, WithEnv> + 'static,
+    {
+        Self(BackendFunction::new_typed_with_env_async_captured(
+            store, env, func, capture,
+        ))
+    }
+
     /// Returns the [`FunctionType`] of the `Function`.
     ///
     /// # Example

@@ -332,6 +332,33 @@ impl BackendFunction {
         }
     }
 
+    #[cfg(feature = "experimental-async")]
+    pub fn new_typed_with_env_async_captured<T: 'static, F, Args, Rets>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        func: F,
+        capture: fn(&T) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    ) -> Self
+    where
+        F: AsyncHostFunction<T, Args, Rets, WithEnv> + 'static,
+        Args: WasmTypeList + 'static,
+        Rets: WasmTypeList + 'static,
+    {
+        match &store.as_store_mut().inner.store {
+            #[cfg(feature = "sys")]
+            crate::BackendStore::Sys(_) => Self::Sys(
+                crate::backend::sys::entities::function::Function::new_typed_with_env_async_captured(store, env, func, Some(capture)),
+            ),
+            #[cfg(feature = "v8")]
+            crate::BackendStore::V8(_) => unsupported_async_backend("v8"),
+            #[cfg(feature = "js")]
+            crate::BackendStore::Js(_) => {
+                let _ = capture;
+                Self::Js(crate::backend::js::entities::function::Function::new_typed_with_env_async(store, env, func))
+            }
+        }
+    }
+
     /// Returns the [`FunctionType`] of the `Function`.
     ///
     /// # Example

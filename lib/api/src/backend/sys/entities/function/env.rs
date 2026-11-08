@@ -346,6 +346,8 @@ impl<'a, T: Send + 'static> FunctionEnvMut<'a, T> {
         Some(AsyncFunctionEnvMut {
             store: AsyncFunctionEnvMutStore::Async(store),
             func_env: self.func_env.clone(),
+            local_owner: crate::backend::sys::async_runtime::current_native_local_owner_weak(),
+            import_snapshot: None,
         })
     }
 }
@@ -388,6 +390,8 @@ impl<T> From<FunctionEnv<T>> for crate::FunctionEnv<T> {
 pub struct AsyncFunctionEnvMut<T> {
     pub(crate) store: AsyncFunctionEnvMutStore,
     pub(crate) func_env: FunctionEnv<T>,
+    pub(crate) local_owner: Option<std::rc::Weak<dyn Any>>,
+    pub(crate) import_snapshot: Option<std::sync::Arc<dyn Any + Send + Sync>>,
 }
 
 // We need to let async functions that *don't suspend* run
@@ -533,6 +537,8 @@ impl<T> Clone for AsyncFunctionEnvMut<T> {
         Self {
             store: self.store.clone(),
             func_env: self.func_env.clone(),
+            local_owner: self.local_owner.clone(),
+            import_snapshot: self.import_snapshot.clone(),
         }
     }
 }
@@ -726,6 +732,8 @@ mod split_ownership {
         let env = AsyncFunctionEnvMut {
             store: AsyncFunctionEnvMutStore::Async(store.into_async()),
             func_env: env,
+            local_owner: None,
+            import_snapshot: None,
         };
         let mut write = futures::executor::block_on(env.write());
         {

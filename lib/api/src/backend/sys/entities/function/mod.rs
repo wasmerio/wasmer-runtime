@@ -202,12 +202,30 @@ impl Function {
         F: Fn(AsyncFunctionEnvMut<T>, &[Value]) -> Fut + 'static,
         Fut: Future<Output = Result<Vec<Value>, RuntimeError>> + 'static,
     {
+        Self::new_with_env_async_captured(store, env, ty, func, None)
+    }
+
+    #[cfg(feature = "experimental-async")]
+    pub(crate) fn new_with_env_async_captured<FT, F, Fut, T: 'static>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        ty: FT,
+        func: F,
+        capture: Option<fn(&T) -> Option<Arc<dyn std::any::Any + Send + Sync>>>,
+    ) -> Self
+    where
+        FT: Into<FunctionType>,
+        F: Fn(AsyncFunctionEnvMut<T>, &[Value]) -> Fut + 'static,
+        Fut: Future<Output = Result<Vec<Value>, RuntimeError>> + 'static,
+    {
         let function_type = ty.into();
         let func_ty = function_type.clone();
         let func_env = env.clone().into_sys();
         let store_id = store.objects_mut().id();
         let wrapper = move |values_vec: *mut RawValue| -> HostCallOutcome {
             unsafe {
+                let local_owner =
+                    crate::backend::sys::async_runtime::current_native_local_owner_weak();
                 let mut context = StoreContext::try_get_current_async(store_id);
                 let mut store_mut = match &mut context {
                     crate::GetStoreAsyncGuardResult::Ok(wrapper) => wrapper.as_mut(),
@@ -226,6 +244,12 @@ impl Function {
                         values_vec.add(i).read_unaligned(),
                     ));
                 }
+                let import_snapshot = capture.and_then(|capture| {
+                    // Exact checked allocation in the ORIGINAL factory borrow.
+                    // The trusted reader only clones inert Send metadata.
+                    let data = func_env.as_ref(&store_mut);
+                    capture(data)
+                });
                 let native_invocation = store_mut.inner.native_invocation.clone();
                 let store_async = match context {
                     crate::GetStoreAsyncGuardResult::Ok(wrapper) => {
@@ -252,6 +276,8 @@ impl Function {
                     env::AsyncFunctionEnvMut {
                         store: store_async,
                         func_env: func_env.clone(),
+                        local_owner,
+                        import_snapshot,
                     },
                 ));
                 let sig = func_ty.clone();
@@ -411,11 +437,27 @@ impl Function {
         Args: WasmTypeList + 'static,
         Rets: WasmTypeList + 'static,
     {
+        Self::new_typed_with_env_async_captured(store, env, func, None)
+    }
+
+    #[cfg(feature = "experimental-async")]
+    pub(crate) fn new_typed_with_env_async_captured<T, F, Args, Rets>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        func: F,
+        capture: Option<fn(&T) -> Option<Arc<dyn std::any::Any + Send + Sync>>>,
+    ) -> Self
+    where
+        T: 'static,
+        F: AsyncHostFunction<T, Args, Rets, WithEnv> + 'static,
+        Args: WasmTypeList + 'static,
+        Rets: WasmTypeList + 'static,
+    {
         let signature = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
         let args_sig = Arc::new(signature.clone());
         let results_sig = Arc::new(signature.clone());
         let func = Arc::new(func);
-        Self::new_with_env_async(
+        Self::new_with_env_async_captured(
             store,
             env,
             signature,
@@ -453,6 +495,7 @@ impl Function {
                     )
                 })
             },
+            capture,
         )
     }
 

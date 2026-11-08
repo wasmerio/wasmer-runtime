@@ -9,10 +9,10 @@ pub use async_runtime::{
     NativeCleanupFailures, NativeCleanupFence, NativeCleanupFenceObservation, NativeCleanupGuard,
     NativeCleanupOwner, NativeCleanupSeal, NativeFrameGuard, NativeInvocationScope,
     NativeStoreDestruction, NativeStoreDestructionObserver, NativeStoreDestructionReservation,
-    WeakNativeInvocation, call_async_with_local_owner, call_native_descendant,
-    context_switch_supported, current_native_local_owner, current_native_store_loan,
-    enroll_native_ancestry_tail, native_cleanup_owner, native_invocation_active,
-    with_borrowed_native_store,
+    WeakNativeInvocation, call_async_with_local_owner, call_async_with_local_owner_observed,
+    call_native_descendant, context_switch_supported, current_native_local_owner,
+    current_native_store_loan, enroll_native_ancestry_tail, native_cleanup_owner,
+    native_invocation_active, with_borrowed_native_store,
 };
 mod native_frame;
 #[doc(hidden)]

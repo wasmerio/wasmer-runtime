@@ -69,6 +69,19 @@ impl WeakStoreAsync {
 }
 
 impl StoreAsync {
+    /// Compares existing native backing and generation metadata without locking
+    /// either Store. This grants no access and preserves any actual loan.
+    #[cfg(feature = "sys")]
+    #[doc(hidden)]
+    pub fn same_native_backing(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.inner.downgrade().ptr_eq(&other.inner.downgrade())
+            && match (&self.native_invocation, &other.native_invocation) {
+                (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+                _ => false,
+            }
+    }
+
     pub(crate) fn downgrade(&self) -> WeakStoreAsync {
         WeakStoreAsync {
             id: self.id,
