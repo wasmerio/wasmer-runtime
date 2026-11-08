@@ -5120,6 +5120,115 @@ mod tests {
     }
 
     #[test]
+    fn native_tail_enrollment_commits_owned_job_before_saved_waker_panic() {
+        use std::sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct PanicWake {
+            payload: Mutex<Option<DeferredPanic>>,
+            wakes: AtomicUsize,
+        }
+        impl std::task::Wake for PanicWake {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.wakes.fetch_add(1, Ordering::SeqCst);
+                let exact = self.payload.lock().unwrap().take().unwrap();
+                std::panic::resume_unwind(exact);
+            }
+        }
+        struct Payload(Arc<AtomicUsize>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct Job {
+            polls: Rc<Cell<usize>>,
+            drops: Rc<Cell<usize>>,
+        }
+        impl Future for Job {
+            type Output = ();
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                self.polls.set(self.polls.get() + 1);
+                Poll::Ready(())
+            }
+        }
+        impl Drop for Job {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+        let payload_drops = Arc::new(AtomicUsize::new(0));
+        let payload = Box::new(Payload(payload_drops.clone()));
+        let address = (&*payload) as *const Payload;
+        let observer = Arc::new(PanicWake {
+            payload: Mutex::new(Some(payload)),
+            wakes: AtomicUsize::new(0),
+        });
+        let polls = Rc::new(Cell::new(0));
+        let drops = Rc::new(Cell::new(0));
+        let caught = Rc::new(RefCell::new(None));
+        let recorded = caught.clone();
+        let job_polls = polls.clone();
+        let job_drops = drops.clone();
+        let mut store = Store::default();
+        let callback =
+            Function::new_async(&mut store, crate::FunctionType::new([], []), move |_| {
+                assert!(WeakNativeInvocation::current().unwrap().is_current());
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    enroll_native_ancestry_tail(Box::pin(Job {
+                        polls: job_polls.clone(),
+                        drops: job_drops.clone(),
+                    }))
+                }));
+                let Err(exact) = outcome else {
+                    panic!("user saved-Waker panic follows admission");
+                };
+                // Source-internal unit admission probe only: assert the actual live
+                // root's queue owns this SAME job before any poll or destruction.
+                let current = current_retirement_control().unwrap();
+                assert_eq!(current.tails.upgrade().unwrap().queue.borrow().len(), 1);
+                assert_eq!((job_polls.get(), job_drops.get()), (0, 0));
+                *recorded.borrow_mut() = Some(exact);
+                std::future::ready(Ok(Vec::new()))
+            });
+        let mut original = Box::pin(AsyncCallFuture::new(
+            callback.into_sys(),
+            store.into_async(),
+            vec![],
+        ));
+        // Explicit PRIVATE fixture injection of an otherwise ordinary saved
+        // caller Waker. This is not the public profile proof or a new API.
+        *original.tails.waker.borrow_mut() = Some(Arc::new(Waker::from(observer.clone())));
+        let Poll::Ready(result) = original
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("same original caller must finish after its queued job");
+        };
+        assert!(result.is_ok());
+        assert_eq!(observer.wakes.load(Ordering::SeqCst), 1);
+        assert_eq!((polls.get(), drops.get()), (1, 1));
+        let exact = caught.borrow_mut().take().unwrap();
+        assert_eq!(
+            exact.downcast_ref::<Payload>().unwrap() as *const _,
+            address
+        );
+        assert_eq!(payload_drops.load(Ordering::SeqCst), 0);
+        drop(original);
+        assert_eq!(
+            (polls.get(), drops.get()),
+            (1, 1),
+            "no duplicate recovery job"
+        );
+        drop(exact);
+        assert_eq!(payload_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn native_store_destruction_reservation_excludes_competitors_and_returns_only_after_completion()
     {
         let guard = NativeStoreDestructionGuard::new(None);
