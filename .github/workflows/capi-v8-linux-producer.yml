@@ -7,13 +7,115 @@ on:
         description: Full reviewed private Next workflow commit SHA
         type: string
         required: true
+      capacity_probe:
+        description: Read-only capacity/tools probe on the existing trusted Linux runner
+        type: boolean
+        default: false
+        required: false
 
 permissions:
   contents: read
 
 jobs:
+  capacity-probe:
+    if: github.repository == 'wasmerio/wasmer-next' && github.event.repository.private && github.ref == 'refs/heads/main' && inputs.capacity_probe
+    runs-on: aux-pub-trusted-16cpu-amd64
+    timeout-minutes: 5
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      REQUESTED_CANDIDATE: ${{ inputs.candidate_ref }}
+    steps:
+      - name: Record existing capacity and tools without changing the host
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v python3 >/dev/null; then
+            printf '%s\n' '{"error":"python3 is absent; no probe or producer ran"}' | tee "$RUNNER_TEMP/capi-v8-capacity-probe.json"
+            exit 1
+          fi
+          python3 - <<'PY' | tee "$RUNNER_TEMP/capi-v8-capacity-probe.log"
+          import json, os, platform, re, shutil, subprocess
+          from pathlib import Path
+
+          requested = os.environ["REQUESTED_CANDIDATE"]
+          if not re.fullmatch(r"[0-9a-f]{40}", requested) or requested != os.environ["GITHUB_SHA"]:
+              raise SystemExit("probe must execute the exact reviewed main workflow")
+
+          def read(path, limit=16384):
+              try:
+                  with open(path) as source:
+                      return source.read(limit)
+              except OSError as error:
+                  return {"error": str(error)}
+
+          mounts = []
+          for line in str(read("/proc/self/mountinfo")).splitlines():
+              left, separator, right = line.partition(" - ")
+              fields, details = left.split(), right.split()
+              if separator and len(fields) >= 5 and len(details) >= 2:
+                  decode = lambda text: re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), text)
+                  mounts.append({"mount": decode(fields[4]), "device": fields[2],
+                                 "filesystem": details[0], "source": decode(details[1])})
+          paths = {}
+          for name, raw in {"runner_temp": os.environ["RUNNER_TEMP"],
+                            "workspace": os.environ["GITHUB_WORKSPACE"],
+                            "mnt": "/mnt", "tmp": "/tmp"}.items():
+              path = Path(raw).resolve()
+              if not path.exists():
+                  paths[name] = {"path": str(path), "exists": False}
+                  continue
+              stats, usage = path.stat(), shutil.disk_usage(path)
+              matching = [mount for mount in mounts if path == Path(mount["mount"])
+                          or Path(mount["mount"]) in path.parents]
+              paths[name] = {"path": str(path), "exists": True, "st_dev": stats.st_dev,
+                  "writable_and_searchable": os.access(path, os.W_OK | os.X_OK),
+                  "free_bytes": usage.free, "total_bytes": usage.total,
+                  "mount": max(matching, key=lambda item: len(item["mount"])) if matching else None}
+
+          tools = {}
+          for name in ("gcc", "g++", "cc", "c++", "ldd", "ninja", "git", "python3", "readelf", "nm", "curl"):
+              executable = shutil.which(name)
+              if executable is None:
+                  tools[name] = {"present": False}
+                  continue
+              try:
+                  result = subprocess.run([executable, "--version"], timeout=5,
+                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                  tools[name] = {"present": True, "path": executable,
+                                 "exit": result.returncode, "version": result.stdout[:8192]}
+              except (OSError, subprocess.TimeoutExpired) as error:
+                  tools[name] = {"present": True, "path": executable, "error": str(error)}
+          memory = {line.split(":", 1)[0]: line.split(":", 1)[1].strip()
+                    for line in str(read("/proc/meminfo")).splitlines() if ":" in line
+                    and line.split(":", 1)[0] in ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree")}
+          cgroup = {name: read("/sys/fs/cgroup/" + name) for name in
+                    ("memory.max", "memory.current", "cpu.max", "pids.max")}
+          result = {"candidate": requested, "run_id": os.environ["GITHUB_RUN_ID"],
+              "attempt": os.environ["GITHUB_RUN_ATTEMPT"], "probe_only": True,
+              "producer_ran": False, "os_release": read("/etc/os-release"),
+              "kernel": platform.release(), "system": platform.system(), "arch": platform.machine(),
+              "libc": platform.libc_ver(), "cpu_count": os.cpu_count(),
+              "affinity_count": len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
+              "memory": memory, "cgroup": cgroup, "paths": paths, "tools": tools,
+              "unchanged_admission_bytes": 14 * 1024**3}
+          text = json.dumps(result, indent=2) + "\n"
+          (Path(os.environ["RUNNER_TEMP"]) / "capi-v8-capacity-probe.json").write_text(text)
+          print(text, end="")
+          PY
+      - name: Retain only the read-only probe evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        timeout-minutes: 2
+        with:
+          name: capi-v8-capacity-probe-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/capi-v8-capacity-probe.json
+            ${{ runner.temp }}/capi-v8-capacity-probe.log
+          if-no-files-found: error
+          retention-days: 14
   linux-x64:
-    if: github.repository == 'wasmerio/wasmer-next' && github.event.repository.private
+    if: github.repository == 'wasmerio/wasmer-next' && github.event.repository.private && !inputs.capacity_probe
     runs-on: ubuntu-22.04
     timeout-minutes: 180
     env:
