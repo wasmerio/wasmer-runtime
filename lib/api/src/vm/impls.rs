@@ -34,7 +34,7 @@ impl VMFunctionEnvironment {
             #[cfg(feature = "js")]
             Self::Js(env) => env.contents,
             #[cfg(feature = "v8")]
-            Self::V8(env) => env.contents,
+            Self::V8(env) => env.into_contents(),
         }
     }
 }

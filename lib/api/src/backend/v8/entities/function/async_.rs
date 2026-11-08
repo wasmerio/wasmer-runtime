@@ -111,6 +111,12 @@ impl Function {
                                 &mut results.as_mut().unwrap().0,
                             )
                         };
+                        // A host callback already caught the original panic.
+                        // Never run on_called or replay the guest under it.
+                        if frame.has_panic() {
+                            discard_trap(&frame, trap);
+                            return Err(RuntimeError::new("V8 call panicked"));
+                        }
                         let mut guard =
                             StoreAsyncWriteLock::try_acquire(&store).ok_or_else(|| {
                                 RuntimeError::new("V8 call returned with a borrowed Store")
@@ -119,18 +125,22 @@ impl Function {
                         let callback = guard.as_store_mut().inner.on_called.take();
                         let action = callback.map(|callback| callback(guard.as_store_mut()));
                         drop(guard);
+                        if frame.has_panic() {
+                            discard_trap(&frame, trap);
+                            guarded_dispose(&frame, || drop(action));
+                            return Err(RuntimeError::new("V8 call panicked"));
+                        }
                         match action {
                             Some(Ok(wasmer_types::OnCalledAction::InvokeAgain)) => {
-                                if !trap.is_null() {
-                                    unsafe { wasm_trap_delete(trap) };
+                                discard_trap(&frame, trap);
+                                if frame.has_panic() {
+                                    return Err(RuntimeError::new("V8 call panicked"));
                                 }
                                 continue;
                             }
                             Some(Ok(wasmer_types::OnCalledAction::Trap(error)))
                             | Some(Err(error)) => {
-                                if !trap.is_null() {
-                                    unsafe { wasm_trap_delete(trap) };
-                                }
+                                discard_trap(&frame, trap);
                                 return Err(RuntimeError::user(error));
                             }
                             Some(Ok(wasmer_types::OnCalledAction::Finish)) | None => {}
@@ -512,4 +522,22 @@ fn guarded_dispose(frame: &crate::backend::v8::async_runtime::CallGuard, cleanup
     if let Err(panic) = catch_unwind(AssertUnwindSafe(cleanup)) {
         frame.record(panic, unwinding);
     }
+}
+
+// A discarded trap can own an encoded Rust error as well as the C wrapper.
+// Catch the decode before later destruction and retain the same first carrier.
+fn discard_trap(frame: &crate::backend::v8::async_runtime::CallGuard, raw: *mut wasm_trap_t) {
+    if raw.is_null() {
+        return;
+    }
+    let unwinding = std::thread::panicking();
+    let decoded = match catch_unwind(AssertUnwindSafe(|| Trap::from(raw))) {
+        Ok(trap) => Some(trap),
+        Err(panic) => {
+            frame.record(panic, unwinding);
+            None
+        }
+    };
+    guarded_dispose(frame, || unsafe { wasm_trap_delete(raw) });
+    guarded_dispose(frame, || drop(decoded));
 }

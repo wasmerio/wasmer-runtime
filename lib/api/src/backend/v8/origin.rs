@@ -36,7 +36,7 @@ pub(crate) struct Origin {
     token: Weak<()>,
 }
 impl Origin {
-    pub(crate) fn of(store: &impl AsStoreRef) -> Result<Self, RuntimeError> {
+    pub(crate) fn of(store: &(impl AsStoreRef + ?Sized)) -> Result<Self, RuntimeError> {
         let view = store.as_store_ref();
         if !view.inner.store.is_v8() {
             return Err(RuntimeError::new("V8 handle requires a V8 Store"));
@@ -59,7 +59,10 @@ impl Origin {
     pub(crate) fn same(&self, other: &Self) -> bool {
         self.thread == other.thread && self.token.ptr_eq(&other.token)
     }
-    pub(crate) fn check_store(&self, store: &impl AsStoreRef) -> Result<(), RuntimeError> {
+    pub(crate) fn check_store(
+        &self,
+        store: &(impl AsStoreRef + ?Sized),
+    ) -> Result<(), RuntimeError> {
         self.check_alive()?;
         let view = store.as_store_ref();
         let actual = Self::of(&view)?;
@@ -112,7 +115,10 @@ impl<T> Handle<T> {
             .expect("invalid V8 handle provenance");
         self.raw
     }
-    pub(crate) fn checked_raw(&self, store: &impl AsStoreRef) -> Result<*mut T, RuntimeError> {
+    pub(crate) fn checked_raw(
+        &self,
+        store: &(impl AsStoreRef + ?Sized),
+    ) -> Result<*mut T, RuntimeError> {
         self.origin.check_store(store)?;
         Ok(self.raw)
     }

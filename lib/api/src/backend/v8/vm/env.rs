@@ -34,6 +34,12 @@ impl VMFunctionEnvironment {
             .as_mut()
             .expect("V8 function environment is separately lent")
     }
+    /// Consume the actual owned value; a separately lent slot has no value to move.
+    pub fn into_contents(mut self) -> Box<dyn Any + Send + 'static> {
+        self.contents
+            .take()
+            .expect("V8 function environment is separately lent")
+    }
     pub(crate) fn matches(&self, expected: &Weak<()>) -> bool {
         expected.ptr_eq(&Arc::downgrade(&self.identity))
     }

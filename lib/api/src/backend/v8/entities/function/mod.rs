@@ -626,7 +626,7 @@ fn sync_typed_results<Rets: WasmTypeList>(
         .as_mut()
         .iter()
         .zip(types)
-        .map(|(value, ty)| unsafe { Value::from_raw(store, ty, *value) })
+        .map(|(value, ty)| unsafe { Value::from_raw(store, *ty, *value) })
         .collect())
 }
 

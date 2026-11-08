@@ -438,24 +438,29 @@ impl WriteRetirement {
         }
     }
 
-    pub(crate) fn finish(&self, mut first: Option<Panic>, unwinding: bool) {
+    pub(crate) fn finish(&self, first: Option<Panic>, unwinding: bool) {
         self.released.set(true);
+        // Capture the applicable call once. Later T destructors may enter B,
+        // but must observe A's already-published original P in A's carrier.
+        let frame = self.binding.upgrade().and_then(|binding| {
+            let frame = binding.active.borrow().upgrade();
+            frame
+        });
+        let local = RefCell::new(None);
+        let carrier = frame.as_ref().map(|frame| &frame.panic).unwrap_or(&local);
+        if let Some(first) = first {
+            record_first(carrier, first, unwinding);
+        }
         let values = std::mem::take(&mut *self.displaced.borrow_mut());
         for value in values {
             if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(value))) {
-                if first.is_none() && !unwinding {
-                    first = Some(panic);
-                } else {
-                    discard_panic(panic);
-                }
+                record_first(carrier, panic, unwinding);
             }
         }
-        if let Some(first) = first {
-            if unwinding {
-                discard_panic(first);
-            } else {
-                resume_unwind(first);
-            }
+        // An active caller retains its own exact first value. Only a guard
+        // without such a caller transports at this actual Rust Drop boundary.
+        if let Some(first) = local.into_inner() {
+            resume_unwind(first);
         }
     }
 }

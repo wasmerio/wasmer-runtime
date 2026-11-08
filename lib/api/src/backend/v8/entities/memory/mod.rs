@@ -167,7 +167,7 @@ impl Memory {
             .0
             .origin
             .check_store(store)
-            .expect("foreign V8 memory");
+            .map_err(|error| MemoryError::Generic(error.to_string()))?;
         let store_mut = store.as_store_mut();
         let min_size = Pages::from_bytes_rounded_up(min_size).ok_or_else(|| {
             MemoryError::Generic("could not represent {min_size} in Pages".to_owned())
@@ -189,7 +189,7 @@ impl Memory {
             .0
             .origin
             .check_store(store)
-            .expect("foreign V8 memory");
+            .map_err(|error| MemoryError::Generic(error.to_string()))?;
         Err(MemoryError::UnsupportedOperation {
             message: "reset not supported for V8 memory".to_owned(),
         })
@@ -213,7 +213,7 @@ impl Memory {
             .0
             .origin
             .check_store(store)
-            .expect("foreign V8 memory");
+            .map_err(|error| MemoryError::Generic(error.to_string()))?;
 
         let ty = self.ty(store);
         if !ty.shared {
@@ -283,7 +283,7 @@ impl Memory {
             .0
             .origin
             .check_store(store)
-            .expect("foreign V8 memory");
+            .map_err(|error| MemoryError::Generic(error.to_string()))?;
         Ok(SharedMemory::new(crate::vm::VMSharedMemory::V8(
             self.handle.as_shared()?,
         )))

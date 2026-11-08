@@ -91,9 +91,13 @@ impl<T> FunctionEnv<T> {
 
     fn restore(
         &self,
+        backing: &LentBacking,
         store: &mut StoreMut<'_>,
         value: Box<dyn Any + Send>,
     ) -> Result<(), Box<dyn Any + Send>> {
+        if !backing.matches(store) {
+            return Err(value);
+        }
         let crate::StoreObjects::V8(objects) = &mut store.inner.objects else {
             return Err(value);
         };
@@ -141,11 +145,35 @@ impl<T> Clone for FunctionEnv<T> {
     }
 }
 
+// This snapshot belongs to the original access, independently of movable
+// StoreObjects. A replacement guard cannot adopt the original lent Box.
+#[derive(Clone)]
+struct LentBacking {
+    address: usize,
+    origin: crate::backend::v8::origin::Origin,
+}
+impl LentBacking {
+    fn capture(store: &StoreMut<'_>) -> Self {
+        Self {
+            address: store.inner as *const crate::StoreInner as usize,
+            origin: store.inner.store.as_v8().origin.capture(),
+        }
+    }
+    fn matches(&self, store: &StoreMut<'_>) -> bool {
+        store.inner as *const crate::StoreInner as usize == self.address
+            && store.inner.store.is_v8()
+            && self
+                .origin
+                .same(&store.inner.store.as_v8().origin.capture())
+    }
+}
+
 /// A temporary handle to a [`FunctionEnv`].
 pub struct FunctionEnvMut<'a, T: 'a> {
     pub(crate) store_mut: Option<StoreMut<'a>>,
     pub(crate) func_env: FunctionEnv<T>,
     lease: Option<SplitLease<'a>>,
+    backing: LentBacking,
     #[cfg(feature = "experimental-async")]
     retirement: Option<crate::backend::v8::async_runtime::RetirementCap>,
 }
@@ -174,7 +202,9 @@ impl<'a, T: 'static> FunctionEnvMut<'a, T> {
         #[cfg(feature = "experimental-async")]
         let retirement = crate::backend::v8::async_runtime::RetirementCap::capture(&store)
             .expect("V8 environment belongs to another write scope");
+        let backing = LentBacking::capture(&store);
         Self {
+            backing,
             store_mut: Some(store),
             func_env,
             lease: None,
@@ -227,6 +257,7 @@ impl<'a, T: 'static> FunctionEnvMut<'a, T> {
     pub fn as_mut(&mut self) -> FunctionEnvMut<'_, T> {
         FunctionEnvMut {
             store_mut: Some(self.store_mut.as_mut().unwrap().as_store_mut()),
+            backing: self.backing.clone(),
             func_env: self.func_env.clone(),
             lease: self
                 .lease
@@ -260,9 +291,9 @@ impl<T> Drop for FunctionEnvMut<'_, T> {
         let Some(SplitLease::Owned(value)) = self.lease.take() else {
             return;
         };
-        let original = self
-            .func_env
-            .restore(self.store_mut.as_mut().unwrap(), value);
+        let original =
+            self.func_env
+                .restore(&self.backing, self.store_mut.as_mut().unwrap(), value);
         if let Err(value) = original {
             // End this frame's real Store subborrow BEFORE any disposition.
             // Original write-cap transfer is metadata-only; it never resolves
@@ -375,9 +406,10 @@ pub struct AsyncFunctionEnvHandle<T> {
 
 #[cfg(feature = "experimental-async")]
 pub struct AsyncFunctionEnvHandleMut<T> {
-    write_lock: StoreAsyncWriteLock,
+    write_lock: Option<StoreAsyncWriteLock>,
     pub(crate) func_env: FunctionEnv<T>,
     lease: Option<Box<dyn Any + Send>>,
+    backing: LentBacking,
     retirement: crate::backend::v8::async_runtime::RetirementCap,
 }
 
@@ -474,31 +506,37 @@ impl<T: 'static> AsyncFunctionEnvHandleMut<T> {
             crate::backend::v8::async_runtime::RetirementCap::capture(&write_lock.as_store_mut())
                 .expect("V8 async environment has invalid write custody")
                 .expect("V8 async environment requires its actual owned write guard");
+        let backing = LentBacking::capture(&write_lock.as_store_mut());
         Self {
-            write_lock,
+            write_lock: Some(write_lock),
             func_env,
             lease: None,
+            backing,
             retirement,
         }
     }
     pub fn data_mut(&mut self) -> &mut T {
         match &mut self.lease {
             Some(value) => value.downcast_mut().unwrap(),
-            None => self.func_env.as_mut(&mut self.write_lock),
+            None => self.func_env.as_mut(self.write_lock.as_mut().unwrap()),
         }
     }
     pub fn data_and_store_mut(&mut self) -> (&mut T, &mut StoreAsyncWriteLock) {
         if self.lease.is_none() {
-            self.lease = Some(self.func_env.lend(&mut self.write_lock.as_store_mut()));
+            self.lease = Some(
+                self.func_env
+                    .lend(&mut self.write_lock.as_mut().unwrap().as_store_mut()),
+            );
         }
         (
             self.lease.as_mut().unwrap().downcast_mut().unwrap(),
-            &mut self.write_lock,
+            self.write_lock.as_mut().unwrap(),
         )
     }
     pub fn as_function_env_mut(&mut self) -> FunctionEnvMut<'_, T> {
         FunctionEnvMut {
-            store_mut: Some(self.write_lock.as_store_mut()),
+            store_mut: Some(self.write_lock.as_mut().unwrap().as_store_mut()),
+            backing: self.backing.clone(),
             func_env: self.func_env.clone(),
             lease: self.lease.as_mut().map(SplitLease::Borrowed),
             retirement: Some(self.retirement.clone()),
@@ -512,14 +550,17 @@ impl<T> Drop for AsyncFunctionEnvHandleMut<T> {
         let Some(value) = self.lease.take() else {
             return;
         };
-        if let Err(value) = self
-            .func_env
-            .restore(&mut self.write_lock.as_store_mut(), value)
-        {
+        if let Err(value) = self.func_env.restore(
+            &self.backing,
+            &mut self.write_lock.as_mut().unwrap().as_store_mut(),
+            value,
+        ) {
             // The exact still-live holder drains only after this field's real
             // write lock/context and all unlock notifications have retired.
             if let Err(value) = self.retirement.try_retain(value) {
-                dispose_lent(value);
+                // The caller may have replaced A's guard with B. End that
+                // CURRENT actual guard before any displaced T destructor.
+                dispose_after_guard(self.write_lock.take(), value);
             }
         }
     }
@@ -528,17 +569,47 @@ impl<T> Drop for AsyncFunctionEnvHandleMut<T> {
 #[cfg(feature = "experimental-async")]
 impl<T: 'static> AsStoreRef for AsyncFunctionEnvHandleMut<T> {
     fn as_store_ref(&self) -> StoreRef<'_> {
-        self.write_lock.as_store_ref()
+        self.write_lock.as_ref().unwrap().as_store_ref()
     }
 }
 
 #[cfg(feature = "experimental-async")]
 impl<T: 'static> AsStoreMut for AsyncFunctionEnvHandleMut<T> {
     fn as_store_mut(&mut self) -> StoreMut<'_> {
-        self.write_lock.as_store_mut()
+        self.write_lock.as_mut().unwrap().as_store_mut()
     }
 
     fn objects_mut(&mut self) -> &mut crate::StoreObjects {
-        self.write_lock.objects_mut()
+        self.write_lock.as_mut().unwrap().objects_mut()
+    }
+}
+
+#[cfg(feature = "experimental-async")]
+fn dispose_after_guard(guard: Option<StoreAsyncWriteLock>, value: Box<dyn Any + Send>) {
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+    let unwinding = std::thread::panicking();
+    let mut first = catch_unwind(AssertUnwindSafe(|| drop(guard))).err();
+    if let Err(mut panic) = catch_unwind(AssertUnwindSafe(|| drop(value))) {
+        if first.is_none() {
+            first = Some(panic);
+        } else {
+            loop {
+                match catch_unwind(AssertUnwindSafe(|| drop(panic))) {
+                    Ok(()) => break,
+                    Err(next) => panic = next,
+                }
+            }
+        }
+    }
+    if let Some(mut panic) = first {
+        if !unwinding {
+            resume_unwind(panic);
+        }
+        loop {
+            match catch_unwind(AssertUnwindSafe(|| drop(panic))) {
+                Ok(()) => break,
+                Err(next) => panic = next,
+            }
+        }
     }
 }

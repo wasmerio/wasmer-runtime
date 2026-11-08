@@ -122,7 +122,17 @@ impl Instance {
     ) -> Result<(Self, Exports), InstantiationError> {
         check_isolate(store);
         let store_ref = store.as_store_ref();
-        if externs.iter().any(|value| !value.is_from_store(store)) {
+        if externs.iter().any(|value| {
+            // Sys handles may share a numeric StoreId; that is not V8 origin.
+            let is_v8 = match value {
+                Extern::Function(value) => matches!(&value.0, crate::BackendFunction::V8(_)),
+                Extern::Memory(value) => matches!(&value.0, crate::BackendMemory::V8(_)),
+                Extern::Table(value) => matches!(&value.0, crate::BackendTable::V8(_)),
+                Extern::Global(value) => matches!(&value.0, crate::BackendGlobal::V8(_)),
+                Extern::Tag(value) => matches!(&value.0, crate::BackendTag::V8(_)),
+            };
+            !is_v8 || !value.is_from_store(store)
+        }) {
             return Err(InstantiationError::DifferentStores);
         }
         let externs: Vec<VMExtern> = externs
