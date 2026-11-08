@@ -45,7 +45,7 @@ private V8 provider candidate. Apply it only to V8
 `b0a55a7dad7f536cce1f9aaddba89894c8533946`, after the original eight patches
 from producer `844d01dc10edaa0461715f484e06b004f1fd023e` and the authoritative
 library-TLS patch9. Its SHA-256 is
-`d51568aa5e8e782515fe92c22ec1c9e2f9d9be926ebeaab9effbf0b41596088d`.
+`cf248bf0964a508002860577ddb2b29bc955e389c89649868e2895abf297dfbc`.
 It uses V8's existing canonical callable-reference conversions and rooting;
 it changes only `src/wasm/c-api.cc` and `third_party/wasm-api/wasm.hh`.
 

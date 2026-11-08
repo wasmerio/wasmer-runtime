@@ -1,20 +1,22 @@
 # Authored and committed by OpenAI Codex.
 # Source-only candidate against V8 b0a55a7dad7f536cce1f9aaddba89894c8533946 plus original producer eight patches and TLS9.
-# Combined source tuple c491fd2bb2f17dfcb014dc2b3ee9649e21cacabd..41542fd8b4fbf8c7c95b0e1c2759939449b67a59.
+# Combined source tuple c491fd2bb2f17dfcb014dc2b3ee9649e21cacabd..73e59195aae6852b86e7b9fee725c4e7ef48bfb7.
 # No compiler/provider adoption or build acceptance is implied.
 diff --git a/src/wasm/c-api.cc b/src/wasm/c-api.cc
-index 4ccb673..4f47de1 100644
+index 4ccb673..a2a7d94 100644
 --- a/src/wasm/c-api.cc
 +++ b/src/wasm/c-api.cc
-@@ -1744,6 +1744,89 @@ i::DirectHandle<i::Object> WasmRefToV8(i::Isolate* isolate, const Ref* ref) {
+@@ -1744,6 +1744,91 @@ i::DirectHandle<i::Object> WasmRefToV8(i::Isolate* isolate, const Ref* ref) {
    return impl(ref)->v8_object();
  }
  
 +
 +own<Trap> RefConversionTrap(StoreImpl* store, const char* message) {
 +  CHECK_NOT_NULL(message);
-+  auto text = Message::make_nt(std::string(message));
-+  CHECK(text);
++  size_t length = std::strlen(message) + 1;
++  auto text = Message::make_uninitialized(length);
++  CHECK_NOT_NULL(text.get());
++  std::memcpy(text.get(), message, length);
 +  auto trap = Trap::make(seal<Store>(store), text);
 +  // Allocation failure must never become the null/success return channel.
 +  CHECK(trap);
@@ -96,7 +98,7 @@ index 4ccb673..4f47de1 100644
  void PrepareFunctionData(
      i::Isolate* isolate,
      i::DirectHandle<i::WasmExportedFunctionData> function_data,
-@@ -1765,92 +1848,124 @@ void PrepareFunctionData(
+@@ -1765,92 +1850,124 @@ void PrepareFunctionData(
        i::wasm::CWasmArgumentsPacker::TotalSize(sig));
  }
  
@@ -287,7 +289,7 @@ index 4ccb673..4f47de1 100644
  }
  
  i::DirectHandle<i::JSReceiver> GetProperException(
-@@ -1907,13 +2022,33 @@ WASM_EXPORT auto Func::call(const vec<Val>& args, vec<Val>& results) const
+@@ -1907,13 +2024,33 @@ WASM_EXPORT auto Func::call(const vec<Val>& args, vec<Val>& results) const
        i::wasm::GetTypeCanonicalizer()->LookupFunctionSignature(
            module->canonical_sig_id(
                module->functions[function_index].sig_index));
@@ -322,7 +324,7 @@ index 4ccb673..4f47de1 100644
  
    i::DirectHandle<i::Object> object_ref;
    if (function_index < static_cast<int>(module->num_imported_functions)) {
-@@ -1972,44 +2107,65 @@ i::Address FuncData::v8_callback(i::Address host_data_foreign,
+@@ -1972,44 +2109,65 @@ i::Address FuncData::v8_callback(i::Address host_data_foreign,
    const ownvec<ValType>& param_types = self->type->params();
    const ownvec<ValType>& result_types = self->type->results();
  
@@ -422,7 +424,7 @@ index 4ccb673..4f47de1 100644
  
    own<Trap> trap;
    if (self->kind == kCallbackWithEnv) {
-@@ -2017,43 +2173,54 @@ i::Address FuncData::v8_callback(i::Address host_data_foreign,
+@@ -2017,43 +2175,54 @@ i::Address FuncData::v8_callback(i::Address host_data_foreign,
    } else {
      trap = self->callback(params, results);
    }
@@ -512,7 +514,7 @@ index 4ccb673..4f47de1 100644
        }
      }
    }
-@@ -2135,7 +2302,8 @@ WASM_EXPORT auto Global::get() const -> Val {
+@@ -2135,7 +2304,8 @@ WASM_EXPORT auto Global::get() const -> Val {
        if (IsWasmNull(*result)) {
          result = v8_global->GetIsolate()->factory()->null_value();
        }
@@ -522,7 +524,7 @@ index 4ccb673..4f47de1 100644
      }
      case i::wasm::kS128: {
        v128_t value;
-@@ -2306,7 +2474,13 @@ WASM_EXPORT auto Table::make(Store* store_abs, const TableType* type,
+@@ -2306,7 +2476,13 @@ WASM_EXPORT auto Table::make(Store* store_abs, const TableType* type,
        i::wasm::AddressType::kI32);
  
    if (ref) {
@@ -537,7 +539,7 @@ index 4ccb673..4f47de1 100644
      for (uint32_t i = 0; i < minimum; i++) {
        table_obj->Set(isolate, table_obj, i, init);
      }
-@@ -3348,7 +3522,7 @@ inline auto adopt_val(wasm_val_t v) -> wasm::Val {
+@@ -3348,7 +3524,7 @@ inline auto adopt_val(wasm_val_t v) -> wasm::Val {
      }
      case wasm::ValKind::EXTERNREF:
      case wasm::ValKind::FUNCREF:
@@ -546,7 +548,7 @@ index 4ccb673..4f47de1 100644
      default:
        UNREACHABLE();
    }
-@@ -3386,7 +3560,7 @@ inline auto borrow_val(const wasm_val_t* v) -> borrowed_val {
+@@ -3386,7 +3562,7 @@ inline auto borrow_val(const wasm_val_t* v) -> borrowed_val {
      }
      case wasm::ValKind::EXTERNREF:
      case wasm::ValKind::FUNCREF:
