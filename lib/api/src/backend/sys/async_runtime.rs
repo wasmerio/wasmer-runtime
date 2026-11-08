@@ -5327,7 +5327,51 @@ mod tests {
                     with_borrowed_native_store(&wrong, |_| actions.set(3)).is_err(),
                     "same public ID does not authorize another backing/generation"
                 );
-                // A correctly parked target can still be used after rejection.
+                struct RestoreMetadata<'a, 'store> {
+                    store: &'a mut StoreMut<'store>,
+                    generation: Option<Arc<NativeInvocationGeneration>>,
+                    origin: Option<Arc<NativeInvocationGeneration>>,
+                }
+                impl Drop for RestoreMetadata<'_, '_> {
+                    fn drop(&mut self) {
+                        // Restore BOTH fields before disposing either temporary
+                        // Arc, including if the discriminator assertion unwinds.
+                        let generation = std::mem::replace(
+                            &mut self.store.inner.native_invocation,
+                            self.generation.take(),
+                        );
+                        let origin = std::mem::replace(
+                            &mut self.store.inner.native_access_origin,
+                            self.origin.take(),
+                        );
+                        drop((generation, origin));
+                    }
+                }
+                let generation = wrong.native_invocation.as_ref().unwrap();
+                let result = Store::with_current(|view| {
+                    // Give this derived A view B's VALID generation and matching
+                    // access origin, but leave A's noncloneable backing guard
+                    // untouched. Only the actual receipt identity can reject it.
+                    let generation = view.inner.native_invocation.replace(generation.clone());
+                    let origin = view
+                        .inner
+                        .native_access_origin
+                        .replace(wrong.native_invocation.as_ref().unwrap().clone());
+                    let restore = RestoreMetadata {
+                        store: view,
+                        generation,
+                        origin,
+                    };
+                    restore
+                        .store
+                        .parked(|| with_borrowed_native_store(&wrong, |_| actions.set(6)))
+                })
+                .unwrap();
+                assert_eq!(
+                    result.unwrap_err().message(),
+                    "borrowed Store backing or origin changed"
+                );
+                // A correctly parked target remains usable after restoration.
                 assert!(with_borrowed_native_store(&a, |_| ()).unwrap().is_some());
             });
         });
