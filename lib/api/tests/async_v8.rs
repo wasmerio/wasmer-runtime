@@ -215,6 +215,109 @@ fn v8_async_external_timer_wakes_the_same_stack_after_actual_pending() {
 }
 
 #[test]
+fn v8_async_guest_import_timer_resumes_its_live_wasm_activation() {
+    if !run_in_subprocess("v8_async_guest_import_timer_resumes_its_live_wasm_activation") {
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (pending_send, pending_receive) = tokio::sync::oneshot::channel();
+    let (complete_send, complete_receive) = tokio::sync::oneshot::channel();
+    let sender = runtime.spawn(async move {
+        pending_receive.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        complete_send.send(37i32).unwrap();
+    });
+    let pending_send = Rc::new(RefCell::new(Some(pending_send)));
+    let complete_receive = Rc::new(RefCell::new(Some(complete_receive)));
+    let polls = Rc::new(Cell::new(0));
+    let phase = Rc::new(RefCell::new(None::<wasmer::Global>));
+    let observed_phase = phase.clone();
+    let mut store = store();
+    let environment = FunctionEnv::new(&mut store, 0i32);
+    let observed_polls = polls.clone();
+    let function = Function::new_with_env_async(
+        &mut store,
+        &environment,
+        FunctionType::new([], [Type::I32]),
+        move |env: AsyncFunctionEnvMut<i32>, _| {
+            let mut pending_send = pending_send.borrow_mut().take();
+            let mut receive = complete_receive.borrow_mut().take().unwrap();
+            let polls = observed_polls.clone();
+            let phase = observed_phase.clone();
+            async move {
+                let value = std::future::poll_fn(|cx| {
+                    polls.set(polls.get() + 1);
+                    {
+                        let mut guard = env
+                            .try_write()
+                            .expect("the live guest stack holds no Rust Store guard");
+                        let marker = phase.borrow().as_ref().unwrap().clone();
+                        assert_eq!(
+                            marker.get(&mut guard).i32(),
+                            Some(1),
+                            "the actual guest entered and has not resumed past its import"
+                        );
+                    }
+                    let result = Pin::new(&mut receive).poll(cx);
+                    if result.is_pending()
+                        && let Some(send) = pending_send.take()
+                    {
+                        send.send(()).unwrap();
+                    }
+                    result
+                })
+                .await
+                .unwrap();
+                *env.write().await.data_mut() = value;
+                Ok(vec![Value::I32(value)])
+            }
+        },
+    );
+    // This is the guest/import variant, distinct from the direct host-call
+    // sibling. Before/after markers and result+1 require an actual guest
+    // activation to remain on the same OS stack across the import Pending.
+    let module = Module::new(
+        &store,
+        wat::parse_str(
+            r#"(module
+        (import "host" "timer" (func $timer (result i32)))
+        (global $phase (export "phase") (mut i32) (i32.const 0))
+        (func (export "run") (result i32)
+            i32.const 1 global.set $phase
+            call $timer
+            i32.const 2 global.set $phase
+            i32.const 1 i32.add))"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let instance = Instance::new(
+        &mut store,
+        &module,
+        &imports! { "host" => { "timer" => function } },
+    )
+    .unwrap();
+    let marker = instance.exports.get_global("phase").unwrap().clone();
+    *phase.borrow_mut() = Some(marker.clone());
+    let guest = instance.exports.get_function("run").unwrap().clone();
+    let store = store.into_async();
+    let result = futures::executor::block_on(guest.call_async(&store, vec![])).unwrap();
+    assert_eq!(result[0].i32(), Some(38));
+    assert!(
+        polls.get() >= 2,
+        "the actual import returned Pending before the timer wake"
+    );
+    runtime.block_on(sender).unwrap();
+    let mut guard = futures::executor::block_on(store.write_lock());
+    assert_eq!(*environment.as_ref(&guard), 37);
+    assert_eq!(marker.get(&mut guard).i32(), Some(2));
+}
+
+#[test]
 fn v8_async_construction_is_inert_and_first_poll_busy_preserves_reuse() {
     if !run_in_subprocess("v8_async_construction_is_inert_and_first_poll_busy_preserves_reuse") {
         return;
