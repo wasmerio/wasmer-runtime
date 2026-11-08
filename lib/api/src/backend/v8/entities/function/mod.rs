@@ -824,13 +824,14 @@ unsafe fn invoke_sync_callback<F>(
         }
     };
     drop(scope); // all real guard/destructor callbacks settle before C return
-    let result = if publisher.has_panic() {
-        Err(RuntimeError::new("V8 synchronous host cleanup panicked"))
-    } else {
-        result
-    };
     match result {
+        Ok(()) if publisher.has_panic() => publisher.emit_user(Box::new(RuntimeError::new(
+            "V8 synchronous host cleanup panicked",
+        ))),
         Ok(()) => std::ptr::null_mut(),
+        // Keep the SAME already-owned error in the actual call's finite row.
+        // A guard-unlock P is already published; the outer Rust boundary then
+        // disposes this error under P after C++ returns, never across C ABI.
         Err(error) => publisher.emit_user(Box::new(error)),
     }
 }
@@ -867,3 +868,211 @@ impl_host_function!([C] S26, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, 
 
 #[cfg(feature = "experimental-async")]
 mod async_;
+
+#[cfg(all(test, feature = "experimental-async"))]
+mod epilogue_tests {
+    use super::*;
+    use crate::{AsStoreAsync, FunctionEnvMut, Store, StoreAsyncWriteLock};
+    use std::{
+        cell::RefCell,
+        error::Error,
+        fmt,
+        future::Future,
+        pin::Pin,
+        process::{Child, Command},
+        rc::Rc,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll, Wake, Waker},
+        time::{Duration, Instant},
+    };
+
+    #[derive(Debug)]
+    struct Payload {
+        name: &'static str,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct PanicUnlockWake {
+        panic: Mutex<Option<Box<Payload>>>,
+        calls: Arc<AtomicUsize>,
+    }
+    impl Wake for PanicUnlockWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let panic = self.panic.lock().unwrap().take();
+            if let Some(panic) = panic {
+                panic::resume_unwind(panic);
+            }
+        }
+    }
+    #[derive(Debug)]
+    struct ErrorDropQ {
+        drops: Arc<AtomicUsize>,
+        panic: Option<Box<Payload>>,
+    }
+    impl fmt::Display for ErrorDropQ {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("same original callback error")
+        }
+    }
+    impl Error for ErrorDropQ {}
+    impl Drop for ErrorDropQ {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            panic::resume_unwind(self.panic.take().unwrap());
+        }
+    }
+    type Waiter = Pin<Box<dyn Future<Output = StoreAsyncWriteLock>>>;
+    struct PendingOwner(Rc<RefCell<Option<Waiter>>>);
+    impl Drop for PendingOwner {
+        fn drop(&mut self) {
+            drop(self.0.borrow_mut().take());
+        }
+    }
+
+    #[test]
+    fn sync_callback_unlock_p_keeps_original_error_drop_q_inside_outer_rust_boundary() {
+        const CHILD_ENV: &str = "WASMER_V8_TRAP_EPILOGUE_CHILD";
+        const TEST: &str = "backend::v8::entities::function::epilogue_tests::sync_callback_unlock_p_keeps_original_error_drop_q_inside_outer_rust_boundary";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // Existing async_v8/async_sync_borrow owned-child pattern. A C ABI
+            // abort cannot hide this exact regression or strand a child.
+            struct OwnedChild(Child);
+            impl Drop for OwnedChild {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let mut child = OwnedChild(
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(CHILD_ENV, "1")
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                match child.0.try_wait() {
+                    Ok(Some(status)) => {
+                        assert!(status.success(), "epilogue proof failed: {status}");
+                        return;
+                    }
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    result => panic!("epilogue proof did not finish: {result:?}"),
+                }
+            }
+        }
+        let p_drops = Arc::new(AtomicUsize::new(0));
+        let q_drops = Arc::new(AtomicUsize::new(0));
+        let error_drops = Arc::new(AtomicUsize::new(0));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let callback_returns = Arc::new(AtomicUsize::new(0));
+        let pending_observed = Arc::new(AtomicUsize::new(0));
+        let p = Box::new(Payload {
+            name: "P",
+            drops: p_drops.clone(),
+        });
+        let address = (&*p) as *const Payload as usize;
+        let waker = Waker::from(Arc::new(PanicUnlockWake {
+            panic: Mutex::new(Some(p)),
+            calls: wakes.clone(),
+        }));
+        let waiting = Rc::new(RefCell::new(None::<Waiter>));
+        let pending = waiting.clone();
+        let q_count = q_drops.clone();
+        let error_count = error_drops.clone();
+        let returns = callback_returns.clone();
+        let observed = pending_observed.clone();
+        let callback_waker = waker.clone();
+        let mut store = Store::new(crate::v8::V8::new());
+        let environment = crate::FunctionEnv::new(&mut store, 77usize);
+        let ready = crate::Function::new_typed(&mut store, || 31i32);
+        // Test-only local callback capture through the EXISTING backend typed
+        // constructor (whose F bound does not impose the public Send+Sync
+        // facade restriction). No new API/bound or unsafe Send implementation.
+        // The actual C++ callback and SyncCallbackScope still run unchanged.
+        let callback = Function::new_typed_with_env::<usize, _, (), ()>(
+            &mut store,
+            &environment,
+            move |mut env: FunctionEnvMut<usize>| -> Result<(), RuntimeError> {
+                *env.data_mut() += 1;
+                let cap = env.as_store_async().unwrap().store();
+                let mut waiter: Waiter = Box::pin(async move { cap.write_lock().await });
+                if waiter
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&callback_waker))
+                    .is_pending()
+                {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }
+                *pending.borrow_mut() = Some(waiter);
+                returns.fetch_add(1, Ordering::SeqCst);
+                Err(RuntimeError::user(Box::new(ErrorDropQ {
+                    drops: error_count.clone(),
+                    panic: Some(Box::new(Payload {
+                        name: "Q",
+                        drops: q_count.clone(),
+                    })),
+                })))
+            },
+        );
+        let callback = crate::Function(BackendFunction::V8(callback));
+        let store = store.into_async();
+        // Clears the actual admitted waiter on normal AND assertion unwind;
+        // its temporary Store cap never becomes a persistent callback cycle.
+        let cleanup = PendingOwner(waiting.clone());
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            futures::executor::block_on(callback.call_async(&store, vec![]))
+        }))
+        .unwrap_err();
+        assert_eq!(pending_observed.load(Ordering::SeqCst), 1);
+        assert_eq!(callback_returns.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            1,
+            "actual write unlock woke its enrolled waiter"
+        );
+        assert_eq!(error_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(q_drops.load(Ordering::SeqCst), 1);
+        let first = result.downcast::<Payload>().unwrap();
+        assert_eq!(first.name, "P");
+        assert_eq!((&*first) as *const Payload as usize, address);
+        assert_eq!(p_drops.load(Ordering::SeqCst), 0);
+        drop(first);
+        assert_eq!(p_drops.load(Ordering::SeqCst), 1);
+        let mut waiter = waiting.borrow_mut().take().unwrap();
+        let mut guard = match waiter.as_mut().poll(&mut Context::from_waker(&waker)) {
+            Poll::Ready(guard) => guard,
+            Poll::Pending => panic!("real callback guard and fields must have released"),
+        };
+        assert_eq!(*environment.as_ref(&guard), 78);
+        *environment.as_mut(&mut guard) += 1;
+        drop(guard);
+        drop(waiter);
+        drop(cleanup);
+        let result = futures::executor::block_on(ready.call_async(&store, vec![])).unwrap();
+        assert_eq!(result[0].i32(), Some(31));
+        let guard = StoreAsyncWriteLock::try_acquire(&store).unwrap();
+        assert_eq!(*environment.as_ref(&guard), 79);
+        drop(guard);
+        let weak = store.downgrade();
+        drop(store);
+        assert!(
+            weak.upgrade().is_none(),
+            "no waiter/callback Store cycle remains"
+        );
+    }
+}
