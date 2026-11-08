@@ -121,6 +121,7 @@ impl AsyncBinding {
     pub(crate) fn enter(self: &Rc<Self>) -> Result<CallGuard, RuntimeError> {
         self.check_async_entry()?;
         let frame = Rc::new(CallFrame {
+            live: std::cell::Cell::new(true),
             sync_borrows: Default::default(),
             panic: RefCell::new(None),
         });
@@ -220,6 +221,7 @@ impl AsyncBinding {
 }
 
 struct CallFrame {
+    live: std::cell::Cell<bool>,
     sync_borrows: std::cell::Cell<usize>,
     panic: RefCell<Option<Panic>>,
 }
@@ -244,6 +246,7 @@ impl CallGuard {
 
 impl Drop for CallGuard {
     fn drop(&mut self) {
+        self.frame.live.set(false);
         let mut current = self.binding.active.borrow_mut();
         debug_assert!(current.ptr_eq(&Rc::downgrade(&self.frame)));
         *current = self.previous.clone();
@@ -255,6 +258,32 @@ impl Drop for CallGuard {
             } else {
                 resume_unwind(panic);
             }
+        }
+    }
+}
+
+// A mutable environment captures this BEFORE exposing a replaceable guard.
+// A later unrelated/current frame is never selected as its failure receiver.
+#[derive(Clone)]
+pub(crate) struct CallPanicCap(Weak<CallFrame>);
+impl CallPanicCap {
+    pub(crate) fn capture(store: &crate::StoreMut<'_>) -> Self {
+        Self(
+            store
+                .inner
+                .store
+                .as_v8()
+                .async_binding
+                .active
+                .borrow()
+                .clone(),
+        )
+    }
+    pub(crate) fn record(&self, panic: Panic, unwinding: bool, local: &RefCell<Option<Panic>>) {
+        let frame = self.0.upgrade().filter(|frame| frame.live.get());
+        match frame {
+            Some(frame) => record_first(&frame.panic, panic, unwinding),
+            None => record_first(local, panic, unwinding),
         }
     }
 }

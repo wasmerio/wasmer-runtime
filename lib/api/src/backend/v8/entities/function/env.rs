@@ -411,6 +411,7 @@ pub struct AsyncFunctionEnvHandleMut<T> {
     lease: Option<Box<dyn Any + Send>>,
     backing: LentBacking,
     retirement: crate::backend::v8::async_runtime::RetirementCap,
+    failure: crate::backend::v8::async_runtime::CallPanicCap,
 }
 
 #[cfg(feature = "experimental-async")]
@@ -507,12 +508,15 @@ impl<T: 'static> AsyncFunctionEnvHandleMut<T> {
                 .expect("V8 async environment has invalid write custody")
                 .expect("V8 async environment requires its actual owned write guard");
         let backing = LentBacking::capture(&write_lock.as_store_mut());
+        let failure =
+            crate::backend::v8::async_runtime::CallPanicCap::capture(&write_lock.as_store_mut());
         Self {
             write_lock: Some(write_lock),
             func_env,
             lease: None,
             backing,
             retirement,
+            failure,
         }
     }
     pub fn data_mut(&mut self) -> &mut T {
@@ -560,7 +564,7 @@ impl<T> Drop for AsyncFunctionEnvHandleMut<T> {
             if let Err(value) = self.retirement.try_retain(value) {
                 // The caller may have replaced A's guard with B. End that
                 // CURRENT actual guard before any displaced T destructor.
-                dispose_after_guard(self.write_lock.take(), value);
+                dispose_after_guard(&self.failure, self.write_lock.take(), value);
             }
         }
     }
@@ -585,32 +589,26 @@ impl<T: 'static> AsStoreMut for AsyncFunctionEnvHandleMut<T> {
 }
 
 #[cfg(feature = "experimental-async")]
-fn dispose_after_guard(guard: Option<StoreAsyncWriteLock>, value: Box<dyn Any + Send>) {
-    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
+fn dispose_after_guard(
+    failure: &crate::backend::v8::async_runtime::CallPanicCap,
+    guard: Option<StoreAsyncWriteLock>,
+    value: Box<dyn Any + Send>,
+) {
+    use std::{
+        cell::RefCell,
+        panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    };
     let unwinding = std::thread::panicking();
-    let mut first = catch_unwind(AssertUnwindSafe(|| drop(guard))).err();
-    if let Err(mut panic) = catch_unwind(AssertUnwindSafe(|| drop(value))) {
-        if first.is_none() {
-            first = Some(panic);
-        } else {
-            loop {
-                match catch_unwind(AssertUnwindSafe(|| drop(panic))) {
-                    Ok(()) => break,
-                    Err(next) => panic = next,
-                }
-            }
-        }
+    let local = RefCell::new(None);
+    if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(guard))) {
+        // Publish P into the ORIGINAL live caller before T can reenter A/Q.
+        failure.record(panic, unwinding, &local);
     }
-    if let Some(mut panic) = first {
-        if !unwinding {
-            resume_unwind(panic);
-        }
-        loop {
-            match catch_unwind(AssertUnwindSafe(|| drop(panic))) {
-                Ok(()) => break,
-                Err(next) => panic = next,
-            }
-        }
+    if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(value))) {
+        failure.record(panic, unwinding, &local);
+    }
+    if let Some(first) = local.into_inner() {
+        resume_unwind(first);
     }
 }
 
@@ -619,6 +617,7 @@ mod tests {
     use super::*;
     use std::{
         future::Future,
+        rc::Rc,
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
         task::{Context, Poll, Wake, Waker},
     };
@@ -700,6 +699,143 @@ mod tests {
         assert_eq!(*panic.downcast::<usize>().unwrap(), 71);
         assert_eq!(environment.as_ref(&store) as *const usize as usize, address);
         assert_eq!(*environment.as_ref(&store), 14);
+    }
+
+    struct PanicValue {
+        name: &'static str,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for PanicValue {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct PanicUnlockWake(std::sync::Mutex<Option<Box<PanicValue>>>);
+    impl Wake for PanicUnlockWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            let panic = self.0.lock().unwrap().take();
+            if let Some(panic) = panic {
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+    struct ReenterOriginal {
+        function: crate::Function,
+        drops: Arc<AtomicUsize>,
+    }
+    impl Drop for ReenterOriginal {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            let values = crate::Store::with_current(|store| self.function.call(store, &[]))
+                .expect("the original A is explicitly parked")
+                .unwrap();
+            assert_eq!(values[0].i32(), Some(21));
+        }
+    }
+
+    #[test]
+    fn replaced_guard_unlock_panic_is_published_before_t_drop_reenters_original_a() {
+        use std::cell::Cell;
+        let first_drops = Arc::new(AtomicUsize::new(0));
+        let second_drops = Arc::new(AtomicUsize::new(0));
+        let value_drops = Arc::new(AtomicUsize::new(0));
+        let first = Box::new(PanicValue {
+            name: "P",
+            drops: first_drops.clone(),
+        });
+        let address = (&*first) as *const PanicValue as usize;
+        let mut a = crate::Store::new(crate::v8::V8::new());
+        let module = crate::Module::new(
+            &a,
+            wat::parse_str("(module (func (export \"ready\") (result i32) i32.const 21))").unwrap(),
+        )
+        .unwrap();
+        let instance = crate::Instance::new(&mut a, &module, &crate::Imports::new()).unwrap();
+        let environment = FunctionEnv::new(
+            &mut a,
+            ReenterOriginal {
+                function: instance.exports.get_function("ready").unwrap().clone(),
+                drops: value_drops.clone(),
+            },
+        );
+        let binding = a.as_store_ref().inner.store.as_v8().async_binding.clone();
+        let frame = binding.enter().unwrap();
+        let saw_original = Rc::new(Cell::new(false));
+        let observed = saw_original.clone();
+        let second_count = second_drops.clone();
+        let receiver = binding.clone();
+        a.as_store_mut().on_called(move |_| {
+            observed.set(receiver.current_has_panic());
+            receiver.record(
+                Box::new(PanicValue {
+                    name: "Q",
+                    drops: second_count,
+                }),
+                false,
+            );
+            Ok(wasmer_types::OnCalledAction::Finish)
+        });
+        let a = a.into_async();
+        let b = crate::Store::new(crate::v8::V8::new()).into_async();
+        let environment = AsyncFunctionEnvMut {
+            store: a.store(),
+            func_env: environment,
+            import_snapshot: None,
+        };
+        let mut handle = environment.try_write().unwrap();
+        let replacement = StoreAsyncWriteLock::try_acquire(&b).unwrap();
+        let mut waiting = Box::pin(b.write_lock());
+        let waker = Waker::from(Arc::new(PanicUnlockWake(std::sync::Mutex::new(Some(
+            first,
+        )))));
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        {
+            let (_, current) = handle.data_and_store_mut();
+            let mut original = std::mem::replace(current, replacement);
+            std::mem::swap(current.objects_mut(), original.objects_mut());
+            drop(original);
+        }
+        // A new real guard and explicit existing parked scope enable T's
+        // public synchronous A reentry; the captured ORIGINAL holder has ended.
+        let mut guard = StoreAsyncWriteLock::try_acquire(&a).unwrap();
+        guard.as_store_mut().parked(|| drop(handle));
+        drop(guard);
+        assert!(
+            saw_original.get(),
+            "P must be in A before its on_called records Q"
+        );
+        assert_eq!(value_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(second_drops.load(Ordering::SeqCst), 1);
+        let first = frame
+            .take_panic()
+            .unwrap()
+            .downcast::<PanicValue>()
+            .unwrap();
+        assert_eq!((&*first) as *const PanicValue as usize, address);
+        assert_eq!(first.name, "P");
+        assert_eq!(first_drops.load(Ordering::SeqCst), 0);
+        drop(first);
+        assert_eq!(first_drops.load(Ordering::SeqCst), 1);
+        drop(frame);
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_ready()
+        );
+        drop(waiting);
+        drop(environment);
+        drop(instance);
+        drop(b);
+        drop(a);
     }
 
     #[test]
