@@ -613,3 +613,153 @@ fn dispose_after_guard(guard: Option<StoreAsyncWriteLock>, value: Box<dyn Any + 
         }
     }
 }
+
+#[cfg(all(test, feature = "experimental-async"))]
+mod tests {
+    use super::*;
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        task::{Context, Poll, Wake, Waker},
+    };
+
+    struct UnlockWake(Arc<AtomicBool>);
+    impl Wake for UnlockWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct Displaced {
+        unlocked: Arc<AtomicBool>,
+        address: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+        reentered: Arc<AtomicBool>,
+    }
+    impl Drop for Displaced {
+        fn drop(&mut self) {
+            assert!(
+                self.unlocked.load(Ordering::SeqCst),
+                "replacement B guard must retire BEFORE T"
+            );
+            assert_eq!(
+                self as *const Self as usize,
+                self.address.load(Ordering::SeqCst)
+            );
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            // A genuine same-thread V8 reentry after B's real unlock, rather
+            // than merely observing a private restoration flag.
+            let mut store = crate::Store::new(crate::v8::V8::new());
+            let function = crate::Function::new_typed_async(&mut store, || async { 37i32 });
+            let store = store.into_async();
+            let mut future = function.call_async(&store, vec![]);
+            let result = future
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()));
+            assert!(matches!(result, Poll::Ready(Ok(values)) if values[0].i32() == Some(37)));
+            self.reentered.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn split_subframes_restore_the_same_box_on_normal_return_and_unwind() {
+        let mut store = crate::Store::new(crate::v8::V8::new());
+        let environment = FunctionEnv::new(&mut store, 11usize);
+        let address;
+        {
+            let mut frame = environment.clone().into_mut(&mut store);
+            let (data, _) = frame.data_and_store_mut();
+            address = data as *mut usize as usize;
+            *data += 1;
+            {
+                let mut child = frame.as_mut();
+                let (data, mut view) = child.data_and_store_mut();
+                assert_eq!(data as *mut usize as usize, address);
+                *data += 1;
+                // The exact slot is absent while this Box is separately lent.
+                assert!(
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        environment.as_mut(&mut view);
+                    }))
+                    .is_err()
+                );
+            }
+            assert_eq!(*frame.data(), 13);
+        }
+        assert_eq!(environment.as_ref(&store) as *const usize as usize, address);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut frame = environment.clone().into_mut(&mut store);
+            let (data, _) = frame.data_and_store_mut();
+            *data += 1;
+            std::panic::panic_any(71usize);
+        }))
+        .unwrap_err();
+        assert_eq!(*panic.downcast::<usize>().unwrap(), 71);
+        assert_eq!(environment.as_ref(&store) as *const usize as usize, address);
+        assert_eq!(*environment.as_ref(&store), 14);
+    }
+
+    #[test]
+    fn replaced_owned_guard_cannot_restore_transplanted_slot_and_unlocks_before_disposal() {
+        let unlocked = Arc::new(AtomicBool::new(false));
+        let address = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let reentered = Arc::new(AtomicBool::new(false));
+        let mut a = crate::Store::new(crate::v8::V8::new());
+        let environment = FunctionEnv::new(
+            &mut a,
+            Displaced {
+                unlocked: unlocked.clone(),
+                address: address.clone(),
+                drops: drops.clone(),
+                reentered: reentered.clone(),
+            },
+        );
+        let b = crate::Store::new(crate::v8::V8::new()).into_async();
+        let a = a.into_async();
+        let environment = AsyncFunctionEnvMut {
+            store: a.store(),
+            func_env: environment,
+            import_snapshot: None,
+        };
+        let mut handle = environment.try_write().unwrap();
+        let replacement = StoreAsyncWriteLock::try_acquire(&b).unwrap();
+        let mut waiting = Box::pin(b.write_lock());
+        let waker = Waker::from(Arc::new(UnlockWake(unlocked.clone())));
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        {
+            let (data, current) = handle.data_and_store_mut();
+            address.store(data as *mut Displaced as usize, Ordering::SeqCst);
+            let mut original = std::mem::replace(current, replacement);
+            // Numeric handle, slot identity and StoreObjects all now match A,
+            // but the actual current backing is B. Restore must still refuse.
+            std::mem::swap(current.objects_mut(), original.objects_mut());
+            drop(original);
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(!unlocked.load(Ordering::SeqCst));
+        drop(handle);
+        assert!(unlocked.load(Ordering::SeqCst));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(reentered.load(Ordering::SeqCst));
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_ready()
+        );
+        drop(waiting);
+        drop(environment);
+        drop(b);
+        drop(a);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+}
