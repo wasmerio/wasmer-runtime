@@ -26,6 +26,48 @@ pub trait BlockingExecutor {
     fn block_on(&self, future: Pin<&mut dyn Future<Output = ()>>) -> Result<(), RuntimeError>;
 }
 
+/// Lend the exact target's existing parked synchronous Store installation.
+///
+/// `None` means the target is absent. An incompatible present installation is
+/// an error and must not be followed by a base-lock retry. No Store reference
+/// or guard may escape `action`; this grants no asynchronous invocation loan.
+#[doc(hidden)]
+pub fn with_borrowed_store<R>(
+    expected: &StoreAsync,
+    action: impl FnOnce(&mut crate::StoreMut<'_>) -> R,
+) -> Result<Option<R>, RuntimeError> {
+    use crate::AsStoreRef;
+
+    crate::StoreContext::with_parked_sync(
+        expected.id,
+        |cached, store| {
+            let view = store.as_store_ref();
+            if view.inner.objects.id() != cached {
+                return Err(RuntimeError::new("borrowed Store identity changed"));
+            }
+            let same = if view.inner.store.is_v8() {
+                let binding = &view.inner.store.as_v8().async_binding;
+                binding.check_thread()?;
+                super::origin::Origin::of(&view)?.check_store(&view)?;
+                binding
+                    .backing
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|backing| backing.refers_to_lock(expected))
+            } else {
+                false
+            };
+            // A foreign Plain V8 Store need not have a bound async lock. A
+            // matching lock under a foreign ID is the target being hidden.
+            if (cached == expected.id) != same {
+                return Err(RuntimeError::new("borrowed V8 Store backing changed"));
+            }
+            Ok(())
+        },
+        |store| Ok(action(store)),
+    )
+}
+
 /// Bind the actual Store's existing owner; no runtime or executor is created.
 /// An expired bound owner is an error, rather than a fallback to another driver.
 #[doc(hidden)]
@@ -267,6 +309,12 @@ impl CallGuard {
     }
     pub(crate) fn record(&self, panic: Panic, unwinding: bool) {
         record_first(&self.frame.panic, panic, unwinding);
+    }
+    pub(crate) fn dispose(&self, cleanup: impl FnOnce()) {
+        let unwinding = std::thread::panicking();
+        if let Err(panic) = catch_unwind(AssertUnwindSafe(cleanup)) {
+            self.record(panic, unwinding);
+        }
     }
 }
 

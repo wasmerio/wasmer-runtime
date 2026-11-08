@@ -30,8 +30,42 @@ use super::Function;
 
 type ImportCapture<T> = fn(&T) -> Option<Arc<dyn Any + Send + Sync>>;
 type OwnedCallFuture = Pin<Box<dyn Future<Output = Result<Box<[Value]>, RuntimeError>>>>;
+type SyncFactory<T> = dyn for<'a> Fn(crate::FunctionEnvMut<'a, T>, &[Value]) -> Result<Vec<Value>, RuntimeError>
+    + Send
+    + Sync;
 
-struct AsyncCallback<T, F> {
+/// One host function with its existing borrowed callback and guard-free adapter.
+/// The actual call scope selects the callback; neither factory is probed.
+#[doc(hidden)]
+pub fn new_with_env_async_and_sync<T, FT, S, A, Fut>(
+    store: &mut impl AsStoreMut,
+    environment: &FunctionEnv<T>,
+    ty: FT,
+    synchronous: S,
+    asynchronous: A,
+) -> crate::Function
+where
+    T: Send + 'static,
+    FT: Into<FunctionType>,
+    S: for<'a> Fn(crate::FunctionEnvMut<'a, T>, &[Value]) -> Result<Vec<Value>, RuntimeError>
+        + Send
+        + Sync
+        + 'static,
+    A: Fn(AsyncFunctionEnvMut<T>, &[Value]) -> Fut + 'static,
+    Fut: Future<Output = Result<Vec<Value>, RuntimeError>> + 'static,
+{
+    let function = Function::new_with_env_async_captured(
+        store,
+        environment,
+        ty.into(),
+        asynchronous,
+        None,
+        Some(Box::new(synchronous)),
+    );
+    crate::Function(crate::BackendFunction::V8(function))
+}
+
+struct AsyncCallback<T: 'static, F> {
     binding: Rc<AsyncBinding>,
     raw_store: *mut wasm_store_t,
     backing: usize,
@@ -41,6 +75,7 @@ struct AsyncCallback<T, F> {
     signature: FunctionType,
     factory: F,
     capture: Option<ImportCapture<T>>,
+    synchronous: Option<Box<SyncFactory<T>>>,
 }
 
 impl Function {
@@ -251,7 +286,7 @@ impl Function {
         F: Fn(AsyncFunctionEnvMut<T>, &[Value]) -> Fut + 'static,
         Fut: Future<Output = Result<Vec<Value>, RuntimeError>> + 'static,
     {
-        Self::new_with_env_async_captured(store, environment, ty.into(), factory, None)
+        Self::new_with_env_async_captured(store, environment, ty.into(), factory, None, None)
     }
 
     fn new_with_env_async_captured<F, Fut, T: 'static>(
@@ -260,6 +295,7 @@ impl Function {
         signature: FunctionType,
         factory: F,
         capture: Option<ImportCapture<T>>,
+        synchronous: Option<Box<SyncFactory<T>>>,
     ) -> Self
     where
         F: Fn(AsyncFunctionEnvMut<T>, &[Value]) -> Fut + 'static,
@@ -279,6 +315,7 @@ impl Function {
             signature: signature.clone(),
             factory,
             capture,
+            synchronous,
         });
         // The Store owns the SAME stable Box before any V8 publication. Its
         // Rust arena catches capture Drop; wee8 receives no Rust finalizer.
@@ -408,6 +445,7 @@ impl Function {
                 }
             },
             capture,
+            None,
         )
     }
 }
@@ -439,6 +477,29 @@ where
             );
         }
     };
+    if publisher.mode() == crate::backend::v8::error::TrapMode::BorrowedSync
+        && let Some(synchronous) = &callback.synchronous
+    {
+        // Reuse the existing constructor-backed borrowed descriptor and scope.
+        // No actual outer guard is released or reacquired in this mode.
+        let mut descriptor = super::FunctionCallbackEnv {
+            store: callback.backing as *mut crate::StoreInner,
+            marker: std::marker::PhantomData,
+            binding: Rc::downgrade(&callback.binding),
+            raw_store: callback.raw_store,
+            func: (),
+            env_handle: Some(callback.environment.handle.clone()),
+            env_identity: Some(callback.environment.identity.clone()),
+            origin: callback.origin.clone(),
+            signature: callback.signature.clone(),
+            trap_calls: callback.trap_calls.clone(),
+        };
+        return unsafe {
+            super::invoke_sync_callback(&mut descriptor, arguments, results, |store, values| {
+                synchronous(callback.environment.clone().into_mut(store).into(), values)
+            })
+        };
+    }
     if publisher.mode() != crate::backend::v8::error::TrapMode::GuardFreeAsync {
         return crate::backend::v8::error::checked_message(
             &callback.origin,

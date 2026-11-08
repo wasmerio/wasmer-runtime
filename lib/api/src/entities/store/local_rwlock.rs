@@ -34,7 +34,7 @@ impl<T> Clone for WeakLocalRwLock<T> {
 }
 
 impl<T> WeakLocalRwLock<T> {
-    #[cfg(feature = "sys")]
+    #[cfg(any(feature = "sys", feature = "v8"))]
     pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
         Weak::ptr_eq(&self.inner, &other.inner)
     }

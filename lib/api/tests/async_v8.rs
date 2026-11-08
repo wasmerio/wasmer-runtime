@@ -445,3 +445,268 @@ fn v8_async_first_panic_prevents_on_called_replay() {
     assert_eq!(observed.get(), 1);
     assert_eq!(callbacks.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn v8_guard_free_instantiation_selects_dual_callback_without_losing_borrowed_start() {
+    if !run_in_subprocess(
+        "v8_guard_free_instantiation_selects_dual_callback_without_losing_borrowed_start",
+    ) {
+        return;
+    }
+    let mut store = store();
+    let environment = FunctionEnv::new(&mut store, 123i32);
+    let synchronous = Arc::new(AtomicUsize::new(0));
+    let asynchronous = Rc::new(Cell::new(0));
+    let sync_count = synchronous.clone();
+    let async_count = asynchronous.clone();
+    let function = wasmer::v8::new_with_env_async_and_sync(
+        &mut store,
+        &environment,
+        FunctionType::new([], [Type::I32]),
+        move |env: FunctionEnvMut<'_, i32>, _| {
+            assert_eq!(*env.data(), 123);
+            sync_count.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![Value::I32(31)])
+        },
+        move |env: AsyncFunctionEnvMut<i32>, _| {
+            let count = async_count.clone();
+            async move {
+                assert_eq!(*env.try_read().expect("no real outer guard").data(), 123);
+                count.set(count.get() + 1);
+                Ok(vec![Value::I32(47)])
+            }
+        },
+    );
+    let module = Module::new(
+        &store,
+        wat::parse_str(
+            r#"(module
+        (import "host" "value" (func $value (result i32)))
+        (global $answer (mut i32) (i32.const 0))
+        (func $start call $value global.set $answer)
+        (start $start)
+        (func (export "answer") (result i32) global.get $answer)
+        (func (export "call") (result i32) call $value))"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let instance = Instance::new(
+        &mut store,
+        &module,
+        &imports! { "host" => { "value" => function.clone() } },
+    )
+    .unwrap();
+    assert_eq!(synchronous.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        instance
+            .exports
+            .get_function("answer")
+            .unwrap()
+            .call(&mut store, &[])
+            .unwrap()[0]
+            .i32(),
+        Some(31)
+    );
+    assert_eq!(
+        instance
+            .exports
+            .get_function("call")
+            .unwrap()
+            .call(&mut store, &[])
+            .unwrap()[0]
+            .i32(),
+        Some(31)
+    );
+    assert_eq!(synchronous.load(Ordering::SeqCst), 2);
+    assert_eq!(asynchronous.get(), 0);
+    let store = store.into_async();
+    let held = futures::executor::block_on(store.write_lock());
+    drop(wasmer::v8::instantiate_async(
+        &store,
+        module.clone(),
+        vec![function.clone().into()],
+    ));
+    let mut busy =
+        wasmer::v8::instantiate_async(&store, module.clone(), vec![function.clone().into()]);
+    assert!(matches!(poll_once(busy.as_mut()), Poll::Ready(Err(_))));
+    assert_eq!(
+        asynchronous.get(),
+        0,
+        "busy/lazy construction cannot run start"
+    );
+    drop(busy);
+    drop(held);
+    let instance = futures::executor::block_on(wasmer::v8::instantiate_async(
+        &store,
+        module,
+        vec![function.into()],
+    ))
+    .unwrap();
+    assert_eq!(asynchronous.get(), 1);
+    assert_eq!(synchronous.load(Ordering::SeqCst), 2);
+    let answer = instance.exports.get_function("answer").unwrap();
+    assert_eq!(
+        futures::executor::block_on(answer.call_async(&store, vec![])).unwrap()[0].i32(),
+        Some(47)
+    );
+    let call = instance.exports.get_function("call").unwrap();
+    assert_eq!(
+        futures::executor::block_on(call.call_async(&store, vec![])).unwrap()[0].i32(),
+        Some(47)
+    );
+    assert_eq!(asynchronous.get(), 2);
+}
+
+#[test]
+fn v8_guard_free_instance_start_drives_a_real_pending_timer_import() {
+    if !run_in_subprocess("v8_guard_free_instance_start_drives_a_real_pending_timer_import") {
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (pending_send, pending_receive) = tokio::sync::oneshot::channel();
+    let (complete_send, complete_receive) = tokio::sync::oneshot::channel();
+    let sender = runtime.spawn(async move {
+        pending_receive.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        complete_send.send(37i32).unwrap();
+    });
+    let pending_send = Rc::new(RefCell::new(Some(pending_send)));
+    let complete_receive = Rc::new(RefCell::new(Some(complete_receive)));
+    let polls = Rc::new(Cell::new(0));
+    let mut store = store();
+    let environment = FunctionEnv::new(&mut store, 0i32);
+    let observed = polls.clone();
+    let function = Function::new_with_env_async(
+        &mut store,
+        &environment,
+        FunctionType::new([], [Type::I32]),
+        move |env: AsyncFunctionEnvMut<i32>, _| {
+            let mut send = pending_send.borrow_mut().take();
+            let mut receive = complete_receive.borrow_mut().take().unwrap();
+            let polls = observed.clone();
+            async move {
+                let value = std::future::poll_fn(|cx| {
+                    polls.set(polls.get() + 1);
+                    assert!(
+                        env.try_write().is_some(),
+                        "Wasm start must not retain its real Store guard"
+                    );
+                    let result = Pin::new(&mut receive).poll(cx);
+                    if result.is_pending()
+                        && let Some(send) = send.take()
+                    {
+                        send.send(()).unwrap();
+                    }
+                    result
+                })
+                .await
+                .unwrap();
+                *env.write().await.data_mut() = value;
+                Ok(vec![Value::I32(value)])
+            }
+        },
+    );
+    let module = Module::new(
+        &store,
+        wat::parse_str(
+            r#"(module
+        (import "host" "timer" (func $timer (result i32)))
+        (global $answer (mut i32) (i32.const 0))
+        (func $start call $timer global.set $answer)
+        (start $start)
+        (func (export "answer") (result i32) global.get $answer))"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let store = store.into_async();
+    let instance = futures::executor::block_on(wasmer::v8::instantiate_async(
+        &store,
+        module,
+        vec![function.into()],
+    ))
+    .unwrap();
+    assert!(
+        polls.get() >= 2,
+        "actual start import must have returned Pending"
+    );
+    let answer = instance.exports.get_function("answer").unwrap();
+    assert_eq!(
+        futures::executor::block_on(answer.call_async(&store, vec![])).unwrap()[0].i32(),
+        Some(37)
+    );
+    assert_eq!(
+        *environment.as_ref(&futures::executor::block_on(store.read_lock())),
+        37
+    );
+    runtime.block_on(sender).unwrap();
+}
+
+#[test]
+fn v8_checked_borrow_reenters_exact_lock_and_restores_plain_foreign_store() {
+    if !run_in_subprocess("v8_checked_borrow_reenters_exact_lock_and_restores_plain_foreign_store")
+    {
+        return;
+    }
+    let first = store();
+    let first_id = first.id();
+    let first = first.into_async();
+    let mut foreign = store();
+    let foreign_id = foreign.id();
+    let mut wrong = store();
+    wrong.as_store_mut().objects_mut().set_id(first_id);
+    let wrong = wrong.into_async();
+    assert!(
+        wasmer::v8::with_borrowed_store(&first, |_| ())
+            .unwrap()
+            .is_none()
+    );
+    let mut guard = futures::executor::block_on(first.write_lock());
+    guard.as_store_mut().parked(|| {
+        let error = wasmer::v8::with_borrowed_store(&wrong, |_| panic!("wrong backing admitted"))
+            .unwrap_err();
+        assert!(error.to_string().contains("backing changed"));
+        wasmer::v8::with_borrowed_store(&first, |current| {
+            current.parked(|| {
+                foreign.as_store_mut().parked(|| {
+                    assert_eq!(
+                        wasmer::v8::with_borrowed_store(&first, |first| first.objects_mut().id())
+                            .unwrap(),
+                        Some(first_id)
+                    );
+                    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        wasmer::v8::with_borrowed_store(&first, |_| {
+                            std::panic::resume_unwind(Box::new(71u64))
+                        })
+                        .unwrap();
+                    }))
+                    .unwrap_err();
+                    assert_eq!(*panic.downcast::<u64>().unwrap(), 71);
+                    assert_eq!(
+                        Store::with_current(|current| current.objects_mut().id()),
+                        Some(foreign_id)
+                    );
+                });
+            });
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            Store::with_current(|current| current.objects_mut().id()),
+            Some(first_id)
+        );
+    });
+    drop(guard);
+    assert!(Store::with_current(|_| ()).is_none());
+    assert!(
+        wasmer::v8::with_borrowed_store(&first, |_| ())
+            .unwrap()
+            .is_none()
+    );
+    assert!(poll_once(Box::pin(first.write_lock()).as_mut()).is_ready());
+}

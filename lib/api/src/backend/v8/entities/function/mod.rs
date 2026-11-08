@@ -868,6 +868,8 @@ impl_host_function!([C] S26, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, 
 
 #[cfg(feature = "experimental-async")]
 mod async_;
+#[cfg(feature = "experimental-async")]
+pub use async_::new_with_env_async_and_sync;
 
 #[cfg(all(test, feature = "experimental-async"))]
 mod epilogue_tests {

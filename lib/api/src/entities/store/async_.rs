@@ -44,6 +44,11 @@ impl Clone for WeakStoreAsync {
 }
 
 impl WeakStoreAsync {
+    #[cfg(feature = "v8")]
+    pub(crate) fn refers_to_lock(&self, store: &StoreAsync) -> bool {
+        self.inner.ptr_eq(&store.inner.downgrade())
+    }
+
     pub(crate) fn upgrade(&self) -> Option<StoreAsync> {
         #[cfg(feature = "sys")]
         if self.loan.as_ref().is_some_and(|loan| !loan.is_live()) {

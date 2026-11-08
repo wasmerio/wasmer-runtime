@@ -11,7 +11,11 @@ pub use entities::{engine::Engine as V8, *};
 #[cfg(feature = "experimental-async")]
 pub(crate) mod async_runtime;
 #[cfg(feature = "experimental-async")]
-pub use async_runtime::{BlockingExecutor, set_blocking_executor};
+pub use async_runtime::{BlockingExecutor, set_blocking_executor, with_borrowed_store};
+#[cfg(feature = "experimental-async")]
+pub use entities::function::new_with_env_async_and_sync;
+#[cfg(feature = "experimental-async")]
+pub use entities::instance::instantiate_async;
 
 pub(crate) mod origin;
 
