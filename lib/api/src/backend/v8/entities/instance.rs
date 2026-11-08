@@ -248,6 +248,11 @@ pub fn instantiate_async(
             let raw_module = unsafe {
                 wasm_module_obtain(raw_store, module.as_v8().handle.v8_shared_module_handle)
             };
+            if raw_module.is_null() {
+                return Err(InstantiationError::Start(crate::RuntimeError::new(
+                    "V8 could not obtain the instance module",
+                )));
+            }
             obtained = Some(OwnedValue::reference(
                 unsafe { wasm_module_as_ref(raw_module) },
                 false,

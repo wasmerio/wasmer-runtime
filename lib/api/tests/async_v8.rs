@@ -710,3 +710,95 @@ fn v8_checked_borrow_reenters_exact_lock_and_restores_plain_foreign_store() {
     );
     assert!(poll_once(Box::pin(first.write_lock()).as_mut()).is_ready());
 }
+
+#[test]
+fn v8_dual_callback_factory_disposal_preserves_first_panic_during_normal_and_active_unwind() {
+    if !run_in_subprocess(
+        "v8_dual_callback_factory_disposal_preserves_first_panic_during_normal_and_active_unwind",
+    ) {
+        return;
+    }
+    struct Capture {
+        panic: std::sync::Mutex<Option<Box<dyn std::any::Any + Send>>>,
+        drops: Arc<AtomicUsize>,
+        calls: Arc<AtomicUsize>,
+    }
+    impl Capture {
+        fn called(&self) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+            let panic = self.panic.get_mut().unwrap().take().unwrap();
+            std::panic::resume_unwind(panic);
+        }
+    }
+    struct DropStore(Option<Store>);
+    impl Drop for DropStore {
+        fn drop(&mut self) {
+            drop(self.0.take());
+        }
+    }
+    for active in [false, true] {
+        let mut store = store();
+        let environment = FunctionEnv::new(&mut store, ());
+        let first = Box::new(37usize);
+        let first_address = (&*first) as *const usize as usize;
+        let first_drops = Arc::new(AtomicUsize::new(0));
+        let second_drops = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let asynchronous = Capture {
+            panic: std::sync::Mutex::new(Some(first)),
+            drops: first_drops.clone(),
+            calls: calls.clone(),
+        };
+        let synchronous = Capture {
+            panic: std::sync::Mutex::new(Some(Box::new(47usize))),
+            drops: second_drops.clone(),
+            calls: calls.clone(),
+        };
+        let function = wasmer::v8::new_with_env_async_and_sync(
+            &mut store,
+            &environment,
+            FunctionType::new([], []),
+            move |_: FunctionEnvMut<'_, ()>, _| {
+                synchronous.called();
+                Ok(vec![])
+            },
+            move |_: AsyncFunctionEnvMut<()>, _| {
+                asynchronous.called();
+                std::future::ready(Ok(vec![]))
+            },
+        );
+        if active {
+            let primary = Box::new(71usize);
+            let primary_address = (&*primary) as *const usize as usize;
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _store = DropStore(Some(store));
+                std::panic::resume_unwind(primary);
+            }))
+            .unwrap_err()
+            .downcast::<usize>()
+            .unwrap();
+            assert_eq!((&*caught) as *const usize as usize, primary_address);
+            assert_eq!(*caught, 71);
+        } else {
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(store)))
+                .unwrap_err()
+                .downcast::<usize>()
+                .unwrap();
+            assert_eq!((&*caught) as *const usize as usize, first_address);
+            assert_eq!(*caught, 37);
+        }
+        assert_eq!(first_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(second_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "factory construction/teardown cannot execute either callback"
+        );
+        drop(function); // expired inert metadata remains safe after actual arena Drop
+    }
+}

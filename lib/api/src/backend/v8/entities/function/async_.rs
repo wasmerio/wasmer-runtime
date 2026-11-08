@@ -73,9 +73,25 @@ struct AsyncCallback<T: 'static, F> {
     origin: Origin,
     environment: env::FunctionEnv<T>,
     signature: FunctionType,
-    factory: F,
+    factory: Option<F>,
     capture: Option<ImportCapture<T>>,
     synchronous: Option<Box<SyncFactory<T>>>,
+}
+
+impl<T: 'static, F> Drop for AsyncCallback<T, F> {
+    fn drop(&mut self) {
+        let unwinding = std::thread::panicking();
+        // Each actual factory is consumed once. Publish P before another
+        // capture's destructor can produce Q; never rely on struct Drop glue.
+        let factory = self.factory.take();
+        if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(factory))) {
+            self.binding.record(panic, unwinding);
+        }
+        let synchronous = self.synchronous.take();
+        if let Err(panic) = catch_unwind(AssertUnwindSafe(|| drop(synchronous))) {
+            self.binding.record(panic, unwinding);
+        }
+    }
 }
 
 impl Function {
@@ -313,7 +329,7 @@ impl Function {
             origin: Origin::of(&view).expect("actual V8 constructor Store"),
             environment: environment.as_v8().clone(),
             signature: signature.clone(),
-            factory,
+            factory: Some(factory),
             capture,
             synchronous,
         });
@@ -548,7 +564,7 @@ where
                 }));
             (environment, values)
         }; // no actual Store/context guard survives the factory or its future
-        let future = (callback.factory)(environment, &values);
+        let future = (callback.factory.as_ref().expect("live V8 callback"))(environment, &values);
         let output = binding.run_host_future(future)?;
         if output.len() != callback.signature.results().len()
             || output
