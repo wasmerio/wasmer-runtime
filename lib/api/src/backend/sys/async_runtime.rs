@@ -5446,6 +5446,45 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_native_access_preserves_logical_native_host_future_policy() {
+        let expected = Rc::new(RefCell::new(None));
+        let captured = expected.clone();
+        let polls = Rc::new(Cell::new(0));
+        let observed = polls.clone();
+        let mut raw = Store::default();
+        let _scope = NativeInvocationScope::bind(&mut raw).unwrap();
+        let function = Function::new_async(&mut raw, crate::FunctionType::new([], []), move |_| {
+            let expected = captured.borrow().as_ref().cloned().unwrap();
+            let observed = observed.clone();
+            std::future::poll_fn(move |_| {
+                // This is the REAL host future polled outside its suspended
+                // coroutine, while its original native control remains active.
+                assert!(CoroutineContext::get_current().is_none());
+                assert!(!context_switch_supported());
+                assert!(native_invocation_active());
+                assert!(with_borrowed_native_store(&expected, |_| ()).is_err());
+                observed.set(observed.get() + 1);
+                Poll::Ready(Ok(Vec::new()))
+            })
+        });
+        let cap = raw.into_async();
+        *expected.borrow_mut() = Some(cap.clone());
+        let mut original = Box::pin(function.call_async(&cap, vec![]));
+        let Poll::Ready(result) = original
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("ready native host future must complete without borrowed routing");
+        };
+        assert!(result.is_ok());
+        assert_eq!(polls.get(), 1);
+        drop(original);
+        assert!(!native_invocation_active());
+        assert!(StoreContext::is_empty());
+        borrowed_test_access(&cap, |_| ());
+    }
+
+    #[test]
     fn native_tail_enrollment_commits_owned_job_before_saved_waker_panic() {
         use std::sync::{
             Mutex,
