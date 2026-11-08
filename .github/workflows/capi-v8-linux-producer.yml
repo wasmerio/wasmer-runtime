@@ -117,7 +117,7 @@ jobs:
   linux-x64:
     if: github.repository == 'wasmerio/wasmer-next' && github.event.repository.private && !inputs.capacity_probe
     runs-on: ubuntu-22.04
-    timeout-minutes: 280
+    timeout-minutes: 360
     env:
       PYTHONDONTWRITEBYTECODE: "1"
       REQUESTED_CANDIDATE: ${{ inputs.candidate_ref }}
@@ -153,7 +153,7 @@ jobs:
           submodules: false
           persist-credentials: false
       - name: Build and inspect only the private candidate archive
-        timeout-minutes: 260
+        timeout-minutes: 347
         shell: bash
         run: |
           set -euo pipefail

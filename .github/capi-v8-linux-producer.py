@@ -89,7 +89,7 @@ def main():
     env.update(DEPOT_TOOLS_UPDATE="0", DEPOT_TOOLS_METRICS="0", V8_TAG=V8,
                GIT_CONFIG_NOSYSTEM="1", BOTO_CONFIG=str(root / "boto-config"),
                BOTO_PATH=str(root / "boto-config"))
-    deadline = time.monotonic() + 250 * 60
+    deadline = time.monotonic() + 345 * 60
     measurements = []
 
     def run(name, args, cwd, growth, seconds):
@@ -272,7 +272,7 @@ def main():
     # Bootstrap/preflight is inside the SAME admitted source phase and deadline.
     # It execs the unchanged original recipe, which applies the eight patches, TLS9, then reviewed refs10 with plain git apply.
     run("upstream-recipe", [sys.executable, str(Path(__file__).with_name("capi_v8_depot_bootstrap.py")),
-        str(root)], producer, 12 * GIB, 230 * 60)
+        str(root)], producer, 12 * GIB, 330 * 60)
     if checked_text(["git", "rev-parse", "HEAD"], source) != V8:
         raise RuntimeError("V8 source moved")
     expected_sources = {
