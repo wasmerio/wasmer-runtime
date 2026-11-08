@@ -243,7 +243,9 @@ fn borrowed_scope(
         return Err(RuntimeError::new("borrowed Store generation changed"));
     }
     let scope = INVOCATION_SCOPES
-        .with(|scopes| scopes.borrow().get(&generation.id).and_then(Weak::upgrade))
+        .try_with(|scopes| scopes.borrow().get(&generation.id).and_then(Weak::upgrade))
+        .ok()
+        .flatten()
         .ok_or_else(|| RuntimeError::new("borrowed Store has no bound invocation scope"))?;
     if !Arc::ptr_eq(&scope.generation, generation) || scope.destruction.is_complete() {
         return Err(RuntimeError::new("borrowed Store scope identity changed"));

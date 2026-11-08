@@ -586,17 +586,17 @@ impl StoreContext {
             }
             let mut rows = Vec::new();
             for row in stack.iter().rev() {
+                let StoreContextEntry::Sync(pointer) = (unsafe { &*row.entry.get() }) else {
+                    return Err(crate::RuntimeError::new(
+                        "borrowed Store ancestry is not synchronous",
+                    ));
+                };
                 if rows
                     .iter()
                     .any(|(_, pointer)| *pointer as usize == row.address)
                 {
                     continue;
                 }
-                let StoreContextEntry::Sync(pointer) = (unsafe { &*row.entry.get() }) else {
-                    return Err(crate::RuntimeError::new(
-                        "borrowed Store ancestry is not synchronous",
-                    ));
-                };
                 if row.borrow_count != 0 || row.paused_borrows != 0 || pointer.is_null() {
                     return Err(crate::RuntimeError::new(
                         "borrowed Store ancestry is not parked",
@@ -611,9 +611,12 @@ impl StoreContext {
             // after every live backing's deepest borrow was explicitly parked.
             // The parent's frames stay inaccessible until this child returns.
             let mut parent = unsafe { StoreMut::from_raw(pointer) };
-            parent.parked(|| {
-                crate::Store::with_current(action).expect("derived Sync child installed")
-            })
+            // Install THIS derived child directly. The general parked helper
+            // checks cached current IDs before our controlled identity check;
+            // public set_id may have changed the actual object behind a row.
+            let pointer = &mut *parent.inner as *mut StoreInner;
+            let _child = unsafe { StoreContext::install_borrowed(pointer) };
+            crate::Store::with_current(action).expect("derived Sync child installed")
         }
         // Validate bound foreign rows too: set_id cannot hide the target under
         // another Store's ID and turn a present wrong backing into base retry.
