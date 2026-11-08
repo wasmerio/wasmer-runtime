@@ -488,7 +488,10 @@ impl WriteRetirement {
             frame
         });
         let local = RefCell::new(None);
-        let carrier = frame.as_ref().map(|frame| &frame.panic).unwrap_or(&local);
+        let carrier = frame
+            .as_ref()
+            .map(|frame| frame.panic.as_ref())
+            .unwrap_or(&local);
         if let Some(first) = first {
             record_first(carrier, first, unwinding);
         }
