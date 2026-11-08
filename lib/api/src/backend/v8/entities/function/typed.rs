@@ -89,7 +89,7 @@ macro_rules! impl_native_traits {
 
                  loop {
                     results.clear();
-                    let arguments = crate::backend::v8::references::Values::from_values(&params_list);
+                    let arguments = crate::backend::v8::references::Values::from_values(&params_list, &Args::wasm_types())?;
                     let raw_results = &mut results.0;
                     let raw_arguments = arguments.into_call_arguments();
                     trap = unsafe { wasm_func_call(func, &raw_arguments, raw_results) };
@@ -115,6 +115,7 @@ macro_rules! impl_native_traits {
                      }
                 }
 
+                crate::backend::v8::utils::convert::validate_raw_values(results.as_slice(), &Rets::wasm_types())?;
                 unsafe {
                     let mut rets_list_array = Rets::empty_array();
                     let mut_rets = rets_list_array.as_mut() as *mut [RawValue] as *mut RawValue;
@@ -123,13 +124,13 @@ macro_rules! impl_native_traits {
                         0 => {},
                         1 => {
                             let val = (*results.0.data.wrapping_add(0)).clone();
-                            let val = val.into_wv(store);
+                            let val = val.into_wv(Rets::wasm_types()[0], store)?;
                             *mut_rets = val.as_raw(&mut store);
                         }
                         _n => {
                             for (i, ret_type) in Rets::wasm_types().iter().enumerate() {
                                     let val = (*results.0.data.wrapping_add(i)).clone();
-                                    let val = val.into_wv(store);
+                                    let val = val.into_wv(*ret_type, store)?;
                                     let slot = mut_rets.add(i);
                                     *slot = val.as_raw(&mut store);
                             }

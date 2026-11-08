@@ -53,8 +53,9 @@ impl Global {
         }
         let store = store.as_store_mut();
         let v8_store = store.inner.store.as_v8();
-        let v8_type = val.ty().into_ct();
-        let v8_value = val.into_cv();
+        let expected = val.ty();
+        let v8_value = val.into_cv(expected)?;
+        let v8_type = expected.into_ct();
         let v8_mutability = if mutability.is_mutable() {
             bindings::wasm_mutability_enum_WASM_VAR
         } else {
@@ -102,11 +103,14 @@ impl Global {
             .origin
             .check_store(store)
             .expect("foreign V8 handle");
+        let expected = self.ty(store).ty;
         let store = store.as_store_ref();
         let mut out = unsafe { std::mem::zeroed() };
         unsafe { wasm_global_get(self.handle.raw(), &mut out) };
         let owned = OwnedValue::adopt(out);
-        (*owned.value()).into_wv(&store)
+        (*owned.value())
+            .into_wv(expected, &store)
+            .expect("V8 global value disagrees with its checked type")
     }
 
     pub fn set(&self, store: &mut impl AsStoreMut, val: Value) -> Result<(), RuntimeError> {
@@ -128,7 +132,7 @@ impl Global {
             return Err(RuntimeError::new("The global is immutable".to_owned()));
         }
 
-        let value = val.into_cv();
+        let value = val.into_cv(self.ty(store).ty)?;
 
         unsafe { wasm_global_set(self.handle.raw(), &value) };
 

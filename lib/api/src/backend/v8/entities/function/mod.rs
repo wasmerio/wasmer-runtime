@@ -62,6 +62,7 @@ pub(crate) struct FunctionCallbackEnv<'a, F> {
     pub(crate) env_handle: Option<StoreHandle<VMFunctionEnvironment>>,
     pub(crate) env_identity: Option<std::sync::Weak<()>>,
     pub(crate) origin: Origin,
+    pub(crate) signature: FunctionType,
 }
 
 impl<'a, F> std::fmt::Debug for FunctionCallbackEnv<'a, F> {
@@ -155,6 +156,7 @@ impl Function {
                 env_handle: Some(env.as_v8().handle.clone()),
                 env_identity: Some(env.as_v8().identity.clone()),
                 origin: origin.clone(),
+                signature: fn_ty.clone(),
             }));
 
         let wasm_function = unsafe {
@@ -242,6 +244,10 @@ impl Function {
                 env_handle: None,
                 env_identity: None,
                 origin: origin.clone(),
+                signature: FunctionType::new(
+                    Args::wasm_types().to_vec(),
+                    Rets::wasm_types().to_vec(),
+                ),
             }));
 
         let wasm_function = unsafe {
@@ -337,6 +343,10 @@ impl Function {
                 env_handle: Some(env.as_v8().handle.clone()),
                 env_identity: Some(env.as_v8().identity.clone()),
                 origin: origin.clone(),
+                signature: FunctionType::new(
+                    Args::wasm_types().to_vec(),
+                    Rets::wasm_types().to_vec(),
+                ),
             }));
 
         let wasm_function = unsafe {
@@ -447,7 +457,7 @@ impl Function {
 
         loop {
             results.clear();
-            let arguments = Values::from_values(params);
+            let arguments = Values::from_values(params, signature.params())?;
             let function = self.handle.raw();
             let raw_results = &mut results.0;
             let raw_arguments = arguments.into_call_arguments();
@@ -474,11 +484,16 @@ impl Function {
             return Err(Into::<Trap>::into(trap).into());
         }
 
+        crate::backend::v8::utils::convert::validate_raw_values(
+            results.as_slice(),
+            signature.results(),
+        )?;
         let values = results
             .as_slice()
             .iter()
-            .map(|value| (*value).into_wv(store))
-            .collect::<Vec<_>>()
+            .zip(signature.results())
+            .map(|(value, ty)| (*value).into_wv(*ty, store))
+            .collect::<Result<Vec<_>, RuntimeError>>()?
             .into_boxed_slice();
         Ok(values)
     }
@@ -733,18 +748,39 @@ unsafe fn invoke_sync_callback<F>(
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| -> Result<(), RuntimeError> {
         let mut store = scope.store();
         let arguments = unsafe { &*arguments };
-        let values = crate::backend::v8::references::borrowed_values(arguments)
+        let raw = crate::backend::v8::references::borrowed_values(arguments);
+        crate::backend::v8::utils::convert::validate_raw_values(
+            raw,
+            descriptor.signature.params(),
+        )?;
+        let values = raw
             .iter()
-            .map(|value| (*value).into_wv(&store))
-            .collect::<Vec<_>>();
+            .zip(descriptor.signature.params())
+            .map(|(value, ty)| (*value).into_wv(*ty, &store))
+            .collect::<Result<Vec<_>, RuntimeError>>()?;
         let output = callback(&mut store, &values)?;
         let results = unsafe { &mut *results };
-        if output.len() != results.size || output.iter().any(|value| !value.is_from_store(&store)) {
+        if output.len() != results.size
+            || output.len() != descriptor.signature.results().len()
+            || output
+                .iter()
+                .zip(descriptor.signature.results())
+                .any(|(value, ty)| value.ty() != *ty)
+            || output.iter().any(|value| !value.is_from_store(&store))
+        {
             return Err(RuntimeError::new("invalid V8 synchronous host results"));
         }
+        crate::backend::v8::utils::convert::validate_values(
+            &output,
+            descriptor.signature.results(),
+        )?;
         let results = crate::backend::v8::references::borrowed_values_mut(results);
-        for (slot, value) in results.iter_mut().zip(output) {
-            OwnedValue::copy(&value.into_cv()).replace(slot);
+        for ((slot, value), ty) in results
+            .iter_mut()
+            .zip(output)
+            .zip(descriptor.signature.results())
+        {
+            OwnedValue::copy(&value.into_cv(*ty)?).replace(slot);
         }
         Ok(())
     }));

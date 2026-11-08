@@ -183,13 +183,17 @@ impl Values {
         }
         values
     }
-    pub(crate) fn from_values(values: &[crate::Value]) -> Self {
+    pub(crate) fn from_values(
+        values: &[crate::Value],
+        expected: &[wasmer_types::Type],
+    ) -> Result<Self, crate::RuntimeError> {
         use super::utils::convert::IntoCApiValue;
+        super::utils::convert::validate_values(values, expected)?;
         let mut result = Self::empty(values.len());
-        for (slot, value) in result.as_mut_slice().iter_mut().zip(values) {
-            OwnedValue::copy(&value.clone().into_cv()).replace(slot);
+        for ((slot, value), ty) in result.as_mut_slice().iter_mut().zip(values).zip(expected) {
+            OwnedValue::copy(&value.clone().into_cv(*ty)?).replace(slot);
         }
-        result
+        Ok(result)
     }
     pub(crate) fn as_slice(&self) -> &[wasm_val_t] {
         if self.0.size == 0 {

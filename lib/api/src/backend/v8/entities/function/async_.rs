@@ -114,7 +114,7 @@ impl Function {
                         function.handle.origin.check_store(&guard)?;
                         // C++ consumes each physical argument vector. Keep the
                         // SAME Rust Values for a requested InvokeAgain instead.
-                        arguments = Some(CallValues::from_values(&parameters));
+                        arguments = Some(CallValues::from_values(&parameters, signature.params())?);
                         let raw_function = function.handle.raw();
                         let raw_results = &mut results.as_mut().unwrap().0;
                         drop(guard);
@@ -167,13 +167,16 @@ impl Function {
                             RuntimeError::new("V8 result Store is still borrowed")
                         })?;
                         function.handle.origin.check_store(&guard)?;
-                        let values = results
-                            .as_ref()
-                            .unwrap()
-                            .as_slice()
+                        let raw = results.as_ref().unwrap().as_slice();
+                        crate::backend::v8::utils::convert::validate_raw_values(
+                            raw,
+                            signature.results(),
+                        )?;
+                        let values = raw
                             .iter()
-                            .map(|value| (*value).into_wv(&guard))
-                            .collect::<Vec<_>>()
+                            .zip(signature.results())
+                            .map(|(value, ty)| (*value).into_wv(*ty, &guard))
+                            .collect::<Result<Vec<_>, RuntimeError>>()?
                             .into_boxed_slice();
                         return Ok(values);
                     }
@@ -424,6 +427,17 @@ where
                     "V8 import belongs to another Store backing",
                 ));
             }
+            let arguments = unsafe { &*arguments };
+            let raw = crate::backend::v8::references::borrowed_values(arguments);
+            crate::backend::v8::utils::convert::validate_raw_values(
+                raw,
+                callback.signature.params(),
+            )?;
+            let values = raw
+                .iter()
+                .zip(callback.signature.params())
+                .map(|(value, ty)| (*value).into_wv(*ty, &guard))
+                .collect::<Result<Vec<_>, RuntimeError>>()?;
             let snapshot = callback
                 .capture
                 .and_then(|capture| capture(callback.environment.as_ref(&guard)));
@@ -433,11 +447,6 @@ where
                     func_env: callback.environment.clone(),
                     import_snapshot: snapshot,
                 }));
-            let arguments = unsafe { &*arguments };
-            let values = crate::backend::v8::references::borrowed_values(arguments)
-                .iter()
-                .map(|value| (*value).into_wv(&guard))
-                .collect::<Vec<_>>();
             (environment, values)
         }; // no actual Store/context guard survives the factory or its future
         let future = (callback.factory)(environment, &values);
@@ -452,6 +461,7 @@ where
                 "V8 async host function returned wrong results",
             ));
         }
+        crate::backend::v8::utils::convert::validate_values(&output, callback.signature.results())?;
         let _guard = StoreAsyncWriteLock::try_acquire(&store)
             .ok_or_else(|| RuntimeError::new("V8 host result Store is still borrowed"))?;
         let results = unsafe { &mut *results };
@@ -462,8 +472,12 @@ where
             return Err(RuntimeError::new("V8 host result belongs to another Store"));
         }
         let destination = crate::backend::v8::references::borrowed_values_mut(results);
-        for (slot, value) in destination.iter_mut().zip(output) {
-            OwnedValue::copy(&value.into_cv()).replace(slot);
+        for ((slot, value), ty) in destination
+            .iter_mut()
+            .zip(output)
+            .zip(callback.signature.results())
+        {
+            OwnedValue::copy(&value.into_cv(*ty)?).replace(slot);
         }
         Ok(())
     }));

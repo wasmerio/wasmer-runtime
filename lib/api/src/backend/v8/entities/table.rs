@@ -50,8 +50,16 @@ impl Table {
 
         let engine = store_mut.engine();
 
+        if !matches!(
+            ty.ty,
+            wasmer_types::Type::FuncRef | wasmer_types::Type::ExternRef
+        ) {
+            return Err(RuntimeError::new(
+                "V8 table requires a declared reference type",
+            ));
+        }
+        let init: wasm_val_t = init.into_cv(ty.ty)?;
         let wasm_tablety = Self::type_to_v8(ty);
-        let init: wasm_val_t = init.into_cv();
 
         Ok(Self {
             handle: Handle::new(
@@ -101,7 +109,7 @@ impl Table {
         if self.handle.origin.check_store(store).is_err() {
             return None;
         }
-        let store_mut = store.as_store_mut();
+        let expected = self.ty(store).ty;
 
         if index >= self.size(store) {
             return None;
@@ -111,14 +119,14 @@ impl Table {
             let ref_ = wasm_table_get(self.handle.raw(), index);
 
             if ref_.is_null() {
-                return match self.ty(store).ty {
+                return match expected {
                     wasmer_types::Type::ExternRef => Some(Value::ExternRef(None)),
                     wasmer_types::Type::FuncRef => Some(Value::FuncRef(None)),
                     ty => panic!("unsupported table type: {ty:?}"),
                 };
             }
 
-            let kind = match self.ty(store).ty {
+            let kind = match expected {
                 wasmer_types::Type::ExternRef => wasm_valkind_enum_WASM_EXTERNREF,
                 wasmer_types::Type::FuncRef => wasm_valkind_enum_WASM_FUNCREF,
                 ty => panic!("unsupported table type: {ty:?}"),
@@ -129,7 +137,11 @@ impl Table {
                 of: bindings::wasm_val_t__bindgen_ty_1 { ref_ },
             });
 
-            Some((*value.value()).into_wv(store))
+            Some(
+                (*value.value())
+                    .into_wv(expected, store)
+                    .expect("V8 table value disagrees with its checked element type"),
+            )
         }
     }
 
@@ -143,27 +155,22 @@ impl Table {
         if !val.is_from_store(store) {
             return Err(RuntimeError::new("foreign V8 table value"));
         }
-        let store_mut = store.as_store_mut();
-
-        unsafe {
-            let init = match val {
-                Value::ExternRef(None) | Value::FuncRef(None) => std::ptr::null_mut(),
-                Value::FuncRef(Some(ref r)) => wasm_func_as_ref(r.as_v8().handle.raw()),
-                _ => {
-                    return Err(RuntimeError::new(format!(
-                        "Could not grow table due to unsupported init value type: {val:?} "
-                    )));
-                }
-            };
-
-            if !wasm_table_set(self.handle.raw(), index, init) {
-                return Err(RuntimeError::new(format!(
-                    "Could not set value {val:?} table at index {index}"
-                )));
-            }
-
-            Ok(())
+        let expected = self.ty(store).ty;
+        if !matches!(
+            expected,
+            wasmer_types::Type::FuncRef | wasmer_types::Type::ExternRef
+        ) {
+            return Err(RuntimeError::new(
+                "V8 table requires a declared reference type",
+            ));
         }
+        let value = val.clone().into_cv(expected)?;
+        if !unsafe { wasm_table_set(self.handle.raw(), index, value.of.ref_) } {
+            return Err(RuntimeError::new(format!(
+                "Could not set value {val:?} table at index {index}"
+            )));
+        }
+        Ok(())
     }
 
     pub fn size(&self, store: &impl AsStoreRef) -> u32 {
@@ -186,25 +193,21 @@ impl Table {
         if !init.is_from_store(store) {
             return Err(RuntimeError::new("foreign V8 table grow value"));
         }
-        let store_mut = store.as_store_mut();
-
-        unsafe {
-            let size = wasm_table_size(self.handle.raw());
-            let init = match init {
-                Value::ExternRef(None) | Value::FuncRef(None) => std::ptr::null_mut(),
-                Value::FuncRef(Some(r)) => wasm_func_as_ref(r.as_v8().handle.raw()),
-                _ => {
-                    return Err(RuntimeError::new(format!(
-                        "Could not grow table due to unsupported init value type: {init:?} "
-                    )));
-                }
-            };
-            if !wasm_table_grow(self.handle.raw(), delta, init) {
-                return Err(RuntimeError::new("Could not grow table"));
-            }
-
-            Ok(size)
+        let expected = self.ty(store).ty;
+        if !matches!(
+            expected,
+            wasmer_types::Type::FuncRef | wasmer_types::Type::ExternRef
+        ) {
+            return Err(RuntimeError::new(
+                "V8 table requires a declared reference type",
+            ));
         }
+        let value = init.into_cv(expected)?;
+        let size = unsafe { wasm_table_size(self.handle.raw()) };
+        if !unsafe { wasm_table_grow(self.handle.raw(), delta, value.of.ref_) } {
+            return Err(RuntimeError::new("Could not grow table"));
+        }
+        Ok(size)
     }
 
     pub fn copy(
