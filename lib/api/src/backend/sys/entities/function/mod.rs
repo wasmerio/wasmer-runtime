@@ -35,6 +35,9 @@ use wasmer_vm::{
     raise_user_trap, resume_panic, wasmer_call_trampoline,
 };
 
+#[cfg(feature = "experimental-async")]
+type ImportCapture<T> = fn(&T) -> Option<Arc<dyn std::any::Any + Send + Sync>>;
+
 #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A WebAssembly `function` instance, in the `sys` runtime.
@@ -211,7 +214,7 @@ impl Function {
         env: &FunctionEnv<T>,
         ty: FT,
         func: F,
-        capture: Option<fn(&T) -> Option<Arc<dyn std::any::Any + Send + Sync>>>,
+        capture: Option<ImportCapture<T>>,
     ) -> Self
     where
         FT: Into<FunctionType>,
@@ -445,7 +448,7 @@ impl Function {
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
         func: F,
-        capture: Option<fn(&T) -> Option<Arc<dyn std::any::Any + Send + Sync>>>,
+        capture: Option<ImportCapture<T>>,
     ) -> Self
     where
         T: 'static,
