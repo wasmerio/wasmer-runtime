@@ -771,6 +771,23 @@ impl StoreContext {
         });
     }
 
+    // A wrapper dropping during G retires only its OWN already-counted
+    // receipt. Never dereference Store data, search older rows or panic while
+    // preserving the active Rust unwind if TLS/metadata is unavailable.
+    fn release_borrow_during_unwind(id: StoreId, installation: StoreContextId) {
+        let _ = STORE_CONTEXT_STACK.try_with(|cell| {
+            let Ok(mut stack) = cell.try_borrow_mut() else {
+                return;
+            };
+            let Some(top) = stack.last_mut() else {
+                return;
+            };
+            if top.id == id && top.installation == installation && top.borrow_count > 0 {
+                top.borrow_count -= 1;
+            }
+        });
+    }
+
     fn uninstall(id: StoreId, installation: StoreContextId) {
         let removed = STORE_CONTEXT_STACK.with(|cell| {
             let mut stack = cell.borrow_mut();
@@ -1116,6 +1133,7 @@ impl Clone for StorePtrWrapper {
 impl Drop for StorePtrWrapper {
     fn drop(&mut self) {
         if std::thread::panicking() {
+            StoreContext::release_borrow_during_unwind(self.store_id, self.installation);
             return;
         }
         StoreContext::release_borrow(self.store_id, self.installation);
@@ -1165,6 +1183,7 @@ impl StoreAsyncGuardWrapper {
 impl Drop for StoreAsyncGuardWrapper {
     fn drop(&mut self) {
         if std::thread::panicking() {
+            StoreContext::release_borrow_during_unwind(self.store_id, self.installation);
             return;
         }
         StoreContext::release_borrow(self.store_id, self.installation);
@@ -1614,5 +1633,287 @@ mod native_suspension {
         drop(nested);
         drop(root);
         assert!(StoreContext::is_empty());
+    }
+}
+
+#[cfg(test)]
+mod unwind_borrow_retirement {
+    use super::*;
+    use crate::{Function, Store};
+    use std::{
+        cell::Cell,
+        panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    struct OnDrop<F: FnMut()>(F);
+    impl<F: FnMut()> Drop for OnDrop<F> {
+        fn drop(&mut self) {
+            (self.0)();
+        }
+    }
+    fn during_g(value: impl Sized) {
+        let primary = Box::new(0xC0DEusize);
+        let address = (&*primary) as *const usize as usize;
+        let caught = catch_unwind(AssertUnwindSafe(|| {
+            let _value = value;
+            resume_unwind(primary);
+        }))
+        .unwrap_err()
+        .downcast::<usize>()
+        .unwrap();
+        assert_eq!(*caught, 0xC0DE);
+        assert_eq!(
+            (&*caught) as *const usize as usize,
+            address,
+            "the exact active G survives"
+        );
+    }
+    fn snapshot() -> Vec<(StoreId, StoreContextId, u32, u32, usize)> {
+        STORE_CONTEXT_STACK.with(|cell| {
+            cell.borrow()
+                .iter()
+                .map(|row| {
+                    (
+                        row.id,
+                        row.installation,
+                        row.borrow_count,
+                        row.paused_borrows,
+                        row.address,
+                    )
+                })
+                .collect()
+        })
+    }
+
+    #[test]
+    fn sync_wrapper_retires_its_exact_top_borrow_during_unwind() {
+        let mut store = Store::default();
+        let scalar = Function::new_typed(&mut store, || 42i32);
+        let completed = Cell::new(0);
+        store.as_store_mut().parked(|| {
+            during_g(OnDrop(|| {
+                for _ in 0..2 {
+                    // No assertions or new panic inside this real G Drop.
+                    let result = Store::with_current(|actual| scalar.call(actual, &[]));
+                    if let Some(Ok(values)) = result
+                        && values[0].i32() == Some(42)
+                    {
+                        completed.set(completed.get() + 1);
+                    }
+                }
+            }));
+            assert_eq!(completed.get(), 2);
+            let rows = snapshot();
+            assert_eq!(rows.last().unwrap().2, 0);
+            assert_eq!(rows.last().unwrap().3, 0);
+        });
+        assert!(StoreContext::is_empty());
+        assert_eq!(scalar.call(&mut store, &[]).unwrap()[0].i32(), Some(42));
+    }
+
+    #[test]
+    #[cfg(feature = "experimental-async")]
+    fn async_wrapper_retires_its_exact_top_borrow_during_unwind() {
+        let mut original = Store::default();
+        let scalar = Function::new_typed(&mut original, || 43i32);
+        let store = original.into_async();
+        let id = store.id;
+        let root = StoreContext::install_async(store.inner.try_write().unwrap());
+        let completed = Cell::new(0);
+        during_g(OnDrop(|| {
+            for _ in 0..2 {
+                if let GetStoreAsyncGuardResult::Ok(mut wrapper) =
+                    unsafe { StoreContext::try_get_current_async(id) }
+                {
+                    let result = scalar.call(&mut wrapper.as_mut(), &[]);
+                    if let Ok(values) = result
+                        && values[0].i32() == Some(43)
+                        && wrapper.as_mut().objects_mut().id() == id
+                    {
+                        completed.set(completed.get() + 1);
+                    }
+                    wrapper
+                        .as_mut()
+                        .on_called(|_| Ok(wasmer_types::OnCalledAction::Finish));
+                }
+            }
+        }));
+        assert_eq!(completed.get(), 2);
+        assert_eq!(snapshot().last().unwrap().2, 0);
+        assert_eq!(snapshot().last().unwrap().3, 0);
+        assert!(
+            store.inner.try_write().is_none(),
+            "the original Async context still owns its real write guard"
+        );
+        drop(root);
+        assert!(store.inner.try_write().is_some());
+        let mut store = store.into_store().unwrap();
+        assert!(
+            store.inner.on_called.is_some(),
+            "both actual wrappers accessed the real Store"
+        );
+        assert_eq!(scalar.call(&mut store, &[]).unwrap()[0].i32(), Some(43));
+        assert!(StoreContext::is_empty());
+    }
+
+    #[test]
+    fn unwind_receipt_never_releases_a_replacement_or_older_row() {
+        for same_store in [false, true] {
+            let mut store = Store::default();
+            let id = store.id();
+            let pointer = store.as_store_mut().inner as *mut StoreInner;
+            let original = unsafe { StoreContext::install(pointer) };
+            let mut wrapper = Some(unsafe { StoreContext::get_current(id) });
+            let installation = wrapper.as_ref().unwrap().installation;
+            let mut other = Store::default();
+            let child_pointer = if same_store {
+                pointer
+            } else {
+                other.as_store_mut().inner as *mut StoreInner
+            };
+            // Actual wrappers are not accessed through their pointers while
+            // shadowed. The exact old receipt alone is dropped during G.
+            let child = unsafe { StoreContext::install_borrowed(child_pointer) };
+            let child_id = STORE_CONTEXT_STACK.with(|cell| cell.borrow().last().unwrap().id);
+            let current = unsafe { StoreContext::get_current(child_id) };
+            let before = snapshot();
+            during_g(OnDrop(|| drop(wrapper.take())));
+            assert_eq!(
+                snapshot(),
+                before,
+                "neither a replacement nor an older matching row is mutated"
+            );
+            assert_eq!(before[0].2, 1);
+            assert_eq!(before[1].2, 1);
+            drop(current);
+            drop(child);
+            // Like the existing rejected-wrapper sibling: restore fixture
+            // accounting explicitly after its unmatched receipt was consumed.
+            StoreContext::release_borrow(id, installation);
+            drop(original);
+            assert!(StoreContext::is_empty());
+        }
+    }
+
+    #[test]
+    fn unwind_receipt_is_noop_while_context_metadata_is_borrowed() {
+        for mutable in [false, true] {
+            let mut store = Store::default();
+            let id = store.id();
+            let root = unsafe { StoreContext::install(store.as_store_mut().inner) };
+            let mut wrapper = Some(unsafe { StoreContext::get_current(id) });
+            let installation = wrapper.as_ref().unwrap().installation;
+            let before = snapshot();
+            STORE_CONTEXT_STACK.with(|cell| {
+                if mutable {
+                    let stack = cell.borrow_mut();
+                    during_g(OnDrop(|| drop(wrapper.take())));
+                    assert_eq!(stack.last().unwrap().borrow_count, 1);
+                } else {
+                    let stack = cell.borrow();
+                    during_g(OnDrop(|| drop(wrapper.take())));
+                    assert_eq!(stack.last().unwrap().borrow_count, 1);
+                }
+            });
+            assert_eq!(snapshot(), before);
+            // Fault-profile cleanup only: the real consumed wrapper correctly
+            // made no mutation while another RefCell borrow prevented it.
+            StoreContext::release_borrow(id, installation);
+            drop(root);
+            assert!(StoreContext::is_empty());
+        }
+    }
+
+    #[test]
+    fn unwind_receipt_zero_empty_and_wrong_id_leave_metadata_unchanged() {
+        let mut store = Store::default();
+        let root = unsafe { StoreContext::install(store.as_store_mut().inner) };
+        let wrapper = unsafe { StoreContext::get_current(store.id()) };
+        let (id, installation) = (wrapper.store_id, wrapper.installation);
+        drop(wrapper);
+        let before = snapshot();
+        // Explicit metadata edge controls, using exact captured metadata AFTER
+        // normal receipt retirement, not fabricated wrapper/cap authority.
+        during_g(OnDrop(|| {
+            StoreContext::release_borrow_during_unwind(id, installation)
+        }));
+        assert_eq!(snapshot(), before);
+        let other = Store::default();
+        during_g(OnDrop(|| {
+            StoreContext::release_borrow_during_unwind(other.id(), installation)
+        }));
+        assert_eq!(snapshot(), before);
+        drop(root);
+        during_g(OnDrop(|| {
+            StoreContext::release_borrow_during_unwind(id, installation)
+        }));
+        assert!(StoreContext::is_empty());
+    }
+
+    thread_local! {
+        static LATE_OWNER: RefCell<Option<LateOwner>> = const { RefCell::new(None) };
+    }
+    struct LateOwner {
+        wrapper: Option<StorePtrWrapper>,
+        install: StoreInstallGuard,
+        _store: Store,
+        checked: Arc<AtomicUsize>,
+    }
+    impl Drop for LateOwner {
+        fn drop(&mut self) {
+            let callback_ran = Cell::new(false);
+            let unavailable = STORE_CONTEXT_STACK
+                .try_with(|_| callback_ran.set(true))
+                .is_err();
+            let wrapper = self.wrapper.take();
+            let primary = Box::new(0xC0DEusize);
+            let address = (&*primary) as *const usize as usize;
+            let caught = catch_unwind(AssertUnwindSafe(|| {
+                let _wrapper = wrapper;
+                resume_unwind(primary);
+            }));
+            let exact = caught
+                .as_ref()
+                .err()
+                .and_then(|panic| panic.downcast_ref::<usize>())
+                .is_some_and(|primary| {
+                    *primary == 0xC0DE && primary as *const usize as usize == address
+                });
+            if unavailable && !callback_ran.get() && exact {
+                self.checked.fetch_add(1, Ordering::SeqCst);
+            }
+            // The actual TLS stack (and its Sync row) has ALREADY been
+            // destroyed. Consume only this fixture guard's empty metadata;
+            // never call strict uninstall against destroyed TLS or fake a pop.
+            self.install.installation.take();
+        }
+    }
+    #[test]
+    fn unwind_receipt_during_late_tls_destruction_preserves_g() {
+        let checked = Arc::new(AtomicUsize::new(0));
+        let result = checked.clone();
+        std::thread::spawn(move || {
+            // Existing TeardownTls sibling ordering: the Owner initializes
+            // first, so the real primary stack is destroyed before Owner.
+            LATE_OWNER.with(|_| ());
+            let mut store = Store::default();
+            let install = unsafe { StoreContext::install(store.as_store_mut().inner) };
+            let wrapper = unsafe { StoreContext::get_current(store.id()) };
+            LATE_OWNER.with(|owner| {
+                *owner.borrow_mut() = Some(LateOwner {
+                    wrapper: Some(wrapper),
+                    install,
+                    _store: store,
+                    checked: result,
+                })
+            });
+        })
+        .join()
+        .unwrap();
+        assert_eq!(checked.load(Ordering::SeqCst), 1);
     }
 }
