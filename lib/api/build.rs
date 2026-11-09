@@ -8,6 +8,33 @@ fn build_v8() {
     };
 
     const WEE8_RELEASE_VERSION: &str = "11.9.7";
+    const NEXT_LINUX_CACHE: &str = "next-13.6.233.17-r42556478120-56d46612";
+    const NEXT_LINUX_ASSET: &str =
+        "https://api.github.com/repos/wasmerio/wasmer-next/releases/assets/726693826";
+    const NEXT_LINUX_ARCHIVE_SHA: &str =
+        "56d466127af223f0fc4ca453d6326bcd8db8eeba50482326def81c9674949a41";
+    const NEXT_LINUX_LIBRARY_SHA: &str =
+        "8624c72e07e7c4c08f12fa7274ff57ddc3f11ddc3b3a74c45bc246a088d3496c";
+
+    fn assert_sha256(mut input: impl std::io::Read, expected: &str, kind: &str) {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = input
+                .read(&mut buffer)
+                .unwrap_or_else(|_| panic!("cannot read accepted wee8 {kind} for verification"));
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        assert_eq!(
+            format!("{:x}", digest.finalize()),
+            expected,
+            "accepted wee8 {kind} checksum mismatch; remove the affected owned cache or use WASMER_V8_ARTIFACT_DIR"
+        );
+    }
 
     let (asset_name, platform_name) = match (
         env::var("CARGO_CFG_TARGET_OS").unwrap().as_str(),
@@ -30,7 +57,11 @@ fn build_v8() {
     let v8_header_path = PathBuf::from(&crate_root).join("third-party").join("wee8");
     let cache_dir = stable_target_dir(&out_path)
         .join("wee8-artifacts")
-        .join(WEE8_RELEASE_VERSION)
+        .join(if platform_name == "linux-amd64" {
+            NEXT_LINUX_CACHE
+        } else {
+            WEE8_RELEASE_VERSION
+        })
         .join(platform_name);
     let archive_path = cache_dir.join(asset_name);
     let library_name = if cfg!(target_os = "windows") {
@@ -61,6 +92,8 @@ fn build_v8() {
         root.join("lib")
     });
     let explicit_artifact = configured.is_some();
+    let pinned_linux = platform_name == "linux-amd64" && !explicit_artifact;
+    let isolated_prefix = explicit_artifact || pinned_linux;
     let v8_lib_dir = configured.unwrap_or_else(|| cache_dir.join("lib"));
     let v8_lib_path = v8_lib_dir.join(library_name);
 
@@ -75,18 +108,61 @@ fn build_v8() {
         });
 
         if !archive_path.exists() {
-            let url = format!(
-                "https://github.com/wasmerio/wee8-custom-builds/releases/download/{WEE8_RELEASE_VERSION}/{asset_name}"
-            );
-            let tar_data = ureq::get(&url)
-                .call()
-                .expect("failed to download v8")
-                .body_mut()
-                .with_config()
-                // Windows prebuilts are substantially larger.
-                .limit(200 * 1024 * 1024)
-                .read_to_vec()
-                .expect("failed to download v8 lib");
+            use std::io::Write;
+
+            let tar_data = if pinned_linux {
+                // Credentials are used only for this private request. Do not emit
+                // rerun-if-env-changed for them: Cargo persists watched values.
+                let token = env::var("GH_TOKEN")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| {
+                        env::var("GITHUB_TOKEN")
+                            .ok()
+                            .filter(|value| !value.trim().is_empty())
+                    })
+                    .unwrap_or_else(|| panic!(
+                        "accepted Linux wee8 download requires GH_TOKEN or GITHUB_TOKEN with Contents: read access to private wasmerio/wasmer-next; alternatively set WASMER_V8_ARTIFACT_DIR to a verified unpacked artifact"
+                    ));
+                let mut authorization =
+                    ureq::http::HeaderValue::from_str(&format!("Bearer {}", token.trim()))
+                        .unwrap_or_else(|_| {
+                            panic!("invalid GitHub read-token header for private wee8")
+                        });
+                authorization.set_sensitive(true);
+                let bytes = ureq::get(NEXT_LINUX_ASSET)
+                    .header("Accept", "application/octet-stream")
+                    .header("Authorization", authorization)
+                    .header("User-Agent", "wasmer-v8-build")
+                    .config()
+                    .redirect_auth_headers(ureq::config::RedirectAuthHeaders::Never)
+                    .timeout_global(Some(std::time::Duration::from_secs(180)))
+                    .build()
+                    .call()
+                    .unwrap_or_else(|_| panic!(
+                        "cannot download accepted private Linux wee8 asset; check token Contents: read access or use WASMER_V8_ARTIFACT_DIR"
+                    ))
+                    .body_mut()
+                    .with_config()
+                    .limit(200 * 1024 * 1024)
+                    .read_to_vec()
+                    .unwrap_or_else(|_| panic!("cannot read accepted private Linux wee8 asset"));
+                assert_sha256(bytes.as_slice(), NEXT_LINUX_ARCHIVE_SHA, "archive");
+                bytes
+            } else {
+                let url = format!(
+                    "https://github.com/wasmerio/wee8-custom-builds/releases/download/{WEE8_RELEASE_VERSION}/{asset_name}"
+                );
+                ureq::get(&url)
+                    .call()
+                    .expect("failed to download v8")
+                    .body_mut()
+                    .with_config()
+                    // Windows prebuilts are substantially larger.
+                    .limit(200 * 1024 * 1024)
+                    .read_to_vec()
+                    .expect("failed to download v8 lib")
+            };
 
             fs::write(&archive_path, tar_data).unwrap_or_else(|err| {
                 panic!(
@@ -102,6 +178,19 @@ fn build_v8() {
                 archive_path.display()
             )
         });
+        if pinned_linux {
+            assert_sha256(
+                tar_data.as_slice(),
+                NEXT_LINUX_ARCHIVE_SHA,
+                "cached archive",
+            );
+        }
+        let unpack_tmp = tempfile::TempDir::new_in(&cache_dir).unwrap_or_else(|err| {
+            panic!(
+                "failed to create temporary wee8 unpack directory in {}: {err}",
+                cache_dir.display()
+            )
+        });
         let tar = xz::read::XzDecoder::new(tar_data.as_slice());
         let mut archive = tar::Archive::new(tar);
         archive.unpack(&cache_dir).unwrap_or_else(|err| {
@@ -113,7 +202,12 @@ fn build_v8() {
         });
     }
 
-    if !explicit_artifact {
+    if pinned_linux {
+        let library = fs::File::open(&v8_lib_path)
+            .unwrap_or_else(|_| panic!("cannot open accepted Linux wee8 library cache"));
+        assert_sha256(library, NEXT_LINUX_LIBRARY_SHA, "library");
+    }
+    if !isolated_prefix {
         println!("cargo:rustc-link-search=native={}", v8_lib_dir.display());
     }
 
@@ -199,7 +293,7 @@ fn build_v8() {
             }
         })
         .collect();
-    let prefix_dir = if explicit_artifact {
+    let prefix_dir = if isolated_prefix {
         let directory = out_path.join("wee8-prefixed");
         fs::create_dir_all(&directory).expect("failed to create owned wee8 prefix directory");
         println!("cargo:rustc-link-search=native={}", directory.display());

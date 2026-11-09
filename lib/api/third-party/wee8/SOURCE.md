@@ -13,7 +13,46 @@ The raw input is not modified: symbol-prefixed copies and the Store ownership
 adapter are generated under the build's `OUT_DIR`. Verify the artifact's source,
 SHA256 and paired headers before selecting it. This explicit input is also the
 offline/prepopulated route; it does not certify an arbitrary supplied library.
-When unset, the existing provider and cache selection remain unchanged.
+When unset, Linux x86_64 GNU selects the private pinned provider below. Other
+targets retain their existing provider and cache policy.
+
+## Linux GNU default acquisition
+
+The accepted Linux x86_64 GNU archive is retained in the private Next prerelease
+[wee8-13.6.233.17-next-r42556478120](https://github.com/wasmerio/wasmer-next/releases/tag/wee8-13.6.233.17-next-r42556478120).
+The immutable GitHub asset ID is `726693826`. Its archive SHA-256 is
+`56d466127af223f0fc4ca453d6326bcd8db8eeba50482326def81c9674949a41`, and raw
+`lib/libv8.a` SHA-256 is
+`8624c72e07e7c4c08f12fa7274ff57ddc3f11ddc3b3a74c45bc246a088d3496c`.
+The build checks downloaded and cached archives before extraction and checks
+the raw library before generating its symbol-prefixed copy. Its cache namespace
+is distinct from the old `11.9.7` provider. Generated prefix/shim outputs stay
+under `OUT_DIR`, with no raw-cache link-search entry.
+
+A fresh download needs an explicitly supplied existing `GH_TOKEN` or
+`GITHUB_TOKEN` with Contents: read access to private `wasmerio/wasmer-next`.
+Authentication uses the standard GitHub asset API; Authorization is sensitive
+and never forwarded on redirects. Missing access or digest mismatch fails with
+an actionable error, without falling back to the old Linux provider. Tokens are
+not written into Cargo environment-tracking fingerprints or generated files.
+
+For trusted CI steps that build V8, pass the existing read token as a step
+`GH_TOKEN` environment value; a job with `permissions: { contents: read }` is
+sufficient in this repository. No token is needed for an already verified
+library cache. For a prepopulated/offline build, unpack the verified release
+archive and set `WASMER_V8_ARTIFACT_DIR` to that absolute root before invoking
+the existing Makefile/Cargo command. Cargo's `--offline` constrains Cargo's
+registry resolution; this explicit directory also avoids build-script HTTP.
+
+The release includes paired `wasm.hh`, licenses, `PROVENANCE.json`,
+`ACCEPTANCE.json` and `SHA256SUMS`. It records actual four affected reference
+passes and the fresh official shared-CAPI/unchanged original C-example passes;
+carried-forward unaffected callback/Pending evidence is identified separately.
+This does not advertise all V8 APIs or all platforms. The pinned wee8 Engine
+continues to be shared for the process lifetime, without per-wrapper global
+teardown or reinitialization guarantees.
+
+## Header and Store adapter provenance
 
 The `wasm.h` and complete `wasm.hh` come from V8
 `b0a55a7dad7f536cce1f9aaddba89894c8533946` (13.6.233.17), with the original
@@ -70,15 +109,11 @@ The candidate C++ header SHA-256 is
 `67eae9b38696c2620e797e3c96c30441ea5dfdfa62957d1f635040c010429729`;
 the public C header remains
 `97f49de5418f02c55633dbcdc96b72fb404659c9275e9a47a3b4d6bdce384b96`.
-The tracked C++ header is the exact `candidate-wasm.hh` retained by private Next
-Actions run `42537667351`, candidate commit
-`dd13e1dd0d34db284f6c8eee0afd878ac2d60144`. The corresponding library archive
-SHA-256 is `efcfa8cd7d417e3ad043d6d759acd988860df0996f48876efa1449677cf0379b`;
-its raw `lib/libv8.a` SHA-256 is
-`d27d644a21409e41081cc4c66565534112c31ef18a201cdd13c55fd73389a95d`.
-The isolated validation tuple selects this archive explicitly. Default provider
-selection remains unchanged until the actual shared C API and reference gates
-pass; successful packaging alone does not establish consumer acceptance.
+The tracked C++ header is byte-identical in private Next Actions runs
+`42537667351` and corrected `42556478120`. The accepted archive above comes
+from corrected candidate commit `570aeebd90e4734c7bcb214b8549df5dbb6e670b`,
+including patch0011 below. The first run's distinct archive and failure evidence
+remain retained; packaging alone was never treated as consumer acceptance.
 
 ## Private candidate C-entry layout and Global scope correction
 
@@ -105,5 +140,6 @@ The exact source hashes after patch0011 are:
 
 The prior run425376 packaging evidence remains valid for its original tuple;
 its first reference matrix passed one test and failed four, so it is not an
-accepted default provider. A new source build and actual affected reference
-gates are required before adoption.
+accepted default provider. Corrected run425564 completed the source build,
+passed the four affected reference controls and fresh official shared-CAPI/C
+consumer gates; its acceptance evidence is included in the private release.
