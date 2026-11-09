@@ -64,7 +64,7 @@ shared C API acceptance or provider adoption.
 `canonical-call-layout.patch` follows the original eight patches, TLS9 and
 `canonical-references.patch`, as producer patch0011. It is authored by OpenAI
 Codex; its SHA-256 is
-`9fbd293ab34c6d54a94fefef8283e91fbc766bfea869f3a087c69466cee2e84c`.
+`6ff5755d0d7d6de03d329b9d49a7d05f3a313bf192ae36abf6a647b37aa9f0bc`.
 
 It changes only both `BuildCWasmEntry` parameter/result offsets from
 `value_kind_size()` to `value_kind_full_size()` in

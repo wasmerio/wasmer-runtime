@@ -2,33 +2,21 @@ diff --git a/src/compiler/wasm-compiler.cc b/src/compiler/wasm-compiler.cc
 index 87a194b..34c5984 100644
 --- a/src/compiler/wasm-compiler.cc
 +++ b/src/compiler/wasm-compiler.cc
-@@ -979,7 +979,7 @@ class WasmWrapperGraphBuilder : public WasmGraphBuilder {
-           graph()->NewNode(GetSafeLoadOperator(offset, type), arg_buffer,
-                            Int32Constant(offset), effect(), control()));
+@@ -981,3 +981,3 @@ class WasmWrapperGraphBuilder : public WasmGraphBuilder {
        args[pos++] = arg_load;
 -      offset += type.value_kind_size();
 +      offset += type.value_kind_full_size();
      }
- 
-     args[pos++] = effect();
-@@ -1011,7 +1011,7 @@ class WasmWrapperGraphBuilder : public WasmGraphBuilder {
-                                            call, control());
-       SetEffect(
+@@ -1013,3 +1013,3 @@ class WasmWrapperGraphBuilder : public WasmGraphBuilder {
            BuildSafeStore(offset, type, arg_buffer, value, effect(), control()));
 -      offset += type.value_kind_size();
 +      offset += type.value_kind_full_size();
        pos++;
-     }
- 
 diff --git a/src/wasm/c-api.cc b/src/wasm/c-api.cc
 index a2a7d94..ec80096 100644
 --- a/src/wasm/c-api.cc
 +++ b/src/wasm/c-api.cc
-@@ -2325,6 +2325,7 @@ WASM_EXPORT auto Global::get() const -> Val {
- 
- WASM_EXPORT void Global::set(const Val& val) {
+@@ -2327,2 +2327,3 @@ WASM_EXPORT void Global::set(const Val& val) {
    v8::Isolate::Scope isolate_scope(impl(this)->store()->isolate());
 +  i::HandleScope handle_scope(impl(this)->store()->i_isolate());
    i::DirectHandle<i::WasmGlobalObject> v8_global = impl(this)->v8_object();
-   switch (val.kind()) {
-     case ValKind::I32:
