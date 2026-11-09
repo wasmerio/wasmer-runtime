@@ -58,3 +58,31 @@ records the actual patched C++ header separately; using it for the Store shim
 requires explicit adoption of that exact archive/header source tuple. Source
 review and patch applicability do not establish compilation, reference fidelity,
 shared C API acceptance or provider adoption.
+
+## Private candidate C-entry layout and Global scope correction
+
+`canonical-call-layout.patch` follows the original eight patches, TLS9 and
+`canonical-references.patch`, as producer patch0011. It is authored by OpenAI
+Codex; its SHA-256 is
+`9fbd293ab34c6d54a94fefef8283e91fbc766bfea869f3a087c69466cee2e84c`.
+
+It changes only both `BuildCWasmEntry` parameter/result offsets from
+`value_kind_size()` to `value_kind_full_size()` in
+`src/compiler/wasm-compiler.cc`, and adds the lexical `Global::set` HandleScope
+in `src/wasm/c-api.cc`. With the unchanged pointer-compressed configuration,
+the existing packer and full-pointer loads/stores use eight-byte references;
+four-byte offset increments overlap those slots. Numeric and v128 widths,
+C/C++ headers, reference ownership, GN, tools and other producer policies are
+unchanged. No Rust pointer compensation is used.
+
+The exact source hashes after patch0011 are:
+
+| file | SHA-256 |
+| --- | --- |
+| src/compiler/wasm-compiler.cc | eec8744ceceb6f98509844494d3d40a8e6db3b3f128301154386eac3e15977a5 |
+| src/wasm/c-api.cc | 533a9bcf0c66075485a4b612f94466e13b4b9de9edc8974bbb6d08799db9b894 |
+
+The prior run425376 packaging evidence remains valid for its original tuple;
+its first reference matrix passed one test and failed four, so it is not an
+accepted default provider. A new source build and actual affected reference
+gates are required before adoption.

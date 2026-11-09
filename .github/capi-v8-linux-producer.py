@@ -1,7 +1,8 @@
 """Private packaging experiment; this does not certify the Wasmer C API.
 
 The upstream recipe, its eight existing patches and GN arguments stay fixed.
-Only the upstream library-TLS and reviewed canonical-reference patches change V8 source. A task-local depot path
+Only the authoritative library-TLS and reviewed reference/call-layout patches
+change V8 source. A task-local depot path
 and a two-job Ninja launcher replace the recipe's shared /tmp and unbounded jobs.
 """
 
@@ -33,6 +34,10 @@ REF_PATCH_SHA = "cf248bf0964a508002860577ddb2b29bc955e389c89649868e2895abf297dfb
 REF_CC_SHA = "359360dff155be26ae35e355135bb54cb9db45caf3bb12630daaeba60c28bfb8"
 REF_HH_SHA = "67eae9b38696c2620e797e3c96c30441ea5dfdfa62957d1f635040c010429729"
 C_HEADER_SHA = "97f49de5418f02c55633dbcdc96b72fb404659c9275e9a47a3b4d6bdce384b96"
+LAYOUT_PATCH_NAME = "0011-Correct-CWasm-entry-layout-and-global-scope.patch"
+LAYOUT_PATCH_SHA = "9fbd293ab34c6d54a94fefef8283e91fbc766bfea869f3a087c69466cee2e84c"
+LAYOUT_CC_SHA = "533a9bcf0c66075485a4b612f94466e13b4b9de9edc8974bbb6d08799db9b894"
+LAYOUT_COMPILER_SHA = "eec8744ceceb6f98509844494d3d40a8e6db3b3f128301154386eac3e15977a5"
 GIB = 1024**3
 
 
@@ -237,6 +242,14 @@ def main():
     if digest(references) != REF_PATCH_SHA:
         raise RuntimeError("canonical-reference patch copy changed")
     shutil.copyfile(references, evidence / REF_PATCH_NAME)
+    layout_input = candidate / "lib/api/third-party/wee8/canonical-call-layout.patch"
+    if digest(layout_input) != LAYOUT_PATCH_SHA:
+        raise RuntimeError("reviewed call-layout patch checksum mismatch")
+    layout = producer / "patches" / LAYOUT_PATCH_NAME
+    shutil.copyfile(layout_input, layout)
+    if digest(layout) != LAYOUT_PATCH_SHA:
+        raise RuntimeError("call-layout patch copy changed")
+    shutil.copyfile(layout, evidence / LAYOUT_PATCH_NAME)
     original = (producer / "build.sh").read_bytes()
     if hashlib.sha256(original).hexdigest() != BUILD_SCRIPT_SHA:
         raise RuntimeError("original producer recipe checksum mismatch")
@@ -250,11 +263,13 @@ def main():
     shutil.copyfile(tls, evidence / tls.name)
     tools = {name: checked_text([name, "--version"]) for name in ("cc", "c++", "gcc", "g++", "ninja", "readelf", "git", "ldd")}
     patches = {p.name: digest(p) for p in sorted((producer / "patches").glob("*.patch"))}
-    if len(patches) != 10 or list(patches)[-2:] != [tls.name, REF_PATCH_NAME]:
-        raise RuntimeError("expected original eight patches, TLS9, then reviewed canonical refs10")
+    if len(patches) != 11 or list(patches)[-3:] != [tls.name, REF_PATCH_NAME, LAYOUT_PATCH_NAME]:
+        raise RuntimeError("expected original eight patches, TLS9, refs10, then reviewed call-layout11")
     identity = dict(candidate=os.environ["REQUESTED_CANDIDATE"], producer=PRODUCER, v8=V8,
                     depot=DEPOT, tls_source=TLS_SOURCE, tls_sha256=TLS_PATCH_SHA,
                     canonical_refs_patch_sha256=REF_PATCH_SHA,
+                    canonical_refs_cc_sha256=REF_CC_SHA,
+                    call_layout_patch_sha256=LAYOUT_PATCH_SHA,
                     candidate_wasm_hh_sha256=REF_HH_SHA, unchanged_wasm_h_sha256=C_HEADER_SHA,
                     original_build_sha256=BUILD_SCRIPT_SHA, original_compiler="unrecorded; no ELF .comment",
                     original_runner="ubuntu-22.04; system GCC and depot_tools were unpinned",
@@ -270,13 +285,14 @@ def main():
                     phase_estimates="new guarded estimates, not historical measured peaks; GN may invoke compiler checks")
     (evidence / "identity.json").write_text(json.dumps(identity, indent=2) + "\n")
     # Bootstrap/preflight is inside the SAME admitted source phase and deadline.
-    # It execs the unchanged original recipe, which applies the eight patches, TLS9, then reviewed refs10 with plain git apply.
+    # It execs the unchanged original recipe, which applies the eight patches, TLS9, refs10, then call-layout11 with plain git apply.
     run("upstream-recipe", [sys.executable, str(Path(__file__).with_name("capi_v8_depot_bootstrap.py")),
         str(root)], producer, 12 * GIB, 330 * 60)
     if checked_text(["git", "rev-parse", "HEAD"], source) != V8:
         raise RuntimeError("V8 source moved")
     expected_sources = {
-        "src/wasm/c-api.cc": REF_CC_SHA,
+        "src/wasm/c-api.cc": LAYOUT_CC_SHA,
+        "src/compiler/wasm-compiler.cc": LAYOUT_COMPILER_SHA,
         "third_party/wasm-api/wasm.hh": REF_HH_SHA,
         "third_party/wasm-api/wasm.h": C_HEADER_SHA,
     }

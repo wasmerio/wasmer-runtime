@@ -150,6 +150,7 @@ jobs:
             /Cargo.toml
             /lib/api/build.rs
             /lib/api/third-party/wee8/canonical-references.patch
+            /lib/api/third-party/wee8/canonical-call-layout.patch
           submodules: false
           persist-credentials: false
       - name: Build and inspect only the private candidate archive
