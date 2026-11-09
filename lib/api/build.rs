@@ -33,14 +33,40 @@ fn build_v8() {
         .join(WEE8_RELEASE_VERSION)
         .join(platform_name);
     let archive_path = cache_dir.join(asset_name);
-    let v8_lib_dir = cache_dir.join("lib");
-    let v8_lib_path = v8_lib_dir.join(if cfg!(target_os = "windows") {
+    let library_name = if cfg!(target_os = "windows") {
         "v8.lib"
     } else {
         "libv8.a"
+    };
+    println!("cargo:rerun-if-env-changed=WASMER_V8_ARTIFACT_DIR");
+    let configured = env::var_os("WASMER_V8_ARTIFACT_DIR").map(|value| {
+        let root = PathBuf::from(value);
+        assert!(
+            root.is_absolute(),
+            "WASMER_V8_ARTIFACT_DIR must be an absolute artifact directory"
+        );
+        let root = root.canonicalize().unwrap_or_else(|error| {
+            panic!(
+                "cannot open WASMER_V8_ARTIFACT_DIR {}: {error}",
+                root.display()
+            )
+        });
+        let library = root.join("lib").join(library_name);
+        assert!(
+            library.is_file(),
+            "WASMER_V8_ARTIFACT_DIR must contain lib/{library_name}: {}",
+            root.display()
+        );
+        println!("cargo:rerun-if-changed={}", library.display());
+        root.join("lib")
     });
+    let explicit_artifact = configured.is_some();
+    let v8_lib_dir = configured.unwrap_or_else(|| cache_dir.join("lib"));
+    let v8_lib_path = v8_lib_dir.join(library_name);
 
-    if !v8_lib_path.exists() {
+    // A configured input is authoritative, including failures after validation.
+    // Never turn a bad/missing candidate into a download of the old provider.
+    if !explicit_artifact && !v8_lib_path.exists() {
         fs::create_dir_all(&cache_dir).unwrap_or_else(|err| {
             panic!(
                 "failed to create v8 cache dir {}: {err}",
@@ -87,7 +113,9 @@ fn build_v8() {
         });
     }
 
-    println!("cargo:rustc-link-search=native={}", v8_lib_dir.display());
+    if !explicit_artifact {
+        println!("cargo:rustc-link-search=native={}", v8_lib_dir.display());
+    }
 
     // Rename the wasm-c-api symbols from V8 so they do not collide with
     // Wasmer's own wasm-c-api exports when this crate is linked into tests.
@@ -171,7 +199,15 @@ fn build_v8() {
             }
         })
         .collect();
-    let prefixed_v8_lib_path = v8_lib_dir.join("libv8prefixed.a");
+    let prefix_dir = if explicit_artifact {
+        let directory = out_path.join("wee8-prefixed");
+        fs::create_dir_all(&directory).expect("failed to create owned wee8 prefix directory");
+        println!("cargo:rustc-link-search=native={}", directory.display());
+        directory
+    } else {
+        v8_lib_dir.clone()
+    };
+    let prefixed_v8_lib_path = prefix_dir.join("libv8prefixed.a");
     let output = std::process::Command::new(objcopy)
         .args(syms)
         .arg(v8_lib_path.display().to_string())

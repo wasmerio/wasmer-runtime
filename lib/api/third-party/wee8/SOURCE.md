@@ -1,5 +1,20 @@
 # wee8 public headers and private Store ownership adapter
 
+## Explicit artifact input
+
+`WASMER_V8_ARTIFACT_DIR=/absolute/path/to/artifact` selects an already unpacked,
+host-supplied artifact containing `lib/libv8.a` (`lib/v8.lib` on Windows).
+Configured relative paths, missing directories and missing libraries fail the
+build; they never fall back to the original cache or a network download. The
+selection is tracked with Cargo's `rerun-if-env-changed`, and the library input
+is tracked with `rerun-if-changed`.
+
+The raw input is not modified: symbol-prefixed copies and the Store ownership
+adapter are generated under the build's `OUT_DIR`. Verify the artifact's source,
+SHA256 and paired headers before selecting it. This explicit input is also the
+offline/prepopulated route; it does not certify an arbitrary supplied library.
+When unset, the existing provider and cache selection remain unchanged.
+
 The existing `wasm.h` and added complete `wasm.hh` are the paired public headers
 from V8 `b0a55a7dad7f536cce1f9aaddba89894c8533946` (13.6.233.17), as built by the
 original wee8 producer revision `844d`. The artifact release label is `11.9.7`.
