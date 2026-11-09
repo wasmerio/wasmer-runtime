@@ -519,7 +519,11 @@ public:
   explicit Val(float32_t z) : kind_(ValKind::F32) { impl_.f32 = z; }
   explicit Val(float64_t z) : kind_(ValKind::F64) { impl_.f64 = z; }
   explicit Val(v128_t v) : kind_(ValKind::V128) { impl_.v128 = v; }
-  explicit Val(own<Ref>&& r) : kind_(ValKind::EXTERNREF) { impl_.ref = r.release(); }
+  // The declared reference kind is required even when the reference is null.
+  explicit Val(own<Ref>&& r, ValKind kind = ValKind::EXTERNREF) : kind_(kind) {
+    assert(wasm::is_ref(kind));
+    impl_.ref = r.release();
+  }
 
   Val(Val&& that) : kind_(that.kind_), impl_(that.impl_) {
     if (is_ref()) that.impl_.ref = nullptr;

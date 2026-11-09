@@ -15,10 +15,12 @@ SHA256 and paired headers before selecting it. This explicit input is also the
 offline/prepopulated route; it does not certify an arbitrary supplied library.
 When unset, the existing provider and cache selection remain unchanged.
 
-The existing `wasm.h` and added complete `wasm.hh` are the paired public headers
-from V8 `b0a55a7dad7f536cce1f9aaddba89894c8533946` (13.6.233.17), as built by the
-original wee8 producer revision `844d`. The artifact release label is `11.9.7`.
-The archive's C header is byte-identical to this tracked `wasm.h`.
+The `wasm.h` and complete `wasm.hh` come from V8
+`b0a55a7dad7f536cce1f9aaddba89894c8533946` (13.6.233.17), with the original
+eight patches from producer `844d`, the authoritative library-TLS patch9, and
+`canonical-references.patch` below. The C header is unchanged; the C++ header
+includes the canonical reference-kind metadata. The original artifact release
+label `11.9.7` alone does not identify this source tuple.
 
 The header-affecting original patches, applied in their original order, are:
 
@@ -29,14 +31,14 @@ The header-affecting original patches, applied in their original order, are:
 | 0005-Add-v128-support-to-wasm-c-api.patch | 1ef4fbe65020669d914c0a61afccd1fafe43703955f6f7b7dcfa727abbaf8d00 |
 | 0007-shared-memory.patch | f09a3c97261ecd9257f441b68a4c6768b51d48fd20cfac55c00a5298d4a6d0ba |
 
-The other four original patches do not modify these headers. Reproduction is a
-checkout of the exact V8 revision followed by those original header patches;
-copy the resulting complete `third_party/wasm-api/wasm.{h,hh}` unchanged.
+The other four original patches and TLS9 do not modify these headers. Reproduce
+the exact V8 revision with the original eight patches, TLS9, then the canonical
+reference patch; copy the complete `third_party/wasm-api/wasm.{h,hh}` unchanged.
 
 | tracked file | SHA-256 |
 | --- | --- |
 | wasm.h | 97f49de5418f02c55633dbcdc96b72fb404659c9275e9a47a3b4d6bdce384b96 |
-| wasm.hh | d2dfa5e09297be15ffbbfed29c71769bbbd5a9cd57c3c95344dffd1d97bb2ed3 |
+| wasm.hh | 67eae9b38696c2620e797e3c96c30441ea5dfdfa62957d1f635040c010429729 |
 | LICENSE | c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08 |
 
 `LICENSE` is the exact Apache 2.0 `third_party/wasm-api/LICENSE`, rather than the
@@ -68,11 +70,15 @@ The candidate C++ header SHA-256 is
 `67eae9b38696c2620e797e3c96c30441ea5dfdfa62957d1f635040c010429729`;
 the public C header remains
 `97f49de5418f02c55633dbcdc96b72fb404659c9275e9a47a3b4d6bdce384b96`.
-The active vendored `wasm.hh` above remains unchanged. The candidate helper
-records the actual patched C++ header separately; using it for the Store shim
-requires explicit adoption of that exact archive/header source tuple. Source
-review and patch applicability do not establish compilation, reference fidelity,
-shared C API acceptance or provider adoption.
+The tracked C++ header is the exact `candidate-wasm.hh` retained by private Next
+Actions run `42537667351`, candidate commit
+`dd13e1dd0d34db284f6c8eee0afd878ac2d60144`. The corresponding library archive
+SHA-256 is `efcfa8cd7d417e3ad043d6d759acd988860df0996f48876efa1449677cf0379b`;
+its raw `lib/libv8.a` SHA-256 is
+`d27d644a21409e41081cc4c66565534112c31ef18a201cdd13c55fd73389a95d`.
+The isolated validation tuple selects this archive explicitly. Default provider
+selection remains unchanged until the actual shared C API and reference gates
+pass; successful packaging alone does not establish consumer acceptance.
 
 ## Private candidate C-entry layout and Global scope correction
 
