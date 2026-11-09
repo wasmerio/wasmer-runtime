@@ -39,6 +39,9 @@ impl Drop for CApiEngine {
 }
 
 /// The V8 engine.
+///
+/// Independent engine facades share the process-wide wee8 engine. Dropping a
+/// facade does not dispose or reinitialize the process-wide V8 platform.
 #[derive(Clone, Debug, Default)]
 pub struct Engine {
     pub(crate) inner: Arc<CApiEngine>,
