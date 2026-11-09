@@ -89,6 +89,10 @@ impl Value {
     }
 
     /// Converts the `Value` into a `RawValue`.
+    ///
+    /// # Panics
+    /// A nonnull V8 function reference must belong to the supplied live Store
+    /// on its original thread; a mismatch panics before any C++ operation.
     pub fn as_raw(&self, store: &impl AsStoreRef) -> RawValue {
         match *self {
             Self::I32(i32) => RawValue { i32 },
@@ -108,7 +112,10 @@ impl Value {
     /// Converts a `RawValue` to a `Value`.
     ///
     /// # Safety
-    ///
+    /// For a V8 FuncRef, nonzero bits must be a live external C function
+    /// reference from this exact Store, on its original thread. The caller
+    /// retains its actual owner until conversion copies/interns it. An internal
+    /// tagged Wasm reference or arbitrary integer does not meet this contract.
     pub unsafe fn from_raw(
         store: &mut impl crate::entities::store::AsStoreMut,
         ty: Type,

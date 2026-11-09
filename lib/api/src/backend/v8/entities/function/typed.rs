@@ -47,6 +47,9 @@ macro_rules! impl_native_traits {
                     if !function.is_from_store(&write) {
                         return Err(RuntimeError::new("V8 typed function belongs to another Store"));
                     }
+                    if $(!FromToNativeWasmType::is_from_store(&$x, &write) ||)* false {
+                        return Err(RuntimeError::new("V8 typed argument belongs to another Store"));
+                    }
                     let signature = function.ty(&write);
                     let raw = [ $( $x.to_native().into_raw(&mut write) ),* ];
                     let values = raw.iter().zip(signature.params()).map(|(raw, ty)| {
@@ -72,6 +75,10 @@ macro_rules! impl_native_traits {
 
                  if !self.func.is_from_store(store) {
                      return Err(RuntimeError::new("V8 typed function belongs to another Store"));
+                 }
+
+                 if $(!FromToNativeWasmType::is_from_store(&$x, store) ||)* false {
+                     return Err(RuntimeError::new("V8 typed argument belongs to another Store"));
                  }
 
                  // // let store_ptr = Value::I64(store.as_store_mut().as_raw() as _).as_jsvalue(store);

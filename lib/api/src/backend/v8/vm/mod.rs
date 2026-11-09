@@ -120,17 +120,27 @@ impl VMExternRef {
 
 pub(crate) struct VMFuncRef(*mut wasm_ref_t);
 impl VMFuncRef {
-    /// Converts the `VMExternRef` into a `RawValue`.
+    /// Passively encodes a borrowed external C function reference; no owner moves.
     pub fn into_raw(self) -> RawValue {
-        unimplemented!()
+        RawValue {
+            funcref: self.0 as usize,
+        }
     }
 
-    /// Extracts a `VMExternRef` from a `RawValue`.
+    /// Extracts a borrowed external C function reference, or null as None.
     ///
     /// # Safety
-    /// `raw` must be a valid `VMExternRef` instance.
-    pub unsafe fn from_raw(_raw: RawValue) -> Option<Self> {
-        unimplemented!();
+    /// Nonzero bits must name a live external C function reference. The caller
+    /// keeps its actual owner live; conversion into a Function must use that
+    /// SAME live Store on its original thread. These are not V8-internal tagged
+    /// references. Packing/unpacking itself performs no C++ operation.
+    pub unsafe fn from_raw(raw: RawValue) -> Option<Self> {
+        let reference = unsafe { raw.funcref } as *mut wasm_ref_t;
+        if reference.is_null() {
+            None
+        } else {
+            Some(Self(reference))
+        }
     }
 }
 
@@ -222,5 +232,174 @@ impl VMSharedMemory {
             store.reference_roots.memory(memory),
             store.origin.capture(),
         ))
+    }
+}
+
+#[cfg(all(test, feature = "experimental-async"))]
+mod raw_funcref_tests {
+    use super::VMFuncRef;
+    use crate::{AsStoreRef, Function, Store, Type, Value};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use wasmer_types::RawValue;
+
+    #[test]
+    fn rooted_external_cref_raw_roundtrip_survives_temporary_owners_and_rejects_foreign_inputs() {
+        const TEST: &str = "backend::v8::vm::raw_funcref_tests::rooted_external_cref_raw_roundtrip_survives_temporary_owners_and_rejects_foreign_inputs";
+        const CHILD: &str = "WASMER_V8_EXTERNAL_CREF_RAW_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            struct Owned(std::process::Child);
+            impl Drop for Owned {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let mut child = Owned(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(CHILD, "1")
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                match child.0.try_wait() {
+                    Ok(Some(status)) => {
+                        assert!(status.success(), "external CRef child failed: {status}");
+                        return;
+                    }
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    status => panic!("external CRef roundtrip did not finish: {status:?}"),
+                }
+            }
+        }
+        let mut store = Store::new(crate::v8::V8::new());
+        let target = Function::new_typed(&mut store, |input: i32| input + 7);
+        let factories = Arc::new(AtomicUsize::new(0));
+        let observed = factories.clone();
+        let echo = Function::new_typed(&mut store, move |value: Option<Function>| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            value
+        });
+        let typed = echo
+            .typed::<Option<Function>, Option<Function>>(&store)
+            .unwrap();
+        let baseline = store
+            .as_store_ref()
+            .inner
+            .store
+            .as_v8()
+            .reference_roots
+            .len();
+        let original = vec![Value::FuncRef(Some(target.clone()))];
+        let raw = original[0].as_raw(&store);
+        assert_ne!(unsafe { raw.funcref }, 0);
+        let vm = unsafe { VMFuncRef::from_raw(raw) }.unwrap();
+        let packed = vm.into_raw();
+        assert_eq!(unsafe { packed.funcref }, unsafe { raw.funcref });
+        let reconstructed = unsafe { Value::from_raw(&mut store, Type::FuncRef, packed) };
+        let reconstructed = reconstructed.unwrap_funcref().as_ref().unwrap().clone();
+        drop(original);
+        assert_eq!(reconstructed, target);
+        assert_eq!(
+            reconstructed.call(&mut store, &[Value::I32(5)]).unwrap()[0].i32(),
+            Some(12)
+        );
+
+        // This is an ACTUAL independently owned C++ Val vector, not merely
+        // inert Function metadata. The decoder must retain before its Drop.
+        let temporary = crate::backend::v8::references::Values::from_values(
+            &[Value::FuncRef(Some(target.clone()))],
+            &[Type::FuncRef],
+        )
+        .unwrap();
+        let temporary_ref = unsafe { (*temporary.0.data).of.ref_ };
+        let vm = unsafe {
+            VMFuncRef::from_raw(RawValue {
+                funcref: temporary_ref as usize,
+            })
+        }
+        .unwrap();
+        let retained =
+            unsafe { Function::from_vm_funcref(&mut store, crate::vm::VMFuncRef::V8(vm)) };
+        drop(temporary);
+        assert_eq!(retained, target);
+        assert_eq!(
+            retained.call(&mut store, &[Value::I32(6)]).unwrap()[0].i32(),
+            Some(13)
+        );
+        for _ in 0..8 {
+            let value = Value::FuncRef(Some(retained.clone()));
+            let raw = value.as_raw(&store);
+            let copied = unsafe { Value::from_raw(&mut store, Type::FuncRef, raw) };
+            assert_eq!(copied.unwrap_funcref().as_ref().unwrap(), &target);
+            drop(value);
+            drop(copied);
+            assert_eq!(
+                store
+                    .as_store_ref()
+                    .inner
+                    .store
+                    .as_v8()
+                    .reference_roots
+                    .len(),
+                baseline
+            );
+        }
+        let zero = Value::FuncRef(None).as_raw(&store);
+        assert_eq!(unsafe { zero.funcref }, 0);
+        assert!(unsafe { VMFuncRef::from_raw(zero) }.is_none());
+        assert!(
+            unsafe { Value::from_raw(&mut store, Type::FuncRef, zero) }
+                .unwrap_funcref()
+                .is_none()
+        );
+
+        let mut foreign = Store::new(crate::v8::V8::new());
+        let foreign_target = Function::new_typed(&mut foreign, |input: i32| input + 90);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Value::FuncRef(Some(target.clone())).as_raw(&foreign)
+            }))
+            .is_err()
+        );
+        assert!(
+            typed
+                .call(&mut store, Some(foreign_target.clone()))
+                .is_err()
+        );
+        assert_eq!(factories.load(Ordering::SeqCst), 0);
+        assert!(typed.call(&mut store, None).unwrap().is_none());
+        assert_eq!(factories.load(Ordering::SeqCst), 1);
+        let store = store.into_async();
+        let refused = typed.call_async(&store, Some(foreign_target.clone()));
+        assert_eq!(factories.load(Ordering::SeqCst), 1, "construction is inert");
+        assert!(futures::executor::block_on(refused).is_err());
+        assert_eq!(factories.load(Ordering::SeqCst), 1);
+        assert!(
+            futures::executor::block_on(typed.call_async(&store, None))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(factories.load(Ordering::SeqCst), 2);
+        drop(store);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Value::FuncRef(Some(retained.clone())).as_raw(&foreign)
+            }))
+            .is_err(),
+            "stale safe conversion refuses before C++"
+        );
+        assert_eq!(
+            foreign_target.call(&mut foreign, &[Value::I32(1)]).unwrap()[0].i32(),
+            Some(91)
+        );
+        // No nonnull FuncRef ever entered a guest argument/result packer here.
+        // Candidate-only typed guest fidelity remains a distinct held gate.
     }
 }

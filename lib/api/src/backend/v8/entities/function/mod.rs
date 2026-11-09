@@ -532,15 +532,49 @@ impl Function {
         Self { handle }
     }
 
-    pub(crate) fn vm_funcref(&self, _store: &impl AsStoreRef) -> VMFuncRef {
-        unimplemented!();
+    pub(crate) fn vm_funcref(&self, store: &impl AsStoreRef) -> VMFuncRef {
+        // This infallible internal boundary rejects foreign/stale handles before
+        // even the C++ cast. The raw ABI borrows an existing canonical C ref.
+        let function = self
+            .handle
+            .checked_raw(store)
+            .expect("invalid V8 function origin");
+        let view = store.as_store_ref();
+        let reference = unsafe { wasm_func_as_ref(function) };
+        let reference = view
+            .inner
+            .store
+            .as_v8()
+            .reference_roots
+            .copy(reference, true);
+        unsafe {
+            VMFuncRef::from_raw(RawValue {
+                funcref: reference as usize,
+            })
+        }
+        .expect("a V8 Function has a nonnull rooted C reference")
     }
 
-    pub(crate) unsafe fn from_vm_funcref(
-        _store: &mut impl AsStoreMut,
-        _funcref: VMFuncRef,
-    ) -> Self {
-        unimplemented!();
+    /// # Safety
+    /// The reference must be a live EXTERNAL C function reference from this
+    /// exact live V8 Store, on its original thread. Its actual owner must remain
+    /// live through this copy; an internal tagged Wasm ref or arbitrary address
+    /// is not a V8 RawValue function reference.
+    pub(crate) unsafe fn from_vm_funcref(store: &mut impl AsStoreMut, funcref: VMFuncRef) -> Self {
+        let view = store.as_store_mut();
+        let origin = Origin::of(&view).expect("invalid V8 function-reference Store");
+        let reference = unsafe { funcref.into_raw().funcref } as *mut wasm_ref_t;
+        // Copy/intern before the caller can dispose its temporary owned vector.
+        let retained = view
+            .inner
+            .store
+            .as_v8()
+            .reference_roots
+            .copy(reference, true);
+        let function = unsafe { wasm_ref_as_func(retained) };
+        Self {
+            handle: Handle::new(function, origin),
+        }
     }
 
     /// Checks whether this `Function` can be used with the given context.
