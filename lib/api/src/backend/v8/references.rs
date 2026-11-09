@@ -1205,7 +1205,7 @@ mod fidelity_tests {
             &[Value::I32(1), Value::I32(5)],
             &[Type::I32, Type::I32],
         );
-        assert!(error.to_string().contains("C API argument type mismatch"));
+        assert!(error.to_string().contains("C API call argument type mismatch"));
         assert_eq!(calls.get(&mut store).i32(), Some(0));
         let error = raw_argument_error(
             &mut store,
@@ -1213,7 +1213,7 @@ mod fidelity_tests {
             &[Value::FuncRef(Some(a.clone()))],
             &[Type::FuncRef],
         );
-        assert!(error.to_string().contains("C API argument count mismatch"));
+        assert!(error.to_string().contains("C API call arity mismatch"));
         assert_eq!(calls.get(&mut store).i32(), Some(0));
         assert_eq!(
             a.call(&mut store, &[Value::I32(8)]).unwrap()[0].i32(),
