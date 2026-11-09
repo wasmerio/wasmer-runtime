@@ -124,3 +124,115 @@ impl From<Engine> for crate::Engine {
         }
     }
 }
+
+#[cfg(test)]
+mod lifetime_tests {
+    use super::*;
+    use crate::{Function, Imports, Instance, Module, Store, Value};
+
+    fn guest(engine: Engine) -> (Store, Module, Instance, Function) {
+        let mut store = Store::new(engine);
+        let bytes = wat::parse_str(
+            "(module (func (export \"run\") (param i32) (result i32) local.get 0 i32.const 7 i32.add))",
+        ).unwrap();
+        let module = Module::new(&store, bytes).unwrap();
+        let instance = Instance::new(&mut store, &module, &Imports::new()).unwrap();
+        let run = instance.exports.get_function("run").unwrap().clone();
+        (store, module, instance, run)
+    }
+
+    #[test]
+    fn process_engine_survives_independent_facades_stores_and_engine_mut_replacement() {
+        const TEST: &str = "backend::v8::entities::engine::lifetime_tests::process_engine_survives_independent_facades_stores_and_engine_mut_replacement";
+        const CHILD: &str = "WASMER_V8_PROCESS_ENGINE_LIFETIME_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            struct Owned(std::process::Child);
+            impl Drop for Owned {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let mut child = Owned(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(CHILD, "1")
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                match child.0.try_wait() {
+                    Ok(Some(status)) => {
+                        assert!(status.success(), "Engine lifetime child failed: {status}");
+                        return;
+                    }
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10))
+                    }
+                    status => panic!("Engine lifetime did not finish: {status:?}"),
+                }
+            }
+        }
+        let first = Engine::new();
+        let second = Engine::new();
+        let actual = first.inner.engine;
+        assert!(!actual.is_null());
+        assert!(
+            !Arc::ptr_eq(&first.inner, &second.inner),
+            "independent Rust facade owners"
+        );
+        assert_eq!(actual, second.inner.engine, "one actual process Engine");
+        let (mut a, module_a, instance_a, run_a) = guest(first.clone());
+        let (mut b, module_b, instance_b, run_b) = guest(second.clone());
+        drop(first);
+        drop(second);
+        assert_eq!(
+            run_a.call(&mut a, &[Value::I32(5)]).unwrap()[0].i32(),
+            Some(12)
+        );
+        assert_eq!(
+            run_b.call(&mut b, &[Value::I32(11)]).unwrap()[0].i32(),
+            Some(18)
+        );
+        drop(instance_a);
+        drop(module_a);
+        drop(a);
+        drop(run_a);
+        assert_eq!(
+            run_b.call(&mut b, &[Value::I32(6)]).unwrap()[0].i32(),
+            Some(13)
+        );
+
+        let replacement = Engine::new();
+        assert_eq!(replacement.inner.engine, actual);
+        *b.engine_mut() = replacement.into();
+        assert_eq!(
+            run_b.call(&mut b, &[Value::I32(19)]).unwrap()[0].i32(),
+            Some(26)
+        );
+        drop(instance_b);
+        drop(module_b);
+        drop(b);
+        drop(run_b);
+
+        // Every earlier facade and Store is gone. A later facade still borrows
+        // the SAME intentional process owner, not a recreated V8 platform.
+        let later = Engine::new();
+        assert_eq!(later.inner.engine, actual);
+        let (mut c, module_c, instance_c, run_c) = guest(later);
+        assert_eq!(
+            run_c.call(&mut c, &[Value::I32(26)]).unwrap()[0].i32(),
+            Some(33)
+        );
+        drop(instance_c);
+        drop(module_c);
+        drop(c);
+        drop(run_c);
+        let last_facade = Engine::new();
+        assert_eq!(last_facade.inner.engine, actual);
+        drop(last_facade);
+        assert_eq!(ENGINE.get().unwrap().lock().unwrap().0, actual);
+        // This is wrapper/Store reuse evidence, not process-global disposal.
+    }
+}
