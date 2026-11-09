@@ -29,8 +29,13 @@ fn build_v8() {
             }
             digest.update(&buffer[..count]);
         }
+        let actual: String = digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         assert_eq!(
-            format!("{:x}", digest.finalize()),
+            actual,
             expected,
             "accepted wee8 {kind} checksum mismatch; remove the affected owned cache or use WASMER_V8_ARTIFACT_DIR"
         );
