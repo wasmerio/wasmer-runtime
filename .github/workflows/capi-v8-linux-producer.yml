@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   capacity-probe:
-    if: github.repository == 'wasmerio/wasmer-next' && github.event.repository.private && github.ref == 'refs/heads/main' && inputs.capacity_probe
+    if: github.repository == 'wasmerio/wasmer-runtime' && github.event.repository.private && github.ref == 'refs/heads/next' && inputs.capacity_probe
     runs-on: aux-pub-trusted-16cpu-amd64
     timeout-minutes: 5
     env:
@@ -115,7 +115,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
   linux-x64:
-    if: github.repository == 'wasmerio/wasmer-next' && github.event.repository.private && !inputs.capacity_probe
+    if: github.repository == 'wasmerio/wasmer-runtime' && github.event.repository.private && !inputs.capacity_probe
     runs-on: ubuntu-22.04
     timeout-minutes: 360
     env:

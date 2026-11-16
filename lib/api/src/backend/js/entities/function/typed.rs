@@ -8,9 +8,8 @@
 //! let add_one_native: TypedFunction<i32, i32> = add_one.typed().unwrap();
 //! ```
 use crate::{
-    AsStoreMut, CallWrapper, FromToNativeWasmType, NativeWasmType, NativeWasmTypeInto,
-    RuntimeError, TypedFunction, Value, WasmTypeList,
-    entities::function::call_wrapper::call_wrapped,
+    AsStoreMut, FromToNativeWasmType, NativeWasmType, NativeWasmTypeInto, RuntimeError,
+    TypedFunction, Value, WasmTypeList,
     js::utils::convert::{AsJs, js_value_to_wasmer},
 };
 #[cfg(feature = "experimental-async")]
@@ -61,39 +60,63 @@ macro_rules! impl_native_traits {
 
             /// Call the typed func and return results.
             #[allow(clippy::too_many_arguments)]
-            pub fn call_js(&self, store: &mut impl AsStoreMut, $( $x: $x, )* ) -> Result<Rets, RuntimeError> where
-            $( $x: FromToNativeWasmType,  )*
+            pub(crate) fn call_wrapped_js(&self, store: &mut impl AsStoreMut, wrapper: Option<&mut dyn crate::CallWrapper>, $( $x: $x, )* ) -> Result<Rets, RuntimeError>
+            where $( $x: FromToNativeWasmType, )*
             {
-                self.call_wrapped_js(store, None, $( $x, )*)
+                if $(!FromToNativeWasmType::is_from_store(&$x, store) ||)* false {
+                    return Err(RuntimeError::new("cross-`Store` values are not supported"));
+                }
+                let signature = self.func.ty(store);
+                let raw = [ $( $x.to_native().into_raw(store) ),* ];
+                let params = raw.iter().zip(signature.params()).map(|(raw, ty)| {
+                    unsafe { Value::from_raw(store, *ty, *raw) }
+                }).collect::<Vec<_>>();
+                let results = self.func.call_wrapped(store, wrapper.expect("wrapped call supplies a wrapper"), &params)?;
+                let mut raw = Rets::empty_array();
+                for (slot, value) in raw.as_mut().iter_mut().zip(results.iter()) {
+                    *slot = value.as_raw(store);
+                }
+                Ok(unsafe { Rets::from_array(store, raw) })
             }
 
-            /// Call the typed func through `wrapper` and return results.
-            #[allow(clippy::too_many_arguments)]
-            pub(crate) fn call_wrapped_js(&self, mut store: &mut impl AsStoreMut, wrapper: Option<&mut dyn CallWrapper>, $( $x: $x, )* ) -> Result<Rets, RuntimeError> where
+            pub fn call_js(&self, mut store: &mut impl AsStoreMut, $( $x: $x, )* ) -> Result<Rets, RuntimeError> where
             $( $x: FromToNativeWasmType,  )*
             {
                 #[allow(unused_unsafe)]
                 let params_list: Vec<_> = unsafe {
                     vec![ $( (<$x::Native as NativeWasmType>::WASM_TYPE, $x.to_native().into_raw(store) ) ),* ]
                 };
-                let mut results = JsValue::UNDEFINED;
-                call_wrapped(store, wrapper, |store| {
-                    let args_array = unsafe {
-                        Array::from_iter(
-                            params_list
-                                .clone()
-                                .into_iter()
-                                .map(|(b, a)| Value::from_raw(store, b, a).as_jsvalue(store)),
-                        )
-                    };
-                    results = self
-                        .func
-                        .as_js()
-                        .handle
-                        .function
-                        .apply(&JsValue::UNDEFINED, &args_array)?;
-                    Ok(())
-                })?;
+                let results = {
+                    let mut r;
+                    // TODO: This loop is needed for asyncify. It will be refactored with https://github.com/wasmerio/wasmer/issues/3451
+                    loop {
+                        let args_array = unsafe {
+                            Array::from_iter(
+                                params_list
+                                    .clone()
+                                    .into_iter()
+                                    .map(|(b, a)| Value::from_raw(store, b, a).as_jsvalue(store)),
+                            )
+                        };
+                        r = self
+                            .func
+                            .as_js()
+                            .handle
+                            .function
+                            .apply(&JsValue::UNDEFINED, &args_array);
+                        let store_mut = store.as_store_mut();
+                        if let Some(callback) = store_mut.inner.on_called.take() {
+                            match callback(store_mut) {
+                                Ok(wasmer_types::OnCalledAction::InvokeAgain) => { continue; }
+                                Ok(wasmer_types::OnCalledAction::Finish) => { break; }
+                                Ok(wasmer_types::OnCalledAction::Trap(trap)) => { return Err(RuntimeError::user(trap)) },
+                                Err(trap) => { return Err(RuntimeError::user(trap)) },
+                            }
+                        }
+                        break;
+                    }
+                    r?
+                };
                 let mut rets_list_array = Rets::empty_array();
                 let mut_rets = rets_list_array.as_mut() as *mut [RawValue] as *mut RawValue;
                 match Rets::size() {

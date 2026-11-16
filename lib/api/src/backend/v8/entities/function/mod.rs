@@ -421,6 +421,20 @@ impl Function {
         unimplemented!();
     }
 
+    pub(crate) fn call_wrapped(
+        &self,
+        store: &mut impl AsStoreMut,
+        wrapper: Option<&mut dyn crate::CallWrapper>,
+        params: &[Value],
+    ) -> Result<Box<[Value]>, RuntimeError> {
+        let mut results = None;
+        crate::entities::function::call_wrapper::call_wrapped(store, wrapper, |store| {
+            results = Some(self.call(store, params)?);
+            Ok(())
+        })?;
+        Ok(results.expect("successful wrapper completed a call"))
+    }
+
     pub fn call(
         &self,
         store: &mut impl AsStoreMut,

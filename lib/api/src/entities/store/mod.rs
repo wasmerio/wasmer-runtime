@@ -83,6 +83,7 @@ impl Store {
                 #[cfg(all(feature = "sys", feature = "experimental-async"))]
                 native_access_origin: None,
                 objects: StoreObjects::from_store_ref(&store),
+                on_called: None,
                 store,
                 #[cfg(all(feature = "sys", feature = "experimental-async"))]
                 native_destruction: None,

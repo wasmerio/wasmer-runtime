@@ -163,7 +163,9 @@ pub fn install(store_id: StoreId) -> Result<InterruptInstallGuard, InstallError>
         .expect("interrupt installation count overflow");
     THREAD_INTERRUPT_STATE.with(|state| {
         let mut bookkeeping = state.bookkeeping.borrow_mut();
-        bookkeeping.interrupted.insert(store_id, store_state.interrupted.clone());
+        bookkeeping
+            .interrupted
+            .insert(store_id, store_state.interrupted.clone());
         bookkeeping.installed.push(installation);
         bookkeeping.active.push(installation);
         state
@@ -220,7 +222,9 @@ pub(super) fn uninstall(store_id: StoreId, installation: InstallationId) {
         .expect("interrupt installation count underflow");
     if count == 0 {
         store_state_entry.remove();
-        THREAD_INTERRUPT_STATE.with(|state| { state.bookkeeping.borrow_mut().interrupted.remove(&store_id); });
+        THREAD_INTERRUPT_STATE.with(|state| {
+            state.bookkeeping.borrow_mut().interrupted.remove(&store_id);
+        });
     } else {
         store_state_entry.get_mut().installations = count;
     }
@@ -307,8 +311,13 @@ pub(crate) fn on_interrupted() -> bool {
 pub fn is_interrupted(store_id: StoreId) -> bool {
     THREAD_INTERRUPT_STATE.with(|state| {
         let bookkeeping = state.bookkeeping.borrow();
-        bookkeeping.active.iter().any(|entry| entry.store_id == store_id)
-            && bookkeeping.interrupted.get(&store_id)
+        bookkeeping
+            .active
+            .iter()
+            .any(|entry| entry.store_id == store_id)
+            && bookkeeping
+                .interrupted
+                .get(&store_id)
                 .is_some_and(|flag| flag.load(Ordering::Acquire))
     })
 }

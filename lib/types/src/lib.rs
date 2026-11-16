@@ -77,7 +77,7 @@ pub use crate::memory::MemoryStyle;
 pub use crate::stack::{FrameInfo, SourceLoc, TrapInformation};
 pub use crate::store_id::StoreId;
 pub use crate::table::TableStyle;
-pub use crate::trapcode::TrapCode;
+pub use crate::trapcode::{OnCalledAction, TrapCode};
 pub use crate::utils::is_wasm;
 pub use crate::vmoffsets::{VMBuiltinFunctionIndex, VMOffsets, vmctx_offset};
 pub use serialize::MetadataHeader;

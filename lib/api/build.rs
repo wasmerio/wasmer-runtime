@@ -35,8 +35,7 @@ fn build_v8() {
             .map(|byte| format!("{byte:02x}"))
             .collect();
         assert_eq!(
-            actual,
-            expected,
+            actual, expected,
             "accepted wee8 {kind} checksum mismatch; remove the affected owned cache or use WASMER_V8_ARTIFACT_DIR"
         );
     }
@@ -112,6 +111,15 @@ fn build_v8() {
             )
         });
 
+        if v8_lib_dir.exists() && !v8_lib_path.exists() {
+            fs::remove_dir_all(&v8_lib_dir).unwrap_or_else(|err| {
+                panic!(
+                    "failed to remove incomplete wee8 lib dir {}: {err}",
+                    v8_lib_dir.display()
+                )
+            });
+        }
+
         if !archive_path.exists() {
             use std::io::Write;
 
@@ -169,10 +177,25 @@ fn build_v8() {
                     .expect("failed to download v8 lib")
             };
 
-            fs::write(&archive_path, tar_data).unwrap_or_else(|err| {
+            let mut archive_tmp =
+                tempfile::NamedTempFile::new_in(&cache_dir).unwrap_or_else(|err| {
+                    panic!(
+                        "failed to create temporary v8 archive download file in {}: {err}",
+                        cache_dir.display()
+                    )
+                });
+            archive_tmp.write_all(&tar_data).unwrap_or_else(|err| {
                 panic!(
-                    "failed to write v8 archive cache {}: {err}",
-                    archive_path.display()
+                    "failed to write temporary v8 archive download file {}: {err}",
+                    archive_tmp.path().display()
+                )
+            });
+            archive_tmp.persist(&archive_path).unwrap_or_else(|err| {
+                panic!(
+                    "failed to finalize v8 archive cache {} from temporary file {}: {}",
+                    archive_path.display(),
+                    err.file.path().display(),
+                    err.error
                 )
             });
         }
@@ -198,11 +221,37 @@ fn build_v8() {
         });
         let tar = xz::read::XzDecoder::new(tar_data.as_slice());
         let mut archive = tar::Archive::new(tar);
-        archive.unpack(&cache_dir).unwrap_or_else(|err| {
+        archive.unpack(unpack_tmp.path()).unwrap_or_else(|err| {
+            let _ = fs::remove_file(&archive_path);
             panic!(
-                "failed to unpack v8 archive cache {} into {}: {err}",
+                "failed to unpack v8 archive cache {} into {} (cache removed so the next build can re-download): {err}",
                 archive_path.display(),
-                cache_dir.display()
+                unpack_tmp.path().display()
+            )
+        });
+        let staged_lib = unpack_tmp.path().join("lib");
+        if !staged_lib.is_dir() {
+            let _ = fs::remove_file(&archive_path);
+            panic!(
+                "v8 archive {} did not contain a top-level `lib/` directory after unpack (expected {})",
+                archive_path.display(),
+                staged_lib.display()
+            );
+        }
+        if v8_lib_dir.exists() {
+            fs::remove_dir_all(&v8_lib_dir).unwrap_or_else(|err| {
+                panic!(
+                    "failed to remove existing wee8 lib dir {} before rename: {err}",
+                    v8_lib_dir.display()
+                )
+            });
+        }
+        fs::rename(&staged_lib, &v8_lib_dir).unwrap_or_else(|err| {
+            let _ = fs::remove_file(&archive_path);
+            panic!(
+                "failed to move unpacked wee8 lib from {} to {}: {err}",
+                staged_lib.display(),
+                v8_lib_dir.display()
             )
         });
     }
@@ -347,7 +396,6 @@ fn build_v8() {
         .compile("wasmer_v8_store_owner");
 
     println!("cargo:rustc-link-lib=static=v8prefixed");
-
     // Static link dependencies must follow the archive that references them.
     if cfg!(any(target_os = "linux",)) {
         println!("cargo:rustc-link-lib=stdc++");

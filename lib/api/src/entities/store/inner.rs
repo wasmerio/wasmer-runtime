@@ -55,6 +55,15 @@ impl AsStoreMut for StoreInner {
     }
 }
 
+/// Call handler for a store.
+// TODO: better documentation!
+pub type OnCalledHandler = Box<
+    dyn FnOnce(
+        StoreMut<'_>,
+    )
+        -> Result<wasmer_types::OnCalledAction, Box<dyn std::error::Error + Send + Sync>>,
+>;
+
 gen_rt_ty! {
     #[derive(derive_more::From, Debug)]
     pub BackendStore(entities::store::Store);

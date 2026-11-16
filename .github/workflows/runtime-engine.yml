@@ -1,0 +1,28 @@
+name: runtime-engine
+on:
+  push:
+    branches: [next]
+  pull_request:
+    branches: [next]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - run: cargo fmt --all -- --check
+      - run: cargo test -p wasmer --features cranelift,singlepass,experimental-async --locked
+      - run: cargo test -p wasmer-workspace --no-default-features --features cranelift,singlepass,wast,middlewares --test compilers --locked
+  v8:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - run: cargo test -p wasmer --no-default-features --features v8-default,experimental-async --locked
+        env:
+          GH_TOKEN: ${{ secrets.RUNTIME_V8_READ_TOKEN }}

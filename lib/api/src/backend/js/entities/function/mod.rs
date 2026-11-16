@@ -22,10 +22,9 @@ use crate::{
 };
 use crate::{
     AsStoreMut, AsStoreRef, BackendFunction, BackendFunctionEnv, BackendFunctionEnvMut,
-    CallWrapper, FromToNativeWasmType, FunctionEnv, FunctionEnvMut, HostFunction,
-    HostFunctionKind, IntoResult, NativeWasmType, NativeWasmTypeInto, RuntimeError, StoreMut,
-    Value, WasmTypeList, WithEnv, WithoutEnv,
-    entities::function::call_wrapper::call_wrapped,
+    FromToNativeWasmType, FunctionEnv, FunctionEnvMut, HostFunction, HostFunctionKind, IntoResult,
+    NativeWasmType, NativeWasmTypeInto, RuntimeError, StoreMut, Value, WasmTypeList, WithEnv,
+    WithoutEnv,
     js::{
         utils::convert::{AsJs as _, js_value_to_wasmer, wasmer_value_to_js},
         vm::{VMFuncRef, VMFunctionCallback, function::VMFunction},
@@ -471,18 +470,23 @@ impl Function {
         unimplemented!();
     }
 
-    pub fn call(
-        &self,
-        store: &mut impl AsStoreMut,
-        params: &[Value],
-    ) -> Result<Box<[Value]>, RuntimeError> {
-        self.call_wrapped(store, None, params)
-    }
-
     pub(crate) fn call_wrapped(
         &self,
         store: &mut impl AsStoreMut,
-        wrapper: Option<&mut dyn CallWrapper>,
+        wrapper: Option<&mut dyn crate::CallWrapper>,
+        params: &[Value],
+    ) -> Result<Box<[Value]>, RuntimeError> {
+        let mut results = None;
+        crate::entities::function::call_wrapper::call_wrapped(store, wrapper, |store| {
+            results = Some(self.call(store, params)?);
+            Ok(())
+        })?;
+        Ok(results.expect("successful wrapper completed a call"))
+    }
+
+    pub fn call(
+        &self,
+        store: &mut impl AsStoreMut,
         params: &[Value],
     ) -> Result<Box<[Value]>, RuntimeError> {
         // Annotation is here to prevent spurious IDE warnings.
@@ -496,11 +500,34 @@ impl Function {
             arr.set(i as u32, js_value);
         }
 
-        let mut result = JsValue::UNDEFINED;
-        call_wrapped(store, wrapper, |_| {
-            result = js_sys::Reflect::apply(&self.handle.function, &JsValue::NULL, &arr)?;
-            Ok(())
-        })?;
+        let result = {
+            let mut r;
+            // TODO: This loop is needed for asyncify. It will be refactored with https://github.com/wasmerio/wasmer/issues/3451
+            loop {
+                r = js_sys::Reflect::apply(
+                    &self.handle.function,
+                    &wasm_bindgen::JsValue::NULL,
+                    &arr,
+                );
+                let store_mut = store.as_store_mut();
+                if let Some(callback) = store_mut.inner.on_called.take() {
+                    match callback(store_mut) {
+                        Ok(wasmer_types::OnCalledAction::InvokeAgain) => {
+                            continue;
+                        }
+                        Ok(wasmer_types::OnCalledAction::Finish) => {
+                            break;
+                        }
+                        Ok(wasmer_types::OnCalledAction::Trap(trap)) => {
+                            return Err(RuntimeError::user(trap));
+                        }
+                        Err(trap) => return Err(RuntimeError::user(trap)),
+                    }
+                }
+                break;
+            }
+            r?
+        };
 
         let result_types = self.handle.ty.results();
         match result_types.len() {

@@ -25,6 +25,27 @@ macro_rules! impl_native_traits {
             /// Call the typed func and return results.
             #[allow(unused_mut)]
             #[allow(clippy::too_many_arguments)]
+            pub(crate) fn call_wrapped_sys(&self, store: &mut impl AsStoreMut, wrapper: Option<&mut dyn crate::CallWrapper>, $( $x: $x, )* ) -> Result<Rets, RuntimeError>
+            where $( $x: FromToNativeWasmType, )*
+            {
+                if $(!FromToNativeWasmType::is_from_store(&$x, store) ||)* false {
+                    return Err(RuntimeError::new("cross-`Store` values are not supported"));
+                }
+                let signature = self.func.ty(store);
+                let raw = [ $( $x.to_native().into_raw(store) ),* ];
+                let params = raw.iter().zip(signature.params()).map(|(raw, ty)| {
+                    unsafe { Value::from_raw(store, *ty, *raw) }
+                }).collect::<Vec<_>>();
+                let results = self.func.call_wrapped(store, wrapper.expect("wrapped call supplies a wrapper"), &params)?;
+                let mut raw = Rets::empty_array();
+                for (slot, value) in raw.as_mut().iter_mut().zip(results.iter()) {
+                    *slot = value.as_raw(store);
+                }
+                Ok(unsafe { Rets::from_array(store, raw) })
+            }
+
+            /// Call the typed function and return its results.
+            #[allow(clippy::too_many_arguments)]
             pub fn call_sys(&self, store: &mut impl AsStoreMut, $( $x: $x, )* ) -> Result<Rets, RuntimeError> {
                 #[cfg(feature = "experimental-async")]
                 super::check_native_retirement(store)?;
