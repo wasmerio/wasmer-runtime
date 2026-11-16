@@ -1,0 +1,847 @@
+{
+  "source": "50933d71d975c5499b6d9d205136545644850c04",
+  "upstream": "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb",
+  "files": [
+    {
+      "path": ".github/workflows/capi-v8-linux-producer.yml",
+      "explanation": "producer repository/ref guard adapted to wasmer-runtime/next",
+      "upstream_commits": []
+    },
+    {
+      "path": "fuzz/Cargo.toml",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "7b17f44a2db9757ed56cd2b246123b29fd37e2f3 fix(fuzz): enable sanitizer feature (#7159)"
+      ]
+    },
+    {
+      "path": "fuzz/README.md",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "7b17f44a2db9757ed56cd2b246123b29fd37e2f3 fix(fuzz): enable sanitizer feature (#7159)"
+      ]
+    },
+    {
+      "path": "lib/api/build.rs",
+      "explanation": "upstream stable cache path and static dependency link order; fork private provider and atomic archive handling retained",
+      "upstream_commits": [
+        "80499e78824f5a0edb6f7bd0f40c10a4348ba8ff Revert \"deps(v8): update dependency\" (#7166)",
+        "fa46681274bf93de87da5e77e49d68cc1dfd7b2b use newer wee8 release",
+        "0969630c568435b6989a6a43eaff349d221cf9df Revert \"include linux-arm64\"",
+        "e553b06afa4676cdf87b8c414b5ef40af8b083c3 include linux-arm64",
+        "94f9df8fe614669d3b83163463671fdc8c73481d bump to a new release",
+        "47f70f330e15147bbb1c41e5710d193adab60b29 include macOS Frameworks",
+        "058abd0c714ca3db9baba3848b144cc2a2a7936f deps(V8): bump version",
+        "4434ce07535d0322308ed89c4f3407cd46cbbea8 chore(V8): revert complicated download cache for V8 binaries (#7141)",
+        "bcc17a5865f93865ace40d7f04dea97ab98a9685 fix(build): include c++ library after v8prefixed (#7134)"
+      ]
+    },
+    {
+      "path": "lib/api/src/backend/js/entities/function/mod.rs",
+      "explanation": "upstream CallWrapper API integrated with fork call custody; native functions retain upstream ABI flags",
+      "upstream_commits": [
+        "d8efe0b8347c4ca47c50c94f52c0f9a04336f10f feat!(api): replace the OnCalledAction store hook with per-call CallWrapper"
+      ]
+    },
+    {
+      "path": "lib/api/src/backend/js/entities/function/typed.rs",
+      "explanation": "upstream CallWrapper API integrated with fork call custody; native functions retain upstream ABI flags",
+      "upstream_commits": [
+        "d8efe0b8347c4ca47c50c94f52c0f9a04336f10f feat!(api): replace the OnCalledAction store hook with per-call CallWrapper"
+      ]
+    },
+    {
+      "path": "lib/api/src/backend/js/entities/module.rs",
+      "explanation": "automatic integration of both histories",
+      "upstream_commits": [
+        "72414c243e3c3cb3533beebb398c4b370944d633 refactor(api): take IntoBytes in the existing module constructors",
+        "315734be0ebe09a33a1a733034abb6ca4235475e fix(js): let modules share their binary instead of copying it"
+      ]
+    },
+    {
+      "path": "lib/api/src/backend/sys/entities/function/mod.rs",
+      "explanation": "upstream CallWrapper API integrated with fork call custody; native functions retain upstream ABI flags",
+      "upstream_commits": [
+        "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb feat(Cranelift): support tail-call WA extension (#7185)",
+        "71749fd02d2a6faad714713c6016b85d7857b82a fix(api): make call_wrapped re-entry and store access sound",
+        "d8efe0b8347c4ca47c50c94f52c0f9a04336f10f feat!(api): replace the OnCalledAction store hook with per-call CallWrapper",
+        "e653d811a4b5c68d416e74d49354df6b83253035 fix(LLVM): correctly pass m0 param for direct and indirect calls (#7131)"
+      ]
+    },
+    {
+      "path": "lib/api/src/backend/sys/entities/function/typed.rs",
+      "explanation": "upstream CallWrapper API integrated with fork call custody; native functions retain upstream ABI flags",
+      "upstream_commits": [
+        "71749fd02d2a6faad714713c6016b85d7857b82a fix(api): make call_wrapped re-entry and store access sound",
+        "d8efe0b8347c4ca47c50c94f52c0f9a04336f10f feat!(api): replace the OnCalledAction store hook with per-call CallWrapper"
+      ]
+    },
+    {
+      "path": "lib/api/src/backend/sys/entities/table.rs",
+      "explanation": "automatic integration of both histories",
+      "upstream_commits": [
+        "ee2bed1b9a2f7b1c3dad1c04ca75cc12c8e9691e fix(Table): handle type mismatch for set/elem/grow/copy/new operations (#7130)",
+        "ebebff03317ccc7c76ebe01cd8eca9bed926863a fix cargo clippy"
+      ]
+    },
+    {
+      "path": "lib/api/src/backend/v8/entities/function/mod.rs",
+      "explanation": "upstream CallWrapper API integrated with fork call custody; native functions retain upstream ABI flags",
+      "upstream_commits": [
+        "4ea6debe385b3754d6236f328b9a5683ce3e61a7 fix(api): give every V8 entry of call_wrapped its own arguments",
+        "d8efe0b8347c4ca47c50c94f52c0f9a04336f10f feat!(api): replace the OnCalledAction store hook with per-call CallWrapper"
+      ]
+    },
+    {
+      "path": "lib/api/src/backend/v8/entities/function/typed.rs",
+      "explanation": "upstream CallWrapper API integrated with fork call custody; native functions retain upstream ABI flags",
+      "upstream_commits": [
+        "4ea6debe385b3754d6236f328b9a5683ce3e61a7 fix(api): give every V8 entry of call_wrapped its own arguments",
+        "d8efe0b8347c4ca47c50c94f52c0f9a04336f10f feat!(api): replace the OnCalledAction store hook with per-call CallWrapper",
+        "66ad7a78ec0cb60700b07987ebcd94e4c6a4d575 chore: address clippy warnings (#7139)",
+        "ebebff03317ccc7c76ebe01cd8eca9bed926863a fix cargo clippy"
+      ]
+    },
+    {
+      "path": "lib/api/src/backend/v8/entities/table.rs",
+      "explanation": "automatic integration of both histories",
+      "upstream_commits": [
+        "dde74e8f197d0aafd78cb2e31b84a9e5033eaf7a fix(Table): sync correctly embedded VMContext table (#41) (#7133)"
+      ]
+    },
+    {
+      "path": "lib/api/src/entities/function/call_wrapper.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "71749fd02d2a6faad714713c6016b85d7857b82a fix(api): make call_wrapped re-entry and store access sound",
+        "d8efe0b8347c4ca47c50c94f52c0f9a04336f10f feat!(api): replace the OnCalledAction store hook with per-call CallWrapper"
+      ]
+    },
+    {
+      "path": "lib/api/src/entities/function/inner.rs",
+      "explanation": "automatic integration of both histories",
+      "upstream_commits": [
+        "d8efe0b8347c4ca47c50c94f52c0f9a04336f10f feat!(api): replace the OnCalledAction store hook with per-call CallWrapper"
+      ]
+    },
+    {
+      "path": "lib/api/src/entities/function/mod.rs",
+      "explanation": "automatic integration of both histories",
+      "upstream_commits": [
+        "d8efe0b8347c4ca47c50c94f52c0f9a04336f10f feat!(api): replace the OnCalledAction store hook with per-call CallWrapper"
+      ]
+    },
+    {
+      "path": "lib/api/src/entities/module/inner.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "72414c243e3c3cb3533beebb398c4b370944d633 refactor(api): take IntoBytes in the existing module constructors",
+        "315734be0ebe09a33a1a733034abb6ca4235475e fix(js): let modules share their binary instead of copying it"
+      ]
+    },
+    {
+      "path": "lib/api/src/entities/module/mod.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "72414c243e3c3cb3533beebb398c4b370944d633 refactor(api): take IntoBytes in the existing module constructors",
+        "315734be0ebe09a33a1a733034abb6ca4235475e fix(js): let modules share their binary instead of copying it"
+      ]
+    },
+    {
+      "path": "lib/api/src/entities/store/inner.rs",
+      "explanation": "fork on_called API retained for fork async calls; upstream debug-format cleanup retained",
+      "upstream_commits": [
+        "d8efe0b8347c4ca47c50c94f52c0f9a04336f10f feat!(api): replace the OnCalledAction store hook with per-call CallWrapper"
+      ]
+    },
+    {
+      "path": "lib/api/src/entities/table/mod.rs",
+      "explanation": "automatic integration of both histories",
+      "upstream_commits": [
+        "ee2bed1b9a2f7b1c3dad1c04ca75cc12c8e9691e fix(Table): handle type mismatch for set/elem/grow/copy/new operations (#7130)"
+      ]
+    },
+    {
+      "path": "lib/api/src/lib.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "2e24624addbebb7e1c109c33eb2bc5684da771f7 feat(asyncify): add the wasmer-asyncify crate and build WASIX on it",
+        "073218089c0944200e5c4992a48763be481dcff6 refactor(api): move asyncify call support into `wasmer::asyncify`",
+        "d8efe0b8347c4ca47c50c94f52c0f9a04336f10f feat!(api): replace the OnCalledAction store hook with per-call CallWrapper"
+      ]
+    },
+    {
+      "path": "lib/api/src/utils/into_bytes.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "72414c243e3c3cb3533beebb398c4b370944d633 refactor(api): take IntoBytes in the existing module constructors"
+      ]
+    },
+    {
+      "path": "lib/api/src/utils/native/typed_func.rs",
+      "explanation": "automatic integration of both histories",
+      "upstream_commits": [
+        "d8efe0b8347c4ca47c50c94f52c0f9a04336f10f feat!(api): replace the OnCalledAction store hook with per-call CallWrapper"
+      ]
+    },
+    {
+      "path": "lib/api/src/utils/polyfill.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "5508d7e1be4ac93b6f07d6da6e277c5b2ee57969 deps: update wasm-tools related crates (#7110)"
+      ]
+    },
+    {
+      "path": "lib/api/tests/call_wrapper.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "4ea6debe385b3754d6236f328b9a5683ce3e61a7 fix(api): give every V8 entry of call_wrapped its own arguments",
+        "71749fd02d2a6faad714713c6016b85d7857b82a fix(api): make call_wrapped re-entry and store access sound",
+        "d8efe0b8347c4ca47c50c94f52c0f9a04336f10f feat!(api): replace the OnCalledAction store hook with per-call CallWrapper"
+      ]
+    },
+    {
+      "path": "lib/api/tests/module.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "72414c243e3c3cb3533beebb398c4b370944d633 refactor(api): take IntoBytes in the existing module constructors",
+        "315734be0ebe09a33a1a733034abb6ca4235475e fix(js): let modules share their binary instead of copying it"
+      ]
+    },
+    {
+      "path": "lib/compiler-cranelift/src/abi.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb feat(Cranelift): support tail-call WA extension (#7185)"
+      ]
+    },
+    {
+      "path": "lib/compiler-cranelift/src/compiler.rs",
+      "explanation": "automatic integration of both histories",
+      "upstream_commits": [
+        "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb feat(Cranelift): support tail-call WA extension (#7185)",
+        "28a3bb570c8d2dc9b875c9823c26e02152d690ca machO: add experimental-format for macOS as well"
+      ]
+    },
+    {
+      "path": "lib/compiler-cranelift/src/config.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb feat(Cranelift): support tail-call WA extension (#7185)"
+      ]
+    },
+    {
+      "path": "lib/compiler-cranelift/src/elf.rs",
+      "explanation": "upstream Mach-O compact unwind retained; fork dynamic trampoline unwind added separately",
+      "upstream_commits": [
+        "bfec3cbcf9479de445a2a53dc9d8c64a346f25e0 address finding about UNWIND_HAS_LSDA",
+        "58da6770d525790dd07b9a6bfbb63af852c42733 fix build",
+        "102f7355f8e89d9ac1a2b1471c9d51eff862a9e5 use more constants",
+        "a05e67ffb0adc5a1b9a76191518a26fb861406b4 cargo fmt",
+        "28cc0f0b8c36f65e74072be9b0bea71619cb01c7 emit DWARF only for ELF target",
+        "28a3bb570c8d2dc9b875c9823c26e02152d690ca machO: add experimental-format for macOS as well"
+      ]
+    },
+    {
+      "path": "lib/compiler-cranelift/src/func_environ.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb feat(Cranelift): support tail-call WA extension (#7185)",
+        "ee48d12fbec8bd867b3d17d9bf441d148a42d6a6 fix(cranelift): use RawValue slots for exception payloads (#7156)",
+        "9cf5ef685ece0509462fb96cc776c35c5223216d perf(cranelift): avoid runtime calls for non-shared memory.size (#7142)"
+      ]
+    },
+    {
+      "path": "lib/compiler-cranelift/src/trampoline/dynamic_function.rs",
+      "explanation": "automatic integration of both histories",
+      "upstream_commits": [
+        "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb feat(Cranelift): support tail-call WA extension (#7185)"
+      ]
+    },
+    {
+      "path": "lib/compiler-cranelift/src/trampoline/function_call.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb feat(Cranelift): support tail-call WA extension (#7185)"
+      ]
+    },
+    {
+      "path": "lib/compiler-cranelift/src/translator/code_translator.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb feat(Cranelift): support tail-call WA extension (#7185)",
+        "f4b01105f271f0e4d31840df101fa68d5050a4fe deps: update Wasm-related crates (#7132)",
+        "a7362099a7251cc62e2d0964fef0fb02d1172764 fix(Cranelift): handle v128 as exception payload (#7108)"
+      ]
+    },
+    {
+      "path": "lib/compiler-cranelift/src/translator/func_state.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb feat(Cranelift): support tail-call WA extension (#7185)"
+      ]
+    },
+    {
+      "path": "lib/compiler-llvm/Cargo.toml",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "922b7593aea027900fa8cf03dc9867e195d8fbdf deps(LLVM): bump to 23.1 (#6931)",
+        "0bd5478492ca692279885f6328ce6eea3710b3b7 fix: clean up Cargo warnings (remove axum package) (#7111)"
+      ]
+    },
+    {
+      "path": "lib/compiler-llvm/README.md",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "922b7593aea027900fa8cf03dc9867e195d8fbdf deps(LLVM): bump to 23.1 (#6931)"
+      ]
+    },
+    {
+      "path": "lib/compiler-llvm/src/compiler.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "e653d811a4b5c68d416e74d49354df6b83253035 fix(LLVM): correctly pass m0 param for direct and indirect calls (#7131)",
+        "28a3bb570c8d2dc9b875c9823c26e02152d690ca machO: add experimental-format for macOS as well"
+      ]
+    },
+    {
+      "path": "lib/compiler-llvm/src/object_file.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "d7ff25af647677761b0d1ea106e9e94ef25828db address finding",
+        "28a3bb570c8d2dc9b875c9823c26e02152d690ca machO: add experimental-format for macOS as well"
+      ]
+    },
+    {
+      "path": "lib/compiler-llvm/src/translator/code.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "f4b01105f271f0e4d31840df101fa68d5050a4fe deps: update Wasm-related crates (#7132)",
+        "e653d811a4b5c68d416e74d49354df6b83253035 fix(LLVM): correctly pass m0 param for direct and indirect calls (#7131)",
+        "188214f0a52b8178a5a4a023c4155e5629cb5ff9 address how we emit debug info",
+        "5611a7572c84a6c22fa238563c3ccc0575c3fe9a Merge branch 'main' into macho-experimental-artifact-v3",
+        "922b7593aea027900fa8cf03dc9867e195d8fbdf deps(LLVM): bump to 23.1 (#6931)",
+        "781e118db8ba4bde59d36d72f87dc153a84665f8 drop unused argument",
+        "28a3bb570c8d2dc9b875c9823c26e02152d690ca machO: add experimental-format for macOS as well"
+      ]
+    },
+    {
+      "path": "lib/compiler-llvm/src/translator/intrinsics.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "e653d811a4b5c68d416e74d49354df6b83253035 fix(LLVM): correctly pass m0 param for direct and indirect calls (#7131)",
+        "781e118db8ba4bde59d36d72f87dc153a84665f8 drop unused argument",
+        "3688a351b0f02de39468d4f503b36a9d0c70a7da unify naming of LibCall::EHPersonality and expain it"
+      ]
+    },
+    {
+      "path": "lib/compiler-llvm/src/translator/mod.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "e653d811a4b5c68d416e74d49354df6b83253035 fix(LLVM): correctly pass m0 param for direct and indirect calls (#7131)",
+        "922b7593aea027900fa8cf03dc9867e195d8fbdf deps(LLVM): bump to 23.1 (#6931)"
+      ]
+    },
+    {
+      "path": "lib/compiler-llvm/src/translator/trampoline.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "5611a7572c84a6c22fa238563c3ccc0575c3fe9a Merge branch 'main' into macho-experimental-artifact-v3",
+        "922b7593aea027900fa8cf03dc9867e195d8fbdf deps(LLVM): bump to 23.1 (#6931)",
+        "781e118db8ba4bde59d36d72f87dc153a84665f8 drop unused argument"
+      ]
+    },
+    {
+      "path": "lib/compiler-singlepass/src/codegen.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "f4b01105f271f0e4d31840df101fa68d5050a4fe deps: update Wasm-related crates (#7132)",
+        "e5ca9b93809d744af8b33488a748a284d3d41955 fix(Singlepass): lower implicit else through existing else handling (#7128)",
+        "40ebd7d36f6585aff8e54547488f18cac963750e Merge branch 'main' into macho-experimental-artifact-v3",
+        "9c8259608be78923f0e59f413349825fe4cf0d21 fix(Singlepass): add missing loop NaN canonicalization (#7087)",
+        "81706fcf2b1668296837fbbd0df54c349e9a6f31 fix --compiler-debug-dir and .eh_frame padding (zeroes)"
+      ]
+    },
+    {
+      "path": "lib/compiler-singlepass/src/compiler.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "81706fcf2b1668296837fbbd0df54c349e9a6f31 fix --compiler-debug-dir and .eh_frame padding (zeroes)",
+        "cbe1b5b2e02510ab834293bed19445c985173e60 backup"
+      ]
+    },
+    {
+      "path": "lib/compiler-singlepass/src/elf.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "a05e67ffb0adc5a1b9a76191518a26fb861406b4 cargo fmt",
+        "28cc0f0b8c36f65e74072be9b0bea71619cb01c7 emit DWARF only for ELF target"
+      ]
+    },
+    {
+      "path": "lib/compiler-singlepass/src/emitter_x64.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "736fa40801991a38651cdcf31dc30b03c39fa7b7 fix(Singlepass): fix emission of SSE instructions (#7184)",
+        "73e61144c60de60993b61b6e81305cfdcae470dd chore(Singlepass): remove explicit register listing (was bug in dynasm) (#7124)"
+      ]
+    },
+    {
+      "path": "lib/compiler-singlepass/src/machine_arm64.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "c17af29e791ae8bb9243367c7a5a5e10dd2ea39f fix(Singlepass+aarch64): use long jump in `Operator::I64DivU` (#7112)"
+      ]
+    },
+    {
+      "path": "lib/compiler-singlepass/src/machine_riscv.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "3468192c031cd0b28a95bc90ff668eee5d189849 use classical temporary register for move_location",
+        "8aba7e5aade1187f1622ca68b15e86292194acaa fix(Singlepass+riscv64): support fn with many params"
+      ]
+    },
+    {
+      "path": "lib/compiler-singlepass/src/machine_x64.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "736fa40801991a38651cdcf31dc30b03c39fa7b7 fix(Singlepass): fix emission of SSE instructions (#7184)"
+      ]
+    },
+    {
+      "path": "lib/compiler-singlepass/src/output_reporter.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "66ad7a78ec0cb60700b07987ebcd94e4c6a4d575 chore: address clippy warnings (#7139)"
+      ]
+    },
+    {
+      "path": "lib/compiler/src/artifact_builders/artifact_builder.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb feat(Cranelift): support tail-call WA extension (#7185)",
+        "e653d811a4b5c68d416e74d49354df6b83253035 fix(LLVM): correctly pass m0 param for direct and indirect calls (#7131)",
+        "28a3bb570c8d2dc9b875c9823c26e02152d690ca machO: add experimental-format for macOS as well"
+      ]
+    },
+    {
+      "path": "lib/compiler/src/compiler.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb feat(Cranelift): support tail-call WA extension (#7185)",
+        "e653d811a4b5c68d416e74d49354df6b83253035 fix(LLVM): correctly pass m0 param for direct and indirect calls (#7131)",
+        "825357689a2f25fabdc1cca73c6d323fab00900b fix: never enable memory64 feature (#51) (#7129)",
+        "71a90529272d8f0c33ba5a185216052a74996d7d cargo fmt",
+        "f99299ef8d896a56ce31006b57c8e0b4d2dbc18a return rather an UnsupportedTarget",
+        "9e710e69b958e5b08173f27d6dce0a23db777777 define stubs for both arm64 and arm64e",
+        "65c511d8133671907e1125bb60ebb13c4be054d4 fix: switch to -dylib + add small workaround",
+        "81706fcf2b1668296837fbbd0df54c349e9a6f31 fix --compiler-debug-dir and .eh_frame padding (zeroes)",
+        "cbe1b5b2e02510ab834293bed19445c985173e60 backup"
+      ]
+    },
+    {
+      "path": "lib/compiler/src/constants.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "bfec3cbcf9479de445a2a53dc9d8c64a346f25e0 address finding about UNWIND_HAS_LSDA",
+        "102f7355f8e89d9ac1a2b1471c9d51eff862a9e5 use more constants"
+      ]
+    },
+    {
+      "path": "lib/compiler/src/elf.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "980200ae4aa45e65c6cacda841203e0b12c227bf simplify the code",
+        "cbe1b5b2e02510ab834293bed19445c985173e60 backup"
+      ]
+    },
+    {
+      "path": "lib/compiler/src/engine/artifact.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb feat(Cranelift): support tail-call WA extension (#7185)",
+        "e653d811a4b5c68d416e74d49354df6b83253035 fix(LLVM): correctly pass m0 param for direct and indirect calls (#7131)",
+        "45431438bb0038325ad5f25b3623d57a345ebced add check for native object",
+        "a6dee8f9ae833377d561f05825f22fe38c2db613 add sanity check for binary offset",
+        "de8c90351d16ac4a5da25ddc3800a8a52f3c1771 add comment about usage of .eh_frame on macOS (Singlepass)",
+        "d3ee74ebf56c2ee361946de26fc61320bbb5d933 address cargo clippy",
+        "cbe1b5b2e02510ab834293bed19445c985173e60 backup"
+      ]
+    },
+    {
+      "path": "lib/compiler/src/engine/inner.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "a6dee8f9ae833377d561f05825f22fe38c2db613 add sanity check for binary offset",
+        "a5be156ecf2d947cd4e6c3d8305a0b3218c2454d support exp. artifact on macOS with .eh_frame",
+        "28a3bb570c8d2dc9b875c9823c26e02152d690ca machO: add experimental-format for macOS as well"
+      ]
+    },
+    {
+      "path": "lib/compiler/src/engine/mapped_binary.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "a6dee8f9ae833377d561f05825f22fe38c2db613 add sanity check for binary offset",
+        "04cc64d82f9d7ab21bf97a4e16641b4634180c85 add assert about page alignment of segments on macos",
+        "7c9a06999354ccadafc175d3e040e922512aa73a add comment",
+        "0e77f5878eb5be114492289920c7ba3aa670f187 handle existing artifacts for ELF",
+        "3688a351b0f02de39468d4f503b36a9d0c70a7da unify naming of LibCall::EHPersonality and expain it",
+        "ebebff03317ccc7c76ebe01cd8eca9bed926863a fix cargo clippy",
+        "62e4c75f53c7d9c21f44b70716bfe14a93e4c1cc fix conditional build",
+        "5997a670c80bd38bc35c38bf920aaea9fed38ede Merge branch 'macho-experimental-artifact-v4' into macho-experimental-artifact-v3",
+        "cbe1b5b2e02510ab834293bed19445c985173e60 backup",
+        "5377b663cdec9d7371319e952b6643dbdf9f8b4b fix typo",
+        "a5be156ecf2d947cd4e6c3d8305a0b3218c2454d support exp. artifact on macOS with .eh_frame",
+        "28a3bb570c8d2dc9b875c9823c26e02152d690ca machO: add experimental-format for macOS as well"
+      ]
+    },
+    {
+      "path": "lib/compiler/src/engine/mod.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "28a3bb570c8d2dc9b875c9823c26e02152d690ca machO: add experimental-format for macOS as well"
+      ]
+    },
+    {
+      "path": "lib/compiler/src/engine/resolver.rs",
+      "explanation": "automatic integration of both histories",
+      "upstream_commits": [
+        "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb feat(Cranelift): support tail-call WA extension (#7185)",
+        "e653d811a4b5c68d416e74d49354df6b83253035 fix(LLVM): correctly pass m0 param for direct and indirect calls (#7131)"
+      ]
+    },
+    {
+      "path": "lib/compiler/src/engine/trap/frame_info.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "28a3bb570c8d2dc9b875c9823c26e02152d690ca machO: add experimental-format for macOS as well"
+      ]
+    },
+    {
+      "path": "lib/compiler/src/engine/unwind/systemv.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "d592af2f631086cc6dbf6954dc99d8a1629837fa revert changes in unwind info registration",
+        "a5be156ecf2d947cd4e6c3d8305a0b3218c2454d support exp. artifact on macOS with .eh_frame",
+        "28a3bb570c8d2dc9b875c9823c26e02152d690ca machO: add experimental-format for macOS as well"
+      ]
+    },
+    {
+      "path": "lib/compiler/src/engine/unwind/systemv/compact_unwind/mod.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "bfec3cbcf9479de445a2a53dc9d8c64a346f25e0 address finding about UNWIND_HAS_LSDA",
+        "28a3bb570c8d2dc9b875c9823c26e02152d690ca machO: add experimental-format for macOS as well"
+      ]
+    },
+    {
+      "path": "lib/compiler/src/lib.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "f4b01105f271f0e4d31840df101fa68d5050a4fe deps: update Wasm-related crates (#7132)"
+      ]
+    },
+    {
+      "path": "lib/compiler/src/object/module.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "65c511d8133671907e1125bb60ebb13c4be054d4 fix: switch to -dylib + add small workaround"
+      ]
+    },
+    {
+      "path": "lib/compiler/src/translator/mod.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "f4b01105f271f0e4d31840df101fa68d5050a4fe deps: update Wasm-related crates (#7132)"
+      ]
+    },
+    {
+      "path": "lib/compiler/src/translator/module.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "5508d7e1be4ac93b6f07d6da6e277c5b2ee57969 deps: update wasm-tools related crates (#7110)"
+      ]
+    },
+    {
+      "path": "lib/compiler/src/translator/sections.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "825357689a2f25fabdc1cca73c6d323fab00900b fix: never enable memory64 feature (#51) (#7129)",
+        "5508d7e1be4ac93b6f07d6da6e277c5b2ee57969 deps: update wasm-tools related crates (#7110)"
+      ]
+    },
+    {
+      "path": "lib/middlewares/src/metering.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "682518cd7b84e128b8d23ced6b5590e719ea1007 feat(middlewares): expose Metering global indexes (#6998)"
+      ]
+    },
+    {
+      "path": "lib/types/src/features.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "825357689a2f25fabdc1cca73c6d323fab00900b fix: never enable memory64 feature (#51) (#7129)"
+      ]
+    },
+    {
+      "path": "lib/types/src/lib.rs",
+      "explanation": "upstream trap/type updates retained plus fork OnCalledAction compatibility",
+      "upstream_commits": [
+        "d8efe0b8347c4ca47c50c94f52c0f9a04336f10f feat!(api): replace the OnCalledAction store hook with per-call CallWrapper"
+      ]
+    },
+    {
+      "path": "lib/types/src/libcalls.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "3688a351b0f02de39468d4f503b36a9d0c70a7da unify naming of LibCall::EHPersonality and expain it"
+      ]
+    },
+    {
+      "path": "lib/types/src/module.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb feat(Cranelift): support tail-call WA extension (#7185)",
+        "e653d811a4b5c68d416e74d49354df6b83253035 fix(LLVM): correctly pass m0 param for direct and indirect calls (#7131)"
+      ]
+    },
+    {
+      "path": "lib/types/src/serialize.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb feat(Cranelift): support tail-call WA extension (#7185)",
+        "e653d811a4b5c68d416e74d49354df6b83253035 fix(LLVM): correctly pass m0 param for direct and indirect calls (#7131)"
+      ]
+    },
+    {
+      "path": "lib/types/src/trapcode.rs",
+      "explanation": "upstream trap/type updates retained plus fork OnCalledAction compatibility",
+      "upstream_commits": [
+        "d8efe0b8347c4ca47c50c94f52c0f9a04336f10f feat!(api): replace the OnCalledAction store hook with per-call CallWrapper",
+        "ee2bed1b9a2f7b1c3dad1c04ca75cc12c8e9691e fix(Table): handle type mismatch for set/elem/grow/copy/new operations (#7130)"
+      ]
+    },
+    {
+      "path": "lib/types/src/vmoffsets.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb feat(Cranelift): support tail-call WA extension (#7185)",
+        "e653d811a4b5c68d416e74d49354df6b83253035 fix(LLVM): correctly pass m0 param for direct and indirect calls (#7131)"
+      ]
+    },
+    {
+      "path": "lib/vm/Cargo.toml",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "0bd5478492ca692279885f6328ce6eea3710b3b7 fix: clean up Cargo warnings (remove axum package) (#7111)"
+      ]
+    },
+    {
+      "path": "lib/vm/src/instance/mod.rs",
+      "explanation": "automatic integration of both histories",
+      "upstream_commits": [
+        "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb feat(Cranelift): support tail-call WA extension (#7185)",
+        "dde74e8f197d0aafd78cb2e31b84a9e5033eaf7a fix(Table): sync correctly embedded VMContext table (#41) (#7133)",
+        "e653d811a4b5c68d416e74d49354df6b83253035 fix(LLVM): correctly pass m0 param for direct and indirect calls (#7131)",
+        "ee2bed1b9a2f7b1c3dad1c04ca75cc12c8e9691e fix(Table): handle type mismatch for set/elem/grow/copy/new operations (#7130)"
+      ]
+    },
+    {
+      "path": "lib/vm/src/interrupt_registry/unix.rs",
+      "explanation": "fork coroutine installation bookkeeping plus upstream atomic interruption flags and local queries",
+      "upstream_commits": [
+        "49a5f5bb7af3d1d2411283ae9a11c1330f364446 feat(is_interrupted): speed up"
+      ]
+    },
+    {
+      "path": "lib/vm/src/libcalls.rs",
+      "explanation": "automatic integration of both histories",
+      "upstream_commits": [
+        "0b1578e0649629acc5ccad4664d5fd63204dca5e chore: use f32/f64.round_ties_even (#7168)"
+      ]
+    },
+    {
+      "path": "lib/vm/src/table.rs",
+      "explanation": "automatic integration of both histories",
+      "upstream_commits": [
+        "dde74e8f197d0aafd78cb2e31b84a9e5033eaf7a fix(Table): sync correctly embedded VMContext table (#41) (#7133)",
+        "ee2bed1b9a2f7b1c3dad1c04ca75cc12c8e9691e fix(Table): handle type mismatch for set/elem/grow/copy/new operations (#7130)"
+      ]
+    },
+    {
+      "path": "lib/vm/src/vmcontext.rs",
+      "explanation": "automatic integration of both histories",
+      "upstream_commits": [
+        "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb feat(Cranelift): support tail-call WA extension (#7185)",
+        "e653d811a4b5c68d416e74d49354df6b83253035 fix(LLVM): correctly pass m0 param for direct and indirect calls (#7131)"
+      ]
+    },
+    {
+      "path": "tests/compilers/config.rs",
+      "explanation": "automatic integration of both histories",
+      "upstream_commits": [
+        "736fa40801991a38651cdcf31dc30b03c39fa7b7 fix(Singlepass): fix emission of SSE instructions (#7184)"
+      ]
+    },
+    {
+      "path": "tests/compilers/issues.rs",
+      "explanation": "automatic integration of both histories",
+      "upstream_commits": [
+        "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb feat(Cranelift): support tail-call WA extension (#7185)",
+        "ee48d12fbec8bd867b3d17d9bf441d148a42d6a6 fix(cranelift): use RawValue slots for exception payloads (#7156)",
+        "dde74e8f197d0aafd78cb2e31b84a9e5033eaf7a fix(Table): sync correctly embedded VMContext table (#41) (#7133)",
+        "e653d811a4b5c68d416e74d49354df6b83253035 fix(LLVM): correctly pass m0 param for direct and indirect calls (#7131)",
+        "ee2bed1b9a2f7b1c3dad1c04ca75cc12c8e9691e fix(Table): handle type mismatch for set/elem/grow/copy/new operations (#7130)",
+        "e5ca9b93809d744af8b33488a748a284d3d41955 fix(Singlepass): lower implicit else through existing else handling (#7128)"
+      ]
+    },
+    {
+      "path": "tests/compilers/wast.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb feat(Cranelift): support tail-call WA extension (#7185)",
+        "80499e78824f5a0edb6f7bd0f40c10a4348ba8ff Revert \"deps(v8): update dependency\" (#7166)",
+        "2f538fee5c448bd75be9d0060fe67bc5dff55291 move back one allowed trap message",
+        "ffc851115152afbc6e45391a0af55fba3e5c834c cargo fmt",
+        "058abd0c714ca3db9baba3848b144cc2a2a7936f deps(V8): bump version"
+      ]
+    },
+    {
+      "path": "tests/ignores.txt",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "bb6cb1a3c5dbdfc2609ecd897dbf28f7df84e5cb feat(Cranelift): support tail-call WA extension (#7185)",
+        "bdb45cd4bf5f825bf20dea0ec10c0ff6de978e33 fix: enable stack probe tests",
+        "40ebd7d36f6585aff8e54547488f18cac963750e Merge branch 'main' into macho-experimental-artifact-v3",
+        "9c8259608be78923f0e59f413349825fe4cf0d21 fix(Singlepass): add missing loop NaN canonicalization (#7087)",
+        "a5be156ecf2d947cd4e6c3d8305a0b3218c2454d support exp. artifact on macOS with .eh_frame"
+      ]
+    },
+    {
+      "path": "tests/lib/compiler-test-derive/src/lib.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "736fa40801991a38651cdcf31dc30b03c39fa7b7 fix(Singlepass): fix emission of SSE instructions (#7184)",
+        "a5be156ecf2d947cd4e6c3d8305a0b3218c2454d support exp. artifact on macOS with .eh_frame",
+        "28a3bb570c8d2dc9b875c9823c26e02152d690ca machO: add experimental-format for macOS as well"
+      ]
+    },
+    {
+      "path": "tests/lib/compiler-test-derive/src/tests.rs",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "736fa40801991a38651cdcf31dc30b03c39fa7b7 fix(Singlepass): fix emission of SSE instructions (#7184)",
+        "a5be156ecf2d947cd4e6c3d8305a0b3218c2454d support exp. artifact on macOS with .eh_frame",
+        "28a3bb570c8d2dc9b875c9823c26e02152d690ca machO: add experimental-format for macOS as well"
+      ]
+    },
+    {
+      "path": "tests/wast/wasmer/float-operand-alias.wast",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "736fa40801991a38651cdcf31dc30b03c39fa7b7 fix(Singlepass): fix emission of SSE instructions (#7184)"
+      ]
+    },
+    {
+      "path": "tests/wast/wasmer/large-stack-offsets.wast",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "8aba7e5aade1187f1622ca68b15e86292194acaa fix(Singlepass+riscv64): support fn with many params"
+      ]
+    },
+    {
+      "path": "tests/wast/wasmer/loop-entry-nan-canonicalization.wast",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "9c8259608be78923f0e59f413349825fe4cf0d21 fix(Singlepass): add missing loop NaN canonicalization (#7087)"
+      ]
+    },
+    {
+      "path": "tests/wast/wasmer/simd-exceptions-throw.wast",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "a7362099a7251cc62e2d0964fef0fb02d1172764 fix(Cranelift): handle v128 as exception payload (#7108)"
+      ]
+    },
+    {
+      "path": "tests/wast/wasmer/table_mismatch.wast",
+      "explanation": "upstream-only change retained",
+      "upstream_commits": [
+        "ee2bed1b9a2f7b1c3dad1c04ca75cc12c8e9691e fix(Table): handle type mismatch for set/elem/grow/copy/new operations (#7130)"
+      ]
+    }
+  ],
+  "merge_audit": {
+    "a8fe55b54": [
+      {
+        "path": "lib/api/src/backend/sys/async_runtime.rs",
+        "matches_source": true,
+        "retained_upstream_or_integration_delta": false
+      },
+      {
+        "path": "lib/api/src/backend/sys/entities/function/mod.rs",
+        "matches_source": false,
+        "retained_upstream_or_integration_delta": true
+      },
+      {
+        "path": "lib/api/src/backend/sys/entities/module.rs",
+        "matches_source": true,
+        "retained_upstream_or_integration_delta": false
+      },
+      {
+        "path": "lib/api/src/backend/sys/mod.rs",
+        "matches_source": true,
+        "retained_upstream_or_integration_delta": false
+      },
+      {
+        "path": "lib/api/src/entities/store/context.rs",
+        "matches_source": true,
+        "retained_upstream_or_integration_delta": false
+      },
+      {
+        "path": "lib/api/src/entities/store/local_rwlock.rs",
+        "matches_source": true,
+        "retained_upstream_or_integration_delta": false
+      },
+      {
+        "path": "lib/api/src/utils/mod.rs",
+        "matches_source": true,
+        "retained_upstream_or_integration_delta": false
+      },
+      {
+        "path": "lib/api/src/utils/teardown_tls.rs",
+        "matches_source": true,
+        "retained_upstream_or_integration_delta": false
+      },
+      {
+        "path": "lib/api/tests/async_sync_borrow.rs",
+        "matches_source": true,
+        "retained_upstream_or_integration_delta": false
+      },
+      {
+        "path": "lib/vm/src/trap/traphandlers.rs",
+        "matches_source": true,
+        "retained_upstream_or_integration_delta": false
+      }
+    ],
+    "a9a39c9cb": [
+      {
+        "path": "lib/api/src/backend/sys/async_runtime.rs",
+        "matches_source": true,
+        "retained_upstream_or_integration_delta": false
+      },
+      {
+        "path": "lib/api/src/backend/sys/mod.rs",
+        "matches_source": true,
+        "retained_upstream_or_integration_delta": false
+      },
+      {
+        "path": "lib/api/src/entities/store/local_rwlock.rs",
+        "matches_source": true,
+        "retained_upstream_or_integration_delta": false
+      }
+    ]
+  },
+  "remaining_difference_count": 93
+}

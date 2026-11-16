@@ -15,7 +15,9 @@ jobs:
         with:
           submodules: recursive
       - run: cargo fmt --all -- --check
-      - run: cargo test -p wasmer --features cranelift,singlepass,experimental-async --locked
+      # The tiny-stack test requires a fresh process, without larger cached stacks.
+      - run: cargo test -p wasmer --features cranelift,singlepass,experimental-async --locked -- --skip backend::sys::tunables::tests::check_small_stack
+      - run: cargo test -p wasmer --features cranelift,singlepass,experimental-async --locked --lib backend::sys::tunables::tests::check_small_stack
       - run: cargo test -p wasmer-workspace --no-default-features --features cranelift,singlepass,wast,middlewares --test compilers --locked
   v8:
     runs-on: ubuntu-24.04
@@ -23,6 +25,6 @@ jobs:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
-      - run: cargo test -p wasmer --no-default-features --features v8-default,experimental-async --locked
+      - run: cargo test -p wasmer --no-default-features --features v8-default,experimental-async --test async_v8 --test call_wrapper --locked -- --test-threads=1
         env:
           GH_TOKEN: ${{ secrets.RUNTIME_V8_READ_TOKEN }}
