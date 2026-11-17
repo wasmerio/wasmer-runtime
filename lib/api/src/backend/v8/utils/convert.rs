@@ -138,7 +138,7 @@ pub(crate) fn validate_raw_values(
 }
 
 fn validate_raw_value(value: &wasm_val_t, expected: Type) -> Result<(), crate::RuntimeError> {
-    let kind = value.kind as u32;
+    let kind = value.kind as bindings::wasm_valkind_enum;
     let valid = match expected {
         Type::FuncRef | Type::ExternRef => matches!(
             kind,
