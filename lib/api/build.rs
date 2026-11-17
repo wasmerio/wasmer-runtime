@@ -40,8 +40,9 @@ fn build_v8() {
         );
     }
 
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
     let (asset_name, platform_name) = match (
-        env::var("CARGO_CFG_TARGET_OS").unwrap().as_str(),
+        target_os.as_str(),
         env::var("CARGO_CFG_TARGET_ARCH").unwrap().as_str(),
         env::var("CARGO_CFG_TARGET_ENV")
             .unwrap_or_default()
@@ -68,7 +69,7 @@ fn build_v8() {
         })
         .join(platform_name);
     let archive_path = cache_dir.join(asset_name);
-    let library_name = if cfg!(target_os = "windows") {
+    let library_name = if target_os == "windows" {
         "v8.lib"
     } else {
         "libv8.a"
@@ -340,7 +341,7 @@ fn build_v8() {
         .map(|(old, new)| {
             // A bit hacky: we need a way to figure out if we're going to target a Mach-O
             // library or an ELF one to take care of the "_" in front of symbols.
-            if cfg!(any(target_os = "macos", target_os = "ios")) {
+            if matches!(target_os.as_str(), "macos" | "ios") {
                 format!("--redefine-sym=_{old}={new}")
             } else {
                 format!("--redefine-sym={old}={new}")
@@ -397,9 +398,9 @@ fn build_v8() {
 
     println!("cargo:rustc-link-lib=static=v8prefixed");
     // Static link dependencies must follow the archive that references them.
-    if cfg!(any(target_os = "linux",)) {
+    if target_os == "linux" {
         println!("cargo:rustc-link-lib=stdc++");
-    } else if cfg!(target_os = "windows") {
+    } else if target_os == "windows" {
         println!("cargo:rustc-link-lib=winmm");
         println!("cargo:rustc-link-lib=dbghelp");
         println!("cargo:rustc-link-lib=shlwapi");
