@@ -390,6 +390,8 @@ fn build_v8() {
     cc::Build::new()
         .cpp(true)
         .cpp_link_stdlib(None)
+        // The published Windows V8 archive uses the static MSVC runtime.
+        .static_crt(target_os == "windows")
         .std("c++11")
         .define("LIBWASM_STATIC", None)
         .include(&v8_header_path)
