@@ -3,8 +3,8 @@ use std::{
     ffi::CStr,
     marker::PhantomData,
     sync::{
-        Arc, LazyLock,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
     },
 };
 
@@ -12,6 +12,102 @@ use dashmap::{DashMap, Entry};
 use wasmer_types::StoreId;
 
 use super::*;
+
+impl InterruptSignal {
+    fn as_raw(self) -> i32 {
+        match self {
+            Self::Sigusr1 => libc::SIGUSR1,
+            Self::Sigusr2 => libc::SIGUSR2,
+        }
+    }
+}
+
+struct InterruptSignalConfig {
+    selected: InterruptSignal,
+    /// Whether an embedder explicitly selected the signal. Needed to tell
+    /// "still at the default" apart from "explicitly set to the default",
+    /// since only the latter conflicts with a later, different selection.
+    explicitly_selected: bool,
+    /// Whether the signal handler was already installed, after which the
+    /// selection can no longer change.
+    handler_installed: bool,
+}
+
+/// Guards changes to the selected interrupt signal. Never locked from
+/// within the signal handler.
+static INTERRUPT_SIGNAL_CONFIG: Mutex<InterruptSignalConfig> = Mutex::new(InterruptSignalConfig {
+    selected: DEFAULT_INTERRUPT_SIGNAL,
+    explicitly_selected: false,
+    handler_installed: false,
+});
+
+/// The raw value of the selected signal, kept in sync with
+/// [`INTERRUPT_SIGNAL_CONFIG`]. This exists separately because mutexes can't
+/// be locked from within a signal handler, and the handler needs to know
+/// which signal is the interrupt signal.
+static INTERRUPT_SIGNAL_RAW: AtomicI32 = AtomicI32::new(libc::SIGUSR1);
+
+/// Selects the process-wide signal used to interrupt running WASM code.
+///
+/// This must be called before any Wasmer engine or store is created, since
+/// the signal handler is installed as part of that process and the signal
+/// can't be changed afterwards. Selecting the same signal more than once is
+/// allowed, even after the handler was installed.
+pub fn set_interrupt_signal(signal: InterruptSignal) -> Result<(), SetInterruptSignalError> {
+    let mut config = INTERRUPT_SIGNAL_CONFIG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    if config.selected == signal {
+        config.explicitly_selected = true;
+        return Ok(());
+    }
+
+    if config.handler_installed {
+        return Err(SetInterruptSignalError::HandlerAlreadyInstalled {
+            current: config.selected,
+            requested: signal,
+        });
+    }
+
+    if config.explicitly_selected {
+        return Err(SetInterruptSignalError::AlreadySet {
+            current: config.selected,
+            requested: signal,
+        });
+    }
+
+    config.selected = signal;
+    config.explicitly_selected = true;
+    INTERRUPT_SIGNAL_RAW.store(signal.as_raw(), Ordering::SeqCst);
+
+    Ok(())
+}
+
+/// Returns the signal currently selected for interrupting WASM code.
+pub fn interrupt_signal() -> InterruptSignal {
+    INTERRUPT_SIGNAL_CONFIG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .selected
+}
+
+/// Locks in the selected interrupt signal and returns its raw value. Called
+/// when the trap handlers are installed; any later attempt to select a
+/// different signal fails.
+pub(crate) fn install_interrupt_signal() -> i32 {
+    let mut config = INTERRUPT_SIGNAL_CONFIG
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    config.handler_installed = true;
+    config.selected.as_raw()
+}
+
+/// Returns the raw value of the selected interrupt signal. Safe to call from
+/// within a signal handler.
+pub(crate) fn interrupt_signal_raw() -> i32 {
+    INTERRUPT_SIGNAL_RAW.load(Ordering::Relaxed)
+}
 
 /// All necessary data for interrupting a store running WASM code
 /// on a thread.
@@ -263,7 +359,10 @@ pub fn interrupt(store_id: StoreId) -> Result<(), InterruptError> {
 
     unsafe {
         #[allow(trivial_numeric_casts)]
-        let errno = libc::pthread_kill(store_state.pthread as libc::pthread_t, libc::SIGUSR1);
+        let errno = libc::pthread_kill(
+            store_state.pthread as libc::pthread_t,
+            interrupt_signal_raw(),
+        );
         if errno != 0 {
             let error_str = CStr::from_ptr(libc::strerror(errno)).to_str().unwrap();
             return Err(InterruptError::FailedToSendSignal(error_str));

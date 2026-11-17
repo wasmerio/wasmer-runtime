@@ -90,6 +90,12 @@ impl StoreObjects {
     }
 }
 
+#[cfg(all(unix, feature = "experimental-host-interrupt"))]
+pub use wasmer_vm::interrupt_registry::{
+    DEFAULT_INTERRUPT_SIGNAL, InterruptSignal, SetInterruptSignalError, interrupt_signal,
+    set_interrupt_signal,
+};
+
 /// Allows embedders to interrupt a running WASM instance.
 #[cfg(all(unix, feature = "experimental-host-interrupt"))]
 #[derive(Clone)]

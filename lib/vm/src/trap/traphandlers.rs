@@ -265,7 +265,7 @@ cfg_select! {
         static mut PREV_SIGFPE: MaybeUninit<libc::sigaction> = MaybeUninit::uninit();
 
         #[cfg(feature = "experimental-host-interrupt")]
-        static mut PREV_SIGUSR1: MaybeUninit<libc::sigaction> = MaybeUninit::uninit();
+        static mut PREV_INTERRUPT_SIGNAL: MaybeUninit<libc::sigaction> = MaybeUninit::uninit();
 
         unsafe fn platform_init() { unsafe {
             let register = |slot: &mut MaybeUninit<libc::sigaction>, signal: i32, nodefer: bool| {
@@ -303,12 +303,16 @@ cfg_select! {
             // Handle `unreachable` instructions which execute `ud2` right now
             register(&mut PREV_SIGILL, libc::SIGILL, true);
 
-            // SIGUSR1 is used to interrupt long-running WASM code.
+            // The selected interrupt signal is used to interrupt long-running WASM code.
             // It doesn't use NODEFER since, if a second interruption
             // request comes in while one is already being processed,
             // there's nothing meaningful we can do.
             #[cfg(feature = "experimental-host-interrupt")]
-            register(&mut PREV_SIGUSR1, libc::SIGUSR1, false);
+            register(
+                &mut PREV_INTERRUPT_SIGNAL,
+                interrupt_registry::install_interrupt_signal(),
+                false,
+            );
 
             // x86 uses SIGFPE to report division by zero
             if cfg!(target_arch = "x86") || cfg!(target_arch = "x86_64") {
@@ -370,7 +374,7 @@ cfg_select! {
                 libc::SIGFPE => &PREV_SIGFPE,
                 libc::SIGILL => &PREV_SIGILL,
                 #[cfg(feature = "experimental-host-interrupt")]
-                libc::SIGUSR1 => &PREV_SIGUSR1,
+                signal if signal == interrupt_registry::interrupt_signal_raw() => &PREV_INTERRUPT_SIGNAL,
                 _ => panic!("unknown signal: {signum}"),
             };
             // We try to get the fault address associated to this signal
@@ -387,7 +391,7 @@ cfg_select! {
                     process_illegal_op(addr)
                 }
                 #[cfg(feature = "experimental-host-interrupt")]
-                libc::SIGUSR1 => {
+                signal if signal == interrupt_registry::interrupt_signal_raw() => {
                     // If we're not running WASM code from the specific store for which
                     // an interrupt was requested, there's nothing to do.
                     if !interrupt_registry::on_interrupted() {
@@ -415,7 +419,7 @@ cfg_select! {
             // If we're not running WASM code at all, there's nothing to
             // do for an interrupt.
             #[cfg(feature = "experimental-host-interrupt")]
-            if signum == libc::SIGUSR1 {
+            if signum == interrupt_registry::interrupt_signal_raw() {
                 return;
             }
 
