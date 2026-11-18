@@ -25,21 +25,16 @@ Book](https://rust-fuzz.github.io/book/cargo-fuzz.html).
 
 ## Running a fuzzer
 
-This directory provides multiple fuzzers, like for example `validate`. You can run it with:
+Use a nightly Rust toolchain with `cargo-fuzz`. For example, from the
+repository root:
 
 ```sh
-$ cargo fuzz run validate
+rustup toolchain install nightly
+cargo +nightly fuzz run --features=cranelift,sanitizer cranelift
 ```
 
-Another example with the `cranelift` fuzzer:
-
-```sh
-$ cargo fuzz run --features=cranelift,sanitizer cranelift
-```
-
-See the
-[`fuzz/fuzz_targets`](https://github.com/wasmerio/wasmer/tree/main/fuzz/fuzz_targets/)
-directory for the full list of fuzzers.
+See [`Cargo.toml`](./Cargo.toml) for the target names and required features,
+and [`fuzz_targets`](./fuzz_targets) for their implementations.
 
 You should see output that looks something like this:
 
@@ -58,8 +53,8 @@ You should see output that looks something like this:
 It will continue to generate random inputs forever, until it finds a
 bug or is terminated. The testcases for bugs it finds go into
 `fuzz/artifacts/cranelift` and you can rerun the fuzzer on a
-single input by passing it on the command line `cargo fuzz run
-cranelift /path/to/testcase`.
+single input by running
+`cargo +nightly fuzz run --features=cranelift,sanitizer cranelift /path/to/testcase`.
 
 ## The corpus
 
@@ -74,7 +69,7 @@ work for this purpose because we use a custom configuration to our
 `DUMP_TESTCASE=path`. For example:
 
 ```sh
-$ DUMP_TESTCASE=/tmp/crash.wasm cargo fuzz run --features=singlepass,sanitizer singlepass fuzz/artifacts/singlepass/crash-0966412eab4f89c52ce5d681807c8030349470f6
+$ DUMP_TESTCASE=/tmp/crash.wasm cargo +nightly fuzz run --features=singlepass,sanitizer singlepass /path/to/testcase
 ```
 
 [`cargo-fuzz`]: https://github.com/rust-fuzz/cargo-fuzz

@@ -1,6 +1,6 @@
 ---
 name: "❓ Question"
-about: Ask a question about this project
+about: Ask a question about Wasmer Runtime
 title: ''
 labels: "❓ question"
 assignees: ''

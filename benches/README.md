@@ -1,4 +1,12 @@
-# Wasmer Benches
+# Runtime benchmarks
 
-This directory contains small, punctual benches. Other benchmarks are
-landing somewhere else. We will update this section soon.
+These Criterion benchmarks cover runtime operations such as compilation,
+instantiation, and function calls. After following the
+[build setup](../docs/BUILD.md), run a benchmark from the repository root:
+
+```sh
+cargo bench --locked -p wasmer-workspace --features cranelift --bench compile
+```
+
+See the `[[bench]]` entries in [`Cargo.toml`](../Cargo.toml) for available
+benchmarks and required features.

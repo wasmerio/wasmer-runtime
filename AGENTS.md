@@ -1,41 +1,31 @@
 # Working in this repo as an agent
 
-Before your first edit, read `docs/CONTRIBUTING.md` and `docs/BUILD.md` in
-full, plus the row below covering whatever you are about to touch. Skipping one
-of those docs does not exempt you from what it says.
+This repository contains the embeddable Wasmer runtime and its Rust crates.
+The CLI, WASI/WASIX, C API, and package tooling belong in
+[`wasmerio/wasmer`](https://github.com/wasmerio/wasmer).
 
-Always read:
+Before your first edit, read these guides:
 
-| Read                   | For                                                    |
-| ---------------------- | ------------------------------------------------------ |
-| `docs/CONTRIBUTING.md` | PR expectations, commit format, lint gates, code style |
-| `docs/ARCHITECTURE.md` | the crate map, one place per concern, submodules       |
-| `docs/BUILD.md`        | toolchain setup, compiler backends, fast iteration     |
-| `docs/TEST.md`         | test suites, WAST spec tests, `tests/ignores.txt`      |
-| `docs/SECURITY.md`     | supported versions, how to report vulnerabilities      |
+| Read | For |
+| --- | --- |
+| [CONTRIBUTING.md](./docs/CONTRIBUTING.md) | PR expectations, lint, and code style |
+| [BUILD.md](./docs/BUILD.md) | Toolchain setup and backend features |
+| [ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Workspace layout and submodules |
+| [TEST.md](./docs/TEST.md) | Compiler tests, WAST fixtures, and CI |
+| [SECURITY.md](./docs/SECURITY.md) | Private vulnerability reporting |
 
-Read if necessary:
+For platform-specific work, see [RISCV.md](./docs/RISCV.md) for RISC-V support.
 
-| If necessary        | For                            |
-| ------------------- | ------------------------------ |
-| `docs/journal.md`   | snapshot and restore internals |
-| `docs/PACKAGING.md` | distro packaging constraints   |
-| `docs/RISCV.md`     | state of RISC-V support        |
-
-Trust the repository more than any doc. `Makefile` targets and `--help`
-output beat external docs, and docs.wasmer.io lags this repository.
+Trust the workspace manifests, test harness, and CI configuration over external
+docs. Use Cargo and select the package and backend features relevant to the change.
 
 ## Before you write code
 
-Every new test, fixture, syscall implementation, or backend arm has a
-sibling in this repo that already does the same kind of thing. Find it and
-match its location, naming, and structure. If you cannot find one, say so
-before inventing a layout.
+Find a sibling test, fixture, or backend implementation and match its location,
+naming, and structure. If you cannot find one, say so before inventing a layout.
 
-Before implementing a new mechanism, state the design in one or two
-sentences and get agreement. Prioritise the smallest diff that slots into
-existing machinery. Work already done is not an argument for keeping a
-shape: if the design is wrong, say so rather than defending it.
+Before implementing a new mechanism, state the design in one or two sentences
+and get agreement. Prefer the smallest change that fits the existing code.
 
 ## Attribution
 
@@ -43,45 +33,19 @@ An agent MUST disclose that it is the one that committed its changes, and
 MUST NOT feign being a user. The human user is fully responsible for all
 contributions.
 
-## Debugging the Runtime
+## Debugging the runtime
 
-### Logging
-
-Set `RUST_LOG` with standard EnvFilter syntax, for example:
-
-```bash
-RUST_LOG="warn,wasmer_wasix=trace" wasmer run file.wasm
-```
-
-The `-v` to `-vvvv` flags map to warn/info/debug/trace for the targets
-`wasmer`, `wasmer_wasix`, and `virtual_fs`.
-
-`make build-wasmer-debug` builds a debug binary with tokio-console support.
-
-### Run the Workspace CLI Directly
-
-```bash
-cargo run -p wasmer-cli --features cranelift -- run file.wasm
-```
-
-### Inspect and Author Wasm
-
-- Inspect a module with `wasm-tools print file.wasm`. Pipe through `head`
-  or `grep` — the output is large.
-- Author test cases with `wasm-tools parse file.wat -o file.wasm`.
-- Reduce hard cases with `wasm-opt` and `creduce`.
-
-### Compile a C Repro to WASIX
-
-```bash
-WASIXCC_WASM_EXCEPTIONS=1 WASIXCC_PIC=1 wasixcc -g -O0 file.c -o file.wasm
-```
-
-### Debug a Failing WAST Test
-
-Find the `.wast` file under `tests/wast/`, then rerun with the
-backend-filtered command from [docs/TEST.md](./docs/TEST.md). The runner
-prints `Running wast <path>`.
+- Run a small Rust embedding [example](./examples/README.md), or add a regression
+  to the relevant crate or [`tests/compilers`](./tests/compilers).
+- For a failing WAST test, find the fixture under `tests/wast/` and rerun the
+  backend-specific test with `--nocapture`; see [TEST.md](./docs/TEST.md#running-a-single-wast-test).
+  The runner prints `Running wast` with the fixture path.
+- The compiler tests use `test-log`. Set `RUST_LOG` (for example,
+  `RUST_LOG=warn,wasmer_compiler_cranelift=debug`) and use `--nocapture` to see
+  the output immediately.
+- Inspect a module with `wasm-tools print file.wasm`; limit large output with
+  `head` or `grep`. Convert text to Wasm with `wasm-tools parse file.wat -o file.wasm`.
+  Use `wasm-opt` or `creduce` to reduce large fixtures.
 
 ## Personal execution preferences
 

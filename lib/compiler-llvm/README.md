@@ -1,48 +1,30 @@
-# `wasmer-compiler-llvm` [![Build Status](https://github.com/wasmerio/wasmer/actions/workflows/build.yml/badge.svg?style=flat-square)](https://github.com/wasmerio/wasmer/actions?query=workflow%3Abuild) [![Join Wasmer Slack](https://img.shields.io/static/v1?label=Slack&message=join%20chat&color=brighgreen&style=flat-square)](https://slack.wasmer.io) [![BUSL-1.1 License](https://img.shields.io/badge/license-BUSL--1.1-blue?style=flat-square)](https://github.com/wasmerio/wasmer/blob/main/lib/compiler-llvm/LICENSE) [![crates.io](https://img.shields.io/crates/v/wasmer-compiler-llvm.svg)](https://crates.io/crates/wasmer-compiler-llvm)
+# `wasmer-compiler-llvm`
 
-This crate contains a compiler implementation based on [the LLVM Compiler Infrastructure][LLVM].
+[![BUSL-1.1 License](https://img.shields.io/badge/license-BUSL--1.1-blue?style=flat-square)](./LICENSE)
+[![crates.io](https://img.shields.io/crates/v/wasmer-compiler-llvm.svg)](https://crates.io/crates/wasmer-compiler-llvm)
+
+This crate implements a Wasmer compiler using [LLVM](https://llvm.org/). It
+prioritizes optimizing generated code over compilation speed. Benchmark on
+your workload when selecting a compiler.
 
 ## Usage
 
 ```rust
-use wasmer::{Store, EngineBuilder};
+use wasmer::Store;
 use wasmer_compiler_llvm::LLVM;
 
-let compiler = LLVM::new();
-let mut store = Store::new(compiler);
+let mut store = Store::new(LLVM::default());
 ```
 
-*Note: you can find a [full working example using LLVM compiler here][example].*
-
-## When to use LLVM
-
-We recommend using LLVM as the default compiler when running WebAssembly
-files on any **production** system, as it offers maximum performance near
-to native speeds.
+See the [runnable LLVM example](../../examples/compiler_llvm.rs).
 
 ## Requirements
 
-The LLVM compiler requires a valid installation of LLVM in your system.
-It currently requires **LLVM 23.1**.
+Building this backend requires **LLVM 23.1**. Install it with your platform's
+package manager if available, or use a compatible [LLVM build](https://releases.llvm.org/download.html).
+CI uses the [Wasmer LLVM builds](https://github.com/wasmerio/llvm-custom-builds/releases/tag/23.x)
+on some platforms.
 
-
-You can install LLVM easily on your Debian-like system via this command:
-
-```bash
-wget https://apt.llvm.org/llvm.sh -O /tmp/llvm.sh
-sudo bash /tmp/llvm.sh 23
-sudo apt install libpolly-23-dev
-```
-
-Or in macOS:
-
-```bash
-brew install llvm@23
-```
-
-Or via any of the [pre-built binaries that LLVM offers][llvm-pre-built].
-
-
-[LLVM]: https://llvm.org/
-[example]: https://github.com/wasmerio/wasmer/blob/main/examples/compiler_llvm.rs
-[llvm-pre-built]: https://releases.llvm.org/download.html
+If needed, point `LLVM_SYS_231_PREFIX` at the LLVM installation prefix.
+See the [runtime build guide](../../docs/BUILD.md#llvm-compiler) for the Cargo
+command that enables this backend.

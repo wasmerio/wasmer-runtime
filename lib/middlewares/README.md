@@ -7,6 +7,4 @@ middlewares:
   executed in total and putting a limit on the total number of
   operators executed.
 
-  [See the `metering`
-  example](https://github.com/wasmerio/wasmer/blob/main/examples/metering.rs)
-  to get a concrete and complete example.
+  See the runnable [metering example](../../examples/metering.rs).

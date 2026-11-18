@@ -1,12 +1,12 @@
-# Wasmer Attributions
+# Wasmer Runtime attributions
 
 Wasmer is a community effort and makes use of code from various other
 projects ❤️.
 Listed below are notable sections of code that are licensed
 from other projects and the relevant license of those projects.
 
-These are the projects that were used as inspiration and/or that we are using code from.
-Each of the subcrates we have an `Acknowledgements` section with more details.
+This file includes historical notices from the original Wasmer repository.
+See the runtime crate READMEs for acknowledgments specific to each crate.
 
 Projects:
 

@@ -1,15 +1,15 @@
-# Custom wast tests
+# Wasmer-specific WAST tests
 
-In this directory we have created wast tests for different cases
-where we want to test other scenarios than the ones offered
-by the standard WebAssembly spectests.
+These fixtures cover runtime regressions beyond the standard WebAssembly
+spec tests. See the [testing guide](../../../docs/TEST.md#running-a-single-wast-test)
+for how to run a specific fixture.
 
 ## NaN canonicalization: `nan-canonicalization.wast`
 
 This is an extra set of tests that assure that operations with NaNs
 are deterministic regardless of the environment/chipset where it executes in.
 
-## Call Indirect Spilled Stack: `call-indirect-spilledd-stack.wast`
+## Call Indirect Spilled Stack: `call-indirect-spilled-stack.wast`
 
 We had an issue occurring that was making singlepass not working properly
 on the WebAssembly benchmark: https://00f.net/2019/10/22/updated-webassembly-benchmark/.
@@ -35,8 +35,8 @@ This is a simple test to check that a divide by zero is correctly trapped
 
 ## Atomic Load: `atomic_load.wast`
 
-This is a simple test to check that load an atomic "to far" in memory trigger a OutOfBound trap
+An out-of-bounds atomic load must trap.
 
-## Nested Unreachable Blocks: `nested_unreachable_blocks.wast`
+## Nested Unreachable Blocks: `nested-unreachable-blocks.wast`
 
 This was broken at one point in our LLVM backend. Otherwise, it's nothing specific.

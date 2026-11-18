@@ -1,94 +1,50 @@
-# `wasmer` [![Build Status](https://github.com/wasmerio/wasmer/actions/workflows/build.yml/badge.svg?style=flat-square)](https://github.com/wasmerio/wasmer/actions?query=workflow%3Abuild) [![Join Wasmer Slack](https://img.shields.io/static/v1?label=Slack&message=join%20chat&color=brighgreen&style=flat-square)](https://slack.wasmer.io) [![MIT License](https://img.shields.io/github/license/wasmerio/wasmer.svg?style=flat-square)](https://github.com/wasmerio/wasmer/blob/main/LICENSE) [![crates.io](https://img.shields.io/crates/v/wasmer.svg)](https://crates.io/crates/wasmer)
+# `wasmer`
 
-[`Wasmer`](https://wasmer.io/) is the most popular
-[WebAssembly](https://webassembly.org/) runtime for Rust. It supports JIT (Just
-In Time), AOT (Ahead Of Time) compilation, an experimental interpreter as well
-as pluggable compilers suited to your needs.
+[![crates.io](https://img.shields.io/crates/v/wasmer.svg)](https://crates.io/crates/wasmer)
 
-It's designed to be safe and secure, and runnable in any kind of environment.
+The `wasmer` crate is the public Rust API of
+[Wasmer Runtime](https://github.com/wasmerio/wasmer-runtime), an embeddable
+[WebAssembly](https://webassembly.org/) engine.
 
 ## Usage
 
-Here is a small example of using Wasmer to run a WebAssembly module
-written with its WAT format (textual format):
+Add `wasmer` with `cargo add wasmer`. The default native configuration uses
+Cranelift and accepts both binary WebAssembly and its text format (WAT):
 
 ```rust
-use wasmer::{Store, Module, Instance, Value, imports};
+use wasmer::{imports, Instance, Module, Store};
 
-fn main() -> anyhow::Result<()> {
-    let module_wat = r#"
-    (module
-    (type $t0 (func (param i32) (result i32)))
-    (func $add_one (export "add_one") (type $t0) (param $p0 i32) (result i32)
-        local.get $p0
-        i32.const 1
-        i32.add))
-    "#;
-
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut store = Store::default();
-    let module = Module::new(&store, &module_wat)?;
-    // The module doesn't import anything, so we create an empty import object.
-    let import_object = imports! {};
-    let instance = Instance::new(&mut store, &module, &import_object)?;
-
-    let add_one = instance.exports.get_function("add_one")?;
-    let result = add_one.call(&mut store, &[Value::I32(42)])?;
-    assert_eq!(result[0], Value::I32(43));
-
+    let module = Module::new(
+        &store,
+        r#"(module
+            (func (export "add_one") (param i32) (result i32)
+                local.get 0
+                i32.const 1
+                i32.add))"#,
+    )?;
+    let instance = Instance::new(&mut store, &module, &imports! {})?;
+    let add_one = instance.exports.get_typed_function::<i32, i32>(&store, "add_one")?;
+    assert_eq!(add_one.call(&mut store, 42)?, 43);
     Ok(())
 }
 ```
 
-[Discover the full collection of examples](https://github.com/wasmerio/wasmer/tree/main/examples).
+## Backends and compilation
 
-## Features
+- **Native (`sys`)**: choose the Cranelift, Singlepass, or LLVM compiler with
+  Cargo features. You can enable more than one and select the compiler when
+  creating an engine.
+- **V8**: on supported native targets, use `v8-default` with default features
+  disabled to select V8 instead of the native compiler stack.
+- **JavaScript host (`js`)**: build a Rust program for
+  `wasm32-unknown-unknown` with `js-default` and default features disabled.
+  Execution uses the host's WebAssembly engine.
+- **Ahead-of-time compilation**: compile a module for a target and serialize
+  it for later use. A headless engine can load compatible compiled artifacts
+  without a compiler. Only deserialize artifacts you trust.
 
-Wasmer is not only fast, but also designed to be *highly customizable*:
-
-* **Pluggable compilers** — A compiler is used by the engine to
-  transform WebAssembly into executable code:
-  * [`wasmer-compiler-singlepass`] provides a fast compilation-time
-    but an unoptimized runtime speed,
-  * [`wasmer-compiler-cranelift`] provides the right balance between
-    compilation-time and runtime performance, useful for development,
-  * [`wasmer-compiler-llvm`] provides a deeply optimized executable
-    code with the fastest runtime speed, ideal for production. 
-    
-* **Headless mode** — Once a WebAssembly module has been compiled, it
-  is possible to serialize it in a file for example, and later execute
-  it with Wasmer with headless mode turned on. Headless Wasmer has no
-  compiler, which makes it more portable and faster to load. It's
-  ideal for constrained environments.
-  
-* **Cross-compilation** — Most compilers support cross-compilation. It
-  means it possible to pre-compile a WebAssembly module targeting a
-  different architecture or platform and serialize it, to then run it
-  on the targeted architecture and platform later.
-
-* **Run Wasmer in a JavaScript environment** — With the `js` Cargo
-  feature, it is possible to compile a Rust program using Wasmer to
-  WebAssembly. In this context, the resulting WebAssembly module will
-  expect to run in a JavaScript environment, like a browser, Node.js,
-  Deno and so on. In this specific scenario, there is no engines or
-  compilers available, it's the one available in the JavaScript
-  environment that will be used.
-
-Wasmer ships by default with the Cranelift compiler as its great for
-development purposes.  However, we strongly encourage to use the LLVM
-compiler in production as it performs about 50% faster, achieving
-near-native speeds.
-
-Note: if one wants to use multiple compilers at the same time, it's
-also possible! One will need to import them directly via each of the
-compiler crates.
-
-Read [the documentation to learn
-more](https://wasmerio.github.io/wasmer/crates/doc/wasmer/).
-
----
-
-Made with ❤️ by the Wasmer team, for the community
-
-[`wasmer-compiler-singlepass`]: https://github.com/wasmerio/wasmer/tree/main/lib/compiler-singlepass
-[`wasmer-compiler-cranelift`]: https://github.com/wasmerio/wasmer/tree/main/lib/compiler-cranelift
-[`wasmer-compiler-llvm`]: https://github.com/wasmerio/wasmer/tree/main/lib/compiler-llvm
+See the [Rust API reference](https://docs.rs/wasmer/), the
+[build guide](../../docs/BUILD.md#selecting-a-backend), and the
+[runnable examples](../../examples/README.md).

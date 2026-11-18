@@ -1,6 +1,7 @@
 # Wasmer Documentation Assets
 
-This directory contains documentation assets.
+This directory contains documentation assets, including the runtime diagrams
+used by the [embedding examples](../examples/README.md).
 
 `logo.svg` contains the Wasmer wordmark from the inline `Logo` SVG on
 [wasmer.io](https://wasmer.io), retrieved on September 17, 2026. The original

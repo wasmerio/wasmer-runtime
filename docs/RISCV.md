@@ -1,12 +1,10 @@
-# Current state of the RISCV support
+# RISC-V support in Wasmer Runtime
 
-Only Cranelift and LLVM compiler are supported.
-Singlepass can be done, but no resources are allocated on this task for now.
+Cranelift and LLVM support `riscv64`. The
+[Singlepass backend](../lib/compiler-singlepass/README.md) has experimental
+`riscv64` support.
 
-Both LLVM and Cranelift support are quite new, and so it is expected to have a few things not working well.
-
-LLVM code needs a hack to force the ABI to "lp64d", and some tested with function & float/double values are still not working correctly and have be disable for now.
-
-On Cranelift, SIMD is not supported as the CPU doesn't have official SIMD/Vector extension for now, and no Workaround is in place.
-
-Test have be conducted on actual hardware, with a Vision Five 2 board running Debian. Some previous tests have also be done on a Vison Five 1 running Fedora (with LLVM only).
+CI runs the Cranelift tests for `riscv64gc-unknown-linux-gnu`; see
+[`test.yaml`](../.github/workflows/test.yaml) for the runner and feature flags.
+Known limitations, including skipped Cranelift SIMD tests and LLVM ABI-related
+failures, are tracked in [`tests/ignores.txt`](../tests/ignores.txt).

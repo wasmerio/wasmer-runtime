@@ -1,30 +1,26 @@
-# Repository Architecture
+# Runtime repository architecture
 
-This document maps the workspace, one crate per concern. The workspace
-holds tens of crates; the full listing is the `members` section of the
-root [Cargo.toml](../Cargo.toml). The table below covers the paths you
-will touch most:
+The [`members` list in Cargo.toml](../Cargo.toml) is the source of truth for
+the workspace. The root package, `wasmer-workspace`, provides examples,
+benchmarks, and compiler integration tests.
 
-| Path                                                  | Content                                                              |
-| ----------------------------------------------------- | -------------------------------------------------------------------- |
-| `lib/api`                                             | Public `wasmer` crate. Flavors: `sys` (native, default), `v8`, `js`. |
-| `lib/cli`                                             | CLI crate `wasmer-cli`. Binaries: `wasmer`, `wasmer-headless`.       |
-| `lib/compiler`                                        | Compiler framework and traits.                                       |
-| `lib/compiler-{singlepass,cranelift,llvm}`            | The three compiler backends.                                         |
-| `lib/vm`                                              | Low-level VM runtime.                                                |
-| `lib/wasix`                                           | The WASIX implementation (syscalls, processes, threads).             |
-| `lib/journal`                                         | Snapshot and restore support. See [journal.md](./journal.md).        |
-| `lib/virtual-fs`, `lib/virtual-net`, `lib/virtual-io` | Host abstraction layers.                                             |
-| `lib/c-api`                                           | C API (`cdylib` named `wasmer`).                                     |
-| `lib/backend-api`                                     | GraphQL client for the Wasmer registry.                              |
-| `lib/config`, `lib/package`                           | `wasmer.toml` parsing and webc packaging.                            |
-| `tests/compilers`                                     | Integration tests (`wast.rs`, `traps.rs`, `issues.rs`, more).        |
-| `tests/wast/{spec,wasmer}`                            | WAST test files. `spec` is a submodule.                              |
+| Path | Purpose |
+| --- | --- |
+| [`lib/api`](../lib/api) | Public `wasmer` Rust API: modules, instances, stores, and imports and exports. Includes the native (`sys`), V8, and JavaScript host backends. |
+| [`lib/compiler`](../lib/compiler) | Native engine, shared compiler traits, Wasm translation, and compilation artifacts. |
+| [`lib/compiler-cranelift`](../lib/compiler-cranelift), [`lib/compiler-singlepass`](../lib/compiler-singlepass), [`lib/compiler-llvm`](../lib/compiler-llvm) | Native compiler implementations. |
+| [`lib/vm`](../lib/vm) | Low-level native VM: instances, memory, tables, traps, and the Wasm ABI. |
+| [`lib/types`](../lib/types) | Shared WebAssembly types and metadata. |
+| [`lib/cache`](../lib/cache), [`lib/middlewares`](../lib/middlewares), [`lib/derive`](../lib/derive) | Compiled module caching, compiler middleware, and procedural macros. |
+| [`tests/compilers`](../tests/compilers), [`tests/wast`](../tests/wast), [`tests/lib`](../tests/lib) | Compiler integration tests, WAST suites, and test support crates. |
+| [`examples`](../examples), [`benches`](../benches), [`fuzz`](../fuzz) | Embedding examples, benchmarks, and fuzz targets. |
 
-The root crate is a meta-crate.
+The CLI, WASI/WASIX, C API, and package tooling are maintained in
+[`wasmerio/wasmer`](https://github.com/wasmerio/wasmer), not in this workspace.
 
 ## Submodules
 
-Three submodules: `tests/wast/spec`, `lib/napi`, `wasmer-test-files`.
+- `tests/wast/spec`: the WebAssembly spec testsuite.
+- `wasmer-test-files`: shared runtime test fixtures.
 
-For initialization and working with the different crates + submodules, see [BUILD.md](./BUILD.md)
+See [BUILD.md](./BUILD.md#getting-started) for initialization instructions.

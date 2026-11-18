@@ -1,63 +1,36 @@
-# How to Contribute to Wasmer
+# Contributing to Wasmer Runtime
 
-Thank you for your interest in contributing to Wasmer. This document
-outlines the expectations for issues and pull requests.
+## Issues and feature requests
 
-## Issues & Feature Requests
-
-Please use the issue template and provide a failing example if possible to
-help us recreate the issue.
+Use the [runtime issue tracker](https://github.com/wasmerio/wasmer-runtime/issues)
+for the Rust API, compilers, VM, and other runtime crates. Include the backend,
+Cargo features, host platform, and a minimal example if possible. For the CLI,
+WASI/WASIX, C API, and packaging, use the
+[original Wasmer issue tracker](https://github.com/wasmerio/wasmer/issues).
 
 > [!WARNING]
-> Do not fix a security vulnerability in a public PR. Embargoed work goes
-> through the private process in [SECURITY.md](./SECURITY.md). A public fix
-> before disclosure exposes users.
+> Do not report or fix a security vulnerability in a public issue or pull
+> request. Use the private process in [SECURITY.md](./SECURITY.md).
 
-## Code Style
+## Code style and local checks
 
-Sparse "why" comments. Short single-responsibility functions.
+Use short, single-responsibility functions. Prefer comments that explain why
+rather than restating the code.
 
-## Lint and Format
-
-CI rejects lint and format failures. Run before you push:
-
-```bash
-make lint
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked -p wasmer -- -D clippy::all
 ```
 
-The `lint` target in the [Makefile](../Makefile) defines exactly what
-runs. To apply clippy fixes in bulk:
+Adjust the package and features to cover what you changed, and run the relevant
+[runtime tests](./TEST.md). See the lint job in
+[`test.yaml`](../.github/workflows/test.yaml) for the full CI commands.
 
-```bash
-cargo clippy --all --exclude wasmer-swift --locked --fix --allow-dirty -- -D clippy::all
-```
+## Pull requests
 
-`cargo fmt` does not cover `lib/wasix/tests/wasm_tests`. CI formats those
-files with `rustfmt --edition 2024` directly.
-
-## Pull Requests
-
-For large changes, open a GitHub issue first to ensure we can accept the
-change once it is ready.
-
-- Title format is conventional-commit style with crate or area scopes:
-  `fix(Singlepass): ...`, `feat(wasix): ...`, `feat!: ...` for breaking
-  changes, `chore: ...`, `deps: ...`.
-- PRs are squash-merged to `main`. The PR template has one `# Description`
-  section.
-- Before you submit: `make lint`, then `cargo test` in the crates you
-  touched, then a build of the CLI.
-- Do not hand-edit `CHANGELOG.md` or crate versions. Releases generate
-  both (see [dev/release.md](./dev/release.md)).
-- macOS and musl CI jobs run on a PR only when the PR has the `macos` or
-  `musl` label. If your change touches platform code, add the label.
-- Do not commit a submodule pointer bump in an unrelated PR.
-
-## Common Build Issues
-
-### LLVM Dependency
-
-`Didn't find usable system-wide LLVM` means LLVM 23 is missing. Either
-install it or build with `ENABLE_LLVM=0`. See
-[Building Wasmer from Source](./BUILD.md#llvm-compiler) for installation
-instructions.
+- Discuss large changes in a GitHub issue first.
+- Use conventional-commit-style titles, for example `fix(Singlepass): ...`,
+  `feat(runtime): ...`, `feat!: ...`, `chore: ...`, or `deps: ...`.
+- Explain why the change is needed and say what you tested.
+- If the change affects macOS or musl, request the `macos` or `musl` CI label.
+- Do not bump crate versions or submodule pointers in unrelated PRs.
