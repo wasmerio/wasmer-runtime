@@ -358,15 +358,3 @@ Get help, share what you're building, and meet other Wasmer users:
 [X](https://x.com/wasmerio) ·
 [LinkedIn](https://www.linkedin.com/company/wasmerio) ·
 [Blog](https://wasmer.io/posts)
-
-<details>
-<summary>Community translations (may describe an earlier version)</summary>
-
-[中文](./docs/cn/README.md) ·
-[Deutsch](./docs/de/README.md) ·
-[Español](./docs/es/README.md) ·
-[Français](./docs/fr/README.md) ·
-[日本語](./docs/ja/README.md) ·
-[한국어](./docs/ko/README.md)
-
-</details>
