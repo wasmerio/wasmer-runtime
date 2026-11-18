@@ -85,20 +85,6 @@ def replace_version_py(path):
     )
 
 
-def replace_version_iss(path):
-    print(args.old_version + " -> " + args.release_version + " (" + path + ")")
-    replace(
-        path,
-        "AppVersion=" + args.old_version,
-        "AppVersion=" + args.release_version,
-    )
-    replace(
-        path,
-        "AppVersion=" + old_prerelease_version,
-        "AppVersion=" + release_prerelease_version,
-    )
-
-
 print(
     "Updating crate versions from "
     + args.old_version
@@ -116,8 +102,6 @@ for root, dirs, files in os.walk("."):
     for file in files:
         if "Cargo.toml" in file or "Cargo.standalone.toml" in file:
             replace_version(root + "/" + file)
-        elif "wasmer.iss" in file:
-            replace_version_iss(root + "/" + file)
         elif "publish.py" in file:
             replace_version_py(root + "/" + file)
 
