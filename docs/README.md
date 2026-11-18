@@ -22,8 +22,11 @@ The CLI, WASI/WASIX, C API, and packaging documentation are in the
 [original Wasmer repository](https://github.com/wasmerio/wasmer) and the
 [public Wasmer docs](https://docs.wasmer.io/). See the original repository for
 [distro packaging](https://github.com/wasmerio/wasmer/blob/main/docs/PACKAGING.md)
-and [release procedures](https://github.com/wasmerio/wasmer/blob/main/scripts/RELEASE.md).
-It also hosts the [historical changelog](https://github.com/wasmerio/wasmer/blob/main/CHANGELOG.md)
+and [product release procedures](https://github.com/wasmerio/wasmer/blob/main/scripts/RELEASE.md).
+This runtime repository does not ship the CLI or its installers. For the tooling
+that publishes Rust crates from this workspace, see [`scripts/publish.py`](../scripts/publish.py).
+
+The original repository also hosts the [historical changelog](https://github.com/wasmerio/wasmer/blob/main/CHANGELOG.md)
 and the [1.0](https://github.com/wasmerio/wasmer/blob/main/docs/migration_to_1.0.0.md)
 and [3.0](https://github.com/wasmerio/wasmer/blob/main/docs/migration_to_3.0.0.md)
 migration guides.

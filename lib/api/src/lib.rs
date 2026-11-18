@@ -64,7 +64,7 @@
 //! }
 //! ```
 //!
-//! [Discover the full collection of examples](https://github.com/wasmerio/wasmer/tree/main/examples).
+//! [Browse the runtime examples][wasmer-examples].
 //!
 //! # Overview of the Features
 //!
@@ -193,9 +193,9 @@
 //! on the core types in [`Value`]. In order to make them more useful we
 //! give them access to the outside world with [`imports!`].
 //!
-//! If you're looking for a sandboxed, POSIX-like environment to execute Wasm
-//! in, check out the [`wasmer-wasix`] crate for our implementation of WASI,
-//! the WebAssembly System Interface, and WASIX, the Extended version of WASI.
+//! For a POSIX-like environment, use [`wasmer-wasix`], which implements WASI
+//! and its WASIX extensions. It is maintained in the [Wasmer repository][wasmer-product],
+//! outside the runtime workspace.
 //!
 //! In the `wasmer` API we support functions which take their arguments and
 //! return their results dynamically, [`Function`], and functions which
@@ -221,18 +221,9 @@
 //!
 //! # Project Layout
 //!
-//! The Wasmer project is divided into a number of crates, below is a dependency
-//! graph with transitive dependencies removed.
-//!
-//! <div>
-//! <img src="https://raw.githubusercontent.com/wasmerio/wasmer/master/docs/deps_dedup.svg" />
-//! </div>
-//!
-//! While this crate is the top level API, we also publish crates built
-//! on top of this API that you may be interested in using, including:
-//!
-//! - [`wasmer-cache`] for caching compiled Wasm modules,
-//! - [`wasmer-wasix`] for running Wasm modules compiled to the WASI ABI.
+//! See the [runtime architecture guide][runtime-architecture] for a map of the
+//! workspace crates. This crate provides the public Rust API, and
+//! [`wasmer-cache`] adds caching for compiled Wasm modules.
 //!
 //! The Wasmer project has two major abstractions:
 //! 1. [Engine][wasmer-compiler],
@@ -391,7 +382,9 @@
 //! or `js-default` Cargo features.
 //!
 //! [wasm]: https://webassembly.org/
-//! [wasmer-examples]: https://github.com/wasmerio/wasmer/tree/main/examples
+//! [wasmer-examples]: https://github.com/wasmerio/wasmer-runtime/tree/main/examples
+//! [runtime-architecture]: https://github.com/wasmerio/wasmer-runtime/blob/main/docs/ARCHITECTURE.md
+//! [wasmer-product]: https://github.com/wasmerio/wasmer
 //! [`wasmer-cache`]: https://docs.rs/wasmer-cache/
 //! [wasmer-compiler]: https://docs.rs/wasmer-compiler/
 //! [`wasmer-compiler-singlepass`]: https://docs.rs/wasmer-compiler-singlepass/

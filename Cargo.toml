@@ -52,7 +52,7 @@ authors = ["Wasmer Engineering Team <engineering@wasmer.io>"]
 edition = "2024"
 homepage = "https://wasmer.io/"
 license = "MIT"
-repository = "https://github.com/wasmerio/wasmer"
+repository = "https://github.com/wasmerio/wasmer-runtime"
 rust-version = "1.99"
 version = "7.5.0"
 
@@ -224,8 +224,7 @@ wasmer = { version = "=7.5.0", path = "lib/api", default-features = false, featu
 ] }
 
 [features]
-# Don't add the compiler features in default, please add them on the Makefile
-# since we might want to autoconfigure them depending on the availability on the host.
+# Select compiler features explicitly for examples and integration tests.
 default = ["wat", "wast", "cache", "middlewares"]
 # backend means that the `wasmer` crate will be compiled with the `wasmer-compiler`.
 # That means: that is able to execute modules
