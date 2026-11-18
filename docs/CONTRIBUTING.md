@@ -32,5 +32,4 @@ Adjust the package and features to cover what you changed, and run the relevant
 - Use conventional-commit-style titles, for example `fix(Singlepass): ...`,
   `feat(runtime): ...`, `feat!: ...`, `chore: ...`, or `deps: ...`.
 - Explain why the change is needed and say what you tested.
-- If the change affects macOS or musl, request the `macos` or `musl` CI label.
 - Do not bump crate versions or submodule pointers in unrelated PRs.

@@ -141,8 +141,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        skip_macos:
-          - ${{ github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'macos') }}
         metadata:
           - build: linux-x64
             os: ubuntu-22.04
@@ -150,10 +148,6 @@ jobs:
             os: macos-15
           - build: windows-x64
             os: windows-2022
-        exclude:
-          - skip_macos: true
-            metadata:
-              build: macos-arm
     steps:
       - uses: actions/checkout@v6
         with:
@@ -242,10 +236,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        skip_macos:
-          - ${{ github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'macos') }}
-        skip_musl:
-          - ${{ github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'musl') }}
         stage:
           - key: test-all
             description: All tests
@@ -277,13 +267,6 @@ jobs:
             os: ubuntu-22.04
             container: "alpine:edge"
             v8: true
-        exclude:
-          - skip_macos: true
-            metadata:
-              build: macos-arm
-          - skip_musl: true
-            metadata:
-              build: linux-musl
         include:
           - stage:
               key: test-all

@@ -20,8 +20,6 @@ command only selects examples whose required features are enabled.
 
 See [`test.yaml`](../.github/workflows/test.yaml) for the full CI matrix,
 including artifact features, `cargo nextest`, doctests, and V8 on Windows.
-macOS and musl jobs run on pull requests only when the `macos` or `musl` label
-is present, respectively.
 
 ## Running a single WAST test
 
