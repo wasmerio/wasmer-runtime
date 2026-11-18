@@ -23,50 +23,26 @@ wasmer-compiler-singlepass = { version = "=7.5.0", path = "lib/compiler-singlepa
 wasmer-middlewares = { version = "=7.5.0", path = "lib/middlewares", optional = true }
 wasmer-types = { version = "=7.5.0", path = "lib/types" }
 wasmer-wast = { version = "=7.5.0", path = "tests/lib/wast", optional = true }
-wasmer-wasix = { path = "lib/wasix", optional = true }
 
 # Third party dependencies
 crossbeam-queue.workspace = true
-tokio = { workspace = true, features = [
-  "rt",
-  "rt-multi-thread",
-  "macros",
-], optional = true }
 
 [workspace]
 members = [
   "fuzz",
   "lib/api",
   "lib/api/macro-wasmer-engine-test",
-  "lib/asyncify",
-  "lib/backend-api",
-  "lib/c-api",
-  "lib/c-api-imports",
-  "lib/c-api/examples/wasmer-capi-examples-runner",
-  "lib/c-api/tests/wasmer-c-api-test-runner",
   "lib/cache",
-  "lib/cli",
   "lib/compiler-cranelift",
   "lib/compiler-llvm",
   "lib/compiler-singlepass",
   "lib/compiler",
-  "lib/config",
   "lib/derive",
-  "lib/napi",
+  "lib/middlewares",
   "lib/types",
-  "lib/package-sdk",
-  "lib/virtual-io",
-  "lib/virtual-fs",
-  "lib/virtual-net",
   "lib/vm",
-  "lib/wasi-types",
-  "lib/wasix",
-  "lib/journal",
-  "lib/swift",
-  "lib/package",
-  "tests/integration/cli",
-  "tests/integration/ios",
   "tests/lib/compiler-test-derive",
+  "tests/lib/test-generator",
   "tests/lib/wast",
 ]
 resolver = "2"
@@ -81,9 +57,6 @@ rust-version = "1.99"
 version = "7.5.0"
 
 [workspace.dependencies]
-# Repo-local crates
-wasmer-package = { version = "0.705.0", path = "lib/package", default-features = false }
-
 # Wasmer-owned crates
 webc = { version = "=12.0.1", default-features = false, features = [
   "v2",
@@ -371,7 +344,7 @@ wasmer = { version = "=7.5.0", path = "lib/api", default-features = false, featu
 [features]
 # Don't add the compiler features in default, please add them on the Makefile
 # since we might want to autoconfigure them depending on the availability on the host.
-default = ["wat", "wast", "cache", "wasi", "middlewares"]
+default = ["wat", "wast", "cache", "middlewares"]
 # backend means that the `wasmer` crate will be compiled with the `wasmer-compiler`.
 # That means: that is able to execute modules
 backend = []
@@ -384,7 +357,6 @@ v8-default = ["v8", "wasmer/v8-default"]
 engine = []
 cache = ["wasmer-cache"]
 wast = ["wasmer-wast"]
-wasi = ["wasmer-wasix", "tokio"]
 wat = ["wasmer/wat"]
 compiler = ["wasmer/compiler", "backend", "wasmer-compiler/translator"]
 singlepass = ["compiler", "wasmer-compiler-singlepass", "wasmer/singlepass"]
@@ -426,8 +398,6 @@ opt-level = 3
 [profile.dev.package.wasmer-types]
 opt-level = 3
 [profile.dev.package.sha2]
-opt-level = 3
-[profile.dev.package.xxhash-rust]
 opt-level = 3
 [profile.dev.package.digest]
 opt-level = 3
@@ -536,21 +506,6 @@ required-features = ["backend"]
 name = "tunables-limit-memory"
 path = "examples/tunables_limit_memory.rs"
 required-features = ["cranelift"]
-
-[[example]]
-name = "wasi"
-path = "examples/wasi.rs"
-required-features = ["wasi", "wat"]
-
-[[example]]
-name = "wasi-manual-setup"
-path = "examples/wasi_manual_setup.rs"
-required-features = ["tokio", "backend", "wasi", "wat"]
-
-[[example]]
-name = "wasi-pipes"
-path = "examples/wasi_pipes.rs"
-required-features = ["tokio", "backend", "wasi", "wat"]
 
 [[example]]
 name = "table"
