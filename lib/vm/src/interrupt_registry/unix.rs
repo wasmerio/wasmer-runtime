@@ -407,9 +407,17 @@ pub(crate) fn on_interrupted() -> bool {
 }
 
 /// Returns true if the store with the given ID has already been interrupted.
+///
+/// Host-function wrappers call this on the Wasm stack. An interrupt landing
+/// here resets that stack without running destructors, so this read must not
+/// hold a borrow guard: a leaked one would fail every later registry update.
 pub fn is_interrupted(store_id: StoreId) -> bool {
     THREAD_INTERRUPT_STATE.with(|state| {
-        let bookkeeping = state.bookkeeping.borrow();
+        // Safety: the bookkeeping is only mutated by this module's leaf
+        // functions, never during this read; the signal handler only touches
+        // the separate atomics.
+        let bookkeeping = unsafe { state.bookkeeping.try_borrow_unguarded() }
+            .expect("interrupt bookkeeping mutably borrowed during is_interrupted");
         bookkeeping
             .active
             .iter()
@@ -470,6 +478,49 @@ mod tests {
         let empty = unsafe { parked_first.replace_current() };
         assert!(empty.active.is_empty());
         assert_eq!(active_store(), 0);
+    }
+
+    #[test]
+    fn an_interrupt_inside_is_interrupted_on_the_wasm_stack_leaks_no_borrow() {
+        crate::init_traps();
+        // Own thread: a leaked borrow would poison this thread's registry.
+        std::thread::spawn(|| {
+            for _ in 0..64 {
+                let id = StoreId::default();
+                let guard = install(id).unwrap();
+                let spinning = Arc::new(AtomicBool::new(false));
+                let interrupter = std::thread::spawn({
+                    let spinning = spinning.clone();
+                    move || {
+                        while !spinning.load(Ordering::Acquire) {
+                            std::hint::spin_loop();
+                        }
+                        interrupt(id).unwrap();
+                    }
+                });
+                // Host-function wrappers call `is_interrupted` on the Wasm
+                // stack, where the handler resets the stack without dtors.
+                let trapped = unsafe {
+                    crate::catch_traps(
+                        None,
+                        &crate::VMConfig {
+                            wasm_stack_size: None,
+                        },
+                        move || {
+                            spinning.store(true, Ordering::Release);
+                            loop {
+                                std::hint::black_box(is_interrupted(id));
+                            }
+                        },
+                    )
+                };
+                interrupter.join().unwrap();
+                assert!(trapped.is_err());
+                drop(guard);
+            }
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
