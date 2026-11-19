@@ -418,14 +418,12 @@ pub fn is_interrupted(store_id: StoreId) -> bool {
         // the separate atomics.
         let bookkeeping = unsafe { state.bookkeeping.try_borrow_unguarded() }
             .expect("interrupt bookkeeping mutably borrowed during is_interrupted");
+        // Not only `active`: async futures poll their parked roots from the
+        // host stack, and those roots must still observe the interrupt.
         bookkeeping
-            .active
-            .iter()
-            .any(|entry| entry.store_id == store_id)
-            && bookkeeping
-                .interrupted
-                .get(&store_id)
-                .is_some_and(|flag| flag.load(Ordering::Acquire))
+            .interrupted
+            .get(&store_id)
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
     })
 }
 
