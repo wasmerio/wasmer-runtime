@@ -22,8 +22,8 @@ See the [runnable LLVM example](../../examples/compiler_llvm.rs).
 
 Building this backend requires **LLVM 23.1**. Install it with your platform's
 package manager if available, or use a compatible [LLVM build](https://releases.llvm.org/download.html).
-CI uses the [Wasmer LLVM builds](https://github.com/wasmerio/llvm-custom-builds/releases/tag/23.x)
-on some platforms.
+CI uses the [official LLVM 23.1.5 binaries](https://github.com/llvm/llvm-project/releases/tag/llvmorg-23.1.5)
+on glibc-based Linux and Apple Silicon macOS.
 
 If needed, point `LLVM_SYS_231_PREFIX` at the LLVM installation prefix.
 See the [runtime build guide](../../docs/BUILD.md#llvm-compiler) for the Cargo
