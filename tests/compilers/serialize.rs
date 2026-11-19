@@ -4,7 +4,7 @@ use wasmer::{sys::engine::NativeEngineExt, *};
 #[test]
 fn sanity_test_artifact_deserialize() {
     let engine = Engine::headless();
-    let result = unsafe { Module::deserialize(&engine, &[]) };
+    let result = unsafe { Module::deserialize(&engine, []) };
     assert!(result.is_err());
 }
 

@@ -52,7 +52,7 @@ impl IntoBytes for Cow<'_, [u8]> {
 impl IntoBytes for OwnedBuffer {
     /// Shares an in-memory buffer; copies a memory-mapped one.
     fn into_bytes(self) -> Bytes {
-        OwnedBuffer::into_bytes(self)
+        Self::into_bytes(self)
     }
 }
 
