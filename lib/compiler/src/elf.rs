@@ -4,59 +4,29 @@
 
 use crate::compiler::{CompiledObjects, emit_metadata_and_link};
 use crate::dwarf::{EhRelocation, EhTarget};
+use crate::get_object_for_target;
 use crate::misc::{CompiledFunctionExt, CompiledKind};
-use crate::object::get_object_for_target;
-use crate::types::function::{Compilation, FunctionBody};
-use crate::types::relocation::{Relocation, RelocationKind, RelocationTarget};
-use crate::types::section::CustomSection;
+use crate::types::function::Compilation;
 use object::{
     RelocationEncoding, RelocationFlags, RelocationKind as ObjectRelocationKind, SectionKind,
-    SymbolFlags, SymbolKind, SymbolScope, elf,
+    SymbolFlags, SymbolKind, SymbolScope,
     write::{
-        Object, Relocation as ObjectRelocation, SectionId, StandardSection, StandardSegment,
-        Symbol, SymbolId, SymbolSection,
+        Object, Relocation as ObjectRelocation, StandardSection, StandardSegment, Symbol, SymbolId,
+        SymbolSection,
     },
 };
 use std::path::PathBuf;
-use wasmer_types::{
-    CompileError, LibCall, LocalFunctionIndex, TrapInformation, entity::PrimaryMap, target::Target,
-};
-use wasmer_types::{FunctionIndex, FunctionType};
+use wasmer_types::{CompileError, LibCall, TrapInformation, target::Target};
 
-/// The result of compiling a single unit (function or trampoline): either an
-/// in-memory body for the classic artifact format, or a relocatable object
-/// buffer for the ELF artifact format (together with the maximum stack usage,
-/// when known).
-pub enum CompileOutput<T> {
-    /// The compiled body, kept in memory.
-    InMemory(T),
-    /// Serialized relocatable object and the unit's maximum stack usage, when known.
-    Object(Vec<u8>, Option<usize>),
+/// Serialized relocatable object and the unit's maximum stack usage, when known.
+pub struct CompileOutput {
+    /// Serialized relocatable object.
+    pub object: Vec<u8>,
+    /// The unit's maximum stack usage, when known.
+    pub maximum_stack_usage: Option<usize>,
 }
 
-impl<T: crate::compiler::CompiledFunction> crate::compiler::CompiledFunction for CompileOutput<T> {}
-
-/// Extract the object buffers from ELF-mode compile outputs.
-pub fn compile_output_objects<T>(outputs: Vec<CompileOutput<T>>) -> Vec<Vec<u8>> {
-    outputs
-        .into_iter()
-        .map(|output| match output {
-            CompileOutput::Object(object, _) => object,
-            CompileOutput::InMemory(_) => unreachable!(),
-        })
-        .collect()
-}
-
-/// Extract the in-memory bodies from classic-mode compile outputs.
-pub fn compile_output_in_memory<T>(outputs: Vec<CompileOutput<T>>) -> Vec<T> {
-    outputs
-        .into_iter()
-        .map(|output| match output {
-            CompileOutput::InMemory(body) => body,
-            CompileOutput::Object(..) => unreachable!(),
-        })
-        .collect()
-}
+impl crate::compiler::CompiledFunction for CompileOutput {}
 
 /// Declare an undefined text symbol resolved when the objects are linked.
 pub fn add_undefined_symbol(object: &mut Object<'static>, name: String) -> SymbolId {
@@ -90,116 +60,6 @@ pub fn add_libcall_symbol(object: &mut Object<'static>, libcall: LibCall) -> Sym
         section: SymbolSection::Undefined,
         flags: SymbolFlags::None,
     })
-}
-
-/// Map a Wasmer relocation kind onto the corresponding object-file relocation
-/// flags.
-pub fn relocation_kind_to_flags(kind: RelocationKind) -> Result<RelocationFlags, CompileError> {
-    use ObjectRelocationKind as K;
-    Ok(match kind {
-        RelocationKind::Abs4 => RelocationFlags::Generic {
-            kind: K::Absolute,
-            encoding: RelocationEncoding::Generic,
-            size: 32,
-        },
-        RelocationKind::Abs8 => RelocationFlags::Generic {
-            kind: K::Absolute,
-            encoding: RelocationEncoding::Generic,
-            size: 64,
-        },
-        RelocationKind::PCRel4 => RelocationFlags::Generic {
-            kind: K::Relative,
-            encoding: RelocationEncoding::Generic,
-            size: 32,
-        },
-        RelocationKind::X86CallPCRel4 => RelocationFlags::Generic {
-            kind: K::Relative,
-            encoding: RelocationEncoding::X86Branch,
-            size: 32,
-        },
-        RelocationKind::X86CallPLTRel4 => RelocationFlags::Generic {
-            kind: K::PltRelative,
-            encoding: RelocationEncoding::X86Branch,
-            size: 32,
-        },
-        RelocationKind::X86GOTPCRel4 => RelocationFlags::Generic {
-            kind: K::GotRelative,
-            encoding: RelocationEncoding::Generic,
-            size: 32,
-        },
-        RelocationKind::Arm64Call => RelocationFlags::Generic {
-            kind: K::Relative,
-            encoding: RelocationEncoding::AArch64Call,
-            size: 26,
-        },
-        // For RISC-V relocations, please refer to:
-        // https://github.com/riscv-non-isa/riscv-elf-psabi-doc/blob/2484f950a551c653f1823f1bd11926bf5a57fae3/riscv-elf.adoc#relocations
-        RelocationKind::RiscvPCRelHi20 => RelocationFlags::Elf {
-            r_type: elf::R_RISCV_PCREL_HI20,
-        },
-        RelocationKind::RiscvPCRelLo12I => RelocationFlags::Elf {
-            r_type: elf::R_RISCV_PCREL_LO12_I,
-        },
-        RelocationKind::RiscvCall => RelocationFlags::Elf {
-            r_type: elf::R_RISCV_CALL_PLT,
-        },
-        kind => {
-            return Err(CompileError::Codegen(format!(
-                "unsupported ELF relocation kind: {kind:?}"
-            )));
-        }
-    })
-}
-
-/// Apply the compiled code's relocations to `section`, declaring the referenced symbols.
-pub fn add_relocations(
-    object: &mut Object<'static>,
-    section: SectionId,
-    relocations: &[Relocation],
-    local_symbol: Option<(LocalFunctionIndex, SymbolId)>,
-) -> Result<(), CompileError> {
-    for relocation in relocations {
-        let symbol = match relocation.reloc_target {
-            RelocationTarget::LocalFunc(index) => local_symbol
-                .filter(|(local_index, _)| *local_index == index)
-                .map_or_else(
-                    || {
-                        add_undefined_symbol(
-                            object,
-                            CompiledKind::Local(index, String::new()).linkage_name(),
-                        )
-                    },
-                    |(_, symbol)| symbol,
-                ),
-            RelocationTarget::CustomSection(index) => add_undefined_symbol(
-                object,
-                CompiledKind::ImportFunctionTrampoline(
-                    FunctionIndex::from_u32(index.as_u32()),
-                    FunctionType::default(),
-                )
-                .linkage_name(),
-            ),
-            RelocationTarget::LibCall(libcall) => add_libcall_symbol(object, libcall),
-            RelocationTarget::DynamicTrampoline(index) => add_undefined_symbol(
-                object,
-                CompiledKind::DynamicFunctionTrampoline(index, FunctionType::default())
-                    .linkage_name(),
-            ),
-        };
-        let flags = relocation_kind_to_flags(relocation.kind)?;
-        object
-            .add_relocation(
-                section,
-                ObjectRelocation {
-                    offset: relocation.offset as u64,
-                    flags,
-                    symbol,
-                    addend: relocation.addend,
-                },
-            )
-            .map_err(|e| CompileError::Codegen(format!("failed to add ELF relocation: {e}")))?;
-    }
-    Ok(())
 }
 
 /// Emit the per-function trap table into a `.w.traps` section, under a weak
@@ -332,14 +192,14 @@ pub fn emit_eh_frame_section(
 pub fn emit_function_body(
     target: &Target,
     kind: &CompiledKind,
-    body: &FunctionBody,
+    body: &Compilation,
 ) -> Result<Vec<u8>, CompileError> {
     let mut object = get_object_for_target(target.triple())
         .map_err(|e| CompileError::Codegen(format!("cannot create object: {e}")))?;
     let symbol = object.add_symbol(Symbol {
         name: kind.linkage_name().into_bytes(),
         value: 0,
-        size: body.body.len() as u64,
+        size: body.len() as u64,
         kind: SymbolKind::Text,
         scope: SymbolScope::Linkage,
         weak: false,
@@ -347,7 +207,7 @@ pub fn emit_function_body(
         flags: SymbolFlags::None,
     });
     let text = object.section_id(StandardSection::Text);
-    object.add_symbol_data(symbol, text, &body.body, 4);
+    object.add_symbol_data(symbol, text, body, 4);
     object
         .write()
         .map_err(|e| CompileError::Codegen(format!("failed to serialize object: {e}")))
@@ -357,14 +217,14 @@ pub fn emit_function_body(
 pub fn emit_import_trampoline(
     target: &Target,
     kind: &CompiledKind,
-    section: &CustomSection,
+    section_bytes: &[u8],
 ) -> Result<Vec<u8>, CompileError> {
     let mut object = get_object_for_target(target.triple())
         .map_err(|e| CompileError::Codegen(format!("cannot create object: {e}")))?;
     let symbol = object.add_symbol(Symbol {
         name: kind.linkage_name().into_bytes(),
         value: 0,
-        size: section.bytes.len() as u64,
+        size: section_bytes.len() as u64,
         kind: SymbolKind::Text,
         scope: SymbolScope::Linkage,
         weak: false,
@@ -372,7 +232,7 @@ pub fn emit_import_trampoline(
         flags: SymbolFlags::None,
     });
     let text = object.section_id(StandardSection::Text);
-    object.add_symbol_data(symbol, text, section.bytes.as_slice(), 4);
+    object.add_symbol_data(symbol, text, section_bytes, 4);
     object
         .write()
         .map_err(|e| CompileError::Codegen(format!("failed to serialize object: {e}")))
@@ -384,15 +244,14 @@ pub fn link_module(
     pool: &rayon::ThreadPool,
     target: &Target,
     compile_info_blob: &[u8],
-    object_files: Vec<Vec<u8>>,
-    import_trampoline_objects: Vec<Vec<u8>>,
-    trampoline_objects: Vec<Vec<u8>>,
-    dynamic_trampoline_objects: Vec<Vec<u8>>,
+    object_files: Vec<CompileOutput>,
+    import_trampoline_objects: Vec<CompileOutput>,
+    trampoline_objects: Vec<CompileOutput>,
+    dynamic_trampoline_objects: Vec<CompileOutput>,
     debug_dir: Option<PathBuf>,
     module_hash: Option<String>,
-    function_max_stack_usage: PrimaryMap<LocalFunctionIndex, Option<usize>>,
 ) -> Result<Compilation, CompileError> {
-    let elf = emit_metadata_and_link(
+    emit_metadata_and_link(
         pool,
         target,
         compile_info_blob,
@@ -405,9 +264,5 @@ pub fn link_module(
         },
         debug_dir,
         module_hash,
-    )?;
-    Ok(Compilation::Elf {
-        data: elf,
-        function_max_stack_usage,
-    })
+    )
 }

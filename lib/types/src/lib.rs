@@ -80,7 +80,7 @@ pub use crate::table::TableStyle;
 pub use crate::trapcode::TrapCode;
 pub use crate::utils::is_wasm;
 pub use crate::vmoffsets::{VMBuiltinFunctionIndex, VMOffsets, vmctx_offset};
-pub use serialize::MetadataHeader;
+pub use serialize::ARTIFACT_VERSION;
 
 /// Offset in bytes from the beginning of the function.
 pub type CodeOffset = u32;

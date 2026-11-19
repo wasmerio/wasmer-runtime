@@ -15,11 +15,8 @@ use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::io::{Cursor, Write};
 
-use wasmer_compiler::types::{
-    relocation::{Relocation, RelocationKind, RelocationTarget},
-    section::{CustomSection, CustomSectionProtection, SectionBody, SectionIndex},
-};
-use wasmer_types::{LibCall, LocalFunctionIndex};
+use object::write::{Relocation, SymbolId};
+use object::{RelocationEncoding, RelocationFlags, RelocationKind};
 
 /// Relocation information for an LSDA entry that references a tag constant.
 #[derive(Debug, Clone)]
@@ -225,114 +222,8 @@ pub fn build_function_lsda<'a>(
     })
 }
 
-/// Build the global tag section and a tag->offset map.
-pub fn build_tag_section(
-    lsda_data: &[Option<FunctionLsdaData>],
-) -> Option<(CustomSection, HashMap<u32, u32>)> {
-    let mut unique_tags = HashSet::new();
-    for data in lsda_data.iter().flatten() {
-        for reloc in &data.relocations {
-            unique_tags.insert(reloc.tag);
-        }
-    }
-
-    if unique_tags.is_empty() {
-        return None;
-    }
-
-    let mut tags: Vec<u32> = unique_tags.into_iter().collect();
-    tags.sort_unstable();
-
-    let mut bytes = Vec::with_capacity(tags.len() * std::mem::size_of::<u32>());
-    let mut offsets = HashMap::new();
-    for tag in tags {
-        let offset = bytes.len() as u32;
-        bytes.extend_from_slice(&tag.to_ne_bytes());
-        offsets.insert(tag, offset);
-    }
-
-    let section = CustomSection {
-        protection: CustomSectionProtection::Read,
-        alignment: None,
-        bytes: SectionBody::new_with_vec(bytes),
-        relocations: Vec::new(),
-    };
-
-    Some((section, offsets))
-}
-
-/// Build the LSDA custom section and record the offset for each function.
-///
-/// Returns the section (if any) and a vector mapping each function index to
-/// its LSDA offset inside the section. Even when utilizing the same landing pad for exception tags,
-/// Cranelift generates separate landing pad locations.
-/// These locations are essentially small trampolines that redirect to the basic block we established (the EH dispatch block).
-///
-/// The section can be dumped using the elfutils' readelf tool:
-/// ```shell
-/// objcopy -I binary -O elf64-x86-64 --rename-section .data=.gcc_except_table,alloc,contents lsda.bin object.o && eu-readelf -w object.o
-/// ```
-pub fn build_lsda_section(
-    lsda_data: Vec<Option<FunctionLsdaData>>,
-    pointer_bytes: u8,
-    tag_offsets: &HashMap<u32, u32>,
-    tag_section_index: Option<SectionIndex>,
-) -> (Option<CustomSection>, Vec<Option<u32>>) {
-    let mut bytes = Vec::new();
-    let mut relocations = Vec::new();
-    let mut offsets_per_function = Vec::with_capacity(lsda_data.len());
-
-    let pointer_kind = match pointer_bytes {
-        4 => RelocationKind::Abs4,
-        8 => RelocationKind::Abs8,
-        other => panic!("unsupported pointer size {other} for LSDA generation"),
-    };
-
-    for data in lsda_data.into_iter() {
-        if let Some(data) = data {
-            let base = bytes.len() as u32;
-            bytes.extend_from_slice(&data.bytes);
-
-            for reloc in &data.relocations {
-                let target_offset = tag_offsets
-                    .get(&reloc.tag)
-                    .copied()
-                    .expect("missing tag offset for relocation");
-                relocations.push(Relocation {
-                    kind: pointer_kind,
-                    reloc_target: RelocationTarget::CustomSection(
-                        tag_section_index
-                            .expect("tag section index must exist when relocations are present"),
-                    ),
-                    offset: base + reloc.offset,
-                    addend: target_offset as i64,
-                });
-            }
-
-            offsets_per_function.push(Some(base));
-        } else {
-            offsets_per_function.push(None);
-        }
-    }
-
-    if bytes.is_empty() {
-        (None, offsets_per_function)
-    } else {
-        (
-            Some(CustomSection {
-                protection: CustomSectionProtection::Read,
-                alignment: None,
-                bytes: SectionBody::new_with_vec(bytes),
-                relocations,
-            }),
-            offsets_per_function,
-        )
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct CompactUnwindEntryData {
-    pub function: LocalFunctionIndex,
     pub function_length: u32,
     pub compact_encoding: u32,
     pub lsda_offset: Option<u32>,
@@ -342,8 +233,10 @@ pub struct CompactUnwindEntryData {
 /// runtime compact-unwind publisher.
 pub fn build_compact_unwind_section(
     entries: impl IntoIterator<Item = CompactUnwindEntryData>,
-    lsda_section_index: Option<SectionIndex>,
-) -> Option<CustomSection> {
+    function_symbol: SymbolId,
+    personality_symbol: SymbolId,
+    lsda_symbol: Option<SymbolId>,
+) -> Option<(Vec<u8>, Vec<Relocation>)> {
     const ENTRY_SIZE: usize = 32;
     const FUNCTION_ADDR_OFFSET: u32 = 0;
     const PERSONALITY_ADDR_OFFSET: u32 = 16;
@@ -356,6 +249,11 @@ pub fn build_compact_unwind_section(
 
     let mut bytes = Vec::with_capacity(entries.len() * ENTRY_SIZE);
     let mut relocations = Vec::new();
+    let flags = RelocationFlags::Generic {
+        kind: RelocationKind::Absolute,
+        encoding: RelocationEncoding::Generic,
+        size: 64,
+    };
 
     for entry in entries {
         let base = bytes.len() as u32;
@@ -367,36 +265,29 @@ pub fn build_compact_unwind_section(
         bytes.extend_from_slice(&0u64.to_le_bytes());
 
         relocations.push(Relocation {
-            kind: RelocationKind::Abs8,
-            reloc_target: RelocationTarget::LocalFunc(entry.function),
-            offset: base + FUNCTION_ADDR_OFFSET,
+            flags,
+            symbol: function_symbol,
+            offset: u64::from(base + FUNCTION_ADDR_OFFSET),
             addend: 0,
         });
         relocations.push(Relocation {
-            kind: RelocationKind::Abs8,
-            reloc_target: RelocationTarget::LibCall(LibCall::EHPersonality),
-            offset: base + PERSONALITY_ADDR_OFFSET,
+            flags,
+            symbol: personality_symbol,
+            offset: u64::from(base + PERSONALITY_ADDR_OFFSET),
             addend: 0,
         });
 
         if let Some(lsda_offset) = entry.lsda_offset {
             relocations.push(Relocation {
-                kind: RelocationKind::Abs8,
-                reloc_target: RelocationTarget::CustomSection(
-                    lsda_section_index.expect("LSDA section index required for LSDA relocation"),
-                ),
-                offset: base + LSDA_ADDR_OFFSET,
+                flags,
+                symbol: lsda_symbol.expect("LSDA symbol required for LSDA relocation"),
+                offset: u64::from(base + LSDA_ADDR_OFFSET),
                 addend: lsda_offset as i64,
             });
         }
     }
 
-    Some(CustomSection {
-        protection: CustomSectionProtection::Read,
-        alignment: Some(8),
-        bytes: SectionBody::new_with_vec(bytes),
-        relocations,
-    })
+    Some((bytes, relocations))
 }
 
 // Constants are defined in compact_unwind_encoding.h file.

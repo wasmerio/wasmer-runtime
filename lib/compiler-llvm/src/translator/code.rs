@@ -12,9 +12,7 @@ use super::{
     // stackmap::{StackmapEntry, StackmapEntryKind, StackmapRegistry, ValueSemantic},
     state::{ControlFrame, ExtraInfo, IfElseState, PhiLocation, State, TagCatchInfo},
 };
-use crate::{
-    compiler::ModuleBasedSymbolRegistry, config::OptimizationStyle, object_file::CompiledFunction,
-};
+use crate::{CompiledFunction, config::OptimizationStyle};
 use enumset::EnumSet;
 use inkwell::support::get_llvm_version;
 use inkwell::{
@@ -42,7 +40,6 @@ use crate::{
     abi::{LLVMAbi, get_abi},
     config::LLVM,
     error::{err, err_nt},
-    object_file::load_object_file,
 };
 use wasmer_compiler::{
     CANONICAL_NAN_F32, CANONICAL_NAN_F64, FunctionBinaryReader, FunctionBodyData,
@@ -52,10 +49,6 @@ use wasmer_compiler::{
     LEF64_GEQ_U64_MIN, MiddlewareBinaryReader, ModuleMiddlewareChain, ModuleTranslationState,
     WasmSourceMap, from_binaryreadererror_wasmerror, memarg_memory_index,
     misc::{CompiledFunctionExt, CompiledKind},
-    types::{
-        relocation::RelocationTarget,
-        symbols::{Symbol, SymbolRegistry},
-    },
     wasmparser::{Catch, MemArg, Operator},
     wpheaptype_to_type, wptype_to_type,
 };
@@ -66,9 +59,7 @@ use wasmer_types::{
 use wasmer_types::{TagIndex, entity::PrimaryMap};
 use wasmer_vm::{MemoryStyle, TableStyle, VMOffsets};
 
-const FUNCTION_SECTION_ELF: &str = "__TEXT,wasmer_function";
 const FUNCTION_SECTION_MACHO: &str = "__TEXT";
-const FUNCTION_SEGMENT_MACHO: &str = "wasmer_function";
 
 // Since we want to use module-local tag numbers for landing pads,
 // the catch-all tag can't be zero; we instead use i32::MAX, which
@@ -121,7 +112,6 @@ pub struct FuncTranslator {
     target_machines: HashMap<OptimizationStyle, TargetMachine>,
     abi: LLVMAbi,
     binary_fmt: BinaryFormat,
-    func_section: String,
     pointer_width: u8,
     cpu_features: EnumSet<CpuFeature>,
     non_volatile_memory_ops: bool,
@@ -164,15 +154,6 @@ impl FuncTranslator {
             target_triple,
             target_machines,
             abi,
-            func_section: match binary_fmt {
-                BinaryFormat::Elf => FUNCTION_SECTION_ELF.to_string(),
-                BinaryFormat::Macho => FUNCTION_SEGMENT_MACHO.to_string(),
-                _ => {
-                    return Err(CompileError::UnsupportedTarget(format!(
-                        "Unsupported binary format: {binary_fmt:?}"
-                    )));
-                }
-            },
             binary_fmt,
             pointer_width,
             cpu_features,
@@ -193,7 +174,6 @@ impl FuncTranslator {
         config: &LLVM,
         memory_styles: &PrimaryMap<MemoryIndex, MemoryStyle>,
         _table_styles: &PrimaryMap<TableIndex, TableStyle>,
-        symbol_registry: &dyn SymbolRegistry,
         target: &Triple,
         opt_style: OptimizationStyle,
     ) -> Result<Module<'_>, CompileError> {
@@ -204,19 +184,8 @@ impl FuncTranslator {
 
         let m0_is_enabled = enable_m0_optimization(config, memory_styles);
 
-        let (function_name, module_name) = if config.experimental_artifact {
-            (function.linkage_name(), String::new())
-        } else {
-            let function_name =
-                symbol_registry.symbol_to_name(Symbol::LocalFunction(*local_func_index));
-            let module_name = match wasm_module.name.as_ref() {
-                None => format!("<anonymous module> function {function_name}"),
-                Some(module_name) => format!("module {module_name} function {function_name}"),
-            };
-            (function_name, module_name)
-        };
-
-        let module = self.ctx.create_module(module_name.as_str());
+        let module = self.ctx.create_module("");
+        let function_name = function.linkage_name();
 
         let target_machine = &self.target_machines.values().next().unwrap();
         let target_triple = target_machine.get_triple();
@@ -244,73 +213,72 @@ impl FuncTranslator {
             .set_alignment(super::FUNCTION_ALIGNMENT);
 
         // TODO: support dSYM debug info file creation and loading in the future
-        let debug_info =
-            if config.experimental_artifact && matches!(target.binary_format, BinaryFormat::Elf) {
-                let source_location = self.source_map.first_in_function(function_body);
-                let debug_metadata_version = self
-                    .ctx
-                    .i32_type()
-                    .const_int(inkwell::debug_info::debug_metadata_version().into(), false);
-                module.add_basic_value_flag(
-                    "Debug Info Version",
-                    FlagBehavior::Warning,
-                    debug_metadata_version,
-                );
-                module.add_basic_value_flag(
-                    "Dwarf Version",
-                    FlagBehavior::Warning,
-                    self.ctx.i32_type().const_int(4, false),
-                );
+        let debug_info = if matches!(target.binary_format, BinaryFormat::Elf) {
+            let source_location = self.source_map.first_in_function(function_body);
+            let debug_metadata_version = self
+                .ctx
+                .i32_type()
+                .const_int(inkwell::debug_info::debug_metadata_version().into(), false);
+            module.add_basic_value_flag(
+                "Debug Info Version",
+                FlagBehavior::Warning,
+                debug_metadata_version,
+            );
+            module.add_basic_value_flag(
+                "Dwarf Version",
+                FlagBehavior::Warning,
+                self.ctx.i32_type().const_int(4, false),
+            );
 
-                let fallback_source_file = wasm_module.name();
-                let (source_file, source_directory) = source_location
-                    .map(|location| (location.file.as_str(), location.directory.as_str()))
-                    .unwrap_or((&fallback_source_file, "."));
-                let (dibuilder, compile_unit) = module.create_debug_info_builder(
-                    true,
-                    DWARFSourceLanguage::C,
-                    source_file,
-                    source_directory,
-                    "wasmer",
-                    true,
-                    "",
-                    0,
-                    "",
-                    DWARFEmissionKind::Full,
-                    0,
-                    false,
-                    false,
-                    "",
-                    "",
-                );
-                let subroutine_type = dibuilder.create_subroutine_type(
-                    compile_unit.get_file(),
-                    None,
-                    &[],
-                    DIFlags::PUBLIC,
-                );
-                let function_name = wasm_module.get_function_name(func_index);
-                let start_line = source_location
-                    .map(|location| location.line)
-                    .unwrap_or_else(|| (function_body.module_offset as u32).saturating_add(1));
-                let subprogram = dibuilder.create_function(
-                    compile_unit.as_debug_info_scope(),
-                    &function_name,
-                    None,
-                    compile_unit.get_file(),
-                    start_line,
-                    subroutine_type,
-                    false,
-                    true,
-                    start_line,
-                    DIFlags::PUBLIC,
-                    true,
-                );
-                func.set_subprogram(subprogram);
-                Some((dibuilder, subprogram))
-            } else {
-                None
-            };
+            let fallback_source_file = wasm_module.name();
+            let (source_file, source_directory) = source_location
+                .map(|location| (location.file.as_str(), location.directory.as_str()))
+                .unwrap_or((&fallback_source_file, "."));
+            let (dibuilder, compile_unit) = module.create_debug_info_builder(
+                true,
+                DWARFSourceLanguage::C,
+                source_file,
+                source_directory,
+                "wasmer",
+                true,
+                "",
+                0,
+                "",
+                DWARFEmissionKind::Full,
+                0,
+                false,
+                false,
+                "",
+                "",
+            );
+            let subroutine_type = dibuilder.create_subroutine_type(
+                compile_unit.get_file(),
+                None,
+                &[],
+                DIFlags::PUBLIC,
+            );
+            let function_name = wasm_module.get_function_name(func_index);
+            let start_line = source_location
+                .map(|location| location.line)
+                .unwrap_or_else(|| (function_body.module_offset as u32).saturating_add(1));
+            let subprogram = dibuilder.create_function(
+                compile_unit.as_debug_info_scope(),
+                &function_name,
+                None,
+                compile_unit.get_file(),
+                start_line,
+                subroutine_type,
+                false,
+                true,
+                start_line,
+                DIFlags::PUBLIC,
+                true,
+            );
+            func.set_subprogram(subprogram);
+            Some((dibuilder, subprogram))
+        } else {
+            None
+        };
         for (attr, attr_loc) in &func_attrs {
             func.add_attribute(*attr_loc, *attr);
         }
@@ -321,25 +289,7 @@ impl FuncTranslator {
 
         func.add_attribute(AttributeLoc::Function, intrinsics.uwtable);
         func.add_attribute(AttributeLoc::Function, intrinsics.frame_pointer);
-
-        let section = match self.binary_fmt {
-            BinaryFormat::Elf => FUNCTION_SECTION_ELF.to_string(),
-            BinaryFormat::Macho => {
-                format!("{FUNCTION_SECTION_MACHO},{FUNCTION_SEGMENT_MACHO}")
-            }
-            _ => {
-                return Err(CompileError::UnsupportedTarget(format!(
-                    "Unsupported binary format: {:?}",
-                    self.binary_fmt
-                )));
-            }
-        };
-
         func.set_personality_function(intrinsics.personality);
-        if !config.experimental_artifact {
-            func.as_global_value().set_section(Some(&section));
-        }
-
         func.set_linkage(Linkage::DLLExport);
         func.as_global_value()
             .set_dll_storage_class(DLLStorageClass::Export);
@@ -510,7 +460,6 @@ impl FuncTranslator {
             module_translation,
             signature_hashes,
             wasm_module,
-            symbol_registry,
             abi: &self.abi,
             config,
             target_triple: self.target_triple.clone(),
@@ -631,7 +580,6 @@ impl FuncTranslator {
         config: &LLVM,
         memory_styles: &PrimaryMap<MemoryIndex, MemoryStyle>,
         table_styles: &PrimaryMap<TableIndex, TableStyle>,
-        symbol_registry: &ModuleBasedSymbolRegistry,
         target: &Triple,
     ) -> Result<CompiledFunction, CompileError> {
         let func_index = wasm_module.func_index(*local_func_index);
@@ -654,7 +602,6 @@ impl FuncTranslator {
             config,
             memory_styles,
             table_styles,
-            symbol_registry,
             target,
             opt_style,
         )?;
@@ -675,34 +622,7 @@ impl FuncTranslator {
             callbacks.asm_memory_buffer(&function, &module_hash, &asm_buffer)
         }
 
-        if config.experimental_artifact {
-            Ok(CompiledFunction::Elf(memory_buffer.as_slice().to_vec()))
-        } else {
-            Ok(CompiledFunction::Rkyv(Box::new(load_object_file(
-                memory_buffer.as_slice(),
-                &self.func_section,
-                RelocationTarget::LocalFunc(*local_func_index),
-                |name: &str| {
-                    Ok({
-                        let name = if matches!(self.binary_fmt, BinaryFormat::Macho) {
-                            name.strip_prefix("_").unwrap_or(name)
-                        } else {
-                            name
-                        }
-                        .to_string();
-                        if let Some(Symbol::LocalFunction(local_func_index)) =
-                            symbol_registry.name_to_symbol(&name)
-                        {
-                            Some(RelocationTarget::LocalFunc(local_func_index))
-                        } else {
-                            None
-                        }
-                    })
-                },
-                self.binary_fmt,
-                &self.target_triple,
-            )?)))
-        }
+        Ok(memory_buffer.as_slice().to_vec())
     }
 }
 
@@ -2469,8 +2389,6 @@ pub struct LLVMFunctionCodeGenerator<'ctx, 'a> {
     module_translation: &'a ModuleTranslationState,
     signature_hashes: &'a PrimaryMap<SignatureIndex, SignatureHash>,
     wasm_module: &'a ModuleInfo,
-    #[allow(dead_code)]
-    symbol_registry: &'a dyn SymbolRegistry,
     abi: &'a LLVMAbi,
     config: &'a LLVM,
     target_triple: Triple,
