@@ -45,7 +45,6 @@ members = [
   "tests/lib/test-generator",
   "tests/lib/wast",
 ]
-resolver = "2"
 
 [workspace.package]
 authors = ["Wasmer Engineering Team <engineering@wasmer.io>"]
@@ -73,10 +72,6 @@ byteorder = "1.3"
 bytes = "1.11.1"
 bytesize = "2.3.1"
 cc = "1.2.47"
-clap = { version = "4.5.53", default-features = false }
-clap_builder = { version = "4.5.53" }
-clap_derive = { version = "4.5.49" }
-clap_lex = { version = "1" }
 cmake = "0.1.50"
 compiletest_rs = "0.11.2"
 corosensei = "0.3.0"
@@ -189,10 +184,6 @@ glob.workspace = true
 [dev-dependencies]
 anyhow.workspace = true
 bytesize.workspace = true
-clap.workspace = true
-clap_builder.workspace = true
-clap_derive.workspace = true
-clap_lex.workspace = true
 criterion = { workspace = true, features = ["csv_output"] }
 serial_test = { workspace = true, default-features = false }
 compiler-test-derive = { path = "tests/lib/compiler-test-derive" }
