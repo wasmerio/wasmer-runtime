@@ -22,9 +22,7 @@ use wasmer_types::ExportIndex;
 use wasmer_types::MemoryIndex;
 use wasmer_types::entity::PrimaryMap;
 use wasmer_types::target::Target;
-use wasmer_types::{
-    CompilationProgressCallback, CompileError, FunctionIndex, LocalFunctionIndex,
-};
+use wasmer_types::{CompilationProgressCallback, CompileError, FunctionIndex, LocalFunctionIndex};
 use wasmer_vm::MemoryStyle;
 
 /// A compiler that compiles a WebAssembly module with LLVM, translating the Wasm to LLVM IR,

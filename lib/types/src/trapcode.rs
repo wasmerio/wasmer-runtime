@@ -12,16 +12,7 @@ use thiserror::Error;
 /// A trap code describing the reason for a trap.
 ///
 /// All trap instructions have an explicit trap code.
-#[derive(
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Debug,
-    Hash,
-    Error,
-    num_enum::TryFromPrimitive,
-)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Error, num_enum::TryFromPrimitive)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 #[repr(u32)]
