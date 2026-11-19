@@ -19,6 +19,8 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ steps.load_toolchain.outputs.rust_toolchain }}
+      - name: Install zlib
+        run: sudo apt-get update -y && sudo apt-get install -y zlib1g-dev
       - name: Install LLVM
         shell: bash
         run: |
