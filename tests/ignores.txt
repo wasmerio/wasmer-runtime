@@ -30,7 +30,9 @@ llvm spec::linking
 singlepass spec::threads::imports
 cranelift spec::threads::imports
 llvm spec::threads::imports
-
+cranelift spec::cast::
+llvm spec::cast::
+singlepass spec::cast::
 
 # Tail-call
 singlepass return_call
