@@ -140,6 +140,11 @@ impl<'a> ArtifactCreate<'a> for ArtifactBuild {
     }
 
     fn serialize(&self) -> Result<Vec<u8>, SerializeError> {
+        if self.compilation.is_empty() {
+            return Err(SerializeError::Generic(
+                "No in-memory compilation bytes to serialize".to_string(),
+            ));
+        }
         Ok(self.compilation.clone())
     }
 }

@@ -20,16 +20,14 @@ use cranelift_codegen::{
     ir::{self, ExternalName, UserFuncName},
 };
 
-use cranelift_codegen::gimli::{
-    constants::DW_EH_PE_absptr,
-    write::{Address, FrameDescriptionEntry, FrameTable},
-};
+use cranelift_codegen::gimli::write::{Address, FrameDescriptionEntry};
 
 use itertools::Itertools;
 use object::write::{Object, Relocation, SymbolId};
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use std::sync::Arc;
 use wasmer_compiler::WASM_TRAMPOLINE_ESTIMATED_BODY_SIZE;
+use wasmer_compiler::dwarf::WriterRelocate;
 use wasmer_compiler::elf::CompileOutput;
 use wasmer_compiler::elf::{add_libcall_symbol, add_undefined_symbol};
 use wasmer_compiler::misc::{CompiledFunctionExt, CompiledKind};
@@ -50,9 +48,6 @@ use wasmer_types::{
     CompilationProgressCallback, CompileError, FunctionIndex, LocalFunctionIndex, ModuleInfo,
     SignatureIndex, TrapCode, TrapInformation,
 };
-
-const FUNCTION_SYMBOL: usize = 0;
-const PERSONALITY_SYMBOL: usize = 1;
 
 pub struct CraneliftCompiledFunction {
     body: Compilation,
@@ -141,34 +136,12 @@ impl CraneliftCompiler {
             .cloned()
             .map(|cb| ProgressContext::new(cb, total_steps, "cranelift::functions"));
 
-        // Generate the frametable
-        let dwarf_frametable = if function_body_inputs.is_empty() {
-            // If we have no function body inputs, we don't need to
-            // construct the `FrameTable`. Constructing it, with empty
-            // FDEs will cause some issues in Linux.
-            None
-        } else {
-            match target.triple().default_calling_convention() {
-                Ok(CallingConvention::SystemV) => match isa.create_systemv_cie() {
-                    Some(mut cie) => {
-                        cie.personality = Some((
-                            DW_EH_PE_absptr,
-                            Address::Symbol {
-                                symbol: PERSONALITY_SYMBOL,
-                                addend: 0,
-                            },
-                        ));
-                        cie.lsda_encoding = Some(DW_EH_PE_absptr);
-                        let mut dwarf_frametable = FrameTable::default();
-                        let cie_id = dwarf_frametable.add_cie(cie);
-                        Some((dwarf_frametable, cie_id))
-                    }
-                    // Even though we are in a SystemV system, Cranelift doesn't support it
-                    None => None,
-                },
-                _ => None,
-            }
-        };
+        let emit_dwarf_unwind = !function_body_inputs.is_empty()
+            && matches!(
+                target.triple().default_calling_convention(),
+                Ok(CallingConvention::SystemV)
+            )
+            && isa.create_systemv_cie().is_some();
 
         // The `compile_function` closure is used for both the sequential and
         // parallel compilation paths to avoid code duplication.
@@ -276,7 +249,7 @@ impl CraneliftCompiler {
                 .map(mach_trap_to_trap)
                 .collect::<Vec<_>>();
 
-            let emit_lsda = dwarf_frametable.is_some() || emit_macho_compact_unwind;
+            let emit_lsda = emit_dwarf_unwind || emit_macho_compact_unwind;
 
             let compact_unwind_encoding = if emit_macho_compact_unwind {
                 Some(
@@ -304,14 +277,14 @@ impl CraneliftCompiler {
 
             let fde = match compiled_function_unwind_info(&*isa, &context)? {
                 CraneliftUnwindInfo::Fde(fde) => {
-                    if dwarf_frametable.is_some() {
+                    if emit_dwarf_unwind {
                         // For the ELF artifact format each function's
                         // `.eh_frame` relocates against its own text symbol,
                         // so the FDE's initial location must not be shifted.
                         let fde = fde.to_fde(Address::Symbol {
                             // The symbol is the kind of relocation.
                             // "0" is used for functions
-                            symbol: FUNCTION_SYMBOL,
+                            symbol: WriterRelocate::FUNCTION_SYMBOL,
                             addend: 0,
                         });
                         // The unwind information is inserted into the dwarf section
