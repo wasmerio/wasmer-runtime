@@ -64,7 +64,7 @@ loupe = "0.2.0"
 addr2line = "0.27.1"
 anyhow = "1.0"
 backtrace = "0.3"
-bindgen = { version = "0.72.1", default-features = false }
+bindgen = { version = "0.73.2", default-features = false }
 blake3 = "1.0"
 build-deps = "0.1.4"
 bytecheck = { version = "0.8.2" }
