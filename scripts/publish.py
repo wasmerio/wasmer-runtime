@@ -1,6 +1,6 @@
 #! /usr/bin/env python3
 
-"""This is a script for publishing the wasmer crates to crates.io.
+"""Publish the Wasmer runtime crates to crates.io.
 It should be run in the root of wasmer like `python3 scripts/publish.py --help`.
 
 Please lint with pylint and format with black.
@@ -41,16 +41,11 @@ except ImportError:
     sys.exit(1)
 
 SETTINGS = {
-    # extra features to put when publishing, for example wasmer-cli needs a
-    # compiler by default otherwise it won't work standalone
+    # Extra features to enable when publishing runtime workspace crates.
     "publish_features": {
         "wasmer-compiler": "compiler",
-        "wasmer-cli": "default,cranelift",
-        "wasmer-wasix": "sys,wasmer/sys-default",
-        "wasmer-wasix-types": "wasmer/sys-default",
         "wasmer-wast": "wasmer/sys-default",
         "wasmer-cache": "wasmer/sys-default",
-        "wasmer-asyncify": "wasmer/sys-default",
     },
     # workspace members we want to publish but whose path doesn't start by
     # "./lib/"

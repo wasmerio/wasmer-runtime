@@ -1,13 +1,14 @@
 ---
 name: "\U0001F389 Feature request"
-about: Suggest an idea for this project
+about: Suggest a feature for Wasmer Runtime
 title: ''
 labels: "\U0001F389 enhancement"
 assignees: ''
 
 ---
 
-Thanks for proposing a new feature!
+Thanks for proposing a new runtime feature! For CLI, WASI/WASIX, packaging,
+or C API requests, use https://github.com/wasmerio/wasmer/issues.
 
 ### Motivation
 
@@ -19,7 +20,7 @@ A clear and concise description of the feature you would like to add, and how it
 
 ### Alternatives
 
-A clear and concise description of any alternative solutions or features you've considered, and why you're proposed solution is better.
+A clear and concise description of any alternative solutions or features you've considered, and why your proposed solution is better.
 
 ### Additional context
 

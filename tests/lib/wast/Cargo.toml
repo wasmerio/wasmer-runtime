@@ -6,7 +6,7 @@ authors.workspace = true
 license = "MIT OR Apache-2.0 WITH LLVM-exception"
 categories = ["wasm"]
 keywords = ["wasm", "webassembly"]
-repository = "https://github.com/wasmerio/wasmer"
+repository.workspace = true
 readme = "README.md"
 edition.workspace = true
 

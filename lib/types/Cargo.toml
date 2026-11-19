@@ -45,7 +45,7 @@ name = "store_id_alloc"
 harness = false
 
 [features]
-default = ["std"]
+default = ["std", "detect-wasm-features"]
 std = []
 core = []
 enable-serde = ["serde", "serde/std", "serde_bytes", "indexmap/serde"]

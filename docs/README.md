@@ -1,30 +1,32 @@
-# Wasmer Documentation
+# Wasmer Runtime documentation
 
-Wasmer provides multiple documentations. Here are some pointers:
+Start with the [repository README](../README.md). To embed WebAssembly in Rust,
+see the [`wasmer` crate README](../lib/api/README.md), the
+[Rust API reference](https://docs.rs/wasmer/), and the
+[runnable examples](../examples/README.md).
 
-* [The Wasmer runtime
-  `README.md`](https://github.com/wasmerio/wasmer/blob/main/README.md)
-  is a good start for the first steps, like installations, first runs etc.,
-* [The public documentation](https://docs.wasmer.io/) contains all the
-  documentation you need to learn about Wasmer and WebAssembly,
-* [The Rust crates documentations](https://wasmerio.github.io/wasmer/)
-  contain all the documentations to use the `wasmer-*` Rust crates,
-  with many examples,
-* [The collection of
-  examples](https://github.com/wasmerio/wasmer/blob/main/examples/README.md)
-  illustrates how to use Wasmer and its numerous features through very
-  commented examples,
-* [Documentations for all embeddings/language
-  integrations](https://github.com/wasmerio/wasmer/blob/main/README.md):
-  the Wasmer runtime can be embedded in various languages or
-  environments, each embedding provides its own documentation, book
-  etc.,
-* [OS distro packaging
-  notes](https://github.com/wasmerio/wasmer/blob/main/docs/PACKAGING.md)
-  contains notes about how to package Wasmer for OS distributions.
+## Develop the runtime
 
-For contributors, one document per concern:
-[CONTRIBUTING.md](./CONTRIBUTING.md), [ARCHITECTURE.md](./ARCHITECTURE.md),
-[BUILD.md](./BUILD.md), [TEST.md](./TEST.md),
-[SECURITY.md](./SECURITY.md). The root [AGENTS.md](../AGENTS.md) indexes
-them for coding agents and covers debugging the runtime.
+- [Architecture](./ARCHITECTURE.md)
+- [Building from source](./BUILD.md)
+- [Testing](./TEST.md)
+- [Contributing](./CONTRIBUTING.md)
+- [Agent guidance and debugging](../AGENTS.md)
+- [RISC-V support](./RISCV.md)
+- [Security policy](./SECURITY.md)
+- [Third-party attributions](./ATTRIBUTIONS.md)
+
+## Other Wasmer components
+
+The CLI, WASI/WASIX, C API, and packaging documentation are in the
+[original Wasmer repository](https://github.com/wasmerio/wasmer) and the
+[public Wasmer docs](https://docs.wasmer.io/). See the original repository for
+[distro packaging](https://github.com/wasmerio/wasmer/blob/main/docs/PACKAGING.md)
+and [product release procedures](https://github.com/wasmerio/wasmer/blob/main/scripts/RELEASE.md).
+This runtime repository does not ship the CLI or its installers. For the tooling
+that publishes Rust crates from this workspace, see [`scripts/publish.py`](../scripts/publish.py).
+
+The original repository also hosts the [historical changelog](https://github.com/wasmerio/wasmer/blob/main/CHANGELOG.md)
+and the [1.0](https://github.com/wasmerio/wasmer/blob/main/docs/migration_to_1.0.0.md)
+and [3.0](https://github.com/wasmerio/wasmer/blob/main/docs/migration_to_3.0.0.md)
+migration guides.

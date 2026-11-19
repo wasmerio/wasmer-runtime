@@ -29,5 +29,6 @@ jobs:
         env:
           LLVM_DIR: ${{ github.workspace }}/llvm-23
           LLVM_URL: "https://github.com/wasmerio/llvm-custom-builds/releases/download/23.x/llvm-linux-amd64.tar.zst"
-      - name: Build & package documentation
-        run: make package-docs
+      - name: Validate documentation
+        run: >-
+          cargo doc --workspace --release --no-deps --document-private-items --locked --features cranelift,llvm,singlepass,wasmer-artifact-create,static-artifact-create,wasmer-artifact-load,static-artifact-load,wasmer/experimental-async,wasmer/experimental-host-interrupt

@@ -1,4 +1,4 @@
-# Security Policy
+# Wasmer Runtime security policy
 
 ## Supported Versions
 
@@ -17,8 +17,9 @@ The table below summarizes which versions are still supported, and which aren't.
 
 ## Reporting a Vulnerability
 
-The Wasmer team and community take security bugs in Wasmer seriously.
-We appreciate your efforts to responsibly disclose your findings, and will make every effort to acknowledge your contributions.
+Report runtime vulnerabilities privately. Do not open a public issue or pull
+request before disclosure. This repository uses the Wasmer security team's
+reporting process.
 
 To report a security issue, email security@wasmer.io or
 hello@wasmer.io and include the word "SECURITY" in the subject line.

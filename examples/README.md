@@ -1,18 +1,19 @@
 # Wasmer Examples
 
-This directory contains a collection of examples. This isn't an
-exhaustive collection though, if one example is missing, please ask,
-we will be happy to fulfill your needs!
+These examples show how to embed the Wasmer runtime in Rust. Run the commands
+from the repository root after following the [build setup](../docs/BUILD.md).
+The example targets and their required features are listed in
+[`Cargo.toml`](../Cargo.toml).
 
 ## Handy Diagrams
 
-As a quick introduction to Wasmer's main workflows, here are three
-diagrams. We hope it provides an overview of how the crates assemble
-together.
+These diagrams give a high-level overview of the runtime. They use older
+crate names; see the [architecture guide](../docs/ARCHITECTURE.md) for the
+current layout.
 
 1. **Module compilation**, illustrates how WebAssembly bytes are
    validated, parsed, and compiled, with the help of the
-   `wasmer::Module`, `wasmer_engine::Engine`, and
+   `wasmer::Module`, `wasmer::Engine`, and
    `wasmer_compiler::Compiler` API.
 
    ![Module compilation](../assets/diagrams/Diagram_module_compilation.png)
@@ -20,7 +21,7 @@ together.
 2. **Module serialization**, illustrates how a module can be
    serialized and deserialized, with the help of
    `wasmer::Module::serialize` and `wasmer::Module::deserialize`. The
-   important part is that the engine can changed between those two
+   important part is that the engine can change between those two
    steps, and thus how a headless engine can be used for the
    deserialization.
 
@@ -326,36 +327,6 @@ example.
 
    </details>
 
-### Integrations
-
-1. [**WASI**][wasi], explains how to use the [WebAssembly System
-   Interface][WASI] (WASI), i.e. the [`wasmer-wasi`] crate.
-   
-   _Keywords_: wasi, system, interface
-
-   <details>
-   <summary><em>Execute the example</em></summary>
-
-   ```shell
-   $ cargo run --example wasi --release --features "cranelift,wasi"
-   ```
-
-   </details>
-
-2. [**WASI Pipes**][wasi-pipes], builds on the WASI example to show off
-   stdio piping in Wasmer.
-
-   _Keywords_: wasi, system, interface
-
-   <details>
-   <summary><em>Execute the example</em></summary>
-
-   ```shell
-   $ cargo run --example wasi-pipes --release --features "cranelift,wasi"
-   ```
-
-   </details>
-
 [hello-world]: ./hello_world.rs
 [engine]: ./engine.rs
 [engine-headless]: ./engine_headless.rs
@@ -371,15 +342,11 @@ example.
 [imported-function-env]: ./imports_function_env.rs
 [imported-function-env-global]: ./imports_function_env_global.rs
 [instance]: ./instance.rs
-[wasi]: ./wasi.rs
-[wasi-pipes]: ./wasi_pipes.rs
 [table]: ./table.rs
 [memory]: ./memory.rs
 [errors]: ./errors.rs
 [tunables-limit-memory]: ./tunables_limit_memory.rs
 [features]: ./features.rs
-[`wasmer-compiler-singlepass`]: https://github.com/wasmerio/wasmer/tree/main/lib/compiler-singlepass
-[`wasmer-compiler-cranelift`]: https://github.com/wasmerio/wasmer/tree/main/lib/compiler-cranelift
-[`wasmer-compiler-llvm`]: https://github.com/wasmerio/wasmer/tree/main/lib/compiler-llvm
-[`wasmer-wasi`]: https://github.com/wasmerio/wasmer/tree/main/lib/wasi
-[WASI]: https://github.com/WebAssembly/WASI
+[`wasmer-compiler-singlepass`]: ../lib/compiler-singlepass
+[`wasmer-compiler-cranelift`]: ../lib/compiler-cranelift
+[`wasmer-compiler-llvm`]: ../lib/compiler-llvm

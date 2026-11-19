@@ -5,8 +5,7 @@
 //!
 //! # Example
 //!
-//! [See the `metering` detailed and complete
-//! example](https://github.com/wasmerio/wasmer/blob/main/examples/metering.rs).
+//! See the [runnable metering example](https://github.com/wasmerio/wasmer-runtime/blob/main/examples/metering.rs).
 
 use std::convert::TryInto;
 use std::fmt;

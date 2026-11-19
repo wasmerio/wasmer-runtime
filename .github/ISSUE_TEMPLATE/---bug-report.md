@@ -1,6 +1,6 @@
 ---
 name: "\U0001F41E Bug report"
-about: Create a report to help us improve
+about: Report a bug in Wasmer Runtime
 title: ''
 labels: "\U0001F41E bug"
 assignees: ''
@@ -12,13 +12,16 @@ assignees: ''
 ### Describe the bug
 
 <!--
-A clear and concise description of what the bug is.
+Describe the runtime bug. CLI, WASI/WASIX, packaging, and C API issues belong
+at https://github.com/wasmerio/wasmer/issues. For security issues, follow
+https://github.com/wasmerio/wasmer-runtime/blob/main/docs/SECURITY.md.
 
-Copy and paste the result of executing the following in your shell, so we can know the version of wasmer, Rust (if available) and architecture of your environment.
+Include the `wasmer` crate version or commit, Cargo features, backend, and
+host platform. Include the Rust toolchain information below.
 -->
 
 ```sh
-wasmer -vV; rustc -vV
+rustc -vV
 ```
 
 

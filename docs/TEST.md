@@ -1,48 +1,47 @@
-# Testing
+# Testing the runtime
 
-Thanks to the [WebAssembly spec tests](https://github.com/WebAssembly/testsuite)
-we can ensure 100% compatibility with the WebAssembly spec test suite.
+Run these commands from the repository root after following the
+[build setup](./BUILD.md#getting-started). The compiler integration suite
+runs the [WebAssembly spec tests](https://github.com/WebAssembly/testsuite)
+and Wasmer-specific tests against the backends enabled with Cargo features.
 
-Run the full local suite with `make test` (needs `cargo-nextest`;
-`make require-nextest` installs it). It automatically detects the
-compilers available on your system. Follow the
-[Building from Source](./BUILD.md) guide to prepare your system with the
-requirements for each backend.
+## Local checks
 
-The [Makefile](../Makefile) lists the individual test targets and their
-purpose: the WAST spec tests per backend, the CLI, the examples, the
-C API, and more.
-
-It is also possible to test specific parts. One crate:
-
-```bash
-cargo test -p wasmer-wasix --features sys
+```sh
+cargo test --locked -p wasmer
+cargo test --locked -p wasmer-workspace --features cranelift --test compilers
+cargo test --locked -p wasmer-workspace --features cranelift --examples
 ```
 
-One test by name filter:
+These commands exercise a native Cranelift configuration. To test another
+native compiler, select `singlepass` or `llvm` instead where the target and
+[backend prerequisites](./BUILD.md#selecting-a-backend) allow it. The examples
+command only selects examples whose required features are enabled.
 
-```bash
-cargo test --release --tests --features cranelift -- cranelift::spec::simd
+See [`test.yaml`](../.github/workflows/test.yaml) for the full CI matrix,
+including artifact features, `cargo nextest`, doctests, and V8 on Windows.
+
+## Running a single WAST test
+
+Spec fixtures live in `tests/wast/spec`; runtime regressions go in
+[`tests/wast/wasmer`](../tests/wast/wasmer). `build.rs` generates backend-specific
+tests from these fixtures. To run the basic Cranelift variant of `fac.wast`:
+
+```sh
+cargo test --locked -p wasmer-workspace --features cranelift --test compilers \
+  wast::wasmer::fac::cranelift::cranelift -- --exact --nocapture
 ```
 
-## Skipping Tests
+Use `-- --list` instead of the filter and test flags to find generated names.
+For diagnostics, see [Debugging the runtime](../AGENTS.md#debugging-the-runtime).
 
-If a test fails only on one backend or platform, add a line to
-`tests/ignores.txt` with a reason (`<compiler> <test> # reason`). Do not
-chase Singlepass failures for SIMD, relaxed SIMD, exception handling, or
-wide arithmetic. Singlepass does not support these proposals.
+## Skipping tests
 
-To debug a failing WAST test, see
-[AGENTS.md](../AGENTS.md#debugging-the-runtime).
+If a failure is due to a known backend or platform limitation, use the
+narrowest match in [`tests/ignores.txt`](../tests/ignores.txt) and include a
+reason. A rule can combine selectors with `+`, for example
+`cranelift+riscv64 spec::simd`. A bare test pattern applies to all backends
+and platforms. Use `-- --ignored` to run ignored tests explicitly.
 
-## WASIX Guest-Side Tests
-
-WASIX guest-side tests live in `lib/wasix/tests/wasm_tests/`. They need
-`wasixcc` and `cargo-wasix` on PATH. Fixture directives are documented in
-`lib/wasix/tests/wasm_tests.rs`.
-
-## CI Coverage Gaps
-
-macOS and musl CI jobs run on a PR only when the PR carries the `macos` or
-`musl` label (see [CONTRIBUTING.md](./CONTRIBUTING.md)). A PR can pass CI
-and still break `main` on those platforms.
+For other test workflows, see [benchmarks](../benches/README.md) and
+[fuzzing](../fuzz/README.md).
