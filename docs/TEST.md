@@ -21,6 +21,33 @@ command only selects examples whose required features are enabled.
 See [`test.yaml`](../.github/workflows/test.yaml) for the full CI matrix,
 including artifact features, `cargo nextest`, doctests, and V8 on Windows.
 
+## C API
+
+The C API tests link against the release build of `libwasmer`, so build it first
+and rebuild it after each change. They crash without `WASMER_CAPI_CONFIG`, so
+set it to the backend you built.
+
+```sh
+cargo build --locked --release -p wasmer-c-api
+WASMER_CAPI_CONFIG=cranelift cargo test --locked --release -p wasmer-c-api
+cargo test --locked --release -p wasmer-c-api-imports
+```
+
+The C integration tests and examples use a packaged copy of the library. On
+Linux or macOS:
+
+```sh
+mkdir -p package/include package/lib
+cp lib/c-api/wasmer.h lib/c-api/wasmer_wasm.h lib/c-api/tests/wasm-c-api/include/wasm.h package/include/
+find target/release -maxdepth 1 \( -name libwasmer.so -o -name libwasmer.dylib \) -exec cp {} package/lib/ \;
+export WASMER_CAPI_CONFIG=cranelift WASMER_DIR="$PWD/package"
+ROOT_DIR="$PWD/lib/c-api/tests" cargo test --locked --release -p wasmer-c-api-test-runner
+ROOT_DIR="$PWD/lib/c-api/examples" cargo test --locked --release -p wasmer-capi-examples-runner
+```
+
+CI runs these steps through the
+[`test_capi` action](../.github/actions/test_capi/action.yml).
+
 ## Running a single WAST test
 
 Spec fixtures live in `tests/wast/spec`; runtime regressions go in

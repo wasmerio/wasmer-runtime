@@ -3,7 +3,8 @@
 Start with the [repository README](../README.md). To embed WebAssembly in Rust,
 see the [`wasmer` crate README](../lib/api/README.md), the
 [Rust API reference](https://docs.rs/wasmer/), and the
-[runnable examples](../examples/README.md).
+[runnable examples](../examples/README.md). To embed it from C, see the
+[C API README](../lib/c-api/README.md).
 
 ## Develop the runtime
 
@@ -18,7 +19,7 @@ see the [`wasmer` crate README](../lib/api/README.md), the
 
 ## Other Wasmer components
 
-The CLI, WASI/WASIX, C API, and packaging documentation are in the
+The CLI, WASI/WASIX, and packaging documentation are in the
 [original Wasmer repository](https://github.com/wasmerio/wasmer) and the
 [public Wasmer docs](https://docs.wasmer.io/). See the original repository for
 [distro packaging](https://github.com/wasmerio/wasmer/blob/main/docs/PACKAGING.md)
