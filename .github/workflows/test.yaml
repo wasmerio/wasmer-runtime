@@ -94,7 +94,9 @@ jobs:
           cargo clippy --workspace --examples --features "$native_features,experimental-async,wasmer/experimental-host-interrupt" --locked -- -D clippy::all
           cargo clippy -p wasmer-bin-fuzz --features "$native_features" --locked -- -D clippy::all
       - name: Lint JavaScript backend
-        run: cargo clippy --target wasm32-unknown-unknown -p wasmer --no-default-features --features js-default --locked -- -D clippy::all
+        run: |
+          cargo clippy --target wasm32-unknown-unknown -p wasmer --no-default-features --features js-default --locked -- -D clippy::all
+          cargo clippy --target wasm32-unknown-unknown -p wasmer --no-default-features --features js-default,experimental-async --locked -- -D clippy::all
       - name: Assert no files have changed
         shell: bash
         run: |
@@ -137,7 +139,35 @@ jobs:
           key: cache-v${{ env.S3_CACHE_VERSION }}-${{ github.repository }}-${{ runner.os }}-wasmer-test-js-${{ hashFiles('Cargo.lock') }}
       - name: Test JavaScript backend
         working-directory: lib/api
-        run: wasm-pack test --node -- --no-default-features --features js-default,wat,experimental-async,js-serializable-module
+        run: |
+          wasm-pack test --node -- --no-default-features --features js-default,wat
+          # With js-serializable-module, modules keep their binary instead of copying it.
+          wasm-pack test --node -- --no-default-features --features js-default,wat,js-serializable-module --test module
+      # Async calls need JSPI, which Node 24 has behind a flag and Node 25+ has
+      # always, rejecting the flag. Node exits with success when a test waits
+      # forever, so fail_on_hang.cjs makes that a failure. The second run covers
+      # hosts that forbid making JavaScript from strings.
+      - name: Test JSPI on NodeJS 26
+        working-directory: lib/api
+        run: &test-js-jspi |
+          has_jspi='process.exit(typeof WebAssembly.promising === "function" ? 0 : 1)'
+          node_args=--require=./tests/fail_on_hang.cjs
+          if ! node -e "$has_jspi"; then
+            node --experimental-wasm-jspi -e "$has_jspi"
+            node_args=$node_args,--experimental-wasm-jspi
+          fi
+          features=js-default,experimental-async,wat
+          NODE_ARGS="$node_args" wasm-pack test --node -- --no-default-features --features "$features"
+          NODE_ARGS="$node_args,--disallow-code-generation-from-strings" wasm-pack test --node -- --no-default-features --features "$features"
+      # Node 24 runs a suspending import before it refuses to suspend one, where
+      # later versions refuse first. The JSPI tests have to pass on both.
+      - name: Install NodeJS 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Test JSPI on NodeJS 24
+        working-directory: lib/api
+        run: *test-js-jspi
   test_interpreter_api:
     name: API (V8) - ${{ matrix.metadata.build }}
     runs-on: ${{ matrix.metadata.build == 'linux-x64' && (github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64') || matrix.metadata.os }}
@@ -396,7 +426,7 @@ jobs:
           # Linux, so the test-capi stage runs them with its own feature sets.
           args=(--workspace --release --locked --exclude wasmer-c-api --exclude wasmer-c-api-imports
             --exclude wasmer-c-api-test-runner --exclude wasmer-capi-examples-runner)
-          features="$ARTIFACT_FEATURES,experimental-async,wasmer/experimental-host-interrupt"
+          features="$ARTIFACT_FEATURES,experimental-async,wasmer/experimental-host-interrupt,wasmer/unsafe-cothread"
           if [[ "$TEST_PLATFORM" == windows-x64 ]]; then
             # Use V8 as the default backend on Windows, as the Makefile did.
             features+=,v8-default
