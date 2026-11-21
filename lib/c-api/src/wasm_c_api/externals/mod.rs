@@ -11,40 +11,54 @@ pub use memory::*;
 pub use table::*;
 use wasmer_api::{Extern, ExternType, Function, Global, Memory, Table};
 
+/// The extension that created an import, such as a WASI environment.
+#[cfg(feature = "extensions")]
+pub trait ExternOrigin {
+    /// Binds the memory the instance will import before it is created.
+    fn prebind_memory(&self, store: &mut wasmer_api::StoreMut<'_>, memory: &Memory);
+}
+
 #[allow(non_camel_case_types)]
 #[derive(Clone)]
 pub struct wasm_extern_t {
-    pub(crate) inner: Extern,
-    pub(crate) store: StoreRef,
+    pub inner: Extern,
+    pub store: StoreRef,
+    #[cfg(feature = "extensions")]
+    pub origin: Option<std::rc::Rc<dyn ExternOrigin>>,
 }
 
 impl wasm_extern_t {
-    pub(crate) fn new(store: StoreRef, inner: Extern) -> Self {
-        Self { inner, store }
+    pub fn new(store: StoreRef, inner: Extern) -> Self {
+        Self {
+            inner,
+            store,
+            #[cfg(feature = "extensions")]
+            origin: None,
+        }
     }
 
-    pub(crate) fn global(&self) -> Global {
+    pub fn global(&self) -> Global {
         match &self.inner {
             Extern::Global(g) => g.clone(),
             _ => unsafe { std::hint::unreachable_unchecked() },
         }
     }
 
-    pub(crate) fn function(&self) -> Function {
+    pub fn function(&self) -> Function {
         match &self.inner {
             Extern::Function(f) => f.clone(),
             _ => unsafe { std::hint::unreachable_unchecked() },
         }
     }
 
-    pub(crate) fn table(&self) -> Table {
+    pub fn table(&self) -> Table {
         match &self.inner {
             Extern::Table(t) => t.clone(),
             _ => unsafe { std::hint::unreachable_unchecked() },
         }
     }
 
-    pub(crate) fn memory(&self) -> Memory {
+    pub fn memory(&self) -> Memory {
         match &self.inner {
             Extern::Memory(m) => m.clone(),
             _ => unsafe { std::hint::unreachable_unchecked() },

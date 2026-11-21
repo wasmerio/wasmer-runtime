@@ -53,7 +53,7 @@ impl WeakStoreRef {
 /// Opaque type representing a WebAssembly store.
 #[allow(non_camel_case_types)]
 pub struct wasm_store_t {
-    pub(crate) inner: StoreRef,
+    pub inner: StoreRef,
 }
 
 /// Creates a new WebAssembly store given a specific [engine][super::engine].
