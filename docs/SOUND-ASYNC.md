@@ -1,6 +1,7 @@
 # Type-Safe Async API for Wasmer
 
-**Status:** proposal, 2026-11-21
+**Status:** proposal, 2026-11-21. The trials and design notes are in
+[`sound-async/`](./sound-async/README.md).
 
 ## Summary
 
