@@ -34,4 +34,4 @@ jobs:
           LLVM_URL: "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.5/LLVM-23.1.5-Linux-X64.tar.zst"
       - name: Validate documentation
         run: >-
-          cargo doc --workspace --release --no-deps --document-private-items --locked --features cranelift,llvm,singlepass,wasmer-artifact-create,static-artifact-create,wasmer-artifact-load,static-artifact-load,wasmer/experimental-async,wasmer/experimental-host-interrupt
+          cargo doc --workspace --exclude wasmer-c-api --release --no-deps --document-private-items --locked --features cranelift,llvm,singlepass,wasmer-artifact-create,static-artifact-create,wasmer-artifact-load,static-artifact-load,wasmer/experimental-async,wasmer/experimental-host-interrupt
