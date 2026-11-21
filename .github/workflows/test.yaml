@@ -250,6 +250,8 @@ jobs:
             description: Examples
           - key: check-api-features
             description: API (sys)
+          - key: test-capi
+            description: C API
         metadata:
           - build: linux-x64
             os: ubuntu-22.04
@@ -342,7 +344,7 @@ jobs:
         if: matrix.stage.key == 'test-all'
         uses: taiki-e/install-action@nextest
       - name: Install Clang and LLVM on macOS
-        if: runner.os == 'macOS' && (matrix.stage.key == 'test-all' || matrix.stage.key == 'test-examples' || matrix.stage.key == 'check-api-features')
+        if: runner.os == 'macOS' && (matrix.stage.key == 'test-all' || matrix.stage.key == 'test-examples' || matrix.stage.key == 'check-api-features' || matrix.stage.key == 'test-capi')
         shell: bash
         run: |
           brew install llvm
@@ -390,7 +392,10 @@ jobs:
         env:
           TEST_PLATFORM: ${{ matrix.metadata.build }}
         run: |
-          args=(--workspace --release --locked)
+          # C API tests link a prebuilt libwasmer, which cannot include V8 on
+          # Linux, so the test-capi stage runs them with its own feature sets.
+          args=(--workspace --release --locked --exclude wasmer-c-api --exclude wasmer-c-api-imports
+            --exclude wasmer-c-api-test-runner --exclude wasmer-capi-examples-runner)
           features="$ARTIFACT_FEATURES,experimental-async,wasmer/experimental-host-interrupt"
           if [[ "$TEST_PLATFORM" == windows-x64 ]]; then
             # Use V8 as the default backend on Windows, as the Makefile did.
@@ -427,6 +432,30 @@ jobs:
       - name: Check sys API features
         if: matrix.stage.key == 'check-api-features'
         run: cargo check -p wasmer --features "$COMPILERS,$ARTIFACT_FEATURES,artifact-size,core,enable-serde" --locked
+      - name: Check C API feature sets
+        if: matrix.stage.key == 'test-capi'
+        shell: bash
+        run: |
+          for features in compiler-headless wat,compiler,middlewares,singlepass "wat,compiler,middlewares,cranelift,singlepass,$ARTIFACT_FEATURES"; do
+            cargo check -p wasmer-c-api --no-default-features --features "$features" --locked
+          done
+      - name: Test C API imports
+        if: matrix.stage.key == 'test-capi'
+        run: cargo test -p wasmer-c-api-imports --release --locked
+      # musl targets cannot produce the shared library these tests link against.
+      - name: Test C API (Cranelift)
+        if: matrix.stage.key == 'test-capi' && matrix.metadata.build != 'linux-musl'
+        uses: ./.github/actions/test_capi
+        with:
+          backend: cranelift
+          features: wat,compiler,middlewares,cranelift,singlepass,${{ env.ARTIFACT_FEATURES }}
+      # On Linux, wee8's hidden symbols prevent building a shared V8 C API.
+      - name: Test C API (V8)
+        if: matrix.stage.key == 'test-capi' && matrix.metadata.build == 'macos-arm'
+        uses: ./.github/actions/test_capi
+        with:
+          backend: v8
+          features: wat,v8-default
   ci_success:
     name: Tests CI
     runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}

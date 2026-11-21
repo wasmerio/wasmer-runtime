@@ -1,0 +1,46 @@
+name: Test C API
+description: Build the C API for one backend and run its crate, C and example tests
+inputs:
+  backend:
+    description: Backend selected through WASMER_CAPI_CONFIG
+    required: true
+  features:
+    description: Cargo features for wasmer-c-api
+    required: true
+runs:
+  using: composite
+  steps:
+    # The crate's C doctests link against this shared library.
+    - name: Build C API
+      shell: bash
+      env:
+        FEATURES: ${{ inputs.features }}
+      run: cargo build -p wasmer-c-api --release --no-default-features --features "$FEATURES" --locked
+    - name: Test C API crate
+      shell: bash
+      env:
+        FEATURES: ${{ inputs.features }}
+        WASMER_CAPI_CONFIG: ${{ inputs.backend }}
+      run: cargo test -p wasmer-c-api --release --no-default-features --features "$FEATURES" --locked
+    - name: Package C API
+      id: package
+      shell: bash
+      env:
+        BACKEND: ${{ inputs.backend }}
+      run: |
+        package="$RUNNER_TEMP/wasmer-capi-$BACKEND"
+        release="target/${CARGO_BUILD_TARGET:+$CARGO_BUILD_TARGET/}release"
+        mkdir -p "$package/include" "$package/lib"
+        cp lib/c-api/wasmer.h lib/c-api/wasmer_wasm.h lib/c-api/tests/wasm-c-api/include/wasm.h "$package/include/"
+        find "$release" -maxdepth 1 \( -name libwasmer.so -o -name libwasmer.dylib \) -exec cp {} "$package/lib/" \;
+        echo "dir=$package" >> "$GITHUB_OUTPUT"
+    # ROOT_DIR is explicit because the runners otherwise derive it from a
+    # checkout path named `wasmer`.
+    - name: Test C API integration
+      shell: bash
+      env:
+        WASMER_CAPI_CONFIG: ${{ inputs.backend }}
+        WASMER_DIR: ${{ steps.package.outputs.dir }}
+      run: |
+        ROOT_DIR="$PWD/lib/c-api/tests" cargo test -p wasmer-c-api-test-runner --release --locked -- --nocapture
+        ROOT_DIR="$PWD/lib/c-api/examples" cargo test -p wasmer-capi-examples-runner --release --locked -- --nocapture
