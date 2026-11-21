@@ -1,8 +1,9 @@
 # Building Wasmer Runtime from source
 
-This workspace builds Rust libraries with Cargo. It does not build the Wasmer
-CLI or C API; see [the original Wasmer repository](https://github.com/wasmerio/wasmer)
-for those components.
+This workspace builds Rust libraries and the C API with Cargo. It does not build
+the Wasmer CLI or WASI/WASIX; see
+[the original Wasmer repository](https://github.com/wasmerio/wasmer) for those
+components.
 
 ## Getting started
 
@@ -75,3 +76,22 @@ cargo build --locked -p wasmer --target wasm32-unknown-unknown --no-default-feat
 
 See [the runtime examples](../examples/README.md) and [testing guide](./TEST.md)
 for commands that exercise the runtime.
+
+## C API
+
+Build `libwasmer` in `target/release` and generate `lib/c-api/wasmer.h`:
+
+```sh
+cargo build --locked --release -p wasmer-c-api
+```
+
+The default features enable Cranelift and the middlewares. To select Singlepass
+or V8 instead:
+
+```sh
+cargo build --locked --release -p wasmer-c-api --no-default-features --features wat,compiler,middlewares,singlepass
+cargo build --locked --release -p wasmer-c-api --no-default-features --features wat,v8-default
+```
+
+The V8 shared library does not link on Linux. See [TEST.md](./TEST.md#c-api) to
+run the C API tests.

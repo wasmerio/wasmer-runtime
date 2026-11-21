@@ -109,39 +109,25 @@ int main(int argc, const char* argv[]) {
 
 ## Building
 
-You can compile Wasmer shared library from source:
+From the repository root, build the library and generate `lib/c-api/wasmer.h`:
 
-```text
-make build-capi
+```sh
+cargo build --locked --release -p wasmer-c-api
 ```
 
-This will generate the shared library \(depending on your system\):
+This generates the shared library \(depending on your system\):
 
-* Windows: `target/release/libwasmer_c_api.dll`
-* macOS: `target/release/libwasmer_runtime_c_api.dylib`
-* Linux: `target/release/libwasmer_runtime_c_api.so`
+* Windows: `target/release/wasmer.dll`
+* macOS: `target/release/libwasmer.dylib`
+* Linux: `target/release/libwasmer.so`
 
-If you want to generate the library and headers in a friendly format as shown in [Usage](#usage), you can execute the following in Wasmer root:
-
-```bash
-make package-capi
-```
-
-This command will generate a `package` directory, that you can then use easily in the [Wasmer C API examples](https://wasmerio.github.io/wasmer/crates/doc/wasmer_c_api/).
-
+See [Building the C API](../../docs/BUILD.md#c-api) to select a backend.
 
 ## Testing
 
-Tests are run using the release build of the library.  If you make
-changes or compile with non-default features, please ensure you
-rebuild in release mode for the tests to see the changes.
-
-To run all the full suite of tests, enter Wasmer root directory
-and run the following commands:
-
-```sh
-$ make test-capi
-```
+Tests use the release build of the library. If you make changes or compile with
+non-default features, rebuild in release mode for the tests to see them. See
+[Testing the C API](../../docs/TEST.md#c-api) for the full suite.
 
 ## `wasmer config`
 

@@ -1,7 +1,7 @@
 # Working in this repo as an agent
 
-This repository contains the embeddable Wasmer runtime and its Rust crates.
-The CLI, WASI/WASIX, C API, and package tooling belong in
+This repository contains the embeddable Wasmer runtime, its Rust crates, and
+the C API. The CLI, WASI/WASIX, and package tooling belong in
 [`wasmerio/wasmer`](https://github.com/wasmerio/wasmer).
 
 Before your first edit, read these guides:
