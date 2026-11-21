@@ -27,11 +27,11 @@ pub type wasm_valkind_t = u8;
 #[allow(non_camel_case_types)]
 #[derive(Clone, Copy)]
 pub union wasm_val_inner {
-    pub(crate) int32_t: i32,
-    pub(crate) int64_t: i64,
-    pub(crate) float32_t: f32,
-    pub(crate) float64_t: f64,
-    pub(crate) wref: *mut wasm_ref_t,
+    pub int32_t: i32,
+    pub int64_t: i64,
+    pub float32_t: f32,
+    pub float64_t: f64,
+    pub wref: *mut wasm_ref_t,
 }
 
 /// A WebAssembly value composed of its type and its value.
@@ -243,7 +243,7 @@ impl TryFrom<&wasm_val_t> for Value {
 impl wasm_val_t {
     /// Convert a [`Value`] into a [`wasm_val_t`], boxing reference values into a
     /// [`wasm_ref_t`] rooted in `store`. Null references become a null pointer.
-    pub(crate) fn from_value(value: &Value, store: &StoreRef) -> Result<wasm_val_t, &'static str> {
+    pub fn from_value(value: &Value, store: &StoreRef) -> Result<wasm_val_t, &'static str> {
         Ok(match value {
             Value::ExternRef(None) => wasm_val_t {
                 kind: wasm_valkind_enum::WASM_EXTERNREF as _,

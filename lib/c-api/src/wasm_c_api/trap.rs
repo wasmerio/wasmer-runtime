@@ -7,7 +7,7 @@ use wasmer_api::RuntimeError;
 // opaque type which is a `RuntimeError`
 #[allow(non_camel_case_types)]
 pub struct wasm_trap_t {
-    pub(crate) inner: RuntimeError,
+    pub inner: RuntimeError,
 }
 
 impl From<RuntimeError> for wasm_trap_t {

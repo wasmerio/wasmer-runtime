@@ -7,8 +7,8 @@ use wasmer_api::{Extern, Instance, InstantiationError};
 /// Opaque type representing a WebAssembly instance.
 #[allow(non_camel_case_types)]
 pub struct wasm_instance_t {
-    pub(crate) store: StoreRef,
-    pub(crate) inner: Instance,
+    pub store: StoreRef,
+    pub inner: Instance,
 }
 
 /// Creates a new instance from a WebAssembly module and a
@@ -55,6 +55,23 @@ pub unsafe extern "C" fn wasm_instance_new(
         .map(|imp| Extern::from(imp.as_ref().unwrap().as_ref().clone()))
         .take(module_import_count)
         .collect::<Vec<Extern>>();
+
+    #[cfg(feature = "extensions")]
+    if let Some(memory) = externs.iter().find_map(|value| match value {
+        Extern::Memory(memory) => Some(memory),
+        _ => None,
+    }) {
+        for import in imports
+            .as_slice()
+            .iter()
+            .take(module_import_count)
+            .flatten()
+        {
+            if let Some(origin) = &import.origin {
+                origin.prebind_memory(&mut store_mut, memory);
+            }
+        }
+    }
 
     let instance = match Instance::new_by_index(&mut store_mut, wasm_module, &externs) {
         Ok(instance) => instance,
@@ -214,6 +231,87 @@ pub unsafe extern "C" fn wasm_instance_exports(
 #[cfg(test)]
 mod tests {
     use inline_c::assert_c;
+
+    #[cfg(feature = "extensions")]
+    #[test]
+    fn import_origin_binds_its_memory_before_the_start_function() {
+        use super::{wasm_instance_delete, wasm_instance_new};
+        use crate::wasm_c_api::{
+            engine::{wasm_engine_delete, wasm_engine_new},
+            externals::{ExternOrigin, wasm_extern_t, wasm_extern_vec_t},
+            module::wasm_module_t,
+            store::{wasm_store_delete, wasm_store_new},
+        };
+        use std::{
+            rc::Rc,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+        };
+        use wasmer_api::{Extern, Function, Memory, MemoryType, Module, StoreMut};
+
+        struct Origin {
+            memory: Memory,
+            bound: Arc<AtomicBool>,
+        }
+        impl ExternOrigin for Origin {
+            fn prebind_memory(&self, _: &mut StoreMut<'_>, memory: &Memory) {
+                assert!(*memory == self.memory);
+                self.bound.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let engine = wasm_engine_new();
+        let mut store = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "env" "start" (func $start))
+                (import "env" "memory" (memory 1))
+                (func $run (call $start))
+                (start $run))"#,
+        )
+        .unwrap();
+        let bound = Arc::new(AtomicBool::new(false));
+        let bound_at_start = Arc::new(AtomicBool::new(false));
+        let (module, function, memory) = {
+            let mut raw = unsafe { store.inner.store_mut() };
+            let module = Module::new(&raw, wasm).unwrap();
+            let (seen, record) = (bound.clone(), bound_at_start.clone());
+            let function = Function::new_typed(&mut raw, move || {
+                record.store(seen.load(Ordering::SeqCst), Ordering::SeqCst);
+            });
+            let memory = Memory::new(&mut raw, MemoryType::new(1, None, false)).unwrap();
+            (module, function, memory)
+        };
+        let module = wasm_module_t { inner: module };
+        let mut import = wasm_extern_t::new(store.inner.clone(), Extern::Function(function));
+        import.origin = Some(Rc::new(Origin {
+            memory: memory.clone(),
+            bound: bound.clone(),
+        }));
+        let imports: wasm_extern_vec_t = vec![
+            Some(Box::new(import)),
+            Some(Box::new(wasm_extern_t::new(
+                store.inner.clone(),
+                Extern::Memory(memory),
+            ))),
+        ]
+        .into();
+
+        let instance =
+            unsafe { wasm_instance_new(Some(&mut store), Some(&module), Some(&imports), None) };
+
+        assert!(instance.is_some());
+        assert!(bound_at_start.load(Ordering::SeqCst));
+        unsafe {
+            wasm_instance_delete(instance);
+            drop(imports);
+            drop(module);
+            wasm_store_delete(Some(store));
+            wasm_engine_delete(Some(engine));
+        }
+    }
 
     #[allow(
         unexpected_cfgs,

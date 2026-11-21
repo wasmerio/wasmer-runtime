@@ -50,7 +50,7 @@ pub struct wasm_functype_t {
 }
 
 impl wasm_functype_t {
-    pub(crate) fn new(function_type: FunctionType) -> Self {
+    pub fn new(function_type: FunctionType) -> Self {
         Self {
             extern_type: wasm_externtype_t::new(ExternType::Function(function_type)),
         }

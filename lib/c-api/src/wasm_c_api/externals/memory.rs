@@ -8,11 +8,11 @@ use wasmer_api::{Extern, Memory, Pages};
 #[repr(C)]
 #[derive(Clone)]
 pub struct wasm_memory_t {
-    pub(crate) extern_: wasm_extern_t,
+    pub extern_: wasm_extern_t,
 }
 
 impl wasm_memory_t {
-    pub(crate) fn try_from(e: &wasm_extern_t) -> Option<&wasm_memory_t> {
+    pub fn try_from(e: &wasm_extern_t) -> Option<&wasm_memory_t> {
         match &e.inner {
             Extern::Memory(_) => Some(unsafe { &*(e as *const _ as *const _) }),
             _ => None,

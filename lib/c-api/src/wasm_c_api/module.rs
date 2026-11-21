@@ -7,7 +7,7 @@ use wasmer_api::Module;
 #[derive(Clone)]
 #[allow(non_camel_case_types)]
 pub struct wasm_module_t {
-    pub(crate) inner: Module,
+    pub inner: Module,
 }
 
 /// A WebAssembly module contains stateless WebAssembly code that has

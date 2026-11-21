@@ -14,11 +14,11 @@ use wasmer_api::{Extern, Function, FunctionEnv, FunctionEnvMut, RuntimeError, Va
 #[allow(non_camel_case_types)]
 #[repr(C)]
 pub struct wasm_func_t {
-    pub(crate) extern_: wasm_extern_t,
+    pub extern_: wasm_extern_t,
 }
 
 impl wasm_func_t {
-    pub(crate) fn try_from(e: &wasm_extern_t) -> Option<&wasm_func_t> {
+    pub fn try_from(e: &wasm_extern_t) -> Option<&wasm_func_t> {
         match &e.inner {
             Extern::Function(_) => Some(unsafe { &*(e as *const _ as *const _) }),
             _ => None,
