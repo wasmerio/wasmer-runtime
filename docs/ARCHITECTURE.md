@@ -15,7 +15,7 @@ will touch most:
 | `lib/wasix`                                           | The WASIX implementation (syscalls, processes, threads).             |
 | `lib/journal`                                         | Snapshot and restore support. See [journal.md](./journal.md).        |
 | `lib/virtual-fs`, `lib/virtual-net`, `lib/virtual-io` | Host abstraction layers.                                             |
-| `lib/c-api`                                           | C API (`cdylib` named `wasmer`).                                     |
+| `lib/c-api`, `lib/c-api-imports`                      | Engine C API (`cdylib` named `wasmer`), guest `wasm_c_api_v0` imports. |
 | `lib/backend-api`                                     | GraphQL client for the Wasmer registry.                              |
 | `lib/config`, `lib/package`                           | `wasmer.toml` parsing and webc packaging.                            |
 | `tests/compilers`                                     | Integration tests (`wast.rs`, `traps.rs`, `issues.rs`, more).        |

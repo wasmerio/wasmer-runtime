@@ -90,15 +90,22 @@ impl From<&ExternType> for wasm_externtype_t {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wasm_extern_type(r#extern: &wasm_extern_t) -> Box<wasm_externtype_t> {
-    let ty = unsafe { r#extern.ty() };
-    Box::new(wasm_externtype_t::new(ty))
+pub unsafe extern "C" fn wasm_extern_type(
+    r#extern: &wasm_extern_t,
+) -> Option<Box<wasm_externtype_t>> {
+    let ty = c_try!(r#extern.ty());
+    Some(Box::new(wasm_externtype_t::new(ty)))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wasm_extern_kind(r#extern: &wasm_extern_t) -> wasm_externkind_t {
-    let ty = unsafe { r#extern.ty() };
-    wasm_externkind_enum::from(ty) as wasm_externkind_t
+    (match &r#extern.inner {
+        wasmer_api::Extern::Function(_) => wasm_externkind_enum::WASM_EXTERN_FUNC,
+        wasmer_api::Extern::Global(_) => wasm_externkind_enum::WASM_EXTERN_GLOBAL,
+        wasmer_api::Extern::Table(_) => wasm_externkind_enum::WASM_EXTERN_TABLE,
+        wasmer_api::Extern::Memory(_) => wasm_externkind_enum::WASM_EXTERN_MEMORY,
+        wasmer_api::Extern::Tag(_) => wasm_externkind_enum::WASM_EXTERN_TAG,
+    }) as wasm_externkind_t
 }
 
 #[unsafe(no_mangle)]

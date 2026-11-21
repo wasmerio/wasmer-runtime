@@ -8,11 +8,11 @@ use wasmer_api::{Extern, Memory, Pages};
 #[repr(C)]
 #[derive(Clone)]
 pub struct wasm_memory_t {
-    pub(crate) extern_: wasm_extern_t,
+    pub extern_: wasm_extern_t,
 }
 
 impl wasm_memory_t {
-    pub(crate) fn try_from(e: &wasm_extern_t) -> Option<&wasm_memory_t> {
+    pub fn try_from(e: &wasm_extern_t) -> Option<&wasm_memory_t> {
         match &e.inner {
             Extern::Memory(_) => Some(unsafe { &*(e as *const _ as *const _) }),
             _ => None,
@@ -27,9 +27,12 @@ pub unsafe extern "C" fn wasm_memory_new(
 ) -> Option<Box<wasm_memory_t>> {
     let memory_type = memory_type?;
     let store = store?;
-    let mut store_mut = unsafe { store.inner.store_mut() };
     let memory_type = memory_type.inner().memory_type;
-    let memory = c_try!(Memory::new(&mut store_mut, memory_type));
+    let memory = c_try!(c_try!(
+        store
+            .inner
+            .with_mut(|store| Memory::new(store, memory_type))
+    ));
     Some(Box::new(wasm_memory_t {
         extern_: wasm_extern_t::new(store.inner.clone(), memory.into()),
     }))
@@ -57,10 +60,13 @@ pub unsafe extern "C" fn wasm_memory_type(
     memory: Option<&wasm_memory_t>,
 ) -> Option<Box<wasm_memorytype_t>> {
     let memory = memory?;
-    let store_ref = unsafe { memory.extern_.store.store() };
-    Some(Box::new(wasm_memorytype_t::new(
-        memory.extern_.memory().ty(&store_ref),
-    )))
+    let ty = c_try!(
+        memory
+            .extern_
+            .store
+            .with_mut(|store| memory.extern_.memory().ty(store))
+    );
+    Some(Box::new(wasm_memorytype_t::new(ty)))
 }
 
 // get a raw pointer into bytes
@@ -70,8 +76,7 @@ pub unsafe extern "C" fn wasm_memory_data(memory: Option<&mut wasm_memory_t>) ->
         update_last_error("memory pointer is null");
         return std::ptr::null_mut();
     };
-    let store_ref = unsafe { memory.extern_.store.store() };
-    memory.extern_.memory().view(&store_ref).data_ptr()
+    c_try!(memory.extern_.store.with_mut(|store| memory.extern_.memory().view(store).data_ptr()); otherwise std::ptr::null_mut())
 }
 
 // size in bytes
@@ -81,8 +86,7 @@ pub unsafe extern "C" fn wasm_memory_data_size(memory: Option<&wasm_memory_t>) -
         update_last_error("memory pointer is null");
         return 0;
     };
-    let store_ref = unsafe { memory.extern_.store.store() };
-    memory.extern_.memory().view(&store_ref).size().bytes().0
+    c_try!(memory.extern_.store.with_mut(|store| memory.extern_.memory().view(store).size().bytes().0); otherwise 0)
 }
 
 // size in pages
@@ -92,8 +96,7 @@ pub unsafe extern "C" fn wasm_memory_size(memory: Option<&wasm_memory_t>) -> u32
         update_last_error("memory pointer is null");
         return 0;
     };
-    let store_ref = unsafe { memory.extern_.store.store() };
-    memory.extern_.memory().view(&store_ref).size().0 as _
+    c_try!(memory.extern_.store.with_mut(|store| memory.extern_.memory().view(store).size().0); otherwise 0)
 }
 
 // delta is in pages
@@ -104,6 +107,5 @@ pub unsafe extern "C" fn wasm_memory_grow(memory: Option<&mut wasm_memory_t>, de
         return false;
     };
     let wasm_memory = memory.extern_.memory();
-    let mut store_mut = unsafe { memory.extern_.store.store_mut() };
-    wasm_memory.grow(&mut store_mut, Pages(delta)).is_ok()
+    c_try!(memory.extern_.store.with_mut(|store| wasm_memory.grow(store, Pages(delta))); otherwise false).is_ok()
 }

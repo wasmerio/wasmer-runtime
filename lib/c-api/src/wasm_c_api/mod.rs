@@ -332,9 +332,6 @@ pub mod value;
 /// ```
 pub mod version;
 
-#[cfg(feature = "wasi")]
-pub mod wasi;
-
 /// Wasmer-specific API to transform the WAT format into Wasm bytes.
 ///
 /// It is used mostly for testing or for small program purposes.

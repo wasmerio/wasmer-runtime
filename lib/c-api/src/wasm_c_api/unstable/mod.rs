@@ -6,5 +6,3 @@ pub mod module;
 #[cfg(feature = "middlewares")]
 pub mod parser;
 pub mod target_lexicon;
-#[cfg(feature = "wasi")]
-pub mod wasi;

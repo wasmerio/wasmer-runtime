@@ -31,16 +31,24 @@ pub unsafe extern "C" fn wasm_global_new(
 ) -> Option<Box<wasm_global_t>> {
     let global_type = global_type?;
     let store = store?;
-    let mut store_mut = unsafe { store.inner.store_mut() };
     let val = val?;
 
     let global_type = &global_type.inner().global_type;
-    let wasm_val = val.try_into().ok()?;
-    let global = if global_type.mutability.is_mutable() {
-        Global::new_mut(&mut store_mut, wasm_val)
-    } else {
-        Global::new(&mut store_mut, wasm_val)
-    };
+    let wasm_val: Value = val.try_into().ok()?;
+    let belongs = c_try!(store.inner.with_mut(|store| wasm_val.is_from_store(store)));
+    if !belongs {
+        update_last_error("global initializer belongs to another Store");
+        return None;
+    }
+    let global = c_try!(
+        store
+            .inner
+            .with_mut(|store| if global_type.mutability.is_mutable() {
+                Global::new_mut(store, wasm_val)
+            } else {
+                Global::new(store, wasm_val)
+            })
+    );
     Some(Box::new(wasm_global_t {
         extern_: wasm_extern_t::new(store.inner.clone(), global.into()),
     }))
@@ -69,11 +77,10 @@ pub unsafe extern "C" fn wasm_global_get(
         update_last_error("out pointer is null");
         return;
     };
+    // Error paths leave a valid empty scalar without dropping caller-owned stale data.
+    unsafe { std::ptr::write(out, wasm_val_t::default()) };
     let wasm_global = global.extern_.global();
-    let value = {
-        let mut store_mut = unsafe { global.extern_.store.store_mut() };
-        wasm_global.get(&mut store_mut)
-    };
+    let value = c_try!(global.extern_.store.with_mut(|store| wasm_global.get(store)); otherwise ());
     let store = global.extern_.store.clone();
     let new_val = c_try!(wasm_val_t::from_value(&value, &store); otherwise ());
     // `out` is an owned out-parameter; write without dropping stale contents.
@@ -97,8 +104,7 @@ pub unsafe extern "C" fn wasm_global_set(
     };
     let value: Value = c_try!(val.try_into(); otherwise ());
     let wasm_global = global.extern_.global();
-    let mut store_mut = unsafe { global.extern_.store.store_mut() };
-    c_try!(wasm_global.set(&mut store_mut, value); otherwise ());
+    c_try!(c_try!(global.extern_.store.with_mut(|store| wasm_global.set(store, value)); otherwise ()); otherwise ());
 }
 
 #[unsafe(no_mangle)]
@@ -114,10 +120,13 @@ pub unsafe extern "C" fn wasm_global_type(
     global: Option<&wasm_global_t>,
 ) -> Option<Box<wasm_globaltype_t>> {
     let global = global?;
-    let store_ref = unsafe { global.extern_.store.store() };
-    Some(Box::new(wasm_globaltype_t::new(
-        global.extern_.global().ty(&store_ref),
-    )))
+    let ty = c_try!(
+        global
+            .extern_
+            .store
+            .with_mut(|store| global.extern_.global().ty(store))
+    );
+    Some(Box::new(wasm_globaltype_t::new(ty)))
 }
 
 #[cfg(test)]

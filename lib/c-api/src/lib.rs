@@ -9,10 +9,13 @@
 //! can be characterized as a _living standard_. The API is not yet
 //! stable, even though it shows maturity over time. It is described
 //! by the `wasm.h` C header file. However, this crate API provides
-//! some extensions, like the `wasi_*` or `wasmer_*` types and
-//! functions, which aren't yet defined by the standard. The
-//! `wasmer.h` header file already depends on the `wasm.h`
-//! file. A copy lands in this repository for the sake of simplicity.
+//! some extensions, like the `wasmer_*` types and functions, which
+//! aren't yet defined by the standard. The `wasmer.h` header file
+//! already depends on the `wasm.h` file. A copy lands in this
+//! repository for the sake of simplicity.
+//!
+//! The `wasi_*` types and functions live in `wasmer-c-api-wasixv2`,
+//! which builds on this crate through its `extensions` feature.
 
 #![doc(html_favicon_url = "https://wasmer.io/images/icons/favicon-32x32.png")]
 #![doc(html_logo_url = "https://github.com/wasmerio.png?size=200")]

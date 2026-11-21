@@ -33,11 +33,6 @@ wasmer-compiler-llvm = { version = "=7.5.0", path = "../compiler-llvm", optional
 wasmer-compiler-singlepass = { version = "=7.5.0", path = "../compiler-singlepass", optional = true }
 wasmer-middlewares = { version = "=7.5.0", path = "../middlewares", optional = true }
 wasmer-types = { version = "=7.5.0", path = "../types" }
-wasmer-wasix = { path = "../wasix", version = "=0.705.0", features = [
-  "host-fs",
-  "host-vnet",
-  "sys",
-], default-features = false, optional = true }
 anyhow.workspace = true
 enumset.workspace = true
 libc.workspace = true
@@ -57,17 +52,28 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
 [dev-dependencies]
 field-offset.workspace = true
 inline-c.workspace = true
+tokio = { workspace = true, features = ["time"] }
 wat.workspace = true
 
 [features]
-default = ["wat", "sys-default", "cranelift", "compiler", "wasi", "middlewares"]
+default = ["wat", "sys-default", "cranelift", "compiler", "middlewares"]
 wat = ["wasmer-api/wat", "wasmer-c-api-imports/wat"]
-wasi = ["wasmer-wasix"]
+# Rust-only hooks for crates that extend this C API with a WASI
+# implementation: Store continuation endpoints, call entry scopes, import
+# origins and the managed V8 Store. Not covered by semver.
+extensions = ["sys", "wasmer-api/headless"]
+# Test-only introspection of `extensions` internals for extending crates.
+test-support = ["extensions"]
 middlewares = ["compiler", "wasmer-middlewares", "wasmer-api/wasmparser"]
 engine = ["compiler"]
 
 # Enable the `sys` backend.
-sys = ["wasmer-api/sys", "wasmer-compiler", "wasmer-c-api-imports/sys"]
+sys = [
+  "wasmer-api/sys",
+  "wasmer-api/experimental-async",
+  "wasmer-compiler",
+  "wasmer-c-api-imports/sys",
+]
 
 # Enable the `singlepass` compiler.
 singlepass = [

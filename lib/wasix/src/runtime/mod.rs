@@ -2,6 +2,8 @@ pub mod module_cache;
 pub mod package_loader;
 pub mod resolver;
 pub mod task_manager;
+#[cfg(not(target_arch = "wasm32"))]
+mod wasm_c_api;
 
 use self::module_cache::CacheError;
 pub use self::task_manager::{SpawnType, VirtualTaskManager};

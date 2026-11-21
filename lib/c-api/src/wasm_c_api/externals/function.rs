@@ -8,17 +8,17 @@ use crate::wasm_c_api::function_env::FunctionCEnv;
 use libc::c_void;
 use std::mem::MaybeUninit;
 use std::sync::{Arc, Mutex};
-use wasmer_api::{Extern, Function, FunctionEnv, FunctionEnvMut, RuntimeError, Value};
+use wasmer_api::{AsStoreMut, Extern, Function, FunctionEnv, FunctionEnvMut, RuntimeError, Value};
 
 #[derive(Clone)]
 #[allow(non_camel_case_types)]
 #[repr(C)]
 pub struct wasm_func_t {
-    pub(crate) extern_: wasm_extern_t,
+    pub extern_: wasm_extern_t,
 }
 
 impl wasm_func_t {
-    pub(crate) fn try_from(e: &wasm_extern_t) -> Option<&wasm_func_t> {
+    pub fn try_from(e: &wasm_extern_t) -> Option<&wasm_func_t> {
         match &e.inner {
             Extern::Function(_) => Some(unsafe { &*(e as *const _ as *const _) }),
             _ => None,
@@ -74,37 +74,76 @@ pub unsafe extern "C" fn wasm_func_new(
     // Capture a weak store handle (not a strong `StoreRef`) to avoid a
     // store → function → store cycle; upgrade it per call to box ref args.
     let store_weak = store.inner.downgrade();
-    let mut store_mut = unsafe { store.inner.store_mut() };
 
     let func_sig = &function_type.inner().function_type;
     let num_rets = func_sig.results().len();
+    #[cfg(all(feature = "v8", feature = "extensions"))]
+    let async_store_weak = store_weak.clone();
+    #[cfg(all(feature = "v8", feature = "extensions"))]
+    let v8_managed = store.inner.is_v8_managed();
     let inner_callback = move |mut _env: FunctionEnvMut<'_, FunctionCEnv>,
                                args: &[Value]|
           -> Result<Vec<Value>, RuntimeError> {
-        let store = store_weak
-            .upgrade()
-            .ok_or_else(|| RuntimeError::new("store was dropped"))?;
-        let processed_args = callback_args_to_wasm(args, &store)?;
+        let mut loan = _env.as_store_mut();
+        loan.parked(|| {
+            let store = store_weak
+                .upgrade()
+                .ok_or_else(|| RuntimeError::new("store was dropped"))?;
+            let processed_args = callback_args_to_wasm(args, &store)?;
 
-        let mut results: wasm_val_vec_t = vec![
-            wasm_val_t {
-                kind: wasm_valkind_enum::WASM_I64 as _,
-                of: wasm_val_inner { int64_t: 0 },
-            };
-            num_rets
-        ]
-        .into();
+            let mut results: wasm_val_vec_t = vec![
+                wasm_val_t {
+                    kind: wasm_valkind_enum::WASM_I64 as _,
+                    of: wasm_val_inner { int64_t: 0 },
+                };
+                num_rets
+            ]
+            .into();
 
-        let trap = unsafe { callback(&processed_args, &mut results) };
+            let trap = unsafe { callback(&processed_args, &mut results) };
 
-        if let Some(trap) = trap {
-            return Err(trap.inner);
-        }
+            if let Some(trap) = trap {
+                return Err(trap.inner);
+            }
 
-        callback_results_to_values(results.take())
+            callback_results_to_values(results.take())
+        })
     };
-    let env = FunctionEnv::new(&mut store_mut, FunctionCEnv::default());
-    let function = Function::new_with_env(&mut store_mut, &env, func_sig, inner_callback);
+    let function = c_try!(store.inner.with_mut(|store| {
+        let env = FunctionEnv::new(store, FunctionCEnv::default());
+        #[cfg(all(feature = "v8", feature = "extensions"))]
+        if v8_managed {
+            return wasmer_api::v8::new_with_env_async_and_sync(
+                store,
+                &env,
+                func_sig,
+                inner_callback,
+                move |_: wasmer_api::AsyncFunctionEnvMut<FunctionCEnv>, args| {
+                    let args = args.to_vec();
+                    let weak = async_store_weak.clone();
+                    async move {
+                        let store = weak
+                            .upgrade()
+                            .ok_or_else(|| RuntimeError::new("store was dropped"))?;
+                        let processed_args = callback_args_to_wasm(&args, &store)?;
+                        let mut results: wasm_val_vec_t = vec![
+                            wasm_val_t {
+                                kind: wasm_valkind_enum::WASM_I64 as _,
+                                of: wasm_val_inner { int64_t: 0 },
+                            };
+                            num_rets
+                        ]
+                        .into();
+                        if let Some(trap) = unsafe { callback(&processed_args, &mut results) } {
+                            return Err(trap.inner);
+                        }
+                        callback_results_to_values(results.take())
+                    }
+                },
+            );
+        }
+        Function::new_with_env(store, &env, func_sig, inner_callback)
+    }));
     Some(Box::new(wasm_func_t {
         extern_: wasm_extern_t::new(store.inner.clone(), function.into()),
     }))
@@ -122,7 +161,6 @@ pub unsafe extern "C" fn wasm_func_new_with_env(
     let callback = callback?;
     let store = store?;
     let store_weak = store.inner.downgrade();
-    let mut store_mut = unsafe { store.inner.store_mut() };
 
     let func_sig = &function_type.inner().function_type;
     let num_rets = func_sig.results().len();
@@ -141,50 +179,103 @@ pub unsafe extern "C" fn wasm_func_new_with_env(
 
     impl Drop for WrapperEnv {
         fn drop(&mut self) {
-            if let Ok(mut guard) = self.env_finalizer.lock()
-                && Arc::strong_count(&self.env_finalizer) == 1
-                && let Some(env_finalizer) = guard.take()
-            {
-                unsafe { (env_finalizer)(self.env.as_ptr()) };
+            let finalizer = {
+                self.env_finalizer.lock().ok().and_then(|mut guard| {
+                    (Arc::strong_count(&self.env_finalizer) == 1)
+                        .then(|| guard.take())
+                        .flatten()
+                })
+            };
+            if let Some(finalizer) = finalizer {
+                unsafe { finalizer(self.env.as_ptr()) };
             }
         }
     }
-    let inner_callback = move |env: FunctionEnvMut<'_, WrapperEnv>,
+    #[cfg(all(feature = "v8", feature = "extensions"))]
+    let async_store_weak = store_weak.clone();
+    #[cfg(all(feature = "v8", feature = "extensions"))]
+    let v8_managed = store.inner.is_v8_managed();
+    let inner_callback = move |mut env: FunctionEnvMut<'_, WrapperEnv>,
                                args: &[Value]|
           -> Result<Vec<Value>, RuntimeError> {
-        let store = store_weak
-            .upgrade()
-            .ok_or_else(|| RuntimeError::new("store was dropped"))?;
-        let processed_args = callback_args_to_wasm(args, &store)?;
+        let callback_env = env.data().env.as_ptr();
+        let mut loan = env.as_store_mut();
+        loan.parked(|| {
+            let store = store_weak
+                .upgrade()
+                .ok_or_else(|| RuntimeError::new("store was dropped"))?;
+            let processed_args = callback_args_to_wasm(args, &store)?;
 
-        let mut results: wasm_val_vec_t = vec![
-            wasm_val_t {
-                kind: wasm_valkind_enum::WASM_I64 as _,
-                of: wasm_val_inner { int64_t: 0 },
-            };
-            num_rets
-        ]
-        .into();
+            let mut results: wasm_val_vec_t = vec![
+                wasm_val_t {
+                    kind: wasm_valkind_enum::WASM_I64 as _,
+                    of: wasm_val_inner { int64_t: 0 },
+                };
+                num_rets
+            ]
+            .into();
 
-        let trap = unsafe { callback(env.data().env.as_ptr(), &processed_args, &mut results) };
+            let trap = unsafe { callback(callback_env, &processed_args, &mut results) };
 
-        if let Some(trap) = trap {
-            return Err(trap.inner);
-        }
+            if let Some(trap) = trap {
+                return Err(trap.inner);
+            }
 
-        callback_results_to_values(results.take())
+            callback_results_to_values(results.take())
+        })
     };
-    let env = FunctionEnv::new(
-        &mut store_mut,
-        WrapperEnv {
-            env: FunctionCEnv::new(c_try!(
-                std::ptr::NonNull::new(env),
-                "Function environment cannot be a null pointer."
-            )),
-            env_finalizer: Arc::new(Mutex::new(env_finalizer)),
-        },
-    );
-    let function = Function::new_with_env(&mut store_mut, &env, func_sig, inner_callback);
+    let environment = WrapperEnv {
+        env: FunctionCEnv::new(c_try!(
+            std::ptr::NonNull::new(env),
+            "Function environment cannot be a null pointer."
+        )),
+        env_finalizer: Arc::new(Mutex::new(env_finalizer)),
+    };
+    let function = c_try!(store.inner.with_mut(|store| {
+        let env = FunctionEnv::new(store, environment);
+        #[cfg(all(feature = "v8", feature = "extensions"))]
+        if v8_managed {
+            return wasmer_api::v8::new_with_env_async_and_sync(
+                store,
+                &env,
+                func_sig,
+                inner_callback,
+                move |env: wasmer_api::AsyncFunctionEnvMut<WrapperEnv>, args| {
+                    let args = args.to_vec();
+                    let weak = async_store_weak.clone();
+                    async move {
+                        let metadata = {
+                            let guard = env.try_read().ok_or_else(|| {
+                                RuntimeError::new("V8 callback environment is busy")
+                            })?;
+                            guard.data().clone()
+                        };
+                        // The actual read guard ends before the SAME C callback.
+                        // This Arc keeps its finalizer paired with its userdata.
+                        let store = weak
+                            .upgrade()
+                            .ok_or_else(|| RuntimeError::new("store was dropped"))?;
+                        let processed_args = callback_args_to_wasm(&args, &store)?;
+                        let mut results: wasm_val_vec_t = vec![
+                            wasm_val_t {
+                                kind: wasm_valkind_enum::WASM_I64 as _,
+                                of: wasm_val_inner { int64_t: 0 },
+                            };
+                            num_rets
+                        ]
+                        .into();
+                        if let Some(trap) = unsafe {
+                            callback(metadata.env.as_ptr(), &processed_args, &mut results)
+                        } {
+                            return Err(trap.inner);
+                        }
+                        callback_results_to_values(results.take())
+                    }
+                },
+            );
+        }
+        Function::new_with_env(store, &env, func_sig, inner_callback)
+    }));
     Some(Box::new(wasm_func_t {
         extern_: wasm_extern_t::new(store.inner.clone(), function.into()),
     }))
@@ -269,8 +360,7 @@ pub unsafe extern "C" fn wasm_func_call(
     let func = func?;
     let args = args?;
     let store_ref = func.extern_.store.clone();
-    let mut store = func.extern_.store.clone();
-    let mut store_mut = unsafe { store.store_mut() };
+    let function = func.extern_.function();
     // Convert by reference (not `.cloned()`): a shallow clone of a ref-carrying
     // `wasm_val_t` would double-free the boxed `wasm_ref_t`.
     let params = c_try!(
@@ -280,7 +370,7 @@ pub unsafe extern "C" fn wasm_func_call(
             .collect::<Result<Vec<Value>, _>>()
     );
 
-    match func.extern_.function().call(&mut store_mut, &params) {
+    match store_ref.call(&function, params) {
         Ok(wasm_results) => {
             for (slot, val) in results
                 .as_uninit_slice()
@@ -303,8 +393,7 @@ pub unsafe extern "C" fn wasm_func_param_arity(func: Option<&wasm_func_t>) -> us
         update_last_error("func pointer is null");
         return 0;
     };
-    let store_ref = unsafe { func.extern_.store.store() };
-    func.extern_.function().ty(&store_ref).params().len()
+    c_try!(func.extern_.store.with_mut(|store| func.extern_.function().ty(store).params().len()); otherwise 0)
 }
 
 #[unsafe(no_mangle)]
@@ -313,8 +402,7 @@ pub unsafe extern "C" fn wasm_func_result_arity(func: Option<&wasm_func_t>) -> u
         update_last_error("func pointer is null");
         return 0;
     };
-    let store_ref = unsafe { func.extern_.store.store() };
-    func.extern_.function().ty(&store_ref).results().len()
+    c_try!(func.extern_.store.with_mut(|store| func.extern_.function().ty(store).results().len()); otherwise 0)
 }
 
 #[unsafe(no_mangle)]
@@ -322,8 +410,10 @@ pub unsafe extern "C" fn wasm_func_type(
     func: Option<&wasm_func_t>,
 ) -> Option<Box<wasm_functype_t>> {
     let func = func?;
-    let store_ref = unsafe { func.extern_.store.store() };
-    Some(Box::new(wasm_functype_t::new(
-        func.extern_.function().ty(&store_ref),
-    )))
+    let ty = c_try!(
+        func.extern_
+            .store
+            .with_mut(|store| func.extern_.function().ty(store))
+    );
+    Some(Box::new(wasm_functype_t::new(ty)))
 }

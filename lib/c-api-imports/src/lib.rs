@@ -2,14 +2,11 @@ use anyhow::{Context, Result, bail};
 use std::{collections::HashMap, fmt::Display, mem::size_of, num::NonZeroI32, slice, sync::Arc};
 
 use wasmer_api::{
-    Extern, ExternRef, ExternType, Function, Function as WasmerFunction, FunctionEnv,
+    Engine, Extern, ExternRef, ExternType, Function, Function as WasmerFunction, FunctionEnv,
     FunctionEnvMut, FunctionType, Global, GlobalType, Imports, Instance, Memory, Memory32,
     MemoryType, Module, Mutability, Pages, RuntimeError, StoreMut, Table, TableType, Type,
     TypedFunction, Value, WasmPtr, namespace,
 };
-
-#[cfg(feature = "wasix")]
-mod wasix;
 
 /// Import module name used for host-provided WebAssembly C API bindings.
 pub const WASM_C_API_MODULE_NAME: &str = "wasm_c_api_v0";
@@ -79,7 +76,7 @@ fn wasm_c_api_version_from_namespace(namespace: &str) -> Option<WasmCAPIVersion>
     })
 }
 
-type ResolveModuleSync = Arc<dyn Fn(Vec<u8>) -> Result<Module> + Send + Sync>;
+type ResolveModuleSync = Arc<dyn Fn(&Engine, Vec<u8>) -> Result<Module> + Send + Sync>;
 
 struct WasmCapiSession {
     version: Option<WasmCAPIVersion>,
@@ -239,6 +236,12 @@ impl WasmCapiSession {
         Ok(())
     }
 
+    fn deactivate(&mut self, store: &mut StoreMut<'_>) {
+        if let Some(env) = self.func_env.take() {
+            *env.as_mut(store) = WasmCapiEnv::default();
+        }
+    }
+
     fn func_env(&self) -> Result<Option<FunctionEnv<WasmCapiEnv>>> {
         if self.version.is_none() {
             return Ok(None);
@@ -259,6 +262,34 @@ impl WasmCapiSession {
 /// for the instance created with those imports.
 pub struct WasmCapiInstantiationState {
     session: Option<WasmCapiSession>,
+}
+
+impl WasmCapiInstantiationState {
+    /// Returns whether the module imported nothing from `wasm_c_api_v0`.
+    pub fn is_empty(&self) -> bool {
+        self.session.is_none()
+    }
+
+    /// Completes memory, table, and guest allocation wiring for `instance`,
+    /// keeping the state for a later [`Self::deactivate`].
+    pub fn configure_instance(
+        &self,
+        store: &mut StoreMut<'_>,
+        instance: &Instance,
+        imported_memory: Option<&Memory>,
+    ) -> Result<()> {
+        match &self.session {
+            Some(session) => session.configure_instance(store, instance, imported_memory),
+            None => Ok(()),
+        }
+    }
+
+    /// Releases every host object the guest created through the imports.
+    pub fn deactivate(&mut self, store: &mut StoreMut<'_>) {
+        if let Some(session) = &mut self.session {
+            session.deactivate(store);
+        }
+    }
 }
 
 /// Runtime hooks that provide `wasm_c_api_v0` imports for WASIX guests.
@@ -291,8 +322,16 @@ impl WasmCapiRuntimeHooks {
 
     /// Uses an embedder-provided resolver for `wasm_module_new`.
     pub fn with_resolve_module_sync(
-        mut self,
+        self,
         resolve: impl Fn(Vec<u8>) -> Result<Module> + Send + Sync + 'static,
+    ) -> Self {
+        self.with_resolve_module_sync_with_engine(move |_, bytes| resolve(bytes))
+    }
+
+    /// Uses an embedder-provided resolver that compiles for the guest store's engine.
+    pub fn with_resolve_module_sync_with_engine(
+        mut self,
+        resolve: impl Fn(&Engine, Vec<u8>) -> Result<Module> + Send + Sync + 'static,
     ) -> Self {
         self.resolve_module_sync = Some(Arc::new(resolve));
         self
@@ -321,7 +360,10 @@ impl WasmCapiRuntimeHooks {
             return Ok(WasmCapiInstantiationState { session: None });
         }
 
-        session.register_imports(store, imports)?;
+        if let Err(error) = session.register_imports(store, imports) {
+            session.deactivate(store);
+            return Err(error);
+        }
         Ok(WasmCapiInstantiationState {
             session: Some(session),
         })
@@ -1067,10 +1109,11 @@ fn wasm_module_new(mut env: FunctionEnvMut<WasmCapiEnv>, _store: i32, bytes_ptr:
         return INVALID_HANDLE;
     };
 
-    let module = if let Some(resolve_module_sync) = env.data().resolve_module_sync.clone() {
-        resolve_module_sync(bytes)
+    let resolver = env.data().resolve_module_sync.clone();
+    let (_, store) = env.data_and_store_mut();
+    let module = if let Some(resolve) = resolver {
+        resolve(store.engine(), bytes)
     } else {
-        let (_, store) = env.data_and_store_mut();
         Module::new(&store, bytes).map_err(Into::into)
     };
 
@@ -2314,109 +2357,120 @@ fn vec_delete(mut env: FunctionEnvMut<WasmCapiEnv>, vec_ptr: i32) {
     }
 }
 
-fn register_wasm_c_api_imports(
-    store: &mut impl wasmer_api::AsStoreMut,
-    fe: &FunctionEnv<WasmCapiEnv>,
-    io: &mut Imports,
-) {
-    fe.as_mut(&mut *store).func_env = Some(fe.clone());
+macro_rules! wasm_c_api_imports {
+    ($($name:literal => $function:ident),* $(,)?) => {
+        /// Returns whether `namespace.name` is a `wasm_c_api_v0` import this crate registers.
+        pub fn provides_wasm_c_api_import(namespace: &str, name: &str) -> bool {
+            namespace == WASM_C_API_MODULE_NAME && matches!(name, $($name)|*)
+        }
 
-    let ns = namespace! {
-        "wasm_engine_new" => WasmerFunction::new_typed_with_env(store, fe, wasm_engine_new),
-        "wasm_engine_delete" => WasmerFunction::new_typed_with_env(store, fe, delete_handle),
-        "wasm_store_new" => WasmerFunction::new_typed_with_env(store, fe, wasm_store_new),
-        "wasm_store_delete" => WasmerFunction::new_typed_with_env(store, fe, delete_handle),
-        "wasm_module_new" => WasmerFunction::new_typed_with_env(store, fe, wasm_module_new),
-        "wasm_module_validate" => WasmerFunction::new_typed_with_env(store, fe, wasm_module_validate),
-        "wasm_module_delete" => WasmerFunction::new_typed_with_env(store, fe, delete_handle),
-        "wasm_module_imports" => WasmerFunction::new_typed_with_env(store, fe, wasm_module_imports),
-        "wasm_module_exports" => WasmerFunction::new_typed_with_env(store, fe, wasm_module_exports),
-        "wasm_importtype_module" => WasmerFunction::new_typed_with_env(store, fe, wasm_importtype_module),
-        "wasm_importtype_name" => WasmerFunction::new_typed_with_env(store, fe, wasm_importtype_name),
-        "wasm_importtype_type" => WasmerFunction::new_typed_with_env(store, fe, wasm_importtype_type),
-        "wasm_importtype_vec_delete" => WasmerFunction::new_typed_with_env(store, fe, vec_delete),
-        "wasm_exporttype_name" => WasmerFunction::new_typed_with_env(store, fe, wasm_exporttype_name),
-        "wasm_exporttype_type" => WasmerFunction::new_typed_with_env(store, fe, wasm_exporttype_type),
-        "wasm_exporttype_vec_delete" => WasmerFunction::new_typed_with_env(store, fe, vec_delete),
-        "wasm_externtype_kind" => WasmerFunction::new_typed_with_env(store, fe, wasm_externtype_kind),
-        "wasm_externtype_as_functype_const" => WasmerFunction::new_typed_with_env(store, fe, wasm_externtype_as_functype_const),
-        "wasm_functype_copy" => WasmerFunction::new_typed_with_env(store, fe, wasm_functype_copy),
-        "wasm_functype_delete" => WasmerFunction::new_typed_with_env(store, fe, delete_handle),
-        "wasm_functype_params" => WasmerFunction::new_typed_with_env(store, fe, wasm_functype_params),
-        "wasm_functype_results" => WasmerFunction::new_typed_with_env(store, fe, wasm_functype_results),
-        "wasm_valtype_new" => WasmerFunction::new_typed_with_env(store, fe, wasm_valtype_new),
-        "wasm_valtype_kind" => WasmerFunction::new_typed_with_env(store, fe, wasm_valtype_kind),
-        "wasm_val_delete" => WasmerFunction::new_typed_with_env(store, fe, noop_delete),
-        "wasm_val_vec_new_uninitialized" => WasmerFunction::new_typed_with_env(store, fe, wasm_val_vec_new_uninitialized),
-        "wasm_val_vec_delete" => WasmerFunction::new_typed_with_env(store, fe, vec_delete),
-        "wasm_memorytype_new" => WasmerFunction::new_typed_with_env(store, fe, wasm_memorytype_new),
-        "wasm_memorytype_delete" => WasmerFunction::new_typed_with_env(store, fe, delete_handle),
-        "wasm_memory_new" => WasmerFunction::new_typed_with_env(store, fe, wasm_memory_new),
-        "wasm_memory_delete" => WasmerFunction::new_typed_with_env(store, fe, delete_handle),
-        "wasm_memory_copy" => WasmerFunction::new_typed_with_env(store, fe, wasm_memory_copy),
-        "wasm_memory_size" => WasmerFunction::new_typed_with_env(store, fe, wasm_memory_size),
-        "wasm_memory_grow" => WasmerFunction::new_typed_with_env(store, fe, wasm_memory_grow),
-        "wasm_memory_data" => WasmerFunction::new_typed_with_env(store, fe, wasm_memory_data),
-        "wasm_memory_data_size" => WasmerFunction::new_typed_with_env(store, fe, wasm_memory_data_size),
-        "wasm_memory_as_extern" => WasmerFunction::new_typed_with_env(store, fe, wasm_memory_as_extern),
-        "wasm_globaltype_new" => WasmerFunction::new_typed_with_env(store, fe, wasm_globaltype_new),
-        "wasm_globaltype_delete" => WasmerFunction::new_typed_with_env(store, fe, delete_handle),
-        "wasm_globaltype_content" => WasmerFunction::new_typed_with_env(store, fe, wasm_globaltype_content),
-        "wasm_globaltype_mutability" => WasmerFunction::new_typed_with_env(store, fe, wasm_globaltype_mutability),
-        "wasm_global_new" => WasmerFunction::new_typed_with_env(store, fe, wasm_global_new),
-        "wasm_global_delete" => WasmerFunction::new_typed_with_env(store, fe, delete_handle),
-        "wasm_global_copy" => WasmerFunction::new_typed_with_env(store, fe, wasm_global_copy),
-        "wasm_global_type" => WasmerFunction::new_typed_with_env(store, fe, wasm_global_type),
-        "wasm_global_get" => WasmerFunction::new_typed_with_env(store, fe, wasm_global_get),
-        "wasm_global_set" => WasmerFunction::new_typed_with_env(store, fe, wasm_global_set),
-        "wasm_global_as_extern" => WasmerFunction::new_typed_with_env(store, fe, wasm_global_as_extern),
-        "wasm_table_new" => WasmerFunction::new_typed_with_env(store, fe, wasm_table_new),
-        "wasm_table_delete" => WasmerFunction::new_typed_with_env(store, fe, delete_handle),
-        "wasm_table_copy" => WasmerFunction::new_typed_with_env(store, fe, wasm_table_copy),
-        "wasm_table_type" => WasmerFunction::new_typed_with_env(store, fe, wasm_table_type),
-        "wasm_table_size" => WasmerFunction::new_typed_with_env(store, fe, wasm_table_size),
-        "wasm_table_grow" => WasmerFunction::new_typed_with_env(store, fe, wasm_table_grow),
-        "wasm_table_get" => WasmerFunction::new_typed_with_env(store, fe, wasm_table_get),
-        "wasm_table_set" => WasmerFunction::new_typed_with_env(store, fe, wasm_table_set),
-        "wasm_table_as_extern" => WasmerFunction::new_typed_with_env(store, fe, wasm_table_as_extern),
-        "wasm_tabletype_new" => WasmerFunction::new_typed_with_env(store, fe, wasm_tabletype_new),
-        "wasm_tabletype_delete" => WasmerFunction::new_typed_with_env(store, fe, delete_handle),
-        "wasm_tabletype_element" => WasmerFunction::new_typed_with_env(store, fe, wasm_tabletype_element),
-        "wasm_func_as_ref" => WasmerFunction::new_typed_with_env(store, fe, wasm_func_as_ref),
-        "wasm_ref_as_func" => WasmerFunction::new_typed_with_env(store, fe, wasm_ref_as_func),
-        "wasm_foreign_new" => WasmerFunction::new_typed_with_env(store, fe, wasm_foreign_new),
-        "wasm_foreign_delete" => WasmerFunction::new_typed_with_env(store, fe, delete_handle),
-        "wasm_foreign_as_ref" => WasmerFunction::new_typed_with_env(store, fe, handle_identity),
-        "wasm_ref_as_foreign" => WasmerFunction::new_typed_with_env(store, fe, handle_identity),
-        "wasm_ref_delete" => WasmerFunction::new_typed_with_env(store, fe, delete_handle),
-        "wasm_ref_copy" => WasmerFunction::new_typed_with_env(store, fe, wasm_ref_copy),
-        "wasm_ref_same" => WasmerFunction::new_typed_with_env(store, fe, wasm_ref_same),
-        "wasm_ref_get_host_info" => WasmerFunction::new_typed_with_env(store, fe, wasm_ref_get_host_info),
-        "wasm_ref_set_host_info" => WasmerFunction::new_typed_with_env(store, fe, wasm_ref_set_host_info),
-        "wasm_ref_set_host_info_with_finalizer" => WasmerFunction::new_typed_with_env(store, fe, wasm_ref_set_host_info_with_finalizer),
-        "wasm_instance_new" => WasmerFunction::new_typed_with_env(store, fe, wasm_instance_new),
-        "wasm_instance_delete" => WasmerFunction::new_typed_with_env(store, fe, delete_handle),
-        "wasm_instance_exports" => WasmerFunction::new_typed_with_env(store, fe, wasm_instance_exports),
-        "wasm_extern_kind" => WasmerFunction::new_typed_with_env(store, fe, wasm_extern_kind),
-        "wasm_extern_as_func" => WasmerFunction::new_typed_with_env(store, fe, wasm_extern_as_func),
-        "wasm_extern_as_global" => WasmerFunction::new_typed_with_env(store, fe, wasm_extern_as_global),
-        "wasm_extern_as_table" => WasmerFunction::new_typed_with_env(store, fe, wasm_extern_as_table),
-        "wasm_extern_as_memory" => WasmerFunction::new_typed_with_env(store, fe, wasm_extern_as_memory),
-        "wasm_extern_vec_delete" => WasmerFunction::new_typed_with_env(store, fe, vec_delete),
-        "wasm_func_copy" => WasmerFunction::new_typed_with_env(store, fe, wasm_func_copy),
-        "wasm_func_delete" => WasmerFunction::new_typed_with_env(store, fe, delete_handle),
-        "wasm_func_as_extern" => WasmerFunction::new_typed_with_env(store, fe, wasm_func_as_extern),
-        "wasm_func_type" => WasmerFunction::new_typed_with_env(store, fe, wasm_func_type),
-        "wasm_func_call" => WasmerFunction::new_typed_with_env(store, fe, wasm_func_call),
-        "wasm_func_new_with_env" => WasmerFunction::new_typed_with_env(store, fe, wasm_func_new_with_env),
-        "wasm_trap_new" => WasmerFunction::new_typed_with_env(store, fe, wasm_trap_new),
-        "wasm_trap_delete" => WasmerFunction::new_typed_with_env(store, fe, delete_handle),
-        "wasm_trap_message" => WasmerFunction::new_typed_with_env(store, fe, wasm_trap_message),
-        "wasm_byte_vec_new" => WasmerFunction::new_typed_with_env(store, fe, wasm_byte_vec_new),
-        "wasm_byte_vec_delete" => WasmerFunction::new_typed_with_env(store, fe, vec_delete),
+        fn register_wasm_c_api_imports(
+            store: &mut impl wasmer_api::AsStoreMut,
+            fe: &FunctionEnv<WasmCapiEnv>,
+            io: &mut Imports,
+        ) {
+            fe.as_mut(&mut *store).func_env = Some(fe.clone());
+            let ns = namespace! {
+                $($name => WasmerFunction::new_typed_with_env(&mut *store, fe, $function)),*
+            };
+            io.register_namespace(WASM_C_API_MODULE_NAME, ns);
+        }
     };
+}
 
-    io.register_namespace(WASM_C_API_MODULE_NAME, ns);
+wasm_c_api_imports! {
+    "wasm_engine_new" => wasm_engine_new,
+    "wasm_engine_delete" => delete_handle,
+    "wasm_store_new" => wasm_store_new,
+    "wasm_store_delete" => delete_handle,
+    "wasm_module_new" => wasm_module_new,
+    "wasm_module_validate" => wasm_module_validate,
+    "wasm_module_delete" => delete_handle,
+    "wasm_module_imports" => wasm_module_imports,
+    "wasm_module_exports" => wasm_module_exports,
+    "wasm_importtype_module" => wasm_importtype_module,
+    "wasm_importtype_name" => wasm_importtype_name,
+    "wasm_importtype_type" => wasm_importtype_type,
+    "wasm_importtype_vec_delete" => vec_delete,
+    "wasm_exporttype_name" => wasm_exporttype_name,
+    "wasm_exporttype_type" => wasm_exporttype_type,
+    "wasm_exporttype_vec_delete" => vec_delete,
+    "wasm_externtype_kind" => wasm_externtype_kind,
+    "wasm_externtype_as_functype_const" => wasm_externtype_as_functype_const,
+    "wasm_functype_copy" => wasm_functype_copy,
+    "wasm_functype_delete" => delete_handle,
+    "wasm_functype_params" => wasm_functype_params,
+    "wasm_functype_results" => wasm_functype_results,
+    "wasm_valtype_new" => wasm_valtype_new,
+    "wasm_valtype_kind" => wasm_valtype_kind,
+    "wasm_val_delete" => noop_delete,
+    "wasm_val_vec_new_uninitialized" => wasm_val_vec_new_uninitialized,
+    "wasm_val_vec_delete" => vec_delete,
+    "wasm_memorytype_new" => wasm_memorytype_new,
+    "wasm_memorytype_delete" => delete_handle,
+    "wasm_memory_new" => wasm_memory_new,
+    "wasm_memory_delete" => delete_handle,
+    "wasm_memory_copy" => wasm_memory_copy,
+    "wasm_memory_size" => wasm_memory_size,
+    "wasm_memory_grow" => wasm_memory_grow,
+    "wasm_memory_data" => wasm_memory_data,
+    "wasm_memory_data_size" => wasm_memory_data_size,
+    "wasm_memory_as_extern" => wasm_memory_as_extern,
+    "wasm_globaltype_new" => wasm_globaltype_new,
+    "wasm_globaltype_delete" => delete_handle,
+    "wasm_globaltype_content" => wasm_globaltype_content,
+    "wasm_globaltype_mutability" => wasm_globaltype_mutability,
+    "wasm_global_new" => wasm_global_new,
+    "wasm_global_delete" => delete_handle,
+    "wasm_global_copy" => wasm_global_copy,
+    "wasm_global_type" => wasm_global_type,
+    "wasm_global_get" => wasm_global_get,
+    "wasm_global_set" => wasm_global_set,
+    "wasm_global_as_extern" => wasm_global_as_extern,
+    "wasm_table_new" => wasm_table_new,
+    "wasm_table_delete" => delete_handle,
+    "wasm_table_copy" => wasm_table_copy,
+    "wasm_table_type" => wasm_table_type,
+    "wasm_table_size" => wasm_table_size,
+    "wasm_table_grow" => wasm_table_grow,
+    "wasm_table_get" => wasm_table_get,
+    "wasm_table_set" => wasm_table_set,
+    "wasm_table_as_extern" => wasm_table_as_extern,
+    "wasm_tabletype_new" => wasm_tabletype_new,
+    "wasm_tabletype_delete" => delete_handle,
+    "wasm_tabletype_element" => wasm_tabletype_element,
+    "wasm_func_as_ref" => wasm_func_as_ref,
+    "wasm_ref_as_func" => wasm_ref_as_func,
+    "wasm_foreign_new" => wasm_foreign_new,
+    "wasm_foreign_delete" => delete_handle,
+    "wasm_foreign_as_ref" => handle_identity,
+    "wasm_ref_as_foreign" => handle_identity,
+    "wasm_ref_delete" => delete_handle,
+    "wasm_ref_copy" => wasm_ref_copy,
+    "wasm_ref_same" => wasm_ref_same,
+    "wasm_ref_get_host_info" => wasm_ref_get_host_info,
+    "wasm_ref_set_host_info" => wasm_ref_set_host_info,
+    "wasm_ref_set_host_info_with_finalizer" => wasm_ref_set_host_info_with_finalizer,
+    "wasm_instance_new" => wasm_instance_new,
+    "wasm_instance_delete" => delete_handle,
+    "wasm_instance_exports" => wasm_instance_exports,
+    "wasm_extern_kind" => wasm_extern_kind,
+    "wasm_extern_as_func" => wasm_extern_as_func,
+    "wasm_extern_as_global" => wasm_extern_as_global,
+    "wasm_extern_as_table" => wasm_extern_as_table,
+    "wasm_extern_as_memory" => wasm_extern_as_memory,
+    "wasm_extern_vec_delete" => vec_delete,
+    "wasm_func_copy" => wasm_func_copy,
+    "wasm_func_delete" => delete_handle,
+    "wasm_func_as_extern" => wasm_func_as_extern,
+    "wasm_func_type" => wasm_func_type,
+    "wasm_func_call" => wasm_func_call,
+    "wasm_func_new_with_env" => wasm_func_new_with_env,
+    "wasm_trap_new" => wasm_trap_new,
+    "wasm_trap_delete" => delete_handle,
+    "wasm_trap_message" => wasm_trap_message,
+    "wasm_byte_vec_new" => wasm_byte_vec_new,
+    "wasm_byte_vec_delete" => vec_delete,
 }
 
 #[cfg(test)]
@@ -2439,20 +2493,6 @@ mod tests {
         Table, TableType, Value,
     };
     use wat::parse_str;
-
-    #[cfg(feature = "wasi")]
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-    #[cfg(feature = "wasi")]
-    use wasmer_types::ModuleHash;
-    #[cfg(feature = "wasi")]
-    use wasmer_wasix::{
-        PluggableRuntime, WasiError,
-        runners::wasi::{RuntimeOrEngine, WasiRunner},
-        runtime::task_manager::tokio::TokioTaskManager,
-    };
 
     const EMPTY_WASM_MODULE: &[u8] = b"\0asm\x01\0\0\0";
 
@@ -2524,89 +2564,6 @@ mod tests {
         assert!(!WasmCAPIVersion::V0.is_compatible_with(WasmCAPIVersion::Unknown));
         assert!(!WasmCAPIVersion::Unknown.is_compatible_with(WasmCAPIVersion::V0));
         assert!(!WasmCAPIVersion::Unknown.is_compatible_with(WasmCAPIVersion::Unknown));
-    }
-
-    #[cfg(feature = "wasi")]
-    #[test]
-    fn wasm_c_api_imports_run_from_wasix_guest() {
-        let wasm = parse_str(
-            r#"(module
-                (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
-                (import "wasm_c_api_v0" "wasm_engine_new" (func $wasm_engine_new (result i32)))
-                (import "wasm_c_api_v0" "wasm_store_new" (func $wasm_store_new (param i32) (result i32)))
-                (import "wasm_c_api_v0" "wasm_module_validate" (func $wasm_module_validate (param i32 i32) (result i32)))
-                (import "wasm_c_api_v0" "wasm_module_new" (func $wasm_module_new (param i32 i32) (result i32)))
-
-                (memory (export "memory") 1)
-                ;; wasm_byte_vec_t { size: 8, data: 32 }
-                (data (i32.const 16) "\08\00\00\00\20\00\00\00")
-                ;; Empty wasm module: \0asm + version 1.
-                (data (i32.const 32) "\00asm\01\00\00\00")
-
-                (func (export "_start")
-                    (local $engine i32)
-                    (local $store i32)
-                    (local $module i32)
-
-                    (local.set $engine (call $wasm_engine_new))
-                    (if (i32.eqz (local.get $engine))
-                        (then (call $proc_exit (i32.const 10))))
-
-                    (local.set $store (call $wasm_store_new (local.get $engine)))
-                    (if (i32.eqz (local.get $store))
-                        (then (call $proc_exit (i32.const 11))))
-
-                    (if (i32.eqz (call $wasm_module_validate (local.get $store) (i32.const 16)))
-                        (then (call $proc_exit (i32.const 12))))
-
-                    (local.set $module (call $wasm_module_new (local.get $store) (i32.const 16)))
-                    (if (i32.eqz (local.get $module))
-                        (then (call $proc_exit (i32.const 13))))
-                )
-            )"#,
-        )
-        .expect("guest wat parses");
-        let store = Store::default();
-        let module = Module::new(&store, &wasm).expect("guest module compiles");
-
-        let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("tokio runtime starts");
-        let _guard = tokio_runtime.enter();
-        let mut runtime = PluggableRuntime::new(Arc::new(TokioTaskManager::new(
-            tokio_runtime.handle().clone(),
-        )));
-        runtime.set_engine(store.engine().clone());
-
-        let resolve_calls = Arc::new(AtomicUsize::new(0));
-        let resolve_engine = store.engine().clone();
-        let hooks = WasmCapiRuntimeHooks::new().with_resolve_module_sync({
-            let resolve_calls = resolve_calls.clone();
-            move |bytes| {
-                resolve_calls.fetch_add(1, Ordering::SeqCst);
-                Ok(Module::new(&resolve_engine, bytes)?)
-            }
-        });
-        runtime.with_instantiation_hook(hooks);
-
-        let result = WasiRunner::new().run_wasm(
-            RuntimeOrEngine::Runtime(Arc::new(runtime)),
-            "wasm-c-api-smoke",
-            module,
-            ModuleHash::new(&wasm),
-        );
-
-        match result {
-            Ok(()) => {}
-            Err(err) => {
-                if let Some(WasiError::Exit(code)) = err.downcast_ref::<WasiError>() {
-                    panic!("guest exited with status {code}");
-                }
-                panic!("guest failed: {err:?}");
-            }
-        }
-        assert_eq!(resolve_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -3118,5 +3075,105 @@ mod tests {
         )
         .expect("externref reads back");
         assert!(ref_values_same(&value, &roundtripped));
+    }
+}
+
+#[cfg(test)]
+mod instantiation_state_tests {
+    use super::*;
+    use wasmer_api::{AsStoreMut, Store};
+
+    #[test]
+    fn declarations_match_registered_imports() {
+        let mut store = Store::default();
+        let module = Module::new(
+            &store,
+            r#"(module
+            (import "wasm_c_api_v0" "wasm_engine_new" (func (result i32))))"#,
+        )
+        .unwrap();
+        let (imports, _) = WasmCapiRuntimeHooks::new()
+            .additional_imports(&module, &mut store.as_store_mut())
+            .unwrap();
+        for ((namespace, name), _) in imports.into_iter() {
+            assert!(provides_wasm_c_api_import(&namespace, &name));
+        }
+        assert!(!provides_wasm_c_api_import(
+            "wasm_c_api_v1",
+            "wasm_engine_new"
+        ));
+        assert!(!provides_wasm_c_api_import("wasm_c_api_v0", "missing"));
+    }
+
+    #[test]
+    fn partial_preparation_releases_resolver_roots() {
+        let mut store = Store::default();
+        let module = Module::new(
+            &store,
+            r#"(module
+            (import "env" "memory" (memory 1))
+            (import "wasm_c_api_v0" "wasm_engine_new" (func (result i32))))"#,
+        )
+        .unwrap();
+        let root = Arc::new(());
+        let hooks = WasmCapiRuntimeHooks::new().with_resolve_module_sync({
+            let root = root.clone();
+            move |_| {
+                let _ = &root;
+                anyhow::bail!("unused")
+            }
+        });
+        let mut imports = Imports::new();
+        imports.define("env", "memory", Function::new_typed(&mut store, || {}));
+        assert!(
+            hooks
+                .add_imports(&module, &mut store.as_store_mut(), &mut imports)
+                .is_err()
+        );
+        drop(hooks);
+        assert_eq!(Arc::strong_count(&root), 1);
+    }
+
+    #[test]
+    fn deactivation_clears_configured_and_partial_state() {
+        let mut store = Store::default();
+        let module = Module::new(
+            &store,
+            r#"(module
+            (import "env" "memory" (memory 1))
+            (import "wasm_c_api_v0" "wasm_engine_new" (func (result i32)))
+            (export "memory" (memory 0))
+            (func (export "malloc") (param i32) (result i32) i32.const 64)
+            (func (export "free") (param i32)))"#,
+        )
+        .unwrap();
+        for configure in [false, true] {
+            let hooks = WasmCapiRuntimeHooks::new();
+            let (imports, mut state) = hooks
+                .additional_imports(&module, &mut store.as_store_mut())
+                .unwrap();
+            assert!(!state.is_empty());
+            let env = state.session.as_ref().unwrap().func_env().unwrap().unwrap();
+            if configure {
+                let instance = Instance::new(&mut store, &module, &imports).unwrap();
+                let memory = instance.exports.get_memory("memory").unwrap();
+                state
+                    .configure_instance(&mut store.as_store_mut(), &instance, Some(memory))
+                    .unwrap();
+                assert!(env.as_ref(&store).malloc_fn.is_some());
+            }
+            env.as_mut(&mut store).state.insert(WasmObject::Engine);
+            state.deactivate(&mut store.as_store_mut());
+            state.deactivate(&mut store.as_store_mut());
+            let data = env.as_ref(&store);
+            assert!(data.state.objects.is_empty());
+            assert!(data.state.memory_shadows.is_empty());
+            assert!(data.memory.is_none());
+            assert!(data.table.is_none());
+            assert!(data.malloc_fn.is_none());
+            assert!(data.free_fn.is_none());
+            assert!(data.func_env.is_none());
+            assert!(data.resolve_module_sync.is_none());
+        }
     }
 }

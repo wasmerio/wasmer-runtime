@@ -47,10 +47,11 @@ pub unsafe extern "C" fn wasm_table_new(
     let table_type = table_type.inner()._table_type;
     let init_val = init_value(init, table_type.ty);
 
-    let table = {
-        let mut store_mut = unsafe { store.inner.store_mut() };
-        c_try!(Table::new(&mut store_mut, table_type, init_val))
-    };
+    let table = c_try!(c_try!(
+        store
+            .inner
+            .with_mut(|store| Table::new(store, table_type, init_val))
+    ));
 
     Some(Box::new(wasm_table_t {
         extern_: wasm_extern_t::new(store.inner.clone(), table.into()),
@@ -73,8 +74,7 @@ pub unsafe extern "C" fn wasm_table_size(table: Option<&wasm_table_t>) -> usize 
         update_last_error("table pointer is null");
         return 0;
     };
-    let store_ref = unsafe { table.extern_.store.store() };
-    table.extern_.table().size(&store_ref) as _
+    c_try!(table.extern_.store.with_mut(|store| table.extern_.table().size(store) as usize); otherwise 0)
 }
 
 #[unsafe(no_mangle)]
@@ -85,10 +85,13 @@ pub unsafe extern "C" fn wasm_table_type(
         update_last_error("table pointer is null");
         return None;
     };
-    let store_ref = unsafe { table.extern_.store.store() };
-    Some(Box::new(wasm_tabletype_t::new(
-        table.extern_.table().ty(&store_ref),
-    )))
+    let ty = c_try!(
+        table
+            .extern_
+            .store
+            .with_mut(|store| table.extern_.table().ty(store))
+    );
+    Some(Box::new(wasm_tabletype_t::new(ty)))
 }
 
 #[unsafe(no_mangle)]
@@ -109,18 +112,15 @@ pub unsafe extern "C" fn wasm_table_get(
         return None;
     };
     let table_obj = table.extern_.table();
-    let mut store: StoreRef = table.extern_.store.clone();
+    let store: StoreRef = table.extern_.store.clone();
     // `Table::get` returns `None` only for an out-of-bounds index; an in-bounds
     // null element is `Some(ExternRef(None))`, which boxes to a null
     // `wasm_ref_t*` below without registering an error.
-    let value = {
-        let mut store_mut = unsafe { store.store_mut() };
-        match table_obj.get(&mut store_mut, index) {
-            Some(value) => value,
-            None => {
-                update_last_error("table index out of bounds");
-                return None;
-            }
+    let value = match c_try!(store.with_mut(|store| table_obj.get(store, index))) {
+        Some(value) => value,
+        None => {
+            update_last_error("table index out of bounds");
+            return None;
         }
     };
     wasm_ref_t::new(table.extern_.store.clone(), value)
@@ -137,11 +137,12 @@ pub unsafe extern "C" fn wasm_table_set(
         return false;
     };
     let table_obj = table.extern_.table();
-    let mut store: StoreRef = table.extern_.store.clone();
-    let mut store_mut = unsafe { store.store_mut() };
-    let element_ty = table_obj.ty(&store_mut).ty;
-    let value = init_value(r, element_ty);
-    match table_obj.set(&mut store_mut, index, value) {
+    let store: StoreRef = table.extern_.store.clone();
+    let result = c_try!(store.with_mut(|store| {
+        let value = init_value(r, table_obj.ty(store).ty);
+        table_obj.set(store, index, value)
+    }); otherwise false);
+    match result {
         Ok(()) => true,
         Err(e) => {
             update_last_error(e);
@@ -157,11 +158,12 @@ pub unsafe extern "C" fn wasm_table_grow(
     init: *mut wasm_ref_t,
 ) -> bool {
     let table_obj = table.extern_.table();
-    let mut store: StoreRef = table.extern_.store.clone();
-    let mut store_mut = unsafe { store.store_mut() };
-    let element_ty = table_obj.ty(&store_mut).ty;
-    let init_val = init_value(init, element_ty);
-    match table_obj.grow(&mut store_mut, delta, init_val) {
+    let store: StoreRef = table.extern_.store.clone();
+    let result = c_try!(store.with_mut(|store| {
+        let value = init_value(init, table_obj.ty(store).ty);
+        table_obj.grow(store, delta, value)
+    }); otherwise false);
+    match result {
         Ok(_) => true,
         Err(e) => {
             update_last_error(e);

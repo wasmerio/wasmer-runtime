@@ -7,7 +7,7 @@ use wasmer_api::Module;
 #[derive(Clone)]
 #[allow(non_camel_case_types)]
 pub struct wasm_module_t {
-    pub(crate) inner: Module,
+    pub inner: Module,
 }
 
 /// A WebAssembly module contains stateless WebAssembly code that has
@@ -30,10 +30,13 @@ pub unsafe extern "C" fn wasm_module_new(
     bytes: Option<&wasm_byte_vec_t>,
 ) -> Option<Box<wasm_module_t>> {
     let store = store?;
-    let store_mut = unsafe { store.inner.store_mut() };
     let bytes = bytes?;
 
-    let module = c_try!(Module::from_binary(&store_mut, bytes.as_slice()));
+    let module = c_try!(c_try!(
+        store
+            .inner
+            .with_mut(|store| Module::from_binary(store, bytes.as_slice()))
+    ));
 
     Some(Box::new(wasm_module_t { inner: module }))
 }
@@ -92,18 +95,16 @@ pub unsafe extern "C" fn wasm_module_validate(
     store: Option<&mut wasm_store_t>,
     bytes: Option<&wasm_byte_vec_t>,
 ) -> bool {
-    let store = match store {
-        Some(store) => unsafe { store.inner.store_mut() },
-        None => return false,
+    let Some(store) = store else {
+        return false;
     };
     let bytes = match bytes {
         Some(bytes) => bytes,
         None => return false,
     };
 
-    Module::validate(&store, bytes.as_slice())
-        .map(|_| true)
-        .unwrap_or(false)
+    c_try!(store.inner.with_mut(|store| Module::validate(store, bytes.as_slice())); otherwise false)
+        .is_ok()
 }
 
 /// Returns an array of the exported types in the module.
@@ -459,8 +460,10 @@ pub unsafe extern "C" fn wasm_module_deserialize(
 ) -> Option<NonNull<wasm_module_t>> {
     let bytes = bytes?;
 
-    let store_ref = unsafe { store.inner.store() };
-    let module = c_try!(unsafe { Module::deserialize(&store_ref, bytes.as_slice()) });
+    let module =
+        c_try!(c_try!(store.inner.with_mut(|store| unsafe {
+            Module::deserialize(store, bytes.as_slice())
+        })));
 
     Some(Box::into_non_null(Box::new(wasm_module_t {
         inner: module,

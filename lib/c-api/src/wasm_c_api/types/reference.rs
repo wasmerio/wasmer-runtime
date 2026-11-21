@@ -67,6 +67,19 @@ impl wasm_ref_t {
     /// Box a reference value. Returns `None` (i.e. the null `wasm_ref_t*`) for
     /// null references and non-reference values.
     pub(crate) fn new(store: StoreRef, inner: Value) -> Option<Box<wasm_ref_t>> {
+        if matches!(&inner, Value::ExternRef(Some(_)) | Value::FuncRef(Some(_))) {
+            match store.with_mut(|store| inner.is_from_store(store)) {
+                Ok(true) => {}
+                Ok(false) => {
+                    crate::error::update_last_error("reference belongs to another Store");
+                    return None;
+                }
+                Err(error) => {
+                    crate::error::update_last_error(error);
+                    return None;
+                }
+            }
+        }
         match &inner {
             Value::ExternRef(Some(_)) | Value::FuncRef(Some(_)) => Some(Box::new(wasm_ref_t {
                 inner,
@@ -83,8 +96,11 @@ fn with_foreign<R>(ref_: &wasm_ref_t, f: impl FnOnce(&Foreign) -> R) -> Option<R
     match &ref_.inner {
         Value::ExternRef(Some(e)) => {
             let store = ref_.store.upgrade()?;
-            let store_ref = unsafe { store.store() };
-            e.downcast::<Foreign>(&store_ref).map(f)
+            store
+                .with_mut(|store| e.downcast::<Foreign>(store).map(f))
+                .map_err(crate::error::update_last_error)
+                .ok()
+                .flatten()
         }
         _ => None,
     }
@@ -170,10 +186,11 @@ pub unsafe extern "C" fn wasm_foreign_new(
     store: Option<&mut wasm_store_t>,
 ) -> Option<Box<wasm_foreign_t>> {
     let store = store?;
-    let extern_ref = {
-        let mut store_mut = unsafe { store.inner.store_mut() };
-        ExternRef::new(&mut store_mut, Foreign::new())
-    };
+    let extern_ref = c_try!(
+        store
+            .inner
+            .with_mut(|store| ExternRef::new(store, Foreign::new()))
+    );
     Some(Box::new(wasm_ref_t {
         inner: Value::ExternRef(Some(extern_ref)),
         store: store.inner.downgrade(),

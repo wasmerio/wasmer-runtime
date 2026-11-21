@@ -25,7 +25,7 @@
     ++ lib.optional withV8 "napi-v8";
 
   # C API always uses cranelift only
-  capiFeatureList = ["wat" "sys-default" "compiler" "wasi" "middlewares" "cranelift"];
+  capiFeatureList = ["wat" "sys-default" "compiler" "middlewares" "cranelift"];
 
   cliFeatures = lib.concatStringsSep "," cliFeatureList;
   capiFeatures = lib.concatStringsSep "," capiFeatureList;

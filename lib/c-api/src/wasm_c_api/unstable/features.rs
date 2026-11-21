@@ -9,6 +9,7 @@
 //! # fn main() {
 //! #    (assert_c! {
 //! # #include "tests/wasmer.h"
+//! # #include <assert.h>
 //! #
 //! int main() {
 //!     // Declare features.
@@ -16,6 +17,9 @@
 //!
 //!     // Now, let's enable the SIMD feature.
 //!     wasmer_features_simd(features, true);
+//!
+//!     // memory64 is unsupported; requesting it returns false.
+//!     assert(!wasmer_features_memory64(features, true));
 //!
 //!     wasmer_features_delete(features);
 //!
@@ -321,6 +325,25 @@ pub extern "C" fn wasmer_features_multi_memory(
 
     features.inner.multi_memory(enable);
 
+    true
+}
+
+/// Memory64 is currently unsupported by the engine.
+///
+/// Returns `false` for a null features pointer or a request to enable memory64.
+/// Disabling it succeeds and leaves it disabled.
+#[unsafe(no_mangle)]
+pub extern "C" fn wasmer_features_memory64(
+    features: Option<&mut wasmer_features_t>,
+    enable: bool,
+) -> bool {
+    let Some(features) = features else {
+        return false;
+    };
+    if enable {
+        return false;
+    }
+    features.inner._memory64 = false;
     true
 }
 

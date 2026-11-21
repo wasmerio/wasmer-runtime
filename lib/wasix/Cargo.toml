@@ -164,6 +164,7 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+wasmer-c-api-imports = { version = "=7.5.0", path = "../c-api-imports", default-features = false }
 terminal_size.workspace = true
 zstd.workspace = true
 

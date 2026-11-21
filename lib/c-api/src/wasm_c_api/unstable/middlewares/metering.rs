@@ -204,8 +204,8 @@ pub extern "C" fn wasmer_metering_delete(_metering: Option<Box<wasmer_metering_t
 pub unsafe extern "C" fn wasmer_metering_get_remaining_points(
     instance: &mut wasm_instance_t,
 ) -> u64 {
-    let mut store_mut = unsafe { instance.store.store_mut() };
-    match get_remaining_points(&mut store_mut, &instance.inner) {
+    match c_try!(instance.store.with_mut(|store| get_remaining_points(store, &instance.inner)); otherwise u64::MAX)
+    {
         MeteringPoints::Remaining(value) => value,
         MeteringPoints::Exhausted => u64::MAX,
     }
@@ -220,9 +220,8 @@ pub unsafe extern "C" fn wasmer_metering_get_remaining_points(
 pub unsafe extern "C" fn wasmer_metering_points_are_exhausted(
     instance: &mut wasm_instance_t,
 ) -> bool {
-    let mut store_mut = unsafe { instance.store.store_mut() };
     matches!(
-        get_remaining_points(&mut store_mut, &instance.inner),
+        c_try!(instance.store.with_mut(|store| get_remaining_points(store, &instance.inner)); otherwise true),
         MeteringPoints::Exhausted,
     )
 }
@@ -304,8 +303,7 @@ pub unsafe extern "C" fn wasmer_metering_set_remaining_points(
     instance: &mut wasm_instance_t,
     new_limit: u64,
 ) {
-    let mut store_mut = unsafe { instance.store.store_mut() };
-    set_remaining_points(&mut store_mut, &instance.inner, new_limit);
+    c_try!(instance.store.with_mut(|store| set_remaining_points(store, &instance.inner, new_limit)); otherwise ());
 }
 
 /// Transforms a [`wasmer_metering_t`] into a generic

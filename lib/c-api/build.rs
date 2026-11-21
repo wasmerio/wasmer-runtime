@@ -44,9 +44,6 @@ const UNIVERSAL_FEATURE_AS_C_DEFINE: &str = "WASMER_UNIVERSAL_ENABLED";
 const COMPILER_FEATURE_AS_C_DEFINE: &str = "WASMER_COMPILER_ENABLED";
 
 #[allow(unused)]
-const WASI_FEATURE_AS_C_DEFINE: &str = "WASMER_WASI_ENABLED";
-
-#[allow(unused)]
 const MIDDLEWARES_FEATURE_AS_C_DEFINE: &str = "WASMER_MIDDLEWARES_ENABLED";
 
 macro_rules! map_feature_as_c_define {
@@ -88,6 +85,16 @@ fn running_self() -> bool {
     env::var("DOCS_RS").is_err()
         && env::var("_CBINDGEN_IS_RUNNING").is_err()
         && env::var("WASMER_PUBLISH_SCRIPT_IS_RUNNING").is_err()
+        && !in_unpacked_source()
+}
+
+/// Cargo marks the Git and registry sources it unpacks with `.cargo-ok`. A
+/// crate built from one is a dependency and must not write into that source.
+fn in_unpacked_source() -> bool {
+    let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    Path::new(&crate_dir)
+        .ancestors()
+        .any(|dir| dir.join(".cargo-ok").exists())
 }
 
 /// Build the header files for the `wasm_c_api` API.
@@ -143,7 +150,6 @@ fn build_wasm_c_api_headers(crate_dir: &str, out_dir: &str) {
 
     map_feature_as_c_define!("compiler", UNIVERSAL_FEATURE_AS_C_DEFINE, pre_header);
     map_feature_as_c_define!("compiler", COMPILER_FEATURE_AS_C_DEFINE, pre_header);
-    map_feature_as_c_define!("wasi", WASI_FEATURE_AS_C_DEFINE, pre_header);
     map_feature_as_c_define!("middlewares", MIDDLEWARES_FEATURE_AS_C_DEFINE, pre_header);
 
     add_wasmer_version(&mut pre_header);
@@ -220,7 +226,6 @@ fn new_builder(language: Language, crate_dir: &str, include_guard: &str, header:
         .with_define("target_arch", "x86_64", "ARCH_X86_64")
         .with_define("feature", "universal", UNIVERSAL_FEATURE_AS_C_DEFINE)
         .with_define("feature", "compiler", COMPILER_FEATURE_AS_C_DEFINE)
-        .with_define("feature", "wasi", WASI_FEATURE_AS_C_DEFINE)
 }
 
 fn build_inline_c_env_vars() {
@@ -371,20 +376,9 @@ fn shared_object_dir() -> PathBuf {
     shared_object_dir.pop();
 
     assert_eq!(shared_object_dir.file_name(), Some(OsStr::new("build")));
+    // The parent is Cargo's actual profile directory, including a configured
+    // target directory, cross-compilation triple or custom profile name.
     shared_object_dir.pop();
-    shared_object_dir.pop(); // "debug" or "release"
-
-    // We either find `target` or the target triple if cross-compiling.
-    if shared_object_dir.file_name() != Some(OsStr::new("target")) {
-        let target = env::var("TARGET").unwrap();
-        if shared_object_dir.file_name() != Some(OsStr::new("llvm-cov-target")) {
-            assert_eq!(shared_object_dir.file_name(), Some(OsStr::new(&target)));
-        } else {
-            shared_object_dir.set_file_name(&target);
-        }
-    }
-
-    shared_object_dir.push(env::var("PROFILE").unwrap());
 
     shared_object_dir
 }

@@ -185,7 +185,7 @@ pub fn wasm_sys_engine_new_with_config(config: wasm_config_t) -> Option<Box<wasm
         }
         _ => {
             update_last_error("No backend enabled for the `sys` engine: enable one of `compiler` or `compiler-headless`!");
-            return None;
+            None
         }
     }
 }

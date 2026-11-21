@@ -7558,7 +7558,6 @@ dependencies = [
  "wasmer-compiler-singlepass",
  "wasmer-middlewares",
  "wasmer-types",
- "wasmer-wasix",
  "wat",
 ]
 
@@ -7567,10 +7566,7 @@ name = "wasmer-c-api-imports"
 version = "7.5.0"
 dependencies = [
  "anyhow",
- "tokio",
  "wasmer",
- "wasmer-types",
- "wasmer-wasix",
  "wat",
 ]
 
@@ -8154,6 +8150,7 @@ dependencies = [
  "wasm-encoder 0.263.0",
  "wasmer",
  "wasmer-asyncify",
+ "wasmer-c-api-imports",
  "wasmer-config",
  "wasmer-journal",
  "wasmer-package",

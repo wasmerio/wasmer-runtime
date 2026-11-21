@@ -55,8 +55,10 @@ pub unsafe extern "C" fn wasmer_funcenv_new(
         data = &NULL_ENV_PLACEHOLDER as *const u32 as *mut u32 as *mut c_void;
     }
     let inner = FunctionCEnv::new(unsafe { std::ptr::NonNull::new_unchecked(data) });
-    let mut store_mut = unsafe { store.inner.store_mut() };
-    let _ = FunctionEnv::new(&mut store_mut, inner);
+    if let Err(error) = store.inner.with_mut(|store| FunctionEnv::new(store, inner)) {
+        crate::error::update_last_error(error);
+        return None;
+    }
     Some(Box::new(wasmer_funcenv_t { inner }))
 }
 
