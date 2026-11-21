@@ -54,7 +54,7 @@ middlewares = ["compiler", "wasmer-middlewares", "wasmer-api/wasmparser"]
 engine = ["compiler"]
 # Rust-only hooks for crates that extend this C API, such as a WASI
 # implementation. Not covered by semver.
-extensions = ["sys"]
+extensions = []
 
 # Enable the `sys` backend.
 sys = ["wasmer-api/sys", "wasmer-compiler", "wasmer-c-api-imports/sys"]

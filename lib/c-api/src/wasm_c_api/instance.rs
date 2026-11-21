@@ -268,7 +268,8 @@ mod tests {
             r#"(module
                 (import "env" "start" (func $start))
                 (import "env" "memory" (memory 1))
-                (start $start))"#,
+                (func $run (call $start))
+                (start $run))"#,
         )
         .unwrap();
         let bound = Arc::new(AtomicBool::new(false));
