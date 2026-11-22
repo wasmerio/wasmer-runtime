@@ -4,10 +4,14 @@
 /// Defines [`SharedStore`] and how async calls reach their store.
 #[cfg(feature = "experimental-async")]
 mod async_;
+#[cfg(all(test, feature = "experimental-async", feature = "sys"))]
+pub(crate) use async_::is_published;
 #[cfg(feature = "experimental-async")]
 pub(crate) use async_::{CallStore, PollScope, PollStore, SharedState, StoreSlice, WithSlice};
 #[cfg(feature = "experimental-async")]
 pub use async_::{SharedStore, StoreBusy, WeakSharedStore};
+#[cfg(all(feature = "experimental-async", feature = "js"))]
+pub(crate) use async_::{publish_store, published_store};
 
 /// Defines the [`StoreContext`] type.
 mod context;
@@ -77,9 +81,22 @@ impl Store {
             }
         };
 
+        let objects = StoreObjects::from_store_ref(&store);
+        #[cfg(all(
+            feature = "sys",
+            feature = "experimental-async",
+            feature = "experimental-host-interrupt"
+        ))]
+        let _teardown = crate::backend::sys::async_runtime::StoreTeardown(objects.id());
         let inner = Box::new(StoreInner {
-            objects: StoreObjects::from_store_ref(&store),
+            objects,
             store,
+            #[cfg(all(
+                feature = "sys",
+                feature = "experimental-async",
+                feature = "experimental-host-interrupt"
+            ))]
+            _teardown,
             #[cfg(feature = "experimental-async")]
             shared: std::rc::Weak::new(),
             #[cfg(all(feature = "js", feature = "experimental-async"))]
@@ -234,14 +251,12 @@ impl AsEngineRef for Store {
 
 impl AsStoreRef for Store {
     fn as_store_ref(&self) -> StoreRef<'_> {
-        StoreRef { inner: &self.inner }
+        StoreRef::new(&self.inner)
     }
 }
 impl AsStoreMut for Store {
     fn as_store_mut(&mut self) -> StoreMut<'_> {
-        StoreMut {
-            inner: &mut self.inner,
-        }
+        StoreMut::new(&mut self.inner)
     }
 
     fn objects_mut(&mut self) -> &mut StoreObjects {

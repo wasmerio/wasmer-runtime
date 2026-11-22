@@ -52,7 +52,7 @@ impl<T: Any + 'static + Sized> FunctionEnv<T> {
     /// the `&mut T` returned by [`FunctionEnvMut::data_and_store`].
     pub fn as_ref<'a>(&self, store: &'a impl AsStoreMut) -> &'a T {
         self.handle
-            .get(store.as_store_ref().objects().as_sys())
+            .get(store.as_store_ref().host_state_objects().as_sys())
             .as_ref()
             .downcast_ref::<T>()
             .unwrap()
@@ -164,23 +164,19 @@ impl<T: Send + 'static> FunctionEnvMut<'_, T> {
         // store. A `StoreRef` cannot reach it, because `FunctionEnv::as_ref`
         // requires a mutable store view.
         let data = unsafe { &mut *data };
-        (data, self.store_mut.as_store_ref())
+        (data, self.store_mut.as_store_ref().view_only())
     }
 }
 
 impl<T> AsStoreRef for FunctionEnvMut<'_, T> {
     fn as_store_ref(&self) -> StoreRef<'_> {
-        StoreRef {
-            inner: self.store_mut.inner,
-        }
+        self.store_mut.as_store_ref()
     }
 }
 
 impl<T> AsStoreMut for FunctionEnvMut<'_, T> {
     fn as_store_mut(&mut self) -> StoreMut<'_> {
-        StoreMut {
-            inner: self.store_mut.inner,
-        }
+        self.store_mut.as_store_mut()
     }
 
     fn objects_mut(&mut self) -> &mut crate::StoreObjects {

@@ -112,7 +112,7 @@ impl Function {
                 let (func, handle) = state.get();
                 let future = func(crate::AsyncEnv::new(handle.clone(), store_id), args.to_vec());
                 let mut store = env.as_store_mut();
-                crate::backend::v8::async_call::block_on_host(&mut store, future)
+                crate::backend::v8::async_call::run_import(&mut store, future)
             },
         )
     }
@@ -443,13 +443,14 @@ impl Function {
             }
         };
 
+        let store_id = store.objects_mut().id();
         call_wrapped(store, wrapper, |_| {
             // `wasm_func_call` takes the arguments, so every entry gets its own.
             let mut args = Default::default();
-            let trap = unsafe {
+            let trap = crate::backend::v8::guest_entry(store_id, || unsafe {
                 wasm_val_vec_new(&mut args, wasm_params.len(), wasm_params.as_ptr());
                 wasm_func_call(self.handle, &mut args as _, &mut results as *mut _)
-            };
+            });
             if trap.is_null() {
                 Ok(())
             } else {

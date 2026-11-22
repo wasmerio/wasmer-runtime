@@ -33,8 +33,6 @@ pub(crate) struct GuestGuard {
     guests: Cell<u32>,
     /// Exclusive calls neither finished nor dropped.
     calls: Cell<u32>,
-    /// Slices of those calls running now: their code may use the store.
-    slices: Cell<u32>,
     /// A guest is on the stack, or is about to be resumed there.
     holder: Cell<bool>,
     /// That guest's call was dropped.
@@ -46,10 +44,12 @@ pub(crate) struct GuestGuard {
 }
 
 impl GuestGuard {
-    /// Panics if a forgotten call's guest can still reach the store.
+    /// Panics if a call that is neither finished nor dropped holds the store.
+    /// Only the store's owner, and handles taken from it, come through here:
+    /// while that call is alive they can be reached only if it was forgotten.
     #[inline]
-    pub(crate) fn check(&self) {
-        if self.calls.get() != 0 && self.slices.get() == 0 {
+    pub(crate) fn check_owner(&self) {
+        if self.calls.get() != 0 {
             store_is_held();
         }
     }
@@ -77,10 +77,10 @@ impl GuestGuard {
         self.calls.set(self.calls.get() - 1);
     }
 
-    /// Lets the code of a live call use the store until the mark is dropped.
-    pub(crate) fn mark(self: &Rc<Self>) -> SliceMark {
-        self.slices.set(self.slices.get() + 1);
-        SliceMark(Rc::clone(self))
+    /// Whether a live guest or an unfinished exclusive call holds the store. A
+    /// guest whose call was dropped does not: the store is usable at once.
+    pub(crate) fn holds_store(&self) -> bool {
+        self.calls.get() != 0 || (self.holder.get() && !self.holder_cancelled.get())
     }
 
     /// Whether no guest is on the stack.
@@ -146,15 +146,6 @@ fn store_is_held() -> ! {
     )
 }
 
-/// See [`GuestGuard::mark`].
-pub(crate) struct SliceMark(Rc<GuestGuard>);
-
-impl Drop for SliceMark {
-    fn drop(&mut self) {
-        self.0.slices.set(self.0.slices.get() - 1);
-    }
-}
-
 /// The owner of a store's allocation on this backend.
 pub(crate) struct GuardedStore {
     inner: ManuallyDrop<Box<StoreInner>>,
@@ -172,7 +163,7 @@ impl GuardedStore {
 
     /// Gives the allocation up to another owner.
     pub(crate) fn into_box(self) -> Box<StoreInner> {
-        self.guard.check();
+        self.guard.check_owner();
         let mut this = ManuallyDrop::new(self);
         // Safety: `this` is never dropped, so each field is taken once.
         unsafe {
@@ -187,7 +178,7 @@ impl Deref for GuardedStore {
 
     #[inline]
     fn deref(&self) -> &StoreInner {
-        self.guard.check();
+        self.guard.check_owner();
         &self.inner
     }
 }
@@ -195,7 +186,7 @@ impl Deref for GuardedStore {
 impl DerefMut for GuardedStore {
     #[inline]
     fn deref_mut(&mut self) -> &mut StoreInner {
-        self.guard.check();
+        self.guard.check_owner();
         &mut self.inner
     }
 }

@@ -21,7 +21,7 @@
 
 use std::cell::RefCell;
 
-use super::{AsStoreMut, AsStoreRef, StoreInner, StoreMut, StoreRef};
+use super::{StoreInner, StoreMut, StoreRef};
 
 use wasmer_types::StoreId;
 
@@ -49,6 +49,28 @@ thread_local! {
 }
 
 impl StoreContext {
+    /// The depth of the stack, and the borrows of its top entry.
+    #[cfg(all(feature = "js", feature = "experimental-async"))]
+    pub(crate) fn checkpoint() -> (usize, u32) {
+        STORE_CONTEXT_STACK.with(|cell| {
+            let stack = cell.borrow();
+            (stack.len(), stack.last().map_or(0, |top| top.borrow_count))
+        })
+    }
+
+    /// Puts the stack back as [`Self::checkpoint`] found it, after a
+    /// JavaScript exception skipped the frames that held its entries.
+    #[cfg(all(feature = "js", feature = "experimental-async"))]
+    pub(crate) fn restore_checkpoint((depth, borrow_count): (usize, u32)) {
+        STORE_CONTEXT_STACK.with(|cell| {
+            let mut stack = cell.borrow_mut();
+            stack.truncate(depth);
+            if let Some(top) = stack.last_mut() {
+                top.borrow_count = borrow_count;
+            }
+        });
+    }
+
     /// Whether the thread still has what unwinding a call suspended in Wasm
     /// needs of it: false once its thread locals are being destroyed, as it
     /// exits, and always with `baremetal`. A call suspended then is forgotten
@@ -228,12 +250,12 @@ impl StorePtrWrapper {
     pub(crate) fn as_ref(&self) -> StoreRef<'_> {
         // Safety: the pointer is valid for as long as this wrapper holds its
         // borrow of the entry.
-        unsafe { self.store_ptr.as_ref().unwrap().as_store_ref() }
+        StoreRef::from_slice(unsafe { &*self.store_ptr })
     }
 
     pub(crate) fn as_mut(&mut self) -> StoreMut<'_> {
         // Safety: as for `as_ref`.
-        unsafe { self.store_ptr.as_mut().unwrap().as_store_mut() }
+        unsafe { StoreMut::from_raw(self.store_ptr) }
     }
 
     #[cfg(feature = "experimental-async")]

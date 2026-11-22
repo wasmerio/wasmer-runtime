@@ -16,6 +16,7 @@ use std::{
 
 use wasmer_types::StoreId;
 
+use super::store_ref::holding;
 use crate::{Store, StoreContext, StoreInner, StoreMut};
 
 /// How one poll reaches the store of its call.
@@ -33,6 +34,24 @@ enum StoreAccess {
 pub(crate) struct PollStore {
     id: StoreId,
     access: StoreAccess,
+}
+
+/// The store published on this thread, for a JavaScript exception boundary.
+#[cfg(feature = "js")]
+pub(crate) fn published_store() -> Option<PollStore> {
+    POLL_STORE.get()
+}
+
+/// Puts back what [`published_store`] returned.
+#[cfg(feature = "js")]
+pub(crate) fn publish_store(store: Option<PollStore>) {
+    POLL_STORE.set(store);
+}
+
+/// Whether a store is published for a host future on this thread.
+#[cfg(all(test, feature = "sys"))]
+pub(crate) fn is_published() -> bool {
+    POLL_STORE.get().is_some()
 }
 
 thread_local! {
@@ -67,7 +86,7 @@ impl PollStore {
         unsafe {
             match self.access {
                 StoreAccess::Exclusive(ptr) => Rc::clone(&(*ptr).guard),
-                StoreAccess::Shared(state) => Rc::clone(&(*(*state).ptr).guard),
+                StoreAccess::Shared(state) => Rc::clone(&(*state).guard),
             }
         }
     }
@@ -81,6 +100,26 @@ impl PollStore {
             StoreAccess::Shared(state) => {
                 unsafe { (*(*state).ptr).shared.upgrade() }.map(SharedStore)
             }
+        }
+    }
+
+    /// Whether a shared store is in a slice. `None` for an exclusive one.
+    #[cfg(feature = "js")]
+    pub(crate) fn busy(self) -> Option<bool> {
+        match self.access {
+            StoreAccess::Exclusive(_) => None,
+            // Safety: as for `guard`.
+            StoreAccess::Shared(state) => Some(unsafe { &*state }.busy.get()),
+        }
+    }
+
+    /// Puts back what [`Self::busy`] returned, after a JavaScript exception
+    /// skipped the slice that would have.
+    #[cfg(feature = "js")]
+    pub(crate) fn set_busy(self, busy: bool) {
+        if let StoreAccess::Shared(state) = self.access {
+            // Safety: as for `guard`.
+            unsafe { &*state }.busy.set(busy);
         }
     }
 
@@ -279,6 +318,9 @@ pub(crate) struct SharedState {
     ptr: *mut StoreInner,
     /// A slice is running.
     busy: Cell<bool>,
+    /// The guest guard, kept here because a guest may hold `StoreInner`.
+    #[cfg(feature = "js")]
+    guard: Rc<crate::backend::js::guard::GuestGuard>,
 }
 
 impl Drop for SharedState {
@@ -321,6 +363,8 @@ impl std::error::Error for StoreBusy {}
 impl SharedStore {
     pub(crate) fn new(inner: Box<StoreInner>) -> Self {
         let id = inner.objects.id();
+        #[cfg(feature = "js")]
+        let guard = Rc::clone(&inner.guard);
         let ptr = Box::into_raw(inner);
         Self(Rc::new_cyclic(|weak| {
             // Safety: `ptr` was just made and nothing else holds it.
@@ -329,6 +373,8 @@ impl SharedStore {
                 id,
                 ptr,
                 busy: Cell::new(false),
+                #[cfg(feature = "js")]
+                guard,
             }
         }))
     }
@@ -346,20 +392,32 @@ impl SharedStore {
     /// for. Inside [`FunctionEnvMut::release`](crate::FunctionEnvMut::release)
     /// the store is lent to this call.
     pub fn try_with<R>(&self, f: impl FnOnce(StoreMut<'_>) -> R) -> Result<R, StoreBusy> {
-        if self.0.busy.get() {
-            let mut lent = StoreContext::try_get_lent(self.0.id).ok_or(StoreBusy)?;
-            return Ok(f(lent.as_mut()));
+        if self.is_held() {
+            let lent = StoreContext::try_get_lent(self.0.id).ok_or(StoreBusy)?;
+            return Ok(holding(lent, |lent| f(lent.as_mut())));
         }
         let slice = self.poll_store().enter_slice();
         // Safety: the slice is the only holder of the store until it drops,
         // after `f` and every borrow `f` was given are gone.
-        Ok(f(unsafe { StoreMut::from_raw(slice.ptr()) }))
+        Ok(holding(slice, |slice| {
+            f(unsafe { StoreMut::from_raw(slice.ptr()) })
+        }))
+    }
+
+    /// Whether a slice, or on JavaScript a guest or an unfinished exclusive
+    /// call made from a slice of this store, holds the store.
+    fn is_held(&self) -> bool {
+        #[cfg(feature = "js")]
+        if self.0.guard.holds_store() {
+            return true;
+        }
+        self.0.busy.get()
     }
 
     /// Takes the [`Store`] back, if this is its last handle and no slice is
     /// running. A task that has not finished holds a handle.
     pub fn into_store(self) -> Result<Store, Self> {
-        if self.0.busy.get() {
+        if self.is_held() {
             return Err(self);
         }
         match Rc::try_unwrap(self.0) {

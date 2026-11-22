@@ -116,6 +116,28 @@ impl Drop for Lend {
     }
 }
 
+/// The depth of the lends, and whether the innermost one is held.
+#[cfg(feature = "experimental-async")]
+pub(crate) fn checkpoint() -> (usize, bool) {
+    LENDS.with(|lends| {
+        let depth = lends.depth.get();
+        let held = depth.checked_sub(1).is_some_and(|at| lends.held[at].get());
+        (depth, held)
+    })
+}
+
+/// Puts the lends back as [`checkpoint`] found them, after a JavaScript
+/// exception skipped the frames that held them.
+#[cfg(feature = "experimental-async")]
+pub(crate) fn restore((depth, held): (usize, bool)) {
+    LENDS.with(|lends| {
+        lends.depth.set(depth);
+        if let Some(at) = depth.checked_sub(1) {
+            lends.held[at].set(held);
+        }
+    });
+}
+
 /// A host function's hold on the store it runs with: no other host function
 /// can run with the store until it is dropped.
 pub(crate) enum Hold {

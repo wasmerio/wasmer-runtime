@@ -667,18 +667,23 @@ async fn the_host_future_is_polled_with_the_callers_waker() {
         "the host function ran before the guest waited"
     );
     settle().await;
+    assert_eq!(wakes(), 1, "the caller is woken once the guest waits");
+    assert!(
+        !guest.gate.waiting(7),
+        "a host function runs only in a poll of its call"
+    );
+    assert!(call.poll_unpin(&mut cx).is_pending());
     assert!(guest.gate.waiting(7), "the host function did not run");
-    assert_eq!(wakes(), 0, "the caller was woken for nothing");
 
     guest.gate.release(7);
-    assert_eq!(wakes(), 1, "the host future did not wake its caller");
+    assert_eq!(wakes(), 2, "the host future did not wake its caller");
     settle().await;
     assert_eq!(guest.log().len(), 2, "the guest went on without its caller");
 
     assert!(call.poll_unpin(&mut cx).is_pending());
     settle().await;
     assert_eq!(guest.log().last().unwrap(), "2: async, locked");
-    assert_eq!(wakes(), 2, "the finished guest did not wake its caller");
+    assert_eq!(wakes(), 3, "the finished guest did not wake its caller");
     assert!(call.poll_unpin(&mut cx).is_ready());
     guest.into_store();
 }
@@ -977,8 +982,10 @@ async fn results_that_do_not_match_the_signature_trap() {
 
 /// An async import reached through a synchronous call from a host function,
 /// or through a JavaScript frame, cannot suspend its guest. The call fails
-/// with the error other backends give, the host function does not run, and
-/// the call beneath is left as it was: it has its store and can still wait.
+/// with the error other backends give, and the call beneath is left as it
+/// was: it has its store and can still wait. A synchronous entry that lends
+/// the store polls the import once. A raw JavaScript re-entry has no lend, so
+/// the host function does not run.
 #[wasm_bindgen_test]
 async fn a_refused_suspension_leaves_the_call_usable() {
     for raw in [0, 1] {
@@ -993,7 +1000,9 @@ async fn a_refused_suspension_leaves_the_call_usable() {
             if resumed == 1 {
                 expected.insert(0, &waits);
             }
-            // The host function did not run for the refused import, `wait99`.
+            if raw == 0 {
+                expected.insert(usize::from(resumed == 1), "wait99");
+            }
             assert_eq!(guest.log(), expected, "{case}");
             let errors = guest.errors().await;
             assert_eq!(errors.len(), 1, "{case}");
@@ -1003,7 +1012,7 @@ async fn a_refused_suspension_leaves_the_call_usable() {
                 "{case}: {}",
                 errors[0]
             );
-            assert_eq!(guest.gate.dropped(), 0, "{case}");
+            assert_eq!(guest.gate.dropped(), u32::from(raw == 0), "{case}");
             drop(call);
             guest.into_store();
         }
@@ -1040,10 +1049,10 @@ fn an_async_import_outside_call_async_is_refused() {
     let gate = Gate::new(&log);
     let imports = imports! { "host" => { "wait" => gate.import(&mut store) } };
     assert!(Instance::new(&mut store, &module, &imports).is_err());
-    assert!(
-        log.borrow().is_empty(),
-        "a host function ran: {:?}",
-        log.borrow()
+    assert_eq!(
+        *log.borrow(),
+        ["wait7", "wait7"],
+        "each synchronous entry polls its import once"
     );
 }
 
@@ -1422,10 +1431,7 @@ async fn an_embedder_reentry_then_a_foreign_suspension_keeps_the_store() {
             locked(&store),
             "{way}: the store was given up while the guest waits"
         );
-        assert!(
-            log.borrow().is_empty(),
-            "{way}: the refused host function ran"
-        );
+        assert_eq!(*log.borrow(), ["wait99"], "{way}: a sync entry polls once");
         resolve
             .call1(&JsValue::UNDEFINED, &JsValue::from(5))
             .unwrap();
@@ -1438,7 +1444,7 @@ async fn an_embedder_reentry_then_a_foreign_suspension_keeps_the_store() {
             Some(TrapCode::YieldOutsideAsyncContext),
             "{way}: {error}"
         );
-        assert_eq!(gate.dropped(), 0, "{way}");
+        assert_eq!(gate.dropped(), 1, "{way}");
         assert!(store.into_store().is_ok(), "{way}");
     }
 }
@@ -1861,7 +1867,8 @@ async fn a_host_function_belongs_to_its_store() {
     struct Env;
     let unary = FunctionType::new([Type::I32], [Type::I32]);
     let wide = FunctionType::new([Type::I32], [Type::I64]);
-    let make: [(&str, FunctionType, fn(&mut Store) -> Function); 5] = [
+    type Make = fn(&mut Store) -> Function;
+    let make: [(&str, FunctionType, Make); 5] = [
         ("async", unary.clone(), |store| {
             typed_host(store, async |_: &mut AsyncEnv<()>, value: i32| value + 1)
         }),
@@ -2846,6 +2853,13 @@ async fn a_store_dropped_under_a_forgotten_call_outlives_its_guest() {
 
     let mut call = Box::pin(once.call_async(&mut store, &[Value::I32(READY)]));
     assert!(poll_once(&mut call).is_pending());
+    // A wait the engine has accepted, then a poll that wakes the guest.
+    for _ in 0..3 {
+        JsFuture::from(Promise::resolve(&JsValue::UNDEFINED))
+            .await
+            .unwrap();
+    }
+    assert!(poll_once(&mut call).is_pending());
     std::mem::forget(call);
     drop(store);
 
@@ -2856,7 +2870,6 @@ async fn a_store_dropped_under_a_forgotten_call_outlives_its_guest() {
 /// A forgotten call ended its borrow, but its guest can still run: every
 /// public store entry refuses until the guest leaves.
 #[wasm_bindgen_test]
-#[should_panic(expected = "forgotten")]
 fn a_store_used_under_a_forgotten_call_panics() {
     let guest = guest();
     let once = guest.instance.exports.get_function("once").unwrap().clone();
@@ -2864,7 +2877,15 @@ fn a_store_used_under_a_forgotten_call_panics() {
     let mut call = Box::pin(once.call_async(&mut store, &[Value::I32(1)]));
     assert!(poll_once(&mut call).is_pending());
     std::mem::forget(call);
-    let _ = store.as_store_ref();
+    // A panic is a trap here. A JavaScript frame catches it, so that the
+    // test harness stays usable.
+    let uses_store = wasm_bindgen::closure::Closure::once_into_js(move || {
+        let _ = store.as_store_ref();
+    });
+    let used = uses_store
+        .unchecked_ref::<js_sys::Function>()
+        .call0(&JsValue::NULL);
+    assert!(used.is_err(), "a forgotten call's store was used");
 }
 
 /// Dropping a call whose guest cannot be stopped leaves the store usable at

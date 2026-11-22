@@ -24,6 +24,13 @@ pub(crate) struct StoreInner {
     /// freed or aliased store.
     #[cfg(all(feature = "js", feature = "experimental-async"))]
     pub(crate) guard: std::rc::Rc<crate::backend::js::guard::GuestGuard>,
+    /// Releases what forgotten calls left registered for this store.
+    #[cfg(all(
+        feature = "sys",
+        feature = "experimental-async",
+        feature = "experimental-host-interrupt"
+    ))]
+    pub(crate) _teardown: crate::backend::sys::async_runtime::StoreTeardown,
 }
 
 impl std::fmt::Debug for StoreInner {
@@ -37,12 +44,12 @@ impl std::fmt::Debug for StoreInner {
 
 impl AsStoreRef for StoreInner {
     fn as_store_ref(&self) -> StoreRef<'_> {
-        StoreRef { inner: self }
+        StoreRef::new(self)
     }
 }
 impl AsStoreMut for StoreInner {
     fn as_store_mut(&mut self) -> StoreMut<'_> {
-        StoreMut { inner: self }
+        StoreMut::new(self)
     }
 
     fn objects_mut(&mut self) -> &mut StoreObjects {

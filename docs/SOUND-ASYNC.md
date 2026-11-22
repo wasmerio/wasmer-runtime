@@ -373,8 +373,8 @@ view, and V8's C API cannot switch stacks.
 |  | `sys` | JavaScript (JSPI) | V8 |
 | --- | --- | --- | --- |
 | Guest stack | `corosensei` coroutine owned by the call future | Engine-owned JSPI stack | The calling OS stack, never suspended |
-| Level 1 | Full | Full, with the guest guard below | Yes: `poll` blocks while a pending import's future is driven |
-| Level 2 overlap | Full | Full, with the guest guard below | Lexical nesting only; stacks cannot resume out of order |
+| Level 1 | Full | Full, with the guest guard below. Host futures run only inside `poll` | Yes: `poll` blocks while a pending import's future is driven |
+| Level 2 overlap | Full | Full, with the guest guard below | Lexical nesting only; stacks cannot resume out of order, so a task whose import must wait fails with a trap |
 | Cancellation | Drop the host future, then discard the stack | Unwind with an uncatchable trap. A guest already woken runs until it leaves the stack, with its host functions refused | Not possible during an import, because `poll` has not returned |
 | Runtime check that remains | Wrong-store handles | Guest guard, and a lend or live call for each host function | Thread and store ownership checks |
 

@@ -60,14 +60,15 @@ macro_rules! impl_native_traits {
 
 
                  let func = unsafe { wasm_extern_as_func(self.func.to_vm_extern().unwrap_v_8()) };
+                 let store_id = store.objects_mut().id();
 
                  call_wrapped(store, wrapper, |_| {
                     // `wasm_func_call` takes the arguments, so every entry gets its own.
                     let mut params = unsafe { std::mem::zeroed() };
-                    let trap = unsafe {
+                    let trap = crate::backend::v8::guest_entry(store_id, || unsafe {
                         wasm_val_vec_new(&mut params, params_list.len(), params_list.as_ptr());
                         wasm_func_call(func, &params, &mut results)
-                    };
+                    });
                     if trap.is_null() {
                         Ok(())
                     } else {

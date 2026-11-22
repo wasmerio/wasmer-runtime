@@ -389,10 +389,12 @@ impl Function {
     /// On `sys`, the coroutine has a fixed stack of 1 MiB, on which the host
     /// functions the guest calls run. Host futures are polled on the
     /// executor's stack. On `js`, the engine suspends the guest's stack
-    /// (JSPI), and JavaScript that Wasmer never saw must not call a guest's
-    /// export while a guest of the same store runs. On `v8`, the guest stays
-    /// on the calling stack, so `poll` blocks while an import's future is
-    /// driven.
+    /// (JSPI), host futures run only while the call is polled, and JavaScript
+    /// that Wasmer never saw must not call a guest's export while a guest of
+    /// the same store runs. On `v8`, the guest stays on the calling stack, so
+    /// `poll` blocks while an import's future is driven, and a
+    /// [`SharedStore`](crate::SharedStore) task whose import must wait fails
+    /// with a trap.
     #[cfg(feature = "experimental-async")]
     pub fn call_async<'a, S: AsyncCallStore>(
         &'a self,

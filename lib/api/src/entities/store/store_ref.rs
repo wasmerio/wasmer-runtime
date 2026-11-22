@@ -8,14 +8,67 @@ use wasmer_types::ExternType;
 #[cfg(feature = "sys")]
 use wasmer_vm::TrapHandlerFn;
 
+/// How a handle reached its store.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct HandleOrigin {
+    /// Lent for one synchronous slice of a call, rather than taken from the
+    /// store's owner. A slice's handle cannot outlive that slice.
+    from_slice: bool,
+    /// From [`FunctionEnvMut::data_and_store`](crate::FunctionEnvMut::data_and_store),
+    /// whose `&mut T` is live: it must not reach host state.
+    view_only: bool,
+}
+
 /// A temporary handle to a [`crate::Store`].
 #[derive(Debug)]
 pub struct StoreRef<'a> {
     pub(crate) inner: &'a StoreInner,
+    origin: HandleOrigin,
 }
 
 impl<'a> StoreRef<'a> {
+    pub(crate) fn new(inner: &'a StoreInner) -> Self {
+        Self {
+            inner,
+            origin: HandleOrigin::default(),
+        }
+    }
+
+    /// A handle lent for one slice of a call.
+    pub(crate) fn from_slice(inner: &'a StoreInner) -> Self {
+        Self {
+            inner,
+            origin: HandleOrigin {
+                from_slice: true,
+                view_only: false,
+            },
+        }
+    }
+
+    /// This handle, without access to host state.
+    pub(crate) fn view_only(mut self) -> Self {
+        self.origin.view_only = true;
+        self
+    }
+
     pub(crate) fn objects(&self) -> &'a StoreObjects {
+        &self.inner.objects
+    }
+
+    /// The objects, for reading a `FunctionEnv`.
+    ///
+    /// `AsStoreMut` is a public trait, so a wrapper can forward the view of
+    /// [`FunctionEnvMut::data_and_store`](crate::FunctionEnvMut::data_and_store)
+    /// through it. The origin travels with the handle, so that view still
+    /// cannot reach the `T` whose `&mut` is live.
+    ///
+    /// # Panics
+    /// Panics on a handle from `data_and_store`.
+    pub(crate) fn host_state_objects(&self) -> &'a StoreObjects {
+        assert!(
+            !self.origin.view_only,
+            "the store view of `FunctionEnvMut::data_and_store` cannot read host state"
+        );
         &self.inner.objects
     }
 
@@ -42,6 +95,16 @@ impl<'a> StoreRef<'a> {
 /// A temporary handle to a [`crate::Store`].
 pub struct StoreMut<'a> {
     pub(crate) inner: &'a mut StoreInner,
+    origin: HandleOrigin,
+}
+
+impl<'a> StoreMut<'a> {
+    pub(crate) fn new(inner: &'a mut StoreInner) -> Self {
+        Self {
+            inner,
+            origin: HandleOrigin::default(),
+        }
+    }
 }
 
 impl StoreMut<'_> {
@@ -61,10 +124,18 @@ impl StoreMut<'_> {
         self.inner as *const StoreInner as *mut StoreInner
     }
 
+    /// A handle lent for one slice of a call.
+    ///
+    /// # Safety
+    /// The caller holds the store exclusively for as long as this handle.
     #[allow(unused)]
     pub(crate) unsafe fn from_raw(raw: *mut StoreInner) -> Self {
         Self {
             inner: unsafe { &mut *raw },
+            origin: HandleOrigin {
+                from_slice: true,
+                view_only: false,
+            },
         }
     }
 
@@ -116,9 +187,26 @@ impl StoreMut<'_> {
         // SAFETY: `ptr` comes from `&mut *self.inner`, which `&mut self` keeps
         // alive and unreachable for every frame on this thread until `f`
         // returns and the guard is dropped.
-        let _guard = unsafe { super::StoreContext::install(ptr) };
-        f()
+        let guard = unsafe { super::StoreContext::install(ptr) };
+        holding(guard, |_| f())
     }
+}
+
+/// Runs `f` and then drops `guard`, also if a JavaScript exception unwinds
+/// through `f`, which skips the destructors of the frames it crosses.
+#[inline]
+pub(crate) fn holding<G, R>(mut guard: G, f: impl FnOnce(&mut G) -> R) -> R {
+    #[cfg(all(feature = "js", feature = "experimental-async", target_arch = "wasm32"))]
+    {
+        let result = crate::backend::js::boundary::catching(|| f(&mut guard));
+        drop(guard);
+        match result {
+            Ok(value) => value,
+            Err(error) => wasm_bindgen::throw_val(error),
+        }
+    }
+    #[cfg(not(all(feature = "js", feature = "experimental-async", target_arch = "wasm32")))]
+    f(&mut guard)
 }
 
 /// Helper trait for a value that is convertible to a [`StoreRef`].
@@ -136,18 +224,24 @@ pub trait AsStoreMut: AsStoreRef {
     fn objects_mut(&mut self) -> &mut StoreObjects;
 }
 
-/// On JavaScript, a handle made before a call that was then forgotten must
-/// not reach the store while that call's guest can still run.
+/// On JavaScript, a handle from the store's owner must not reach the store
+/// while the guest of a forgotten call can still run. A handle lent to a slice
+/// of that call can, and cannot outlive the slice.
 #[inline]
-fn check_guest_guard(_inner: &StoreInner) {
+fn check_guest_guard(_inner: &StoreInner, _origin: HandleOrigin) {
     #[cfg(all(feature = "js", feature = "experimental-async"))]
-    _inner.guard.check();
+    if !_origin.from_slice {
+        _inner.guard.check_owner();
+    }
 }
 
 impl AsStoreRef for StoreRef<'_> {
     fn as_store_ref(&self) -> StoreRef<'_> {
-        check_guest_guard(self.inner);
-        StoreRef { inner: self.inner }
+        check_guest_guard(self.inner, self.origin);
+        StoreRef {
+            inner: self.inner,
+            origin: self.origin,
+        }
     }
 }
 
@@ -159,18 +253,24 @@ impl AsEngineRef for StoreRef<'_> {
 
 impl AsStoreRef for StoreMut<'_> {
     fn as_store_ref(&self) -> StoreRef<'_> {
-        check_guest_guard(self.inner);
-        StoreRef { inner: self.inner }
+        check_guest_guard(self.inner, self.origin);
+        StoreRef {
+            inner: self.inner,
+            origin: self.origin,
+        }
     }
 }
 impl AsStoreMut for StoreMut<'_> {
     fn as_store_mut(&mut self) -> StoreMut<'_> {
-        check_guest_guard(self.inner);
-        StoreMut { inner: self.inner }
+        check_guest_guard(self.inner, self.origin);
+        StoreMut {
+            inner: self.inner,
+            origin: self.origin,
+        }
     }
 
     fn objects_mut(&mut self) -> &mut StoreObjects {
-        check_guest_guard(self.inner);
+        check_guest_guard(self.inner, self.origin);
         &mut self.inner.objects
     }
 }

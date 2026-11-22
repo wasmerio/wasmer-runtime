@@ -11,7 +11,7 @@
 #[cfg(feature = "experimental-host-interrupt")]
 use std::{
     collections::HashMap,
-    sync::{LazyLock, atomic::AtomicU64},
+    sync::{Arc, LazyLock, atomic::AtomicU64},
 };
 use std::{
     cell::{Cell, RefCell},
@@ -53,9 +53,27 @@ static NEXT_ASYNC_CALL_FUTURE_ID: AtomicU64 = AtomicU64::new(0);
 /// [`notify_pending_futures_of_interrupt`]: a host interrupt is the only
 /// thing that wakes a call from outside. Everything else a call waits for
 /// is a host future, which has the waker itself.
+///
+/// A waker's `clone`, `wake` and `drop` are user code, so they never run under
+/// the map's locks: the map holds `Arc`s, which are cloned and dropped there.
 #[cfg(feature = "experimental-host-interrupt")]
-static ASYNC_CALL_FUTURE_WAKERS: LazyLock<DashMap<StoreId, HashMap<AsyncCallFutureId, Waker>>> =
-    LazyLock::new(DashMap::new);
+static ASYNC_CALL_FUTURE_WAKERS: LazyLock<
+    DashMap<StoreId, HashMap<AsyncCallFutureId, Arc<Waker>>>,
+> = LazyLock::new(DashMap::new);
+
+/// Releases what forgotten calls left registered for a store, when it drops.
+#[cfg(feature = "experimental-host-interrupt")]
+pub(crate) struct StoreTeardown(pub(crate) StoreId);
+
+#[cfg(feature = "experimental-host-interrupt")]
+impl Drop for StoreTeardown {
+    fn drop(&mut self) {
+        // Dropped after the map's lock is released.
+        let wakers = ASYNC_CALL_FUTURE_WAKERS.remove(&self.0);
+        drop(wakers);
+        super::vm::interrupt_registry::release_store(self.0);
+    }
+}
 
 /// The future of one call. `'a` is its borrow of the store, if it has one.
 pub(crate) struct AsyncCallFuture<'a, X: 'static> {
@@ -181,18 +199,14 @@ impl AsStoreRef for AsyncCallStoreMut {
     fn as_store_ref(&self) -> StoreRef<'_> {
         // Safety: the call lends this pointer to its coroutine for the slice
         // that is running.
-        StoreRef {
-            inner: unsafe { &*self.current.get() },
-        }
+        StoreRef::from_slice(unsafe { &*self.current.get() })
     }
 }
 
 impl AsStoreMut for AsyncCallStoreMut {
     fn as_store_mut(&mut self) -> StoreMut<'_> {
         // Safety: as for `as_store_ref`; `&mut self` is the only way to it.
-        StoreMut {
-            inner: unsafe { &mut *self.current.get() },
-        }
+        unsafe { StoreMut::from_raw(self.current.get()) }
     }
 
     fn objects_mut(&mut self) -> &mut crate::StoreObjects {
@@ -255,6 +269,10 @@ impl<'a, X: 'static> AsyncCallFuture<'a, X> {
         resume: Option<AsyncResume>,
         store: Option<*mut StoreInner>,
     ) -> Option<CoroutineResult<AsyncYield, Result<X, RuntimeError>>> {
+        // The store is published for host futures only: a sync host function
+        // of this guest holds it, and must not find it published as well.
+        let _hidden = PollScope::enter(None);
+
         struct SwitchBack<'s> {
             activation: &'s mut Activation,
             base: usize,
@@ -310,16 +328,37 @@ impl<'a, X: 'static> AsyncCallFuture<'a, X> {
 
     #[cfg(feature = "experimental-host-interrupt")]
     fn remove_from_wakers_list(&self) {
-        let mut wakers_entry = match ASYNC_CALL_FUTURE_WAKERS.entry(self.store.id()) {
-            dashmap::Entry::Occupied(o) => o,
-            dashmap::Entry::Vacant(_) => return,
+        let removed = match ASYNC_CALL_FUTURE_WAKERS.entry(self.store.id()) {
+            dashmap::Entry::Occupied(mut wakers) => {
+                let removed = wakers.get_mut().remove(&self.id);
+                if wakers.get().is_empty() {
+                    wakers.remove();
+                }
+                removed
+            }
+            dashmap::Entry::Vacant(_) => None,
         };
+        // After the map's lock is released.
+        drop(removed);
+    }
 
-        let waker_map_ref = wakers_entry.get_mut();
-        waker_map_ref.remove(&self.id);
-        if waker_map_ref.is_empty() {
-            wakers_entry.remove();
+    /// Records the waker of the latest poll, which an interrupt has to wake.
+    #[cfg(feature = "experimental-host-interrupt")]
+    fn register_waker(&self, waker: &Waker) {
+        let store_id = self.store.id();
+        let current = ASYNC_CALL_FUTURE_WAKERS
+            .get(&store_id)
+            .is_some_and(|wakers| wakers.get(&self.id).is_some_and(|w| w.will_wake(waker)));
+        if current {
+            return;
         }
+        let waker = Arc::new(waker.clone());
+        let previous = ASYNC_CALL_FUTURE_WAKERS
+            .entry(store_id)
+            .or_default()
+            .insert(self.id, waker);
+        // After the map's lock is released.
+        drop(previous);
     }
 
     /// Drops a host future the call is waiting on, while it can still reach
@@ -363,6 +402,12 @@ impl<X: 'static> Future for AsyncCallFuture<'_, X> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
+        // Before the interrupt is checked, so that one arriving after the
+        // check wakes this poll's waker.
+        #[cfg(feature = "experimental-host-interrupt")]
+        if this.coroutine.is_some() {
+            this.register_waker(cx.waker());
+        }
         loop {
             #[cfg(feature = "experimental-host-interrupt")]
             {
@@ -406,14 +451,6 @@ impl<X: 'static> Future for AsyncCallFuture<'_, X> {
                     }
                     Poll::Pending => return Poll::Pending,
                 }
-            }
-
-            #[cfg(feature = "experimental-host-interrupt")]
-            {
-                let mut wakers_entry = ASYNC_CALL_FUTURE_WAKERS
-                    .entry(this.store.id())
-                    .or_default();
-                wakers_entry.insert(this.id, cx.waker().clone());
             }
 
             // The store is taken for as long as the guest runs, and given up
@@ -483,12 +520,12 @@ pub(crate) fn block_on_host_future(
 pub(crate) fn notify_pending_futures_of_interrupt(store_id: StoreId) {
     // Woken once the map is unlocked: a waker may poll its call at once,
     // which takes the map's lock again.
-    let wakers: Vec<Waker> = match ASYNC_CALL_FUTURE_WAKERS.get(&store_id) {
+    let wakers: Vec<Arc<Waker>> = match ASYNC_CALL_FUTURE_WAKERS.get(&store_id) {
         Some(wakers) => wakers.values().cloned().collect(),
         None => return,
     };
     for waker in wakers {
-        waker.wake();
+        waker.wake_by_ref();
     }
 }
 
@@ -521,14 +558,14 @@ impl CoroutineContext {
 /// Polls a host future once, where the guest cannot suspend. The store is
 /// reachable through the entry of the synchronous call beneath, whose borrow
 /// this holds so that nothing else can take it meanwhile.
-fn run_immediate(
-    store_id: StoreId,
-    mut future: HostFuture,
-) -> Result<Vec<Value>, AsyncRuntimeError> {
+fn run_immediate(store_id: StoreId, future: HostFuture) -> Result<Vec<Value>, AsyncRuntimeError> {
     // Safety: the entry's pointer is used only for the duration of this poll,
     // in the slices the future takes, while the wrapper's borrow stands.
     let wrapper = unsafe { StoreContext::get_current(store_id) };
     let _scope = PollScope::enter(Some(PollStore::exclusive(store_id, wrapper.as_ptr())));
+    // Declared after the scope, so that its destructor runs with the store of
+    // this entry, not whatever was published before.
+    let mut future = future;
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
     match future.as_mut().poll(&mut cx) {
@@ -685,6 +722,36 @@ mod stack_pool {
             assert!(matches!(poll(call), Poll::Ready(Ok(_))));
         }
         assert_eq!(pooled().len(), STACK_POOL_CAPACITY);
+    }
+
+    /// A guest's sync host function holds the store, so it must not also find
+    /// it published for a host future, even under an outer poll.
+    #[test]
+    fn a_running_guest_hides_the_published_store() {
+        let mut store = sys_store();
+        let seen = Rc::new(Cell::new(None));
+        let ty = FunctionType::new(vec![], vec![]);
+        let inner = Function::new(&mut store, ty.clone(), {
+            let seen = OnOneThread(seen.clone());
+            move |_| {
+                seen.get().set(Some(crate::entities::store::is_published()));
+                Ok(vec![])
+            }
+        });
+        let env = crate::FunctionEnv::new(&mut store, ());
+        let outer = Function::new_async(&mut store, &env, ty, {
+            async move |cx: &mut crate::AsyncEnv<()>, _: &[Value]| {
+                assert!(crate::entities::store::is_published());
+                inner.call_async(cx, &[]).await.map(|_| vec![])
+            }
+        });
+        let mut call = Box::pin(outer.call_async(&mut store, &[]));
+        assert!(matches!(
+            call.as_mut()
+                .poll(&mut Context::from_waker(&futures::task::noop_waker())),
+            Poll::Ready(Ok(_))
+        ));
+        assert_eq!(seen.get(), Some(false));
     }
 
     #[test]

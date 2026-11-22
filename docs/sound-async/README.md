@@ -29,8 +29,8 @@ the API was replaced directly.
 | Area | State |
 | --- | --- |
 | `sys` Level 1 and Level 2 | Done |
-| JavaScript and the guest guard | Done, in `lib/api/src/backend/js/guard.rs` |
-| V8 | Done. `poll` blocks during an import, so another thread must wake it |
+| JavaScript and the guest guard | Done, in `lib/api/src/backend/js/guard.rs`. Host futures run only inside `Call::poll` |
+| V8 | Done. `poll` blocks during an exclusive call's import, so another thread must wake it. A synchronous entry or a `SharedStore` task fails if its import must wait |
 | WASIX and NAPI ports | **Not done.** They live on `next` |
 
 Differences from the proposal's signatures:
@@ -40,6 +40,20 @@ Differences from the proposal's signatures:
 - A guest whose call was dropped now fails at its next host function, even if
   it holds no wait. That follows guard rule 3, and one PR 16 test was changed
   to expect it.
+
+Rules added after reviewing this branch against an alternative implementation:
+
+- A store handle records whether it came from a slice. The handle from
+  `data_and_store` is a view that cannot read host state, so it cannot alias
+  the `&mut T` returned beside it.
+- On JavaScript, one exception boundary restores per-thread state across
+  host-future polls and drops, `try_with` and `parked`. The synchronous host
+  path stays outside it to keep its fast path.
+- While a guest runs, the store published for the current poll is hidden.
+- An interrupt on a forgotten call stays with that call. A new call on the same
+  store gets a fresh flag.
+- User waker code never runs under a runtime lock, and a store's wakers and
+  interrupt entries are released when the store drops.
 
 Tests that depended on the removed lock were deleted or rewritten. Coroutine
 switches cannot run under Miri, so Miri covers the store context and slice

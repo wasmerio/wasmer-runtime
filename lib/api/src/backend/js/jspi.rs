@@ -22,8 +22,9 @@
 //!   [guest guard](crate::backend::js::guard) keeps that safe when the call
 //!   was dropped or forgotten.
 //! * The host future of an async import belongs to the activation and is
-//!   polled with the caller's waker: first in the microtask that sees the
-//!   guest wait, then by the future of the call whenever that is woken.
+//!   polled only by the future of the call, so a forgotten call runs no more
+//!   host code. A JavaScript exception that crosses it fails the call (see
+//!   `boundary`).
 //! * The engine refuses to suspend a guest that was entered by a synchronous
 //!   call, or that has another JavaScript frame on the stack since it was
 //!   entered, and some engines run the body of the import before they
@@ -47,10 +48,15 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     future::Future,
     pin::Pin,
     rc::Rc,
-    task::{Context, Poll, Waker},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Context, Poll, Wake, Waker},
 };
 
 use js_sys::{Array, Function, Reflect};
@@ -64,6 +70,7 @@ use crate::{
     AsStoreRef, AsyncCallRequest, BackendTrap, CallStore, PollScope, PollStore, RuntimeError,
     SharedStore, StoreInner, StoreMut, StoreSlice, Value,
     js::{
+        boundary,
         error::Trap,
         function::{enter_async, entered_synchronously},
         guard::GuestGuard,
@@ -188,6 +195,8 @@ thread_local! {
         &Closure::wrap(Box::new(crate::js::function::mark_entered) as Box<dyn Fn(bool) -> bool>)
             .into_js_value(),
         &Closure::wrap(Box::new(woken) as Box<dyn Fn(i32)>).into_js_value(),
+        &Closure::wrap(Box::new(entered_synchronously) as Box<dyn Fn() -> bool>).into_js_value(),
+        &Closure::wrap(Box::new(wake_caller_of) as Box<dyn Fn(i32)>).into_js_value(),
     );
 }
 
@@ -211,10 +220,10 @@ thread_local! {
 // the import's body runs once the guest's slice is over.
 #[wasm_bindgen(inline_js = r#"
 const resolvers = [], rejecters = [];
-let done, check, mark, woken, trapError, wakes = 0;
+let done, check, mark, woken, entered, wakeCaller, trapError, wakes = 0;
 const pendingWakes = [], pendingValues = [];
-export function jspiInit(d, c, m, w) {
-  done = d; check = c; mark = m; woken = w;
+export function jspiInit(d, c, m, w, e, r) {
+  done = d; check = c; mark = m; woken = w; entered = e; wakeCaller = r;
 }
 export function jspiPrepareTrap() {
   if (trapError !== undefined) return;
@@ -250,8 +259,25 @@ export function jspiHostOf(value) {
 export function jspiIsHost(value) {
   return suspendingOf.has(value);
 }
+const adapterOf = new WeakMap();
+// What a guest imports for an async host function: a small Wasm function that
+// calls it plainly on a synchronous entry, where the engine would refuse a
+// `Suspending` import, and as `Suspending` otherwise. A JavaScript dispatcher
+// could not do this: its own frame would stop the guest from suspending.
+export function jspiAdapt(module, host) {
+  try {
+    const imports = { h: { mode: entered, sync: host, wait: suspendingOf.get(host) } };
+    const { run } = new WebAssembly.Instance(module, imports).exports;
+    adapterOf.set(host, run);
+    hostOf.set(run, host);
+    storeOf.set(run, storeOf.get(host));
+  } catch {
+    // A host that refuses to instantiate this keeps the `Suspending` import:
+    // an async import then fails on a synchronous entry, ready or not.
+  }
+}
 export function jspiImport(value, kinds) {
-  return suspendingOf.get(value) ?? embedderFunction(value, kinds);
+  return adapterOf.get(value) ?? suspendingOf.get(value) ?? embedderFunction(value, kinds);
 }
 const apply = Reflect.apply, markedOf = new WeakMap(), embedderOf = new WeakMap();
 const wasmFunctions = new WeakSet();
@@ -317,7 +343,10 @@ export function jspiIsWasmFunction(value) {
   return isWasmFunction(value);
 }
 export function jspiPublic(value) {
-  return suspendingOf.get(value) ?? value;
+  return adapterOf.get(value) ?? suspendingOf.get(value) ?? value;
+}
+export function jspiWakeCallerLater(token) {
+  queueMicrotask(() => wakeCaller(token));
 }
 export function jspiWait(token) {
   return new Promise((resolve, reject) => { resolvers[token] = resolve; rejecters[token] = reject; });
@@ -386,7 +415,14 @@ export function jspiSettle(promise, token) {
 "#)]
 extern "C" {
     #[wasm_bindgen(js_name = jspiInit)]
-    fn shim_init(done: &JsValue, check: &JsValue, mark: &JsValue, woken: &JsValue);
+    fn shim_init(
+        done: &JsValue,
+        check: &JsValue,
+        mark: &JsValue,
+        woken: &JsValue,
+        entered: &JsValue,
+        wake_caller: &JsValue,
+    );
     #[wasm_bindgen(js_name = jspiPrepareTrap, catch)]
     fn shim_prepare_trap() -> Result<(), JsValue>;
     #[wasm_bindgen(js_name = jspiTrapError)]
@@ -407,14 +443,16 @@ extern "C" {
     fn shim_is_host(value: &JsValue) -> bool;
     #[wasm_bindgen(js_name = jspiImport)]
     fn shim_import(value: &JsValue, kinds: &str) -> JsValue;
+    #[wasm_bindgen(js_name = jspiWakeCallerLater)]
+    fn shim_wake_caller_later(token: i32);
+    #[wasm_bindgen(js_name = jspiAdapt)]
+    fn shim_adapt(module: &js_sys::WebAssembly::Module, host: &Function);
     #[wasm_bindgen(js_name = jspiHostOf)]
     fn shim_host_of(value: &JsValue) -> JsValue;
     #[wasm_bindgen(js_name = jspiPublic)]
     fn shim_public(value: &JsValue) -> JsValue;
     #[wasm_bindgen(js_name = jspiWait)]
     fn shim_wait(token: i32) -> JsValue;
-    #[wasm_bindgen(js_name = jspiWake)]
-    fn shim_wake(token: i32, value: &JsValue);
     #[wasm_bindgen(js_name = jspiWakeLater)]
     fn shim_wake_later(token: i32, value: &JsValue);
     #[wasm_bindgen(js_name = jspiCancelWake)]
@@ -522,7 +560,106 @@ pub(crate) fn host_function(
         );
     }
     SHIM.with(|_| ());
-    shim_host(start, array, store.as_raw().get() as f64)
+    let host = shim_host(start, array, store.as_raw().get() as f64);
+    if let Some(module) = adapter_module(ty) {
+        shim_adapt(&module, &host);
+    }
+    host
+}
+
+thread_local! {
+    /// The compiled adapter of each signature: see `jspiAdapt`.
+    static ADAPTERS: RefCell<HashMap<FunctionType, js_sys::WebAssembly::Module>> =
+        RefCell::new(HashMap::new());
+}
+
+/// The adapter module for `ty`, or `None` if the host refuses to compile it.
+fn adapter_module(ty: &FunctionType) -> Option<js_sys::WebAssembly::Module> {
+    if let Some(module) = ADAPTERS.with(|adapters| adapters.borrow().get(ty).cloned()) {
+        return Some(module);
+    }
+    let bytes = js_sys::Uint8Array::from(adapter_bytes(ty).as_slice());
+    let module = js_sys::WebAssembly::Module::new(&bytes.into()).ok()?;
+    ADAPTERS.with(|adapters| adapters.borrow_mut().insert(ty.clone(), module.clone()));
+    Some(module)
+}
+
+/// The binary of:
+///
+/// ```wat
+/// (module
+///   (import "h" "mode" (func $mode (result i32)))
+///   (import "h" "sync" (func $sync (param ..) (result ..)))
+///   (import "h" "wait" (func $wait (param ..) (result ..)))
+///   (func (export "run") (param ..) (result ..)
+///     (if (call $mode) (then (return (call $sync (local.get ..)))))
+///     (call $wait (local.get ..))))
+/// ```
+fn adapter_bytes(ty: &FunctionType) -> Vec<u8> {
+    fn leb(out: &mut Vec<u8>, mut value: usize) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            out.push(if value == 0 { byte } else { byte | 0x80 });
+            if value == 0 {
+                return;
+            }
+        }
+    }
+    fn value_types(out: &mut Vec<u8>, types: &[Type]) {
+        leb(out, types.len());
+        out.extend(types.iter().map(|ty| match ty {
+            Type::I32 => 0x7f,
+            Type::I64 => 0x7e,
+            Type::F32 => 0x7d,
+            Type::F64 => 0x7c,
+            Type::FuncRef => 0x70,
+            Type::ExternRef => 0x6f,
+            _ => unreachable!("`host_function` refused this type"),
+        }));
+    }
+    fn section(wasm: &mut Vec<u8>, id: u8, contents: &[u8]) {
+        wasm.push(id);
+        leb(wasm, contents.len());
+        wasm.extend_from_slice(contents);
+    }
+    fn forward(body: &mut Vec<u8>, params: usize, callee: u8) {
+        for index in 0..params {
+            body.push(0x20); // local.get
+            leb(body, index);
+        }
+        body.extend_from_slice(&[0x10, callee]); // call
+    }
+
+    let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+    // Type 0 is the import's, type 1 is `() -> i32`.
+    let mut types = vec![2, 0x60];
+    value_types(&mut types, ty.params());
+    value_types(&mut types, ty.results());
+    types.extend_from_slice(&[0x60, 0, 1, 0x7f]);
+    section(&mut wasm, 1, &types);
+
+    let mut imports = vec![3];
+    for (name, type_index) in [(b"mode", 1), (b"sync", 0), (b"wait", 0)] {
+        imports.extend_from_slice(&[1, b'h', 4]);
+        imports.extend_from_slice(name);
+        imports.extend_from_slice(&[0, type_index]);
+    }
+    section(&mut wasm, 2, &imports);
+    section(&mut wasm, 3, &[1, 0]);
+    section(&mut wasm, 7, &[1, 3, b'r', b'u', b'n', 0, 3]);
+
+    let params = ty.params().len();
+    let mut body = vec![0, 0x10, 0, 0x04, 0x40]; // no locals; call $mode; if
+    forward(&mut body, params, 1);
+    body.extend_from_slice(&[0x0f, 0x0b]); // return; end
+    forward(&mut body, params, 2);
+    body.push(0x0b); // end
+    let mut code = vec![1];
+    leb(&mut code, body.len());
+    code.extend(body);
+    section(&mut wasm, 10, &code);
+    wasm
 }
 
 /// Records that `function`, a host function this crate made for the store
@@ -607,10 +744,6 @@ impl Activation {
 
     /// The guest leaves the stack, or will not use the store again.
     fn switch_out(self: &Rc<Self>, to: State) {
-        debug_assert!(
-            !self.held.get(),
-            "the store is given up while a host function holds it"
-        );
         let this = RUNNING.with(|running| {
             let mut running = running.borrow_mut();
             let index = running.iter().position(|other| Rc::ptr_eq(other, self))?;
@@ -619,6 +752,8 @@ impl Activation {
         let was_running = this.is_some();
         drop(this);
         self.state.set(to);
+        // A JavaScript exception may have skipped the hold of a host function.
+        self.held.set(false);
         drop(self.slice.take());
         // Last: this wakes whoever waits for the store.
         if was_running {
@@ -642,6 +777,17 @@ impl Activation {
             return None;
         }
         self.poll_store()?.try_enter_slice()
+    }
+
+    /// The call was dropped while the engine can still run its guest. Its
+    /// host functions now fail without touching the store, which is usable at
+    /// once. A new guest waits for this one to leave the stack.
+    fn release_cancelled(self: &Rc<Self>) {
+        self.finish_call();
+        drop(self.slice.take());
+        if running(self.store_id).is_some_and(|other| Rc::ptr_eq(&other, self)) {
+            self.guard.mark_cancelled();
+        }
     }
 
     /// The call is over for whoever holds it: finished or dropped.
@@ -677,20 +823,13 @@ impl Activation {
         promise
     }
 
-    /// Resolves the promise of the guest's current wait with `value`, with
-    /// the guest's store. In a microtask of its own the guest goes on in the
-    /// next one: nothing else runs before it but what was queued already.
-    /// From the future of the call, whose caller may drop it as soon as the
-    /// poll returns, it is resolved a microtask later, unless the call is
-    /// dropped by then: the guest is unwound instead.
-    fn wake(&self, value: &JsValue, now: bool) {
-        if now {
-            self.state.set(State::Running);
-            shim_wake(self.token, value);
-        } else {
-            self.state.set(State::Woken);
-            shim_wake_later(self.token, value);
-        }
+    /// Resolves the promise of the guest's current wait with `value`, a
+    /// microtask later, unless the call is dropped by then: the guest is then
+    /// unwound instead. The caller may drop the call as soon as its poll
+    /// returns.
+    fn wake(&self, value: &JsValue) {
+        self.state.set(State::Woken);
+        shim_wake_later(self.token, value);
     }
 
     /// The guest waits: the store is given up, and what the guest waits for
@@ -705,15 +844,13 @@ impl Activation {
     /// still holds the store.
     fn forget_refused_wait(&self) {
         if self.state.get() == State::Waiting && !self.accepted.get() {
-            drop(self.import.take());
+            self.drop_import();
             self.state.set(State::Running);
         }
     }
 
-    /// Drives what a guest waits for, with the caller's waker: from the
-    /// microtask that sees the guest wait (`now`), and from the future of the
-    /// call.
-    fn drive(self: &Rc<Self>, cx: &mut Context<'_>, now: bool) {
+    /// Drives what a guest waits for, from the future of the call.
+    fn drive(self: &Rc<Self>, cx: &mut Context<'_>) {
         if self.driving.get() {
             // Polled from inside the poll of the host future:
             // the import is taken out for it, and is not finished. The outer
@@ -723,7 +860,7 @@ impl Activation {
         }
         self.driving.set(true);
         self.redrive.set(false);
-        self.drive_once(cx, now);
+        self.drive_once(cx);
         self.driving.set(false);
         if self.redrive.take() && self.state.get() == State::Waiting {
             // A wake that came during the poll was taken by a poll of the call
@@ -733,7 +870,7 @@ impl Activation {
         }
     }
 
-    fn drive_once(self: &Rc<Self>, cx: &mut Context<'_>, now: bool) {
+    fn drive_once(self: &Rc<Self>, cx: &mut Context<'_>) {
         if self.state.get() != State::Waiting || !self.accepted.get() {
             return;
         }
@@ -748,23 +885,34 @@ impl Activation {
                 self.guard.wait(cx.waker());
                 return;
             }
+            let poll_waker = Arc::new(PollWaker::new(cx.waker().clone()));
+            let waker = Waker::from(poll_waker.clone());
             let outcome = {
                 let _scope = PollScope::enter(Some(store));
-                let _mark = self.guard.mark();
-                import.as_mut().poll(cx)
+                boundary::catching(|| import.as_mut().poll(&mut Context::from_waker(&waker)))
+            };
+            let woken_during_poll = poll_waker.finish();
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // Left part way through: it can be neither resumed nor
+                    // dropped. It holds no store borrow.
+                    std::mem::forget(import);
+                    if self.state.get() == State::Waiting {
+                        *self.error.borrow_mut() = Some(error.into());
+                        self.unwind();
+                    }
+                    return;
+                }
             };
             if self.state.get() != State::Waiting {
                 // The poll dropped the call.
-                let _scope = PollScope::enter(Some(store));
-                drop(import);
+                dispose(store, import);
                 return;
             }
             match outcome {
                 Poll::Ready(Ok(results)) => {
-                    {
-                        let _scope = PollScope::enter(Some(store));
-                        drop(import);
-                    }
+                    dispose(store, import);
                     // A direct call returns them as they are, to no guest.
                     if !self.direct {
                         let deliverable = deliverable(&results);
@@ -780,21 +928,21 @@ impl Activation {
                     *self.results.borrow_mut() = Some(results);
                 }
                 Poll::Ready(Err(error)) => {
-                    {
-                        let _scope = PollScope::enter(Some(store));
-                        drop(import);
-                    }
+                    dispose(store, import);
                     *self.error.borrow_mut() = Some(error);
                     return self.unwind();
                 }
                 Poll::Pending => {
                     *self.import.borrow_mut() = Some(import);
+                    if woken_during_poll {
+                        shim_wake_caller_later(self.token);
+                    }
                     return;
                 }
             }
         }
         match self.try_slice() {
-            Some(slice) => self.resume(slice, now),
+            Some(slice) => self.resume(slice),
             // Another guest has the store: this one goes on when it leaves.
             None => self.guard.wait(cx.waker()),
         }
@@ -803,20 +951,19 @@ impl Activation {
     /// Wakes the guest with the results of its import, with its store. Those
     /// of a direct call are kept for the call, which returns them as they are:
     /// JavaScript would take some for others, or not take them at all.
-    fn resume(self: &Rc<Self>, slice: StoreSlice, now: bool) {
+    fn resume(self: &Rc<Self>, slice: StoreSlice) {
         let values = self.results.take().unwrap_or_default();
         let value = if self.direct {
             *self.returned.borrow_mut() = Some(values);
             JsValue::UNDEFINED
         } else {
-            let _mark = self.guard.mark();
             // Safety: the slice is the only holder of the store.
             let store = unsafe { StoreMut::from_raw(slice.ptr()) };
             results(&values, &store)
         };
         self.switch_in(slice);
         self.accepted.set(false);
-        self.wake(&value, now);
+        self.wake(&value);
     }
 
     /// Wakes the guest with a trap: it unwinds without running guest code.
@@ -847,11 +994,65 @@ impl Activation {
     /// Drops the host future, with the store in reach of its destructor.
     fn drop_import(&self) {
         if let Some(import) = self.import.take() {
-            let _scope = PollScope::enter(self.poll_store());
-            let _mark = self.guard.mark();
-            drop(import);
+            match self.poll_store() {
+                Some(store) => dispose(store, import),
+                None => drop(import),
+            }
         }
     }
+}
+
+/// The waker a host future is polled with: the caller's, noting a wake that
+/// arrives during the poll. An executor that polls inline cannot serve that
+/// wake while it is still polling, so the call passes it on from a microtask.
+struct PollWaker {
+    caller: Waker,
+    polling: AtomicBool,
+    woken: AtomicBool,
+}
+
+impl PollWaker {
+    fn new(caller: Waker) -> Self {
+        Self {
+            caller,
+            polling: AtomicBool::new(true),
+            woken: AtomicBool::new(false),
+        }
+    }
+
+    /// The poll is over. Returns whether it was woken meanwhile.
+    fn finish(&self) -> bool {
+        self.polling.store(false, Ordering::Relaxed);
+        self.woken.load(Ordering::Relaxed)
+    }
+}
+
+impl Wake for PollWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        if self.polling.load(Ordering::Relaxed) {
+            self.woken.store(true, Ordering::Relaxed);
+        }
+        self.caller.wake_by_ref();
+    }
+}
+
+/// Wakes whoever polls the call of `token`.
+fn wake_caller_of(token: i32) {
+    if let Some(activation) = activation(token) {
+        activation.wake_caller();
+    }
+}
+
+/// Drops a host future with its store in reach of its destructor. What
+/// JavaScript throws from there has nowhere to go.
+fn dispose(store: PollStore, future: ImportFuture) {
+    let _scope = PollScope::enter(Some(store));
+    let mut future = Some(future);
+    let _ = boundary::catching(|| drop(future.take()));
 }
 
 fn activation(token: i32) -> Option<Rc<Activation>> {
@@ -876,12 +1077,17 @@ fn running(id: StoreId) -> Option<Rc<Activation>> {
 /// [`hold_running`].
 pub(crate) struct Held {
     activation: Rc<Activation>,
-    _mark: crate::js::guard::SliceMark,
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
-        self.activation.held.set(false);
+        let activation = &self.activation;
+        activation.held.set(false);
+        // The call was dropped under this host function, which had the store
+        // until now: the guard takes it back, as `Call::drop` would have.
+        if activation.cancelled.get() {
+            activation.release_cancelled();
+        }
     }
 }
 
@@ -925,8 +1131,7 @@ pub(crate) fn hold_running(
     }
     let store = activation.store_ptr()?;
     activation.held.set(true);
-    let _mark = activation.guard.mark();
-    Some(Ok((store, Held { activation, _mark })))
+    Some(Ok((store, Held { activation })))
 }
 
 /// The error of an async host function whose guest cannot be suspended: it
@@ -991,10 +1196,42 @@ pub(crate) fn start(
     let activation = match DIRECT.with(|direct| direct.borrow_mut().take()) {
         Some(activation) if activation.store_id == id => activation,
         Some(_) => return Err(Trap::user(Box::new(foreign_store_error())).into()),
+        None if entered_synchronously() => return immediate(id, import()),
         None => suspendable(id)?,
     };
     *activation.import.borrow_mut() = Some(import());
     Ok(activation.wait())
+}
+
+/// An async import called where its guest cannot suspend: it runs here, and
+/// works if it is ready. Its store is the one the synchronous entry lends.
+fn immediate(id: StoreId, future: ImportFuture) -> Result<JsValue, JsValue> {
+    let (ptr, _hold) = crate::js::lent::hold(id.as_raw().get()).map_err(|_| cannot_suspend())?;
+    let store = PollStore::exclusive(id, ptr);
+    let mut future = future;
+    let outcome = {
+        let _scope = PollScope::enter(Some(store));
+        boundary::catching(|| future.as_mut().poll(&mut Context::from_waker(Waker::noop())))
+    };
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // Left part way through: it can be neither resumed nor dropped.
+            std::mem::forget(future);
+            return Err(error);
+        }
+    };
+    dispose(store, future);
+    match outcome {
+        Poll::Ready(Ok(values)) => {
+            deliverable(&values).map_err(|error| JsValue::from(Trap::user(Box::new(error))))?;
+            // Safety: the hold keeps the store for this host function.
+            let store = unsafe { StoreMut::from_raw(ptr) };
+            Ok(results(&values, &store))
+        }
+        Poll::Ready(Err(error)) => Err(Trap::user(Box::new(error)).into()),
+        Poll::Pending => Err(cannot_suspend()),
+    }
 }
 
 /// The microtask after the slice in which a guest started its `wait`th wait:
@@ -1019,11 +1256,9 @@ fn check(token: i32, wait: i32) {
         return activation.unwind();
     }
     activation.accept();
-    let caller = activation.caller.borrow().clone();
-    match caller {
-        Some(caller) => activation.drive(&mut Context::from_waker(&caller), true),
-        None => activation.wake_caller(),
-    }
+    // Only the call's own poll runs the host future: a forgotten call has
+    // none, and must not reach the store from a microtask.
+    activation.wake_caller();
 }
 
 /// The microtask that wakes a guest woken a microtask later (see
@@ -1138,7 +1373,9 @@ impl Call {
             // The first slice of the guest runs here, with the store lent to
             // its host functions as the activation holds it.
             Ok(_lent) => {
-                let _mark = guard.mark();
+                // A sync host function of this guest holds the store, and
+                // must not find it published for a host future as well.
+                let _hidden = PollScope::enter(None);
                 let _entered = enter_async();
                 if direct {
                     DIRECT.with(|slot| *slot.borrow_mut() = Some(activation.clone()));
@@ -1180,7 +1417,7 @@ impl Future for Call {
                 *caller = Some(cx.waker().clone());
             }
         }
-        activation.drive(cx, false);
+        activation.drive(cx);
         let Some(result) = activation.result.take() else {
             return Poll::Pending;
         };
@@ -1200,6 +1437,14 @@ impl Drop for Call {
     fn drop(&mut self) {
         let activation = &self.0;
         drop(activation.caller.take());
+        if activation.held.get() {
+            // A host function of the guest is on the stack and has the store.
+            // Its guest stops at the next host function; `Held` gives the
+            // store up when this one returns. A new guest cannot enter now.
+            activation.cancelled.set(true);
+            activation.guard.mark_cancelled();
+            return;
+        }
         activation.finish_call();
         // Whether the engine suspended a guest that waits is known only once
         // its slice is over: until then it may be running on, refused, and
@@ -1220,13 +1465,7 @@ impl Drop for Call {
         }
         activation.cancelled.set(true);
         if activation.state.get() == State::Running || unconfirmed {
-            // The engine can no longer be stopped from running this guest.
-            // Its host functions now fail without touching the store, which
-            // is usable at once. A new guest waits for this one to leave.
-            drop(activation.slice.take());
-            if running(activation.store_id).is_some_and(|other| Rc::ptr_eq(&other, activation)) {
-                activation.guard.mark_cancelled();
-            }
+            activation.release_cancelled();
         } else {
             drop(activation.store.take());
         }
@@ -1270,7 +1509,6 @@ pub(crate) async fn call<'a, X: 'static>(
     // The store, for the slice that converts the arguments and enters.
     let poll = store.resolve();
     let slice = poll.enter_slice();
-    let mark = guard.mark();
     // Safety: the slice is the only holder of the store until it is dropped.
     let mut store_mut = unsafe { StoreMut::from_raw(slice.ptr()) };
     let params = params(&mut store_mut)?;
@@ -1301,7 +1539,6 @@ pub(crate) async fn call<'a, X: 'static>(
     }
     let promising = handle.promising().map_err(RuntimeError::from)?;
     let direct = AsRef::<JsValue>::as_ref(&promising) == AsRef::<JsValue>::as_ref(&*handle.function);
-    drop(mark);
 
     // The guest runs with the store, in this span and in every later one.
     // Dropping this future while it waits cancels the call.
@@ -1316,7 +1553,6 @@ pub(crate) async fn call<'a, X: 'static>(
 
     guest_left(&guard).await;
     let slice = store.resolve().enter_slice();
-    let _mark = guard.mark();
     // Safety: as above.
     let mut store_mut = unsafe { StoreMut::from_raw(slice.ptr()) };
     let results: Vec<Value> = match returned {
