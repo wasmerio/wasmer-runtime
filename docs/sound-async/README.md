@@ -11,14 +11,40 @@ why, what was tried, what failed, and how to rerun every trial.
   [wasmerio/wasmer-runtime#18](https://github.com/wasmerio/wasmer-runtime/pull/18),
   stacked on
   [wasmerio/wasmer-runtime#16](https://github.com/wasmerio/wasmer-runtime/pull/16).
-- **None of the proposed API is implemented.** The type contract is
-  compile-checked with stub bodies.
+- **The proposed API is implemented in `lib/api`** on `sound-async`. See
+  [implementation status](#implementation-status).
 - All design decisions are settled. See the [decision
   log](./08-decision-log.md).
 - The JavaScript guest guard and the NAPI port are the least proven parts.
   Prototype them early.
 - A trial `StoreRef` port type-checks WASIX and the C API imports on `next`. Its
   tests were not run.
+
+## Implementation status
+
+The old async surface is gone from `lib/api`, including `LocalRwLock` and
+`Cothread`. Nothing in this branch needed the temporary `async_v2` module, so
+the API was replaced directly.
+
+| Area | State |
+| --- | --- |
+| `sys` Level 1 and Level 2 | Done |
+| JavaScript and the guest guard | Done, in `lib/api/src/backend/js/guard.rs` |
+| V8 | Done. `poll` blocks during an import, so another thread must wake it |
+| WASIX and NAPI ports | **Not done.** They live on `next` |
+
+Differences from the proposal's signatures:
+
+- `new_async` and `new_typed_async` require `T: Send + 'static`, which every
+  `FunctionEnv<T>` already needs to exist.
+- A guest whose call was dropped now fails at its next host function, even if
+  it holds no wait. That follows guard rule 3, and one PR 16 test was changed
+  to expect it.
+
+Tests that depended on the removed lock were deleted or rewritten. Coroutine
+switches cannot run under Miri, so Miri covers the store context and slice
+provenance, not the switch itself. The probes in `A2` target the PR 16 API and
+no longer build against this branch.
 
 ## Reading order
 
