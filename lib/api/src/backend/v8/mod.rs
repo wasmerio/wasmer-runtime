@@ -8,7 +8,7 @@ pub(crate) use async_call::guest_entry;
 /// One guest entry through V8's C API.
 #[cfg(not(feature = "experimental-async"))]
 #[inline]
-pub(crate) fn guest_entry<R>(_id: wasmer_types::StoreId, enter: impl FnOnce() -> R) -> R {
+pub(crate) fn guest_entry<R>(_store: &mut impl crate::AsStoreMut, enter: impl FnOnce() -> R) -> R {
     enter()
 }
 

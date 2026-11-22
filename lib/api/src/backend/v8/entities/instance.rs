@@ -121,10 +121,11 @@ impl Instance {
             .iter()
             .map(|extern_| extern_.to_vm_extern())
             .collect::<Vec<_>>();
+        let raw_store = store_ref.inner.store.as_v8().inner;
         // The start function is a synchronous guest entry.
-        let instance = crate::backend::v8::guest_entry(store_ref.objects().id(), || {
+        let instance = crate::backend::v8::guest_entry(store, || {
             InstanceHandle::new(
-                store_ref.inner.store.as_v8().inner,
+                raw_store,
                 module.as_v8().handle.v8_shared_module_handle,
                 externs,
             )

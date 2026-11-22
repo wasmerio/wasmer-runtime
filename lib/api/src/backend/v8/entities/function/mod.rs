@@ -104,15 +104,26 @@ impl Function {
 
         let store_id = store.objects_mut().id();
         let state = OnStoreThread((func, env.clone()));
+        let ty: FunctionType = ty.into();
+        let results = ty.results().to_vec();
         Self::new_with_env(
             store,
             env,
             ty,
-            move |mut env: FunctionEnvMut<'_, T>, args: &[Value]| {
+            move |_: FunctionEnvMut<'_, T>, args: &[Value]| {
                 let (func, handle) = state.get();
-                let future = func(crate::AsyncEnv::new(handle.clone(), store_id), args.to_vec());
-                let mut store = env.as_store_mut();
-                crate::backend::v8::async_call::run_import(&mut store, future)
+                let future = || func(crate::AsyncEnv::new(handle.clone(), store_id), args.to_vec());
+                let values = crate::backend::v8::async_call::run_import(store_id, future)?;
+                // Checked here: V8 takes what it is given for the results of
+                // the signature.
+                if values.len() != results.len()
+                    || values.iter().zip(&results).any(|(value, ty)| value.ty() != *ty)
+                {
+                    return Err(RuntimeError::new(
+                        "an async host function returned values that do not match its signature",
+                    ));
+                }
+                Ok(values)
             },
         )
     }
@@ -443,11 +454,10 @@ impl Function {
             }
         };
 
-        let store_id = store.objects_mut().id();
-        call_wrapped(store, wrapper, |_| {
+        call_wrapped(store, wrapper, |store| {
             // `wasm_func_call` takes the arguments, so every entry gets its own.
             let mut args = Default::default();
-            let trap = crate::backend::v8::guest_entry(store_id, || unsafe {
+            let trap = crate::backend::v8::guest_entry(store, || unsafe {
                 wasm_val_vec_new(&mut args, wasm_params.len(), wasm_params.as_ptr());
                 wasm_func_call(self.handle, &mut args as _, &mut results as *mut _)
             });
@@ -490,6 +500,28 @@ impl Function {
     pub fn is_from_store(&self, _store: &impl AsStoreRef) -> bool {
         true
     }
+}
+
+/// The trap of a host function that panicked. A C callback cannot unwind, so
+/// the panic is kept for the guest entry the host function ran in, which
+/// resumes it once V8's frames are gone: a host function that made that
+/// entry relays it the same way.
+#[cfg(feature = "experimental-async")]
+fn panic_trap(
+    store: &mut impl AsStoreMut,
+    panic: Box<dyn std::any::Any + Send>,
+) -> *mut wasm_trap_t {
+    crate::backend::v8::async_call::keep_panic(panic);
+    let trap = Trap::user(Box::new(RuntimeError::new("a host function panicked")));
+    unsafe { trap.into_wasm_trap(store) }
+}
+
+#[cfg(not(feature = "experimental-async"))]
+fn panic_trap(
+    _store: &mut impl AsStoreMut,
+    _panic: Box<dyn std::any::Any + Send>,
+) -> *mut wasm_trap_t {
+    unimplemented!("host function panicked");
 }
 
 fn make_fn_callback<F, T: Send + 'static>(func: &F, args: usize) -> CCallback
@@ -562,9 +594,7 @@ where
                 unsafe { trap.into_wasm_trap(&mut store) }
             }
 
-            Err(e) => {
-                unimplemented!("host function panicked");
-            }
+            Err(e) => panic_trap(&mut store, e),
         }
     }
 
@@ -670,9 +700,7 @@ macro_rules! impl_host_function {
                         // unimplemented!("host function panicked");
                     },
 
-                    Err(e) => {
-                        unimplemented!("host function panicked");
-                    }
+                    Err(e) => panic_trap(store, e),
                 }
             }}
             func_wrapper::< $( $x, )* Rets, RetsAsResult, Func> as _
@@ -743,7 +771,7 @@ macro_rules! impl_host_function {
                     let trap = crate::backend::v8::error::Trap::user(Box::new(e)); unsafe { trap.into_wasm_trap(store) }
                 },
 
-                Err(e) => { unimplemented!("host function panicked"); }
+                Err(e) => panic_trap(store, e),
               }
             }}
 
