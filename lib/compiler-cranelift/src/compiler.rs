@@ -136,12 +136,12 @@ impl CraneliftCompiler {
             .cloned()
             .map(|cb| ProgressContext::new(cb, total_steps, "cranelift::functions"));
 
-        let emit_dwarf_unwind = !function_body_inputs.is_empty()
-            && matches!(
-                target.triple().default_calling_convention(),
-                Ok(CallingConvention::SystemV)
-            )
-            && isa.create_systemv_cie().is_some();
+        // Also for a module without functions: another module reaches its
+        // dynamic function trampolines through a table.
+        let emit_dwarf_unwind = matches!(
+            target.triple().default_calling_convention(),
+            Ok(CallingConvention::SystemV)
+        ) && isa.create_systemv_cie().is_some();
 
         // The `compile_function` closure is used for both the sequential and
         // parallel compilation paths to avoid code duplication.
@@ -405,12 +405,16 @@ impl CraneliftCompiler {
                     &kind,
                     func_type,
                     &module_hash,
+                    emit_dwarf_unwind,
+                    emit_macho_compact_unwind,
                 )?;
                 if let Some(progress) = progress.as_ref() {
                     progress.notify_steps(WASM_TRAMPOLINE_ESTIMATED_BODY_SIZE)?;
                 }
                 Ok(CompileOutput {
-                    object: wasmer_compiler::elf::emit_function_body(target, &kind, &trampoline)?,
+                    object: crate::elf::emit_dynamic_function_trampoline(
+                        &*isa, target, &kind, trampoline,
+                    )?,
                     maximum_stack_usage: None,
                 })
             })

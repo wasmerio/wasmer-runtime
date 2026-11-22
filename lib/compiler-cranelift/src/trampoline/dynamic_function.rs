@@ -5,20 +5,39 @@
 
 use crate::{
     CraneliftCallbacks, abi,
-    translator::{signature_to_cranelift_ir, type_to_irtype},
+    eh::compact_unwind_encoding_aarch64,
+    translator::{
+        CraneliftUnwindInfo, compiled_function_unwind_info, signature_to_cranelift_ir,
+        type_to_irtype,
+    },
 };
 use cranelift_codegen::{
     Context,
+    gimli::write::{Address, FrameDescriptionEntry},
     ir::{self, Function, InstBuilder, StackSlotData, StackSlotKind, UserFuncName},
     isa::TargetIsa,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use std::{cmp, mem};
 use target_lexicon::Architecture;
-use wasmer_compiler::{misc::CompiledKind, types::function::Compilation};
+use wasmer_compiler::{dwarf::WriterRelocate, misc::CompiledKind, types::function::Compilation};
 use wasmer_types::{CompileError, FunctionType, VMOffsets};
 
-/// Create a trampoline for invoking a WebAssembly function.
+/// A trampoline for calling a dynamic host function from Wasm.
+pub struct DynamicFunctionTrampoline {
+    pub body: Compilation,
+    /// How to unwind its frame on a target that reads DWARF.
+    pub fde: Option<FrameDescriptionEntry>,
+    /// How to unwind its frame on a target that reads Mach-O compact unwind.
+    pub compact_unwind_encoding: Option<u32>,
+}
+
+/// Create a trampoline for calling a dynamic host function from Wasm.
+///
+/// The host function throws the exception it returns from the trampoline's
+/// callee, so the trampoline comes with the unwind information of its frame,
+/// in the forms the module's functions use (`emit_dwarf_unwind`,
+/// `emit_macho_compact_unwind`).
 #[allow(clippy::too_many_arguments)]
 pub fn make_trampoline_dynamic_function(
     callbacks: &Option<CraneliftCallbacks>,
@@ -29,7 +48,9 @@ pub fn make_trampoline_dynamic_function(
     kind: &CompiledKind,
     func_type: &FunctionType,
     module_hash: &Option<String>,
-) -> Result<Compilation, CompileError> {
+    emit_dwarf_unwind: bool,
+    emit_macho_compact_unwind: bool,
+) -> Result<DynamicFunctionTrampoline, CompileError> {
     let pointer_type = isa.pointer_type();
     let frontend_config = isa.frontend_config();
     let signature = signature_to_cranelift_ir(func_type, frontend_config, arch);
@@ -151,11 +172,31 @@ pub fn make_trampoline_dynamic_function(
         .compile(isa, &mut ctrl_plane)
         .map_err(|error| CompileError::Codegen(error.inner.to_string()))?;
     code_buf.extend_from_slice(compiled.code_buffer());
+    let compact_unwind_encoding = emit_macho_compact_unwind
+        .then(|| compact_unwind_encoding_aarch64(&compiled.buffer.unwind_info))
+        .transpose()
+        .map_err(|error| {
+            CompileError::Codegen(format!(
+                "failed to encode aarch64 Mach-O compact unwind for a dynamic function \
+                 trampoline: {error}"
+            ))
+        })?;
+    let fde = match compiled_function_unwind_info(isa, &context)? {
+        CraneliftUnwindInfo::Fde(fde) if emit_dwarf_unwind => Some(fde.to_fde(Address::Symbol {
+            symbol: WriterRelocate::FUNCTION_SYMBOL,
+            addend: 0,
+        })),
+        _ => None,
+    };
 
     if let Some(callbacks) = callbacks.as_ref() {
         callbacks.obj_memory_buffer(kind, module_hash, &code_buf);
         callbacks.asm_memory_buffer(kind, module_hash, arch, &code_buf)?;
     }
 
-    Ok(code_buf)
+    Ok(DynamicFunctionTrampoline {
+        body: code_buf,
+        fde,
+        compact_unwind_encoding,
+    })
 }

@@ -2,6 +2,7 @@
 //! ELF artifact format.
 
 use crate::eh::FunctionLsdaData;
+use crate::trampoline::DynamicFunctionTrampoline;
 use cranelift_codegen::gimli::{
     RunTimeEndian, SectionId as GimliSectionId, constants,
     write::{
@@ -24,8 +25,8 @@ use wasmer_compiler::{
 };
 use wasmer_compiler::{WasmSourceMap, dwarf::init_dwarf_unit};
 use wasmer_compiler::{
-    elf::emit_trap_section,
-    misc::CompiledKind,
+    elf::{add_undefined_symbol, emit_trap_section},
+    misc::{CompiledFunctionExt, CompiledKind},
     types::function::{Compilation, CompiledFunctionFrameInfo},
 };
 use wasmer_types::{CompileError, LocalFunctionIndex, target::Target};
@@ -352,14 +353,36 @@ pub(crate) fn emit_local_function(
         None
     };
 
+    emit_unwind_info(
+        isa,
+        &mut object,
+        function_symbol,
+        body.len(),
+        fde,
+        lsda_section_symbol,
+        compact_unwind_encoding,
+    )?;
+    write_object(object)
+}
+
+/// Emit how the unwinder passes the frame of a function: its entry in
+/// `__compact_unwind`, or its FDE in `.eh_frame`.
+fn emit_unwind_info(
+    isa: &dyn TargetIsa,
+    object: &mut Object<'static>,
+    function_symbol: SymbolId,
+    body_len: usize,
+    fde: Option<FrameDescriptionEntry>,
+    lsda_section_symbol: Option<SymbolId>,
+    compact_unwind_encoding: Option<u32>,
+) -> Result<(), CompileError> {
     if let Some(encoding) = compact_unwind_encoding {
-        let function_length = body.len().try_into().map_err(|_| {
+        let function_length = body_len.try_into().map_err(|_| {
             CompileError::Codegen("function body too large for Mach-O compact unwind".into())
         })?;
-        let personality_symbol = wasmer_compiler::elf::add_libcall_symbol(
-            &mut object,
-            wasmer_types::LibCall::EHPersonality,
-        );
+        let personality_symbol =
+            wasmer_compiler::elf::add_libcall_symbol(object, wasmer_types::LibCall::EHPersonality);
+        let text = object.section_id(StandardSection::Text);
         let text_symbol = object.section_symbol(text);
         let (compact_bytes, compact_relocations) = crate::eh::build_compact_unwind_section(
             [crate::eh::CompactUnwindEntryData {
@@ -429,14 +452,18 @@ pub(crate) fn emit_local_function(
 
         let relocations = std::mem::take(&mut eh_frame.0.relocs);
         emit_eh_frame_section(
-            &mut object,
+            object,
             &eh_frame.0.into_bytes(),
             &relocations,
             function_symbol,
             lsda_section_symbol,
         )?;
     }
+    Ok(())
+}
 
+/// Serialize a relocatable object file.
+fn write_object(object: Object<'static>) -> Result<Vec<u8>, CompileError> {
     let mut bytes = object
         .write()
         .map_err(|e| CompileError::Codegen(format!("failed to serialize object: {e}")))?;
@@ -474,4 +501,31 @@ pub(crate) fn emit_local_function(
         }
     }
     Ok(bytes)
+}
+
+/// Serialize a dynamic function trampoline into its own relocatable object
+/// file. Unlike the other trampolines it has unwind information: an exception
+/// that its host function throws unwinds through its frame to the guest that
+/// catches it.
+pub(crate) fn emit_dynamic_function_trampoline(
+    isa: &dyn TargetIsa,
+    target: &Target,
+    kind: &CompiledKind,
+    trampoline: DynamicFunctionTrampoline,
+) -> Result<Vec<u8>, CompileError> {
+    let mut object = wasmer_compiler::get_object_for_target(target.triple())
+        .map_err(|e| CompileError::Codegen(format!("cannot create object: {e}")))?;
+    let symbol = add_undefined_symbol(&mut object, kind.linkage_name());
+    let text = object.section_id(StandardSection::Text);
+    object.add_symbol_data(symbol, text, &trampoline.body, 4);
+    emit_unwind_info(
+        isa,
+        &mut object,
+        symbol,
+        trampoline.body.len(),
+        trampoline.fde,
+        None,
+        trampoline.compact_unwind_encoding,
+    )?;
+    write_object(object)
 }
