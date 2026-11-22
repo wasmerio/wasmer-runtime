@@ -124,23 +124,9 @@ impl AsJs for Value {
     }
 }
 
-/// What a guest imports for `extern_`: with `experimental-async`, the
-/// `WebAssembly.Suspending` form of an async host function, and for a
-/// JavaScript function an embedder gave, a function that marks what it runs
-/// (see `jspi::import`); anything else as `as_jsvalue` gives it. `as_jsvalue`
-/// gives a single function in the form JavaScript calls it in, the embedder's
-/// own function for one it gave; an import object, and instantiation, need
-/// this one. It is made here, for imports only: what a direct call of the
-/// function returns is read as the function returns it.
+/// What a guest imports for `extern_`: what `as_jsvalue` gives it.
 pub(crate) fn import_jsvalue(extern_: &Extern, store: &impl AsStoreRef) -> JsValue {
-    match extern_ {
-        #[cfg(feature = "experimental-async")]
-        Extern::Function(function) => {
-            let handle = &function.as_js().handle;
-            crate::js::jspi::import(&handle.function.clone().into(), &handle.ty)
-        }
-        _ => extern_.as_jsvalue(&store.as_store_ref()),
-    }
+    extern_.as_jsvalue(&store.as_store_ref())
 }
 
 impl AsJs for Imports {
@@ -307,9 +293,9 @@ impl AsJs for Memory {
 impl AsJs for Function {
     type DefinitionType = crate::FunctionType;
 
-    /// The function, or the `WebAssembly.Suspending` form of an async host
-    /// function, which is what a guest imports: the function itself only
-    /// works for a guest that Wasmer instantiated.
+    /// The function, or for an async host function what a guest imports for
+    /// it (see `jspi::public`): the function itself only works when
+    /// `call_async` calls it.
     fn as_jsvalue(&self, _store: &impl AsStoreRef) -> wasm_bindgen::JsValue {
         let function: JsValue = self.as_js().handle.function.clone().into();
         #[cfg(feature = "experimental-async")]
@@ -317,14 +303,8 @@ impl AsJs for Function {
         function
     }
 
-    /// Takes the `WebAssembly.Suspending` form of an async host function, as
-    /// `as_jsvalue` gives it, for that function. With `experimental-async`, a
-    /// guest imports a JavaScript function given here through one that marks
-    /// what it runs as entered synchronously: a guest it enters cannot be
-    /// suspended, and an async import refuses to before it runs (see
-    /// `Function::call_async`). That one, as an import object gives it, is
-    /// taken for the function itself, which a direct call calls, and which
-    /// `as_jsvalue` gives back.
+    /// Takes the form of an async host function that `as_jsvalue` gives for
+    /// that function.
     fn from_jsvalue(
         store: &mut impl AsStoreMut,
         function_type: &Self::DefinitionType,
@@ -338,8 +318,8 @@ impl AsJs for Function {
 
 impl Function {
     /// A function from a JavaScript value as a WebAssembly instance exports
-    /// it: given as it is, but for the suspending form of an async host
-    /// function, which is taken for that function.
+    /// it: given as it is, but for the public form of an async host function,
+    /// which is taken for that function.
     pub(crate) fn from_export_jsvalue(
         store: &mut impl AsStoreMut,
         function_type: &crate::FunctionType,

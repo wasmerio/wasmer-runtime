@@ -116,16 +116,24 @@ impl Instance {
         externs: &[Extern],
     ) -> Result<(Self, Exports), InstantiationError> {
         check_isolate(store);
+        // V8 takes an import of another store for one of this store's.
+        if externs.iter().any(|extern_| !extern_.is_from_store(store)) {
+            return Err(InstantiationError::DifferentStores);
+        }
         let store_ref = store.as_store_ref();
         let externs: Vec<VMExtern> = externs
             .iter()
             .map(|extern_| extern_.to_vm_extern())
             .collect::<Vec<_>>();
-        let instance = InstanceHandle::new(
-            store_ref.inner.store.as_v8().inner,
-            module.as_v8().handle.v8_shared_module_handle,
-            externs,
-        )?;
+        let raw_store = store_ref.inner.store.as_v8().inner;
+        // The start function is a synchronous guest entry.
+        let instance = crate::backend::v8::guest_entry(store, || {
+            InstanceHandle::new(
+                raw_store,
+                module.as_v8().handle.v8_shared_module_handle,
+                externs,
+            )
+        })?;
         let exports = instance.get_exports(store, module);
 
         Ok((

@@ -11,6 +11,9 @@ pub fn install(store_id: StoreId) -> Result<InterruptInstallGuard, InstallError>
 
 pub(super) fn uninstall(_store_id: StoreId) {}
 
+/// On unsupported platforms no store is ever registered.
+pub fn release_store(_store_id: StoreId) {}
+
 /// Interrupt the given store.
 ///
 /// On unsupported platforms this is a no-op.

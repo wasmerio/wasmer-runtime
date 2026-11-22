@@ -58,7 +58,7 @@ impl VMFunction {
     /// `WebAssembly.promising(function)`, made by the first `call_async` and
     /// kept for the next ones (see `jspi::promising`).
     #[cfg(feature = "experimental-async")]
-    pub(crate) fn promising(&self) -> Result<JsFunction, JsValue> {
+    pub(crate) fn promising(&self) -> Option<JsFunction> {
         crate::js::jspi::promising(&self.function)
     }
 

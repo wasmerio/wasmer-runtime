@@ -18,9 +18,9 @@ use crate::{
     vm::{VMExtern, VMExternFunction},
 };
 
-use super::{super::error::Trap, check_isolate, store::StoreHandle};
+use super::{super::error::Trap, check_isolate, check_owner, store::StoreHandle};
 use itertools::Itertools;
-use wasmer_types::{FunctionType, RawValue};
+use wasmer_types::{FunctionType, RawValue, StoreId};
 
 pub(crate) mod env;
 pub(crate) mod typed;
@@ -37,16 +37,12 @@ type CCallback = unsafe extern "C" fn(
 /// A WebAssembly `function` in `v8`.
 pub struct Function {
     pub(crate) handle: VMFunction,
+    /// The store the function belongs to: V8 does not know.
+    pub(crate) store_id: StoreId,
 }
 
 unsafe impl Send for Function {}
 unsafe impl Sync for Function {}
-
-impl From<VMFunction> for Function {
-    fn from(handle: VMFunction) -> Self {
-        Self { handle }
-    }
-}
 
 pub(crate) struct FunctionCallbackEnv<'a, F> {
     pub(crate) store: StoreMut<'a>,
@@ -108,11 +104,10 @@ impl Function {
             store,
             env,
             ty,
-            move |mut env: FunctionEnvMut<'_, T>, args: &[Value]| {
+            move |_: FunctionEnvMut<'_, T>, args: &[Value]| {
                 let (func, handle) = state.get();
-                let future = func(crate::AsyncEnv::new(handle.clone(), store_id), args.to_vec());
-                let mut store = env.as_store_mut();
-                crate::backend::v8::async_call::block_on_host(&mut store, future)
+                let future = || func(crate::AsyncEnv::new(handle.clone(), store_id), args.to_vec());
+                crate::backend::v8::async_call::run_import(store_id, future)
             },
         )
     }
@@ -173,10 +168,31 @@ impl Function {
 
         let mut store = store.as_store_mut();
         let inner = store.inner.store.as_v8().inner;
+        let store_id = store.inner.objects.id();
 
+        // V8 takes what a host function gives it for the results of the
+        // signature, whatever their types: they are checked first.
+        let results = results.to_vec();
+        let func = move |env: FunctionEnvMut<'_, T>, args: &[Value]| {
+            let values = func(env, args)?;
+            if values.iter().map(Value::ty).ne(results.iter().copied()) {
+                return Err(RuntimeError::new(format!(
+                    "Dynamic function returned wrong signature. Expected {:?} but got {:?}",
+                    results,
+                    values.iter().map(Value::ty).collect::<Vec<_>>()
+                )));
+            }
+            let foreign = |value: &Value| {
+                matches!(value, Value::FuncRef(Some(function)) if function.as_v8().store_id != store_id)
+            };
+            if values.iter().any(foreign) {
+                return Err(RuntimeError::new("cross-`Store` values are not supported"));
+            }
+            Ok(values)
+        };
         let callback: CCallback = make_fn_callback(&func, param_types.len());
 
-        let mut callback_env: *mut FunctionCallbackEnv<'_, F> =
+        let mut callback_env: *mut FunctionCallbackEnv<'_, _> =
             Box::leak(Box::new(FunctionCallbackEnv {
                 store,
                 func,
@@ -199,6 +215,7 @@ impl Function {
 
         Self {
             handle: wasm_function,
+            store_id,
         }
     }
 
@@ -243,6 +260,7 @@ impl Function {
 
         let mut store = store.as_store_mut();
         let inner = store.inner.store.as_v8().inner;
+        let store_id = store.inner.objects.id();
 
         let callback: CCallback = unsafe {
             std::mem::transmute(func.function_callback(crate::BackendKind::V8).unwrap_v_8())
@@ -271,6 +289,7 @@ impl Function {
 
         Self {
             handle: wasm_function,
+            store_id,
         }
     }
 
@@ -323,6 +342,7 @@ impl Function {
 
         let mut store = store.as_store_mut();
         let inner = store.inner.store.as_v8().inner;
+        let store_id = store.inner.objects.id();
 
         let callback: CCallback = unsafe {
             std::mem::transmute(func.function_callback(crate::BackendKind::V8).unwrap_v_8())
@@ -351,11 +371,12 @@ impl Function {
 
         Self {
             handle: wasm_function,
+            store_id,
         }
     }
 
     pub fn ty(&self, _store: &impl AsStoreRef) -> FunctionType {
-        check_isolate(_store);
+        check_owner(_store, self.store_id);
         let type_ = unsafe { wasm_func_type(self.handle) };
         let params: *const wasm_valtype_vec_t = unsafe { wasm_functype_params(type_) };
         let returns: *const wasm_valtype_vec_t = unsafe { wasm_functype_results(type_) };
@@ -404,8 +425,11 @@ impl Function {
         wrapper: Option<&mut dyn CallWrapper>,
         params: &[Value],
     ) -> Result<Box<[Value]>, RuntimeError> {
-        check_isolate(store);
-        // unimplemented!();
+        check_owner(store, self.store_id);
+        // V8 takes a reference of another store for one of its own.
+        if params.iter().any(|param| !param.is_from_store(store)) {
+            return Err(RuntimeError::new("cross-`Store` values are not supported"));
+        }
         let signature = self.ty(store);
         if signature.params().len() != params.len()
             || signature
@@ -443,13 +467,13 @@ impl Function {
             }
         };
 
-        call_wrapped(store, wrapper, |_| {
+        call_wrapped(store, wrapper, |store| {
             // `wasm_func_call` takes the arguments, so every entry gets its own.
             let mut args = Default::default();
-            let trap = unsafe {
+            let trap = crate::backend::v8::guest_entry(store, || unsafe {
                 wasm_val_vec_new(&mut args, wasm_params.len(), wasm_params.as_ptr());
                 wasm_func_call(self.handle, &mut args as _, &mut results as *mut _)
-            };
+            });
             if trap.is_null() {
                 Ok(())
             } else {
@@ -461,16 +485,17 @@ impl Function {
             let results = std::ptr::slice_from_raw_parts(results.data, results.size);
             (*results)
                 .iter()
-                .map(|v| IntoWasmerValue::into_wv(*v))
+                .map(|v| IntoWasmerValue::into_wv(*v, self.store_id))
                 .collect::<Vec<_>>()
                 .into_boxed_slice()
         };
         Ok(values)
     }
 
-    pub(crate) fn from_vm_extern(_store: &mut impl AsStoreMut, internal: VMExternFunction) -> Self {
+    pub(crate) fn from_vm_extern(store: &mut impl AsStoreMut, internal: VMExternFunction) -> Self {
         Self {
             handle: internal.unwrap_v_8(),
+            store_id: store.objects_mut().id(),
         }
     }
 
@@ -486,9 +511,19 @@ impl Function {
     }
 
     /// Checks whether this `Function` can be used with the given context.
-    pub fn is_from_store(&self, _store: &impl AsStoreRef) -> bool {
-        true
+    pub fn is_from_store(&self, store: &impl AsStoreRef) -> bool {
+        self.store_id == store.as_store_ref().objects().id()
     }
+}
+
+/// The trap of a host function that panicked: it carries the panic to the
+/// Rust caller of the guest (see `Trap::from_panic`). A host function that is
+/// that caller relays it the same way.
+fn panic_trap(
+    store: &mut impl AsStoreMut,
+    panic: Box<dyn std::any::Any + Send>,
+) -> *mut wasm_trap_t {
+    unsafe { Trap::from_panic(store, panic) }
 }
 
 fn make_fn_callback<F, T: Send + 'static>(func: &F, args: usize) -> CCallback
@@ -512,6 +547,7 @@ where
         let r: *mut (FunctionCallbackEnv<'_, F>) = env as _;
 
         let mut store = unsafe { (*r).store.as_store_mut() };
+        let store_id = store.inner.objects.id();
         let env_handle = unsafe { (*r).env_handle.as_ref().unwrap().clone() };
         let mut fn_env = env::FunctionEnv::from_handle(env_handle).into_mut(&mut store);
         let func: &F = unsafe { &(*r).func };
@@ -521,7 +557,7 @@ where
         let args_len = unsafe { (*args).size };
 
         for i in 0..args_len {
-            let value = unsafe { (*args_ptr.wrapping_add(i)).into_wv().clone() };
+            let value = unsafe { (*args_ptr.wrapping_add(i)).into_wv(store_id).clone() };
             wasmer_args.push(value);
         }
 
@@ -561,9 +597,7 @@ where
                 unsafe { trap.into_wasm_trap(&mut store) }
             }
 
-            Err(e) => {
-                unimplemented!("host function panicked");
-            }
+            Err(e) => panic_trap(&mut store, e),
         }
     }
 
@@ -626,7 +660,7 @@ macro_rules! impl_host_function {
 
                 $(
                     let c_arg = (*(*args).data.wrapping_add(i)).clone();
-                    let wasmer_arg = c_arg.into_wv();
+                    let wasmer_arg = c_arg.into_wv(store.inner.objects.id());
                     let raw_arg : RawValue = wasmer_arg.as_raw(store);
                     let $x : $x = FromToNativeWasmType::from_native($x::Native::from_raw(store, raw_arg));
 
@@ -669,9 +703,7 @@ macro_rules! impl_host_function {
                         // unimplemented!("host function panicked");
                     },
 
-                    Err(e) => {
-                        unimplemented!("host function panicked");
-                    }
+                    Err(e) => panic_trap(store, e),
                 }
             }}
             func_wrapper::< $( $x, )* Rets, RetsAsResult, Func> as _
@@ -698,7 +730,7 @@ macro_rules! impl_host_function {
 
               $(
               let c_arg = (*(*args).data.wrapping_add(i)).clone();
-              let wasmer_arg = c_arg.into_wv();
+              let wasmer_arg = c_arg.into_wv(store.inner.objects.id());
               let raw_arg : RawValue = wasmer_arg.as_raw(store);
               let $x : $x = FromToNativeWasmType::from_native($x::Native::from_raw(store, raw_arg));
 
@@ -742,7 +774,7 @@ macro_rules! impl_host_function {
                     let trap = crate::backend::v8::error::Trap::user(Box::new(e)); unsafe { trap.into_wasm_trap(store) }
                 },
 
-                Err(e) => { unimplemented!("host function panicked"); }
+                Err(e) => panic_trap(store, e),
               }
             }}
 

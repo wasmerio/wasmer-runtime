@@ -132,7 +132,19 @@ pub fn install(store_id: StoreId) -> Result<InterruptInstallGuard, InstallError>
     });
 
     if store_state.interrupted.load(Ordering::Acquire) {
-        return Err(InstallError::AlreadyInterrupted);
+        let entered_here = THREAD_INTERRUPT_STATE.with(|t| {
+            // Safety: See comments on THREAD_INTERRUPT_STATE.
+            let state = unsafe { t.get().as_ref().unwrap() };
+            state.active_stores.iter().any(|(id, _)| *id == store_id)
+        });
+        if entered_here {
+            return Err(InstallError::AlreadyInterrupted);
+        }
+        // Every call the interrupt reached is suspended, or was forgotten and
+        // never returns. Each keeps the flag it holds, and a live one ends at
+        // its next poll. A new entry starts with a flag of its own, so that a
+        // forgotten call cannot keep the store interrupted for good.
+        store_state.interrupted = Arc::new(AtomicBool::new(false));
     }
     store_state.installations += 1;
 
@@ -174,6 +186,12 @@ pub(super) fn uninstall(store_id: StoreId) {
     if store_state.installations == 0 {
         store_state_entry.remove();
     }
+}
+
+/// Forgets a store that is being dropped. Only calls that were forgotten can
+/// still hold installations of it, and they never run again.
+pub fn release_store(store_id: StoreId) {
+    STORE_INTERRUPT_STATE.remove(&store_id);
 }
 
 impl ThreadInterruptState {

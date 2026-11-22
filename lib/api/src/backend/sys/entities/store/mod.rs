@@ -22,7 +22,19 @@ impl std::fmt::Debug for Store {
     }
 }
 
+/// What this backend keeps beside a store's allocation: nothing. A call
+/// cannot outlive the borrow of the store it was made with.
+#[derive(Clone, Debug)]
+pub(crate) struct StoreKeeper;
+
+impl crate::entities::store::KeepsStore for StoreKeeper {}
+
 impl Store {
+    #[inline]
+    pub(crate) fn keeper(&self) -> &StoreKeeper {
+        &StoreKeeper
+    }
+
     pub(crate) fn new(engine: Engine) -> Self {
         init_traps();
 

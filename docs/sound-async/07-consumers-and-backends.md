@@ -85,7 +85,9 @@ Open points:
   suspended.
 - Level 1 works because `poll` blocks while the import's future is driven. A
   call cannot be cancelled during an import, because `poll` has not returned.
-- Level 2 supports lexical nesting only. Stacks cannot resume out of order.
+- Level 2 supports lexical nesting only. Stacks cannot resume out of order, so a
+  `SharedStore` task or synchronous entry whose import must wait fails with a
+  trap instead of blocking.
 - `Engine::supports_async` returns false for V8 on `next`, so WASIX already
   disables context switching there.
 

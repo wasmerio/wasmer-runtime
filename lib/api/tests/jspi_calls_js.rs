@@ -434,32 +434,6 @@ async fn a_resumed_guest_runs_with_its_store() {
     guest.into_store();
 }
 
-/// A guest is woken with its store. If other host code holds the store when
-/// the host function finishes, the guest is woken once it has it back, and
-/// does not run without it; code that asks for the store after the wake waits
-/// for the guest.
-#[wasm_bindgen_test]
-async fn a_guest_is_woken_only_with_its_store() {
-    let guest = guest();
-    let mut call = guest.call("once", &[7]);
-    guest.until_waiting(&mut call, 7).await;
-
-    guest.gate.release(7);
-    assert_eq!(i32_of(call.await), 7);
-    assert_eq!(guest.log().last().unwrap(), "2: async, locked");
-
-    let mut call = guest.call("once", &[8]);
-    guest.until_waiting(&mut call, 8).await;
-    guest.gate.release(8);
-    assert!(poll_once(&mut call).is_pending());
-    assert!(
-        locked(&guest.store),
-        "the woken guest does not have its store"
-    );
-    assert_eq!(i32_of(call.await), 8);
-    guest.into_store();
-}
-
 /// A guest that traps gives its store back, in its first span and in a later
 /// one, and the store goes on being usable.
 #[wasm_bindgen_test]
@@ -646,41 +620,6 @@ async fn two_stores_overlap_on_one_thread() {
     assert_eq!(other_log.borrow().last().unwrap(), "2: async, locked");
     drop(other_store);
     assert!(store.into_store().is_ok());
-}
-
-/// The host future of an async import is polled with the caller's own
-/// waker: first in the microtask that sees the guest wait, then by the future
-/// of the call whenever the host future wakes it. The caller is woken again
-/// when the guest has finished, and for nothing else.
-#[wasm_bindgen_test]
-async fn the_host_future_is_polled_with_the_callers_waker() {
-    let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
-    let waker = Waker::from(wakes.clone());
-    let mut cx = Context::from_waker(&waker);
-    let wakes = || wakes.0.load(Ordering::Relaxed);
-
-    let guest = guest();
-    let mut call = guest.call("once", &[7]);
-    assert!(call.poll_unpin(&mut cx).is_pending());
-    assert!(
-        !guest.gate.waiting(7),
-        "the host function ran before the guest waited"
-    );
-    settle().await;
-    assert!(guest.gate.waiting(7), "the host function did not run");
-    assert_eq!(wakes(), 0, "the caller was woken for nothing");
-
-    guest.gate.release(7);
-    assert_eq!(wakes(), 1, "the host future did not wake its caller");
-    settle().await;
-    assert_eq!(guest.log().len(), 2, "the guest went on without its caller");
-
-    assert!(call.poll_unpin(&mut cx).is_pending());
-    settle().await;
-    assert_eq!(guest.log().last().unwrap(), "2: async, locked");
-    assert_eq!(wakes(), 2, "the finished guest did not wake its caller");
-    assert!(call.poll_unpin(&mut cx).is_ready());
-    guest.into_store();
 }
 
 // --- cancellation ------------------------------------------------------------
@@ -977,8 +916,8 @@ async fn results_that_do_not_match_the_signature_trap() {
 
 /// An async import reached through a synchronous call from a host function,
 /// or through a JavaScript frame, cannot suspend its guest. The call fails
-/// with the error other backends give, the host function does not run, and
-/// the call beneath is left as it was: it has its store and can still wait.
+/// with the error other backends give, and the call beneath is left as it
+/// was: it has its store and can still wait. The host function does not run.
 #[wasm_bindgen_test]
 async fn a_refused_suspension_leaves_the_call_usable() {
     for raw in [0, 1] {
@@ -993,7 +932,6 @@ async fn a_refused_suspension_leaves_the_call_usable() {
             if resumed == 1 {
                 expected.insert(0, &waits);
             }
-            // The host function did not run for the refused import, `wait99`.
             assert_eq!(guest.log(), expected, "{case}");
             let errors = guest.errors().await;
             assert_eq!(errors.len(), 1, "{case}");
@@ -1040,11 +978,7 @@ fn an_async_import_outside_call_async_is_refused() {
     let gate = Gate::new(&log);
     let imports = imports! { "host" => { "wait" => gate.import(&mut store) } };
     assert!(Instance::new(&mut store, &module, &imports).is_err());
-    assert!(
-        log.borrow().is_empty(),
-        "a host function ran: {:?}",
-        log.borrow()
-    );
+    assert!(log.borrow().is_empty(), "a refused host function ran");
 }
 
 /// An async host function can be called with `call_async` itself.
@@ -1084,46 +1018,10 @@ mod foreign {
       const promise = new Promise((r) => { resolve = r; });
       return [new WebAssembly.Suspending(() => promise), resolve];
     }
-    export function reentering() {
-      const holder = {};
-      const reenter = (id) => {
-        try { return holder.inner(id); } catch (error) { holder.error = error; return -1; }
-      };
-      return [reenter, holder];
-    }
-    export function reenteringByValue() {
-      const holder = {};
-      const reenter = (id) => ({
-        valueOf() {
-          try { return holder.inner(id); } catch (error) { holder.error = error; return -1; }
-        },
-      });
-      return [reenter, holder];
-    }
-    export function reenteringByIteration() {
-      const holder = {};
-      const proto = Array.prototype, original = proto[Symbol.iterator];
-      const reenter = (id) => {
-        // Until the guest's slice is over, iterating an array of -1 and 0,
-        // as what this returns is, re-enters the guest.
-        proto[Symbol.iterator] = function () {
-          if (this.length === 2 && this[0] === -1 && this[1] === 0) {
-            try { holder.inner(id); } catch (error) { holder.error = error; }
-          }
-          return original.call(this);
-        };
-        queueMicrotask(() => { proto[Symbol.iterator] = original; });
-        return [-1, 0];
-      };
-      return [reenter, holder];
-    }
     export function countingTuple(count) {
       const holder = { converted: 0 };
       const value = { valueOf() { holder.converted++; return 1; } };
       return [() => Array(count).fill(value), holder];
-    }
-    export function instantiate(bytes, imports) {
-      return new WebAssembly.Instance(new WebAssembly.Module(bytes), imports).exports;
     }
     export function throwingProxy() {
       const trap = () => { throw new Error("a trap ran"); };
@@ -1162,27 +1060,10 @@ mod foreign {
             bytes: &[u8],
             suspending: &wasm_bindgen::JsValue,
         ) -> wasm_bindgen::JsValue;
-        /// A JavaScript function of an `i32` that calls `holder.inner` with
-        /// it, and the holder, where what that throws is kept as `error`.
-        pub(super) fn reentering() -> js_sys::Array;
-        /// The same, but the function returns an object whose `valueOf`
-        /// calls `holder.inner`: the engine calls it to make an `i32` of it.
-        #[wasm_bindgen(js_name = reenteringByValue)]
-        pub(super) fn reentering_by_value() -> js_sys::Array;
-        /// The same, but the function returns two results, -1 and 0, and
-        /// iterating them, until the guest's slice is over, calls
-        /// `holder.inner`.
-        #[wasm_bindgen(js_name = reenteringByIteration)]
-        pub(super) fn reentering_by_iteration() -> js_sys::Array;
         /// A JavaScript function that returns `count` values, and the
         /// holder that counts how often one was `converted` to a number.
         #[wasm_bindgen(js_name = countingTuple)]
         pub(super) fn counting_tuple(count: u32) -> js_sys::Array;
-        /// The exports of `bytes` instantiated with `imports`.
-        pub(super) fn instantiate(
-            bytes: &[u8],
-            imports: &wasm_bindgen::JsValue,
-        ) -> wasm_bindgen::JsValue;
         /// A function whose `Proxy` traps throw.
         #[wasm_bindgen(js_name = throwingProxy)]
         pub(super) fn throwing_proxy() -> wasm_bindgen::JsValue;
@@ -1201,10 +1082,10 @@ mod foreign {
 }
 
 /// A guest suspended in a `WebAssembly.Suspending` function that Wasmer did
-/// not make, which another module's export calls, keeps its store: nothing
-/// tells this backend when it goes on.
+/// not make, which another module's export calls, holds nothing while it
+/// waits, and goes on when the engine resumes it.
 #[wasm_bindgen_test]
-async fn a_guest_suspended_outside_wasmer_keeps_its_store() {
+async fn a_guest_suspended_outside_wasmer_goes_on() {
     let pair = foreign::foreign_suspending();
     let relay = wat::parse_str(
         r#"(module
@@ -1232,10 +1113,7 @@ async fn a_guest_suspended_outside_wasmer_keeps_its_store() {
     let mut call: Call = Box::pin(run.call_async(&mut store.clone(), &[]));
     assert!(poll_once(&mut call).is_pending());
     settle().await;
-    assert!(
-        locked(&store),
-        "the store was given up while the guest waits"
-    );
+    assert!(!locked(&store), "a suspended guest holds the store");
     resolve
         .call1(&JsValue::UNDEFINED, &JsValue::from(5))
         .unwrap();
@@ -1248,9 +1126,9 @@ async fn a_guest_suspended_outside_wasmer_keeps_its_store() {
 /// an async import there, and then is suspended in a `WebAssembly.Suspending`
 /// function that Wasmer did not make. The import refuses before it makes a
 /// wait, on engines that run its body before refusing too: nothing runs the
-/// host function, and the guest keeps its store while it is suspended.
+/// host function, and the guest goes on when the engine resumes it.
 #[wasm_bindgen_test]
-async fn a_refused_reentry_then_a_foreign_suspension_keeps_the_store() {
+async fn a_refused_reentry_then_a_foreign_suspension_goes_on() {
     let pair = foreign::foreign_suspending();
     let relay = wat::parse_str(
         r#"(module
@@ -1300,10 +1178,7 @@ async fn a_refused_reentry_then_a_foreign_suspension_keeps_the_store() {
     assert!(poll_once(&mut call).is_pending());
     settle().await;
     assert!(poll_once(&mut call).is_pending());
-    assert!(
-        locked(&store),
-        "the store was given up while the guest waits"
-    );
+    assert!(!locked(&store), "a suspended guest holds the store");
     assert!(log.borrow().is_empty(), "the refused host function ran");
     resolve
         .call1(&JsValue::UNDEFINED, &JsValue::from(5))
@@ -1323,124 +1198,6 @@ async fn a_refused_reentry_then_a_foreign_suspension_keeps_the_store() {
         .try_with(|mut lock| env.as_mut(&mut lock).inner = None)
         .expect("the store is free");
     assert!(store.into_store().is_ok());
-}
-
-/// The same with a JavaScript function of the embedder's own, given with
-/// `Function::from_jsvalue`, that calls the export directly: the guest calls
-/// it through one that marks what it runs, so the import refuses there too.
-/// That holds when the function re-enters the guest from its body, from the
-/// conversion of what it returns (`valueOf`), from the iteration of its
-/// results (an `Array.prototype[Symbol.iterator]` of the embedder's), and
-/// when the guest reaches it through a module instantiated from
-/// `Imports::as_jsvalue`.
-#[wasm_bindgen_test]
-async fn an_embedder_reentry_then_a_foreign_suspension_keeps_the_store() {
-    for way in ["body", "result", "iteration", "import object"] {
-        let pair = foreign::foreign_suspending();
-        let relay = wat::parse_str(
-            r#"(module
-              (import "h" "s" (func $s (result i32)))
-              (func (export "s") (result i32) (call $s)))"#,
-        )
-        .unwrap();
-        let suspending = foreign::relay(&relay, &pair.get(0));
-        let resolve: js_sys::Function = pair.get(1).unchecked_into();
-        let reentering = match way {
-            "result" => foreign::reentering_by_value(),
-            "iteration" => foreign::reentering_by_iteration(),
-            _ => foreign::reentering(),
-        };
-        // Two results, -1 and 0, for the iteration: they add up to what the
-        // others return.
-        let (results, add) = match way {
-            "iteration" => ("i32 i32", "(i32.add (call $reenter (i32.const 99)))"),
-            _ => ("i32", "(call $reenter (i32.const 99))"),
-        };
-        let (reenter, holder) = (reentering.get(0), reentering.get(1));
-
-        let mut store = Store::default();
-        let module = Module::new(
-            &store,
-            format!(
-                r#"(module
-                  (import "host" "wait" (func $wait (param i32) (result i32)))
-                  (import "host" "reenter" (func $reenter (param i32) (result {results})))
-                  (import "host" "s" (func $s (result i32)))
-                  (func (export "inner") (param i32) (result i32) (call $wait (local.get 0)))
-                  (func (export "run") (result i32) (i32.add {add} (call $s))))"#
-            ),
-        )
-        .unwrap();
-        let log: Log = Rc::default();
-        let gate = Gate::new(&log);
-        let unary = FunctionType::new([Type::I32], [Type::I32]);
-        let ty = FunctionType::new([], [Type::I32]);
-        let reenter_ty = match way {
-            "iteration" => FunctionType::new([Type::I32], [Type::I32, Type::I32]),
-            _ => unary.clone(),
-        };
-        let reenter = Function::from_jsvalue(&mut store, &reenter_ty, &reenter).unwrap();
-        let reenter = match way {
-            // A module of the embedder's own, instantiated with the import
-            // object of `Imports`, whose export the guest calls.
-            "import object" => {
-                let object = imports! { "h" => { "f" => reenter } }.as_jsvalue(&store);
-                let bytes = wat::parse_str(
-                    r#"(module
-                      (import "h" "f" (func $f (param i32) (result i32)))
-                      (func (export "g") (param i32) (result i32) (call $f (local.get 0))))"#,
-                )
-                .unwrap();
-                let exports = foreign::instantiate(&bytes, &object);
-                let g = js_sys::Reflect::get(&exports, &"g".into()).unwrap();
-                Function::from_jsvalue(&mut store, &unary, &g).unwrap()
-            }
-            _ => reenter,
-        };
-        let imports = imports! {
-            "host" => {
-                "wait" => gate.import(&mut store),
-                "reenter" => reenter,
-                "s" => Function::from_jsvalue(&mut store, &ty, &suspending).unwrap(),
-            }
-        };
-        let instance = Instance::new(&mut store, &module, &imports).unwrap();
-        let inner = instance
-            .exports
-            .get_function("inner")
-            .unwrap()
-            .as_jsvalue(&store);
-        js_sys::Reflect::set(&holder, &"inner".into(), &inner).unwrap();
-        let run = instance.exports.get_function("run").unwrap().clone();
-        let store = store.into_shared();
-
-        let mut call: Call = Box::pin(run.call_async(&mut store.clone(), &[]));
-        assert!(poll_once(&mut call).is_pending(), "{way}");
-        settle().await;
-        assert!(poll_once(&mut call).is_pending(), "{way}");
-        assert!(
-            locked(&store),
-            "{way}: the store was given up while the guest waits"
-        );
-        assert!(
-            log.borrow().is_empty(),
-            "{way}: the refused host function ran"
-        );
-        resolve
-            .call1(&JsValue::UNDEFINED, &JsValue::from(5))
-            .unwrap();
-        // The re-entry failed with -1.
-        assert_eq!(i32_of(call.await), 4, "{way}");
-        let error = js_sys::Reflect::get(&holder, &"error".into()).unwrap();
-        let error = RuntimeError::from(error);
-        assert_eq!(
-            error.clone().to_trap(),
-            Some(TrapCode::YieldOutsideAsyncContext),
-            "{way}: {error}"
-        );
-        assert_eq!(gate.dropped(), 0, "{way}");
-        assert!(store.into_store().is_ok(), "{way}");
-    }
 }
 
 /// A dynamic host function of numbers that returns a value of another type,
@@ -1478,41 +1235,6 @@ async fn a_host_result_that_cannot_be_a_number_leaves_its_guest_able_to_wait() {
     let result = run.call_async(&mut store.clone(), &[]).await;
     assert_eq!(i32_of(result), AUTO);
     assert!(store.into_store().is_ok());
-}
-
-/// An async host function cannot give a guest a thenable: the promise the
-/// guest waits on would wait for it, and give the guest what it settles
-/// with. The import fails instead, and the guest is unwound as when the host
-/// function fails.
-///
-/// So does one whose result throws when its `then` is read, also what
-/// cannot be looked at.
-#[wasm_bindgen_test]
-async fn a_thenable_result_of_an_async_import_fails_it() {
-    for (value, message) in [
-        (externref_results::thenable(true), "thenable"),
-        (externref_results::throwing_then(), "then threw"),
-        (externref_results::revoked_then(), "reading `then`"),
-    ] {
-        let mut store = Store::default();
-        let ty = FunctionType::new([], [Type::ExternRef]);
-        let value = Value::from_jsvalue(&mut store, &Type::ExternRef, &value).unwrap();
-        let f = async_host(&mut store, ty, move |_| {
-            let value = value.clone();
-            async move { Ok(vec![value]) }
-        });
-        let module = Module::new(&store, signature_guest(&[], &[Type::ExternRef])).unwrap();
-        let caught = Rc::new(Cell::new(0));
-        let imports = imports! { "host" => { "f" => f, "caught" => counter(&mut store, &caught) } };
-        let instance = Instance::new(&mut store, &module, &imports).unwrap();
-        let run = instance.exports.get_function("run").unwrap().clone();
-        let store = store.into_shared();
-
-        let error = run.call_async(&mut store.clone(), &[]).await.unwrap_err();
-        assert!(error.message().contains(message), "{error}");
-        assert_eq!(caught.get(), 0, "{message}: the guest caught the failure");
-        assert!(store.into_store().is_ok(), "{message}");
-    }
 }
 
 /// Whatever JavaScript throws is an error, also what throws again when it is
@@ -1562,71 +1284,6 @@ async fn what_javascript_throws_is_an_error_however_it_looks() {
             .await
             .unwrap_err();
         waits().await;
-        assert!(store.into_store().is_ok(), "{name}");
-    }
-}
-
-/// The engine gives a guest no function as a `funcref` but a WebAssembly one,
-/// and throws at the guest otherwise. An async host function that returns
-/// another, of Wasmer or of JavaScript, fails, and its guest is unwound with
-/// nothing to catch.
-#[wasm_bindgen_test]
-async fn a_funcref_result_of_an_async_import_is_a_webassembly_function() {
-    let mut store = Store::default();
-    let exporting = Module::new(&store, r#"(module (func (export "g")))"#).unwrap();
-    let exporting = Instance::new(&mut store, &exporting, &imports! {}).unwrap();
-    let wasm = exporting.exports.get_function("g").unwrap().clone();
-    let sync = Function::new_typed(&mut store, || {});
-    let r#async = typed_host(&mut store, async |_: &mut AsyncEnv<()>| {});
-    let ty = FunctionType::new([], []);
-    let javascript =
-        Function::from_jsvalue(&mut store, &ty, &foreign::throwing(&JsValue::NULL)).unwrap();
-    let cases = [
-        ("null", None, Some(1)),
-        ("wasm", Some(wasm), Some(0)),
-        ("sync", Some(sync), None),
-        ("async", Some(r#async), None),
-        ("javascript", Some(javascript), None),
-    ];
-    for (name, function, expected) in cases {
-        let mut store = Store::default();
-        let ty = FunctionType::new([], [Type::FuncRef]);
-        let value = Value::FuncRef(function);
-        let f = async_host(&mut store, ty, move |_| {
-            let value = value.clone();
-            async move { Ok(vec![value]) }
-        });
-        let module = Module::new(
-            &store,
-            r#"(module
-              (import "host" "f" (func $f (result funcref)))
-              (import "host" "caught" (func $caught))
-              (func (export "run") (result i32)
-                (block $caught
-                  (try_table (catch_all $caught)
-                    (return (ref.is_null (call $f)))))
-                (call $caught)
-                (unreachable)))"#,
-        )
-        .unwrap();
-        let caught = Rc::new(Cell::new(0));
-        let imports = imports! { "host" => { "f" => f, "caught" => counter(&mut store, &caught) } };
-        let instance = Instance::new(&mut store, &module, &imports).unwrap();
-        let run = instance.exports.get_function("run").unwrap().clone();
-        let store = store.into_shared();
-
-        let result = run.call_async(&mut store.clone(), &[]).await;
-        match expected {
-            Some(expected) => assert_eq!(i32_of(result), expected, "{name}"),
-            None => {
-                let error = result.unwrap_err();
-                assert!(
-                    error.message().contains("not a WebAssembly function"),
-                    "{name}: {error}"
-                );
-            }
-        }
-        assert_eq!(caught.get(), 0, "{name}: the guest caught the failure");
         assert!(store.into_store().is_ok(), "{name}");
     }
 }
@@ -1861,7 +1518,8 @@ async fn a_host_function_belongs_to_its_store() {
     struct Env;
     let unary = FunctionType::new([Type::I32], [Type::I32]);
     let wide = FunctionType::new([Type::I32], [Type::I64]);
-    let make: [(&str, FunctionType, fn(&mut Store) -> Function); 5] = [
+    type Make = fn(&mut Store) -> Function;
+    let make: [(&str, FunctionType, Make); 5] = [
         ("async", unary.clone(), |store| {
             typed_host(store, async |_: &mut AsyncEnv<()>, value: i32| value + 1)
         }),
@@ -2772,12 +2430,11 @@ mod externref_results {
     }
 }
 
-/// A woken guest is off the stack until its microtask, and its call may be
-/// dropped meanwhile, which gives its store up: no host function of the
-/// store runs with that store until the guest is back. JavaScript that calls
-/// one in between is refused, as outside any call.
+/// A suspended guest lends its store to no host function, also once what it
+/// waits for is ready: JavaScript that calls one is refused, as outside any
+/// call.
 #[wasm_bindgen_test]
-async fn a_woken_guest_lends_its_store_to_no_host_function() {
+async fn a_suspended_guest_lends_its_store_to_no_host_function() {
     let mut store = Store::default();
     let module = Module::new(
         &store,
@@ -2805,10 +2462,9 @@ async fn a_woken_guest_lends_its_store_to_no_host_function() {
     poll_until(&mut call, || gate.waiting(7)).await;
     gate.release(7);
     assert!(poll_once(&mut call).is_pending());
-    assert!(locked(&store), "the woken guest holds its store");
     assert!(
         touch.call0(&JsValue::UNDEFINED).is_err(),
-        "a host function ran with the store of a woken guest"
+        "a host function ran with the store of a suspended guest"
     );
     assert_eq!(ran.load(Ordering::Relaxed), 0);
     // Dropping the call now gives the store up, with nothing using it.
@@ -2834,9 +2490,9 @@ async fn the_promising_form_is_kept_out_of_reach() {
 
 // --- the guest guard ----------------------------------------------------------
 
-/// A guest co-owns the store's allocation until it leaves the engine's stack:
-/// dropping the store under a forgotten call frees nothing the guest can
-/// reach, and its host functions go on working.
+/// A call that is not over co-owns the store's allocation: dropping the
+/// store under a forgotten call frees nothing its guest can reach, and its
+/// host functions go on working until it is done.
 #[wasm_bindgen_test]
 async fn a_store_dropped_under_a_forgotten_call_outlives_its_guest() {
     let guest = guest();
@@ -2856,7 +2512,6 @@ async fn a_store_dropped_under_a_forgotten_call_outlives_its_guest() {
 /// A forgotten call ended its borrow, but its guest can still run: every
 /// public store entry refuses until the guest leaves.
 #[wasm_bindgen_test]
-#[should_panic(expected = "forgotten")]
 fn a_store_used_under_a_forgotten_call_panics() {
     let guest = guest();
     let once = guest.instance.exports.get_function("once").unwrap().clone();
@@ -2864,87 +2519,13 @@ fn a_store_used_under_a_forgotten_call_panics() {
     let mut call = Box::pin(once.call_async(&mut store, &[Value::I32(1)]));
     assert!(poll_once(&mut call).is_pending());
     std::mem::forget(call);
-    let _ = store.as_store_ref();
-}
-
-/// Dropping a call whose guest cannot be stopped leaves the store usable at
-/// once. A synchronous guest call cannot wait for that guest, so it fails. A
-/// new `call_async` waits for it to leave the stack.
-#[wasm_bindgen_test]
-async fn a_cancelled_guest_on_the_stack_blocks_only_new_guests() {
-    struct Env {
-        inner: Option<Function>,
-        call: Rc<RefCell<Option<Call>>>,
-        sync_error: Rc<RefCell<Option<String>>>,
-        next: Rc<RefCell<Option<Call>>>,
-    }
-    unsafe impl Send for Env {}
-    let mut store = Store::default();
-    let module = Module::new(
-        &store,
-        r#"(module
-          (import "host" "wait" (func $wait (param i32) (result i32)))
-          (import "host" "drop_call" (func $drop_call))
-          (func (export "inner") (result i32) (i32.const 5))
-          (func (export "run") (result i32)
-            (drop (call $wait (i32.const 1000)))
-            (call $drop_call)
-            (i32.const 1)))"#,
-    )
-    .unwrap();
-    let log: Log = Rc::default();
-    let gate = Gate::new(&log);
-    let slot: Rc<RefCell<Option<Call>>> = Rc::default();
-    let sync_error: Rc<RefCell<Option<String>>> = Rc::default();
-    let next: Rc<RefCell<Option<Call>>> = Rc::default();
-    let env = FunctionEnv::new(
-        &mut store,
-        Env {
-            inner: None,
-            call: slot.clone(),
-            sync_error: sync_error.clone(),
-            next: next.clone(),
-        },
-    );
-    let drop_call = |mut env: FunctionEnvMut<'_, Env>| {
-        drop(env.data().call.borrow_mut().take());
-        let inner = env.data().inner.clone().unwrap();
-        let error = inner.call(&mut env, &[]).unwrap_err();
-        *env.data().sync_error.borrow_mut() = Some(error.message());
-        let mut shared = env.shared().expect("a shared store");
-        let mut call: Call = Box::pin(inner.call_async(&mut shared, &[]));
-        assert!(
-            poll_once(&mut call).is_pending(),
-            "the new guest did not wait"
-        );
-        *env.data().next.borrow_mut() = Some(call);
-    };
-    let imports = imports! {
-        "host" => {
-            "wait" => gate.import(&mut store),
-            "drop_call" => Function::new_typed_with_env(&mut store, &env, drop_call),
-        }
-    };
-    let instance = Instance::new(&mut store, &module, &imports).unwrap();
-    env.as_mut(&mut store).inner = instance.exports.get_function("inner").ok().cloned();
-    let run = instance.exports.get_function("run").unwrap().clone();
-    let store = store.into_shared();
-
-    *slot.borrow_mut() = Some(Box::pin(run.call_async(&mut store.clone(), &[])));
-    for _ in 0..20 {
-        if slot.borrow_mut().as_mut().map(poll_once).is_none() {
-            break;
-        }
-        macrotask().await;
-    }
-    assert!(slot.borrow().is_none(), "the guest did not drop its call");
-    let message = sync_error.borrow().clone().expect("the sync call failed");
-    assert!(message.contains("still on the stack"), "{message}");
-
-    let call = next.borrow_mut().take().expect("the new call was made");
-    assert_eq!(i32_of(call.await), 5);
-    store
-        .try_with(|mut lock| env.as_mut(&mut lock).inner = None)
-        .expect("the store is free");
-    assert!(store.into_store().is_ok());
+    // A panic is a trap here. A JavaScript frame catches it, so that the
+    // test harness stays usable.
+    let uses_store = wasm_bindgen::closure::Closure::once_into_js(move || {
+        let _ = store.as_store_ref();
+    });
+    let used = uses_store
+        .unchecked_ref::<js_sys::Function>()
+        .call0(&JsValue::NULL);
+    assert!(used.is_err(), "a forgotten call's store was used");
 }

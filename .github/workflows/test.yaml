@@ -222,6 +222,8 @@ jobs:
         run: cargo clippy -p wasmer --no-default-features --features v8-default --locked -- -D clippy::all
       - name: Test V8 API
         run: cargo nextest run -p wasmer --release --no-default-features --features v8-default --locked
+      - name: Test async V8 API
+        run: cargo nextest run -p wasmer --release --no-default-features --features v8-default,experimental-async --test async_v8 --locked
   test_store_context_miri:
     name: Store context under Miri
     runs-on: ubuntu-22.04

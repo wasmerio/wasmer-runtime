@@ -1,49 +1,41 @@
 //! Async calls on the JavaScript backend, through JSPI.
 //!
-//! One [`Activation`] per `Function::call_async`, owned by the future of that
-//! call. The engine suspends and resumes the guest's stack; this module keeps
-//! what the engine does not know: which call a guest belongs to, who holds
-//! its store while it runs, and what it is waiting for.
+//! The engine runs them. `Function::call_async` calls the
+//! `WebAssembly.promising` form of a function and waits for its promise. An
+//! async host function is a `WebAssembly.Suspending` import that returns a
+//! promise of its host future, which runs on the microtask queue: the engine
+//! suspends the guest on that promise, and resumes it when it settles.
 //!
-//! * An async host function is a JavaScript function, [`host_function`],
-//!   which a guest imports as a `WebAssembly.Suspending` function. Its body,
-//!   [`start`], runs on the guest's stack: it keeps the host future, and
-//!   returns the promise the guest waits on. Called directly by `call_async`,
-//!   the function itself stands for the guest's promising function, and the
-//!   call returns what the host future returned, as it is.
-//! * The activation holds the store while its guest runs: taken by the call,
-//!   given up once the guest waits, and taken back before the guest is woken
-//!   with its results. The store is free while the guest waits, and nothing
-//!   is kept on the thread's store context stack, which is last-in first-out
-//!   when suspensions are not. The host functions of the guest's first slice
-//!   run with the store [`Call::enter`] lends them, as a synchronous call
-//!   does; those of a slice that JavaScript resumed, which no call lends
-//!   anything, with the store the guest holds (see `lent`). The
-//!   [guest guard](crate::backend::js::guard) keeps that safe when the call
-//!   was dropped or forgotten.
-//! * The host future of an async import belongs to the activation and is
-//!   polled with the caller's waker: first in the microtask that sees the
-//!   guest wait, then by the future of the call whenever that is woken.
-//! * The engine refuses to suspend a guest that was entered by a synchronous
-//!   call, or that has another JavaScript frame on the stack since it was
-//!   entered, and some engines run the body of the import before they
-//!   refuse. So the body does nothing that cannot be undone: the store is
-//!   given up, and the host future polled, only once a microtask after the
-//!   guest's slice has seen it waiting ([`check`]). The engine's error for a
-//!   refusal is taken for the one other backends give ([`refusal`]).
-//! * The store changes hands only where this module sees the guest move: it
-//!   is given up when the guest waits in an async host function, or unwinds,
-//!   and when its promise settles. A guest suspended anywhere else, in a
-//!   `WebAssembly.Suspending` function this module did not make, keeps its
-//!   store, and so does one that returned and whose promise waits for a
-//!   thenable it returned, on engines that take one for a promise.
-//! * A guest woken from the future of the call is woken in a microtask,
-//!   unless its call is dropped by then. A guest that must not run again,
-//!   because its call was dropped or its host function failed, is woken with
-//!   the error of a trap, which no exception handler of the guest catches:
-//!   its stack unwinds without running guest code, and the engine frees it.
-//! * A promise takes a thenable it is resolved with for a promise, so the
-//!   results of an import cannot be one: the import fails instead.
+//! JavaScript runs one thing at a time, and a microtask only on an empty
+//! stack, so a resumed guest overlaps nothing else that uses its store. A
+//! guest therefore holds nothing. Only host code takes the store, for one
+//! synchronous slice at a time: a host function while it runs, a host future
+//! inside `AsyncEnv::with`.
+//!
+//! What is kept here is what the engine does not know:
+//!
+//! * Which call a guest belongs to ([`CURRENT`]): the one that entered it,
+//!   and after a wait the one whose promise resumed it. A reaction attached
+//!   to that promise before the engine attaches its own runs right before
+//!   the guest does.
+//! * How long a call's borrow of the store lasts. The engine resumes a guest
+//!   with no `poll` on the stack, also once its call was dropped or
+//!   forgotten. A dropped call gives the store up at once: its host future is
+//!   dropped, and its guest is woken with the error of a trap, which no
+//!   exception handler of the guest catches, so that its stack unwinds
+//!   without running guest code and the engine frees it. A guest that was
+//!   already resumed runs on until its next import, which fails. A forgotten
+//!   call goes on to its end, and the
+//!   [guest guard](crate::backend::js::guard) keeps its store alive and out
+//!   of its owner's reach until then.
+//!
+//! After its first poll a call makes progress whether or not it is polled
+//! again, as a promise does.
+//!
+//! The engine refuses to suspend a guest that was entered by a synchronous
+//! call, or that has a JavaScript frame on the stack since it was entered: an
+//! async host function fails there, ready or not, with the error other
+//! backends give ([`refusal`]).
 
 use std::{
     cell::{Cell, RefCell},
@@ -55,18 +47,21 @@ use std::{
 
 use js_sys::{Array, Function, Reflect};
 use wasm_bindgen::{
-    JsValue,
+    JsCast, JsValue,
     prelude::{Closure, wasm_bindgen},
 };
+use wasm_bindgen_futures::spawn_local;
 use wasmer_types::{FunctionType, StoreId, TrapCode, Type};
 
 use crate::{
     AsStoreRef, AsyncCallRequest, BackendTrap, CallStore, PollScope, PollStore, RuntimeError,
     SharedStore, StoreInner, StoreMut, StoreSlice, Value,
     js::{
+        boundary,
         error::Trap,
-        function::{enter_async, entered_synchronously},
+        function::{enter_async, entered_synchronously, mark_entered},
         guard::GuestGuard,
+        lent,
         utils::convert::{AsJs as _, js_value_to_wasmer},
     },
 };
@@ -75,161 +70,16 @@ use crate::{
 /// Nothing of it has run until it is polled.
 pub(crate) type ImportFuture = Pin<Box<dyn Future<Output = Result<Vec<Value>, RuntimeError>>>>;
 
-/// How an activation reaches its store, until its guest can no longer need it.
-struct ActivationStore {
-    poll: PollStore,
-    /// Keeps a shared store alive for a guest the engine can still resume.
-    _shared: Option<SharedStore>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum State {
-    /// The guest is on the stack, or has left it in a way this module does
-    /// not see: it returned, or waits in a `WebAssembly.Suspending` function
-    /// of somebody else's. The activation holds the store.
-    Running,
-    /// The guest waits on its promise, or is about to: once the wait is
-    /// [`accept`](Activation::accept)ed, the store is free and what the guest
-    /// waits for is driven by the call.
-    Waiting,
-    /// The guest is given its results in a microtask, with the store, which
-    /// the activation holds: see [`Activation::wake`]. Until then it is off
-    /// the stack, and dropping its call unwinds it instead; once that
-    /// microtask ran ([`woken`]), it is `Running`.
-    Woken,
-    /// The guest was woken with a trap. It runs no more and holds nothing.
-    Unwinding,
-    /// The guest's promise settled.
-    Done,
-}
-
-/// One `Function::call_async`.
-struct Activation {
-    token: i32,
-    store_id: StoreId,
-    /// The call is of an async host function, which it calls itself: no
-    /// guest is given its results, which the call returns as they are.
-    direct: bool,
-    state: Cell<State>,
-    /// The call was dropped: its guest must not run again.
-    cancelled: Cell<bool>,
-    /// The store, until the guest can no longer need it.
-    store: RefCell<Option<ActivationStore>>,
-    /// The store's guest guard.
-    guard: Rc<GuestGuard>,
-    /// The call counts in the guard as holding the store: see
-    /// [`Activation::finish_call`].
-    counted: Cell<bool>,
-    /// The store, while the guest runs.
-    slice: RefCell<Option<StoreSlice>>,
-    /// The import the guest waits in, until it is finished.
-    import: RefCell<Option<ImportFuture>>,
-    /// The results of the import, while the guest waits for its store.
-    results: RefCell<Option<Vec<Value>>>,
-    /// The results of the host function of a direct call, as it returned them.
-    returned: RefCell<Option<Vec<Value>>>,
-    /// The error of a host function, kept as it is across the guest's trap.
-    error: RefCell<Option<RuntimeError>>,
-    /// How the guest's promise settled.
-    result: RefCell<Option<Result<JsValue, JsValue>>>,
-    /// Whoever awaits the call: the waker of its last poll.
-    caller: RefCell<Option<Waker>>,
-    /// The call is being polled and is entering the guest. It looks at the
-    /// activation again when the guest leaves the stack, and need not be woken.
-    entering: Cell<bool>,
-    /// The guest's current wait, numbered on the thread rather than by
-    /// activation, so that a microtask queued for a wait knows whether it is
-    /// still the current one, also once its token belongs to another call.
-    waits: Cell<u32>,
-    /// The engine suspended the guest for its current wait.
-    accepted: Cell<bool>,
-    /// What the guest waits for is being driven: a poll of the call from
-    /// inside it, by a waker that polls at once, leaves it to the outer one.
-    driving: Cell<bool>,
-    /// The call was polled from inside its own driving: whoever woke it is
-    /// woken again, once that is over.
-    redrive: Cell<bool>,
-    /// A host function runs with the store the activation holds, in a slice
-    /// of the guest that JavaScript resumed: see [`hold_running`].
-    held: Cell<bool>,
-}
-
-struct Activations {
-    slots: Vec<Option<Rc<Activation>>>,
-    free: Vec<i32>,
-}
-
-/// The first token; tokens index the activations.
-const FIRST_TOKEN: i32 = 1;
-
-thread_local! {
-    /// Every activation that is not done, by token.
-    static ACTIVATIONS: RefCell<Activations> = const {
-        RefCell::new(Activations {
-            slots: Vec::new(),
-            free: Vec::new(),
-        })
-    };
-    /// The activations that hold a store: those whose guest is running.
-    /// There is at most one per store, and a guest that waits is not in here,
-    /// so there are few.
-    static RUNNING: RefCell<Vec<Rc<Activation>>> = const { RefCell::new(Vec::new()) };
-    /// The activation of a direct call of an async host function, while
-    /// [`Call::enter`] calls it: the body runs for that call, and no other.
-    static DIRECT: RefCell<Option<Rc<Activation>>> = const { RefCell::new(None) };
-    /// The last wait any guest of the thread started: see `Activation::waits`.
-    static LAST_WAIT: Cell<u32> = const { Cell::new(0) };
-    /// The error of a trap was made: see [`prepare_trap`].
-    static TRAP_READY: Cell<bool> = const { Cell::new(false) };
-    /// Hands the JavaScript half its Rust callbacks, once per thread.
-    static SHIM: () = shim_init(
-        &Closure::wrap(Box::new(done) as Box<dyn Fn(i32, i32, JsValue)>).into_js_value(),
-        &Closure::wrap(Box::new(check) as Box<dyn Fn(i32, i32)>).into_js_value(),
-        &Closure::wrap(Box::new(crate::js::function::mark_entered) as Box<dyn Fn(bool) -> bool>)
-            .into_js_value(),
-        &Closure::wrap(Box::new(woken) as Box<dyn Fn(i32)>).into_js_value(),
-    );
-}
-
-// The JavaScript half: promises can only be made and settled there. It is
-// static JavaScript, not made from a string: some hosts forbid that. An async
-// host function and its `WebAssembly.Suspending` form find each other in
-// maps of this module, which run no code of the values they are given, as
-// reading a property of a `Proxy` would.
+// The JavaScript half. It is static JavaScript, not made from a string: some
+// hosts forbid that.
 //
-// `wait` makes the promise the guest of a token waits on, which `wake`
-// resolves with the results of its import, and `unwind` rejects with the
-// error of a trap. A trap's error is the one thing a guest's exception
-// handlers do not catch, also when JavaScript throws it; the module that
-// makes one is a constant, `(module (func (export "trap") unreachable))`.
-// It is made before the first guest is entered: a host may refuse to compile
-// WebAssembly after it compiled the guest, and the call then fails before it
-// enters it, rather than when its guest has to be unwound.
-//
-// A guest suspended at a `WebAssembly.Suspending` import resumes in a
-// microtask once its promise is resolved. A microtask queued two hops after
-// the import's body runs once the guest's slice is over.
+// An async host function and its `WebAssembly.Suspending` form, which a guest
+// imports, find each other in the maps below.
 #[wasm_bindgen(inline_js = r#"
-const resolvers = [], rejecters = [];
-let done, check, mark, woken, trapError, wakes = 0;
-const pendingWakes = [], pendingValues = [];
-export function jspiInit(d, c, m, w) {
-  done = d; check = c; mark = m; woken = w;
-}
-export function jspiPrepareTrap() {
-  if (trapError !== undefined) return;
-  const bytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 4, 1, 96, 0, 0, 3, 2, 1, 0,
-    7, 8, 1, 4, 116, 114, 97, 112, 0, 0, 10, 5, 1, 3, 0, 0, 11]);
-  const { trap } = new WebAssembly.Instance(new WebAssembly.Module(bytes)).exports;
-  try { trap(); } catch (error) { trapError = error; }
-}
-export function jspiTrapError() {
-  return trapError;
-}
-export function jspiForgetTrap() {
-  trapError = undefined;
-}
-const suspendingOf = new WeakMap(), hostOf = new WeakMap(), storeOf = new WeakMap();
+const suspendingOf = new WeakMap(), hostOf = new WeakMap();
+const storeOf = new WeakMap(), promisingOf = new WeakMap();
+const noop = () => {};
+let trapError;
 export function jspiHost(start, array, store) {
   const host = array ? (...args) => start(args) : start;
   const suspending = new WebAssembly.Suspending(host);
@@ -244,119 +94,53 @@ export function jspiOwn(value, store) {
 export function jspiOwner(value) {
   return storeOf.get(value);
 }
+export function jspiPublic(value) {
+  return suspendingOf.get(value) ?? value;
+}
 export function jspiHostOf(value) {
-  return hostOf.get(value) ?? embedderOf.get(value) ?? value;
+  return hostOf.get(value) ?? value;
 }
 export function jspiIsHost(value) {
   return suspendingOf.has(value);
 }
-export function jspiImport(value, kinds) {
-  return suspendingOf.get(value) ?? embedderFunction(value, kinds);
-}
-const apply = Reflect.apply, markedOf = new WeakMap(), embedderOf = new WeakMap();
-const wasmFunctions = new WeakSet();
-let probe;
-function isWasmFunction(value) {
-  if (wasmFunctions.has(value)) return true;
-  probe ??= new WebAssembly.Table({ element: "anyfunc", initial: 1 });
-  try { probe.set(0, value); } catch { return false; }
-  probe.set(0, null);
-  wasmFunctions.add(value);
-  return true;
-}
-const toResult = (kind, value) =>
-  kind === "n" ? +value : kind === "b" ? BigInt.asIntN(64, value) : value;
-const iterator = Symbol.iterator;
-// Results the engine iterates without running anything of the embedder's:
-// no prototype to look anything up on, and an iterator of its own.
-function tuple(values) {
-  let index = 0;
-  const next = () => index < values.length
-    ? { __proto__: null, value: values[index++], done: false }
-    : { __proto__: null, value: undefined, done: true };
-  const results = { __proto__: null, next };
-  return { __proto__: null, [iterator]: () => results };
-}
-// What a guest imports for a JavaScript function an embedder gave: one that
-// marks what it runs, converting the results inside the marked region. Only
-// imports are given it: a direct call of the function reads what the
-// function returns itself.
-function embedderFunction(value, kinds) {
-  // The functions this crate makes mark what they run themselves.
-  if (typeof value !== "function" || storeOf.has(value)) return value;
-  let byKinds = markedOf.get(value);
-  let marked = byKinds?.get(kinds);
-  if (marked === undefined) {
-    if (isWasmFunction(value)) return value;
-    marked = function (...args) {
-      const previous = mark(true);
-      try {
-        const result = apply(value, this, args);
-        if (kinds.length === 0) return result;
-        if (kinds.length === 1) return toResult(kinds, result);
-        // As the engine does with what a host function returns: iterated
-        // once, its length checked, and then each value converted.
-        const values = [];
-        for (const item of result) values[values.length] = item;
-        if (values.length !== kinds.length) {
-          throw new TypeError(`expected ${kinds.length} results, got ${values.length}`);
-        }
-        for (let i = 0; i < kinds.length; i++) values[i] = toResult(kinds[i], values[i]);
-        return tuple(values);
-      } finally {
-        mark(previous);
-      }
-    };
-    if (byKinds === undefined) markedOf.set(value, byKinds = new Map());
-    byKinds.set(kinds, marked);
-    embedderOf.set(marked, value);
+// The promising form of each function, made once; `null` for a function that
+// is not a WebAssembly one, which the engine refuses.
+export function jspiPromising(fn) {
+  let promising = promisingOf.get(fn);
+  if (promising === undefined) {
+    try { promising = WebAssembly.promising(fn); } catch { promising = null; }
+    promisingOf.set(fn, promising);
   }
-  return marked;
+  return promising;
 }
-export function jspiIsWasmFunction(value) {
-  return isWasmFunction(value);
+// The promise a guest waits on, and what settles it. `resumed` is attached
+// before the engine attaches its own reaction, so it runs right before the
+// guest is resumed. A rejection has a handler too: a wait the engine refused
+// is rejected with nobody waiting on it.
+export function jspiWait(resumed) {
+  let resolve, reject;
+  const promise = new Promise((s, j) => { resolve = s; reject = j; });
+  promise.then(resumed, noop);
+  return [promise, resolve, reject];
 }
-export function jspiPublic(value) {
-  return suspendingOf.get(value) ?? value;
+export function jspiSettle(promise, done) {
+  promise.then((value) => done(false, value), (error) => done(true, error));
 }
-export function jspiWait(token) {
-  return new Promise((resolve, reject) => { resolvers[token] = resolve; rejecters[token] = reject; });
-}
-export function jspiWake(token, value) {
-  const resolve = resolvers[token];
-  resolvers[token] = rejecters[token] = undefined;
-  if (resolve !== undefined) resolve(value);
-}
-export function jspiUnwind(token) {
-  const reject = rejecters[token];
-  resolvers[token] = rejecters[token] = undefined;
-  if (reject !== undefined) reject(trapError);
-}
-export function jspiWakeLater(token, value) {
-  const wake = ++wakes;
-  pendingWakes[token] = wake;
-  pendingValues[token] = value;
-  queueMicrotask(() => {
-    if (pendingWakes[token] !== wake) return;
-    const value = pendingValues[token];
-    pendingWakes[token] = 0;
-    pendingValues[token] = undefined;
-    jspiWake(token, value);
-    woken(token);
-  });
-}
-export function jspiCancelWake(token) {
-  const pending = pendingWakes[token] > 0;
-  pendingWakes[token] = 0;
-  pendingValues[token] = undefined;
-  return pending;
-}
-export function jspiIsThenable(value) {
-  return (typeof value === "object" || typeof value === "function") && value !== null &&
-    typeof value.then === "function";
-}
-export function jspiCheckLater(token, wait) {
-  queueMicrotask(() => queueMicrotask(() => check(token, wait)));
+// The error of a trap: the one thing a guest's exception handlers do not
+// catch, also when JavaScript throws it. It is made by trapping in
+// `(module (func (export "trap") unreachable))`. A host that refuses to
+// compile that gives its own error instead, which a guest may catch.
+export function jspiTrapError() {
+  if (trapError === undefined) {
+    try {
+      const bytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 4, 1, 96, 0, 0, 3, 2, 1, 0,
+        7, 8, 1, 4, 116, 114, 97, 112, 0, 0, 10, 5, 1, 3, 0, 0, 11]);
+      new WebAssembly.Instance(new WebAssembly.Module(bytes)).exports.trap();
+    } catch (error) {
+      trapError = error;
+    }
+  }
+  return trapError;
 }
 export function jspiIsSuspendError(value) {
   const SuspendError = WebAssembly.SuspendError;
@@ -367,75 +151,35 @@ export function jspiIsSuspendError(value) {
     return false;
   }
 }
-// The promising form of each function, made once. Kept here rather than on
-// the function, where any JavaScript could replace it; and the reaction is
-// attached with the `then` of the promises the engine makes, as it was when
-// this module loaded.
-const promisingOf = new WeakMap(), then = Promise.prototype.then;
-export function jspiPromising(fn) {
-  let promising = promisingOf.get(fn);
-  if (promising === undefined) {
-    promising = WebAssembly.promising(fn);
-    promisingOf.set(fn, promising);
-  }
-  return promising;
-}
-export function jspiSettle(promise, token) {
-  apply(then, promise, [(value) => done(token, 0, value), (error) => done(token, 1, error)]);
-}
 "#)]
 extern "C" {
-    #[wasm_bindgen(js_name = jspiInit)]
-    fn shim_init(done: &JsValue, check: &JsValue, mark: &JsValue, woken: &JsValue);
-    #[wasm_bindgen(js_name = jspiPrepareTrap, catch)]
-    fn shim_prepare_trap() -> Result<(), JsValue>;
-    #[wasm_bindgen(js_name = jspiTrapError)]
-    fn trap_error() -> JsValue;
-    /// Forgets the error of a trap, for it to be made again.
-    #[cfg(test)]
-    #[wasm_bindgen(js_name = jspiForgetTrap)]
-    fn shim_forget_trap();
     #[wasm_bindgen(js_name = jspiHost)]
     fn shim_host(start: &JsValue, array: bool, store: f64) -> Function;
     #[wasm_bindgen(js_name = jspiOwn)]
     fn shim_own(value: &JsValue, store: f64);
     #[wasm_bindgen(js_name = jspiOwner)]
     fn shim_owner(value: &JsValue) -> Option<f64>;
-    #[wasm_bindgen(js_name = jspiIsWasmFunction)]
-    fn shim_is_wasm_function(value: &JsValue) -> bool;
-    #[wasm_bindgen(js_name = jspiIsHost)]
-    fn shim_is_host(value: &JsValue) -> bool;
-    #[wasm_bindgen(js_name = jspiImport)]
-    fn shim_import(value: &JsValue, kinds: &str) -> JsValue;
-    #[wasm_bindgen(js_name = jspiHostOf)]
-    fn shim_host_of(value: &JsValue) -> JsValue;
     #[wasm_bindgen(js_name = jspiPublic)]
     fn shim_public(value: &JsValue) -> JsValue;
+    #[wasm_bindgen(js_name = jspiHostOf)]
+    fn shim_host_of(value: &JsValue) -> JsValue;
+    #[wasm_bindgen(js_name = jspiIsHost)]
+    fn shim_is_host(value: &JsValue) -> bool;
+    #[wasm_bindgen(js_name = jspiPromising)]
+    fn shim_promising(function: &Function) -> Option<Function>;
     #[wasm_bindgen(js_name = jspiWait)]
-    fn shim_wait(token: i32) -> JsValue;
-    #[wasm_bindgen(js_name = jspiWake)]
-    fn shim_wake(token: i32, value: &JsValue);
-    #[wasm_bindgen(js_name = jspiWakeLater)]
-    fn shim_wake_later(token: i32, value: &JsValue);
-    #[wasm_bindgen(js_name = jspiCancelWake)]
-    fn shim_cancel_wake(token: i32) -> bool;
-    #[wasm_bindgen(js_name = jspiIsThenable, catch)]
-    fn shim_is_thenable(value: &JsValue) -> Result<bool, JsValue>;
-    #[wasm_bindgen(js_name = jspiUnwind)]
-    fn shim_unwind(token: i32);
-    #[wasm_bindgen(js_name = jspiCheckLater)]
-    fn shim_check_later(token: i32, wait: i32);
+    fn shim_wait(resumed: &JsValue) -> Array;
+    #[wasm_bindgen(js_name = jspiSettle)]
+    fn shim_settle(promise: &JsValue, done: &JsValue);
+    #[wasm_bindgen(js_name = jspiTrapError)]
+    fn trap_error() -> JsValue;
     #[wasm_bindgen(js_name = jspiIsSuspendError)]
     fn shim_is_suspend_error(value: &JsValue) -> bool;
-    #[wasm_bindgen(js_name = jspiSettle)]
-    fn shim_settle(promise: &JsValue, token: i32);
-    #[wasm_bindgen(js_name = jspiPromising, catch)]
-    fn shim_promising(function: &Function) -> Result<Function, JsValue>;
 }
 
 /// The results of an import, as a `WebAssembly.Suspending` function returns
 /// them, or as its promise resolves with them.
-pub(crate) fn results(values: &[Value], store: &impl AsStoreRef) -> JsValue {
+fn results(values: &[Value], store: &impl AsStoreRef) -> JsValue {
     match values {
         [] => JsValue::UNDEFINED,
         [value] => value.as_jsvalue(store),
@@ -443,60 +187,10 @@ pub(crate) fn results(values: &[Value], store: &impl AsStoreRef) -> JsValue {
     }
 }
 
-/// Whether the results of an import can reach the guest as they are: a
-/// promise takes a thenable it is resolved with for a promise, waits for it,
-/// and gives the guest what it settles with. So an import whose result is one
-/// fails instead, as one whose result cannot be read: reading `then` runs
-/// JavaScript, which may throw. It runs before the store is taken back for
-/// the guest, and may drop the call. The promise reads `then` again when it
-/// is resolved; an object that answers differently, as a `Proxy` can, is
-/// taken for what it answers then. If that is a thenable, the guest waits for
-/// it with its store, also once its call is dropped: the engine resumes the
-/// guest when the thenable settles, and nothing can stop that, so the store
-/// is not given up before.
-///
-/// The engine gives a guest no function as a `funcref` but a WebAssembly
-/// one, and throws an exception at the guest that the guest can catch
-/// otherwise. That fails the import too.
-fn deliverable(values: &[Value]) -> Result<(), RuntimeError> {
-    for value in values {
-        if let Value::FuncRef(Some(function)) = value
-            && !shim_is_wasm_function(&function.as_js().handle.function)
-        {
-            return Err(RuntimeError::new(
-                "an async host function returned a function that is not a WebAssembly \
-                 function, which a guest cannot be given as a `funcref`",
-            ));
-        }
-    }
-    let value: JsValue = match values {
-        [Value::ExternRef(Some(reference))] => match &reference.0 {
-            crate::BackendExternRef::Js(reference) => reference.as_js_value(),
-            #[allow(unreachable_patterns)]
-            _ => return Ok(()),
-        },
-        [Value::FuncRef(Some(function))] => function.as_js().handle.function.clone().into(),
-        // Nothing else is ever a thenable: several results reach the guest
-        // as an array.
-        _ => return Ok(()),
-    };
-    match shim_is_thenable(&value) {
-        Ok(false) => Ok(()),
-        Ok(true) => Err(RuntimeError::new(
-            "an async host function returned a thenable, which a guest cannot be given \
-             through JSPI as it is",
-        )),
-        Err(error) => Err(RuntimeError::new(format!(
-            "reading `then` of what an async host function returned threw: {}",
-            RuntimeError::from(error).message()
-        ))),
-    }
-}
-
 /// The function of an async host function of the store `store`: `start`,
 /// which returns the promise the guest waits on, or, if it takes an `array`,
 /// a function that calls it with its arguments in one. A guest imports it as
-/// a `WebAssembly.Suspending` function, which it keeps (see [`import`]).
+/// a `WebAssembly.Suspending` function (see [`public`]).
 ///
 /// # Panics
 /// Panics if the signature has a type JavaScript has no value of, or takes a
@@ -521,7 +215,6 @@ pub(crate) fn host_function(
              it cannot make a function of what a guest passes"
         );
     }
-    SHIM.with(|_| ());
     shim_host(start, array, store.as_raw().get() as f64)
 }
 
@@ -533,8 +226,7 @@ pub(crate) fn own(function: &JsValue, id: StoreId) {
 
 /// Whether `function` can be used with the store `id`: a host function this
 /// crate made, also given back as an embedder's function, with the store it
-/// was made for only, which, being the caller's, is alive; any other
-/// function with any store.
+/// was made for only; any other function with any store.
 pub(crate) fn belongs_to(function: &JsValue, id: StoreId) -> bool {
     shim_owner(function).is_none_or(|store| store == id.as_raw().get() as f64)
 }
@@ -544,389 +236,314 @@ pub(crate) fn foreign_store_error() -> RuntimeError {
     RuntimeError::new("a host function was called with a store it does not belong to")
 }
 
-/// What a guest imports for `value`, a function of the type `ty`: the
-/// `WebAssembly.Suspending` form of an async host function; for a JavaScript
-/// function an embedder gave, a function that marks what it runs as entered
-/// synchronously (see [`suspendable`]), calls `value` with its receiver and
-/// arguments, and makes of what it returns the primitives the engine takes
-/// for the results of `ty`, so that all the JavaScript the call runs, the
-/// engine's conversion of the results included (`valueOf`, iteration), runs
-/// marked; anything else, a WebAssembly function or a host function of this
-/// crate, which marks what it runs itself, as it is.
-///
-/// Only a guest is given that function, the same one for the same function
-/// and results: a direct call of `value` reads what it returns itself, as an
-/// array of several results, and converts it as a direct call does.
-pub(crate) fn import(value: &JsValue, ty: &FunctionType) -> JsValue {
-    SHIM.with(|_| ());
-    // The conversion each result takes from the engine: to a number, to a
-    // BigInt, or none, which runs no JavaScript.
-    let kinds: String = ty
-        .results()
-        .iter()
-        .map(|ty| match ty {
-            Type::I32 | Type::F32 | Type::F64 => 'n',
-            Type::I64 => 'b',
-            _ => 'r',
-        })
-        .collect();
-    shim_import(value, &kinds)
-}
-
-/// The function `value` stands for, given to this crate: the async host
-/// function whose `WebAssembly.Suspending` form it is, as [`public`] gives
-/// it, or the embedder's own function for one [`import`] made; anything else
-/// as it is.
-pub(crate) fn host_of(value: &JsValue) -> JsValue {
-    shim_host_of(value)
-}
-
-/// Whether `function` is a WebAssembly function, or an async host function:
-/// one `call_async` enters a guest through. Anything else is JavaScript that
-/// runs to the end.
-pub(crate) fn enters_a_guest(function: &JsValue) -> bool {
-    shim_is_host(function) || shim_is_wasm_function(function)
-}
-
-/// What a function is given to JavaScript as: the `WebAssembly.Suspending`
-/// form of an async host function, which is what works outside a guest
-/// Wasmer instantiated, and anything else as it is.
+/// What a function is given to JavaScript as, and what a guest imports for
+/// it: the `WebAssembly.Suspending` form of an async host function, and
+/// anything else as it is.
 pub(crate) fn public(value: &JsValue) -> JsValue {
     shim_public(value)
 }
 
+/// The function `value` stands for, given to this crate: the async host
+/// function whose public form it is, and anything else as it is.
+pub(crate) fn host_of(value: &JsValue) -> JsValue {
+    shim_host_of(value)
+}
+
+/// The promise a guest waits on in an async import, and what it waits for.
+struct Wait {
+    /// Which wait of its call this is: a new one takes the place of one the
+    /// engine refused.
+    id: u32,
+    /// The host future, but while it is being polled.
+    import: Option<ImportFuture>,
+    resolve: Function,
+    reject: Function,
+}
+
+/// One `Function::call_async` that entered a guest.
+struct Activation {
+    store_id: StoreId,
+    guard: Rc<GuestGuard>,
+    /// How the host code of the call reaches the store, until the call is
+    /// over: finished or dropped.
+    store: Cell<Option<PollStore>>,
+    /// Keeps a shared store alive for as long.
+    shared: RefCell<Option<SharedStore>>,
+    /// The call counts in the guard as holding the store through a borrow.
+    counted: Cell<bool>,
+    /// The call was dropped: its guest must not use the store again.
+    cancelled: Cell<bool>,
+    /// The guest's promise settled.
+    done: Cell<bool>,
+    /// What the guest waits for, while it is suspended in an async import.
+    wait: RefCell<Option<Wait>>,
+    waits: Cell<u32>,
+    /// The error of a host function, kept as it is across the guest's trap.
+    error: RefCell<Option<RuntimeError>>,
+    /// How the guest's promise settled.
+    result: RefCell<Option<Result<JsValue, JsValue>>>,
+    /// Whoever awaits the call: the waker of its last poll.
+    caller: RefCell<Option<Waker>>,
+    /// The reaction that runs right before the engine resumes the guest.
+    resumed: RefCell<Option<Reaction>>,
+}
+
+/// A promise reaction: it is given what the promise settled with.
+type Reaction = Closure<dyn FnMut(JsValue)>;
+
+thread_local! {
+    /// The guest of each store that entered or was resumed last: the one that
+    /// is running, if one of that store is. There are few.
+    static CURRENT: RefCell<Vec<Rc<Activation>>> = const { RefCell::new(Vec::new()) };
+    /// An async host function is being called directly: see [`Direct`].
+    static DIRECT: RefCell<Option<Direct>> = const { RefCell::new(None) };
+}
+
+/// The call of the guest of the store `id` that is running.
+fn current(id: usize) -> Option<Rc<Activation>> {
+    CURRENT.with(|current| {
+        let current = current.borrow();
+        let mut current = current.iter();
+        current.find(|activation| activation.store_id.as_raw().get() == id).cloned()
+    })
+}
+
+/// Makes `activation` the running guest of its store. Returns the one before.
+fn set_current(activation: &Rc<Activation>) -> Option<Rc<Activation>> {
+    CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        let slot = current.iter_mut().find(|other| other.store_id == activation.store_id);
+        match slot {
+            Some(slot) => Some(std::mem::replace(slot, Rc::clone(activation))),
+            None => {
+                current.push(Rc::clone(activation));
+                None
+            }
+        }
+    })
+}
+
+/// `activation` is not running any more, if it was.
+fn unset_current(activation: &Rc<Activation>) {
+    // Dropped outside the borrow.
+    let _was = CURRENT.with(|current| {
+        let mut current = current.borrow_mut();
+        let index = current.iter().position(|other| Rc::ptr_eq(other, activation))?;
+        Some(current.swap_remove(index))
+    });
+}
+
 impl Activation {
-    /// The guest goes on, with the store.
-    fn switch_in(self: &Rc<Self>, slice: StoreSlice) {
-        debug_assert!(running(self.store_id).is_none(), "two guests run in one store");
-        self.guard.acquire();
-        *self.slice.borrow_mut() = Some(slice);
-        RUNNING.with(|running| running.borrow_mut().push(self.clone()));
-        self.state.set(State::Running);
-    }
-
-    /// The guest leaves the stack, or will not use the store again.
-    fn switch_out(self: &Rc<Self>, to: State) {
-        debug_assert!(
-            !self.held.get(),
-            "the store is given up while a host function holds it"
-        );
-        let this = RUNNING.with(|running| {
-            let mut running = running.borrow_mut();
-            let index = running.iter().position(|other| Rc::ptr_eq(other, self))?;
-            Some(running.swap_remove(index))
+    /// The reaction of every wait of this call: the engine resumes its guest
+    /// next, from a microtask, so nothing else is on the stack.
+    fn resumed(self: &Rc<Self>) -> JsValue {
+        let mut resumed = self.resumed.borrow_mut();
+        let closure = resumed.get_or_insert_with(|| {
+            let this = Rc::downgrade(self);
+            Closure::new(move |_: JsValue| {
+                if let Some(this) = this.upgrade() {
+                    this.clear_holds();
+                    // The guest is on the stack `call_async` gave it.
+                    mark_entered(false);
+                    set_current(&this);
+                }
+            })
         });
-        let was_running = this.is_some();
-        drop(this);
-        self.state.set(to);
-        drop(self.slice.take());
-        // Last: this wakes whoever waits for the store.
-        if was_running {
-            self.guard.release();
+        closure.as_ref().clone()
+    }
+
+    /// Nothing is on the stack, so nothing holds the store: a JavaScript
+    /// exception may have skipped the frame of a host function that did.
+    fn clear_holds(&self) {
+        self.guard.set_held(false);
+        if let Some(store) = self.store.get() {
+            store.set_busy(false);
         }
     }
 
-    /// The store, while the activation holds it for its guest.
-    fn store_ptr(&self) -> Option<*mut StoreInner> {
-        self.slice.borrow().as_ref().map(StoreSlice::ptr)
+    /// The guest is to wait for `import`. Returns the promise it waits on,
+    /// and has the host future run on the microtask queue.
+    fn wait_for(self: &Rc<Self>, import: ImportFuture) -> JsValue {
+        // A wait is still there: the engine ran this body for it and then
+        // refused to suspend the guest, which went on to here.
+        self.cancel_wait();
+        let id = self.waits.get().wrapping_add(1);
+        self.waits.set(id);
+        let parts = shim_wait(&self.resumed());
+        *self.wait.borrow_mut() = Some(Wait {
+            id,
+            import: Some(import),
+            resolve: parts.get(1).unchecked_into(),
+            reject: parts.get(2).unchecked_into(),
+        });
+        let this = Rc::clone(self);
+        spawn_local(std::future::poll_fn(move |cx| this.drive(id, cx)));
+        parts.get(0)
     }
 
-    /// How this activation's host futures reach the store.
-    fn poll_store(&self) -> Option<PollStore> {
-        self.store.borrow().as_ref().map(|store| store.poll)
+    /// Polls what the guest waits for in its wait `id`, from a microtask: the
+    /// guest is suspended, and the store is free.
+    fn drive(self: &Rc<Self>, id: u32, cx: &mut Context<'_>) -> Poll<()> {
+        let import = {
+            let mut wait = self.wait.borrow_mut();
+            let wait = wait.as_mut().filter(|wait| wait.id == id);
+            wait.and_then(|wait| wait.import.take())
+        };
+        // No import: the wait is over, cancelled or replaced. A wait has its
+        // call's store.
+        let (Some(mut import), Some(store)) = (import, self.store.get()) else {
+            return Poll::Ready(());
+        };
+        unset_current(self);
+        self.clear_holds();
+        // The host future may drop its own call.
+        let _shared = self.shared.borrow().clone();
+        // No host function that JavaScript reaches from the host future runs
+        // with the store meanwhile (see `hold_running`).
+        self.guard.set_held(true);
+        let outcome = {
+            let _scope = PollScope::enter(Some(store));
+            boundary::catching(|| import.as_mut().poll(cx))
+        };
+        self.guard.set_held(false);
+        let result = match outcome {
+            Ok(Poll::Pending) => {
+                let mut wait = self.wait.borrow_mut();
+                if let Some(wait) = wait.as_mut().filter(|wait| wait.id == id) {
+                    wait.import = Some(import);
+                    return Poll::Pending;
+                }
+                drop(wait);
+                // The poll dropped the call.
+                dispose(Some(store), import);
+                return Poll::Ready(());
+            }
+            Ok(Poll::Ready(result)) => {
+                dispose(Some(store), import);
+                result
+            }
+            Err(error) => {
+                // Left part way through: it can be neither resumed nor
+                // dropped. It holds no store borrow.
+                std::mem::forget(import);
+                Err(error.into())
+            }
+        };
+        self.finish_wait(id, result);
+        Poll::Ready(())
     }
 
-    /// The store for the guest to go on with, if no guest holds it.
-    fn try_slice(&self) -> Option<StoreSlice> {
-        if !self.guard.is_free() {
-            return None;
+    /// Settles the promise of the wait `id`, if the guest still waits on it:
+    /// with the results of its import, or with a trap, which unwinds it.
+    fn finish_wait(&self, id: u32, result: Result<Vec<Value>, RuntimeError>) {
+        let wait = {
+            let mut wait = self.wait.borrow_mut();
+            wait.take_if(|wait| wait.id == id)
+        };
+        let (Some(wait), Some(store)) = (wait, self.store.get()) else {
+            return;
+        };
+        match result {
+            Ok(values) => {
+                let slice = store.enter_slice();
+                // Safety: the slice is the only holder of the store.
+                let store = unsafe { StoreMut::from_raw(slice.ptr()) };
+                let _ = wait.resolve.call1(&JsValue::UNDEFINED, &results(&values, &store));
+            }
+            Err(error) => {
+                *self.error.borrow_mut() = Some(error);
+                let _ = wait.reject.call1(&JsValue::UNDEFINED, &trap_error());
+            }
         }
-        self.poll_store()?.try_enter_slice()
     }
 
-    /// The call is over for whoever holds it: finished or dropped.
-    fn finish_call(&self) {
+    /// The guest is not to be given what it waits for: its host future is
+    /// dropped, and it is woken with a trap.
+    fn cancel_wait(&self) {
+        let Some(mut wait) = self.wait.take() else {
+            return;
+        };
+        if let Some(import) = wait.import.take() {
+            dispose(self.store.get(), import);
+        }
+        let _ = wait.reject.call1(&JsValue::UNDEFINED, &trap_error());
+    }
+
+    /// The call is over for whoever made it, finished or dropped: its borrow
+    /// of the store ends here.
+    fn release(&self) {
+        self.store.set(None);
+        drop(self.shared.take());
         if self.counted.replace(false) {
             self.guard.end_call();
         }
     }
 
-    fn wake_caller(&self) {
-        if self.entering.get() {
-            return;
-        }
+    /// The end of the activation: its guest's promise settled.
+    fn retire(self: &Rc<Self>, result: Result<JsValue, JsValue>) {
+        self.done.set(true);
+        unset_current(self);
+        self.cancel_wait();
+        self.release();
+        drop(self.resumed.take());
+        *self.result.borrow_mut() = Some(result);
         // Not woken under the borrow: a waker may do anything.
-        let caller = self.caller.borrow().clone();
+        let caller = self.caller.take();
         if let Some(caller) = caller {
             caller.wake();
         }
     }
-
-    /// The guest is to wait for its import. Returns the promise it waits on,
-    /// and has [`check`] look at the activation once the guest's slice is
-    /// over. Nothing else changes until then: some engines refuse to suspend
-    /// the guest after this ran.
-    fn wait(self: &Rc<Self>) -> JsValue {
-        let promise = shim_wait(self.token);
-        let wait = LAST_WAIT.get().wrapping_add(1);
-        LAST_WAIT.set(wait);
-        self.waits.set(wait);
-        self.accepted.set(false);
-        self.state.set(State::Waiting);
-        shim_check_later(self.token, wait as i32);
-        promise
-    }
-
-    /// Resolves the promise of the guest's current wait with `value`, with
-    /// the guest's store. In a microtask of its own the guest goes on in the
-    /// next one: nothing else runs before it but what was queued already.
-    /// From the future of the call, whose caller may drop it as soon as the
-    /// poll returns, it is resolved a microtask later, unless the call is
-    /// dropped by then: the guest is unwound instead.
-    fn wake(&self, value: &JsValue, now: bool) {
-        if now {
-            self.state.set(State::Running);
-            shim_wake(self.token, value);
-        } else {
-            self.state.set(State::Woken);
-            shim_wake_later(self.token, value);
-        }
-    }
-
-    /// The guest waits: the store is given up, and what the guest waits for
-    /// is driven from now on.
-    fn accept(self: &Rc<Self>) {
-        self.accepted.set(true);
-        self.switch_out(State::Waiting);
-    }
-
-    /// The guest is running again, so a wait the engine never accepted was
-    /// refused: what the guest was to wait for is dropped. The activation
-    /// still holds the store.
-    fn forget_refused_wait(&self) {
-        if self.state.get() == State::Waiting && !self.accepted.get() {
-            drop(self.import.take());
-            self.state.set(State::Running);
-        }
-    }
-
-    /// Drives what a guest waits for, with the caller's waker: from the
-    /// microtask that sees the guest wait (`now`), and from the future of the
-    /// call.
-    fn drive(self: &Rc<Self>, cx: &mut Context<'_>, now: bool) {
-        if self.driving.get() {
-            // Polled from inside the poll of the host future:
-            // the import is taken out for it, and is not finished. The outer
-            // driving goes on, and passes the wake on (see below).
-            self.redrive.set(true);
-            return;
-        }
-        self.driving.set(true);
-        self.redrive.set(false);
-        self.drive_once(cx, now);
-        self.driving.set(false);
-        if self.redrive.take() && self.state.get() == State::Waiting {
-            // A wake that came during the poll was taken by a poll of the call
-            // that did nothing: whoever polls the call now, which that poll
-            // may have changed, is woken again.
-            self.wake_caller();
-        }
-    }
-
-    fn drive_once(self: &Rc<Self>, cx: &mut Context<'_>, now: bool) {
-        if self.state.get() != State::Waiting || !self.accepted.get() {
-            return;
-        }
-        let Some(store) = self.poll_store() else {
-            return;
-        };
-        if let Some(mut import) = self.import.take() {
-            // A host future reaches the store in synchronous slices, so it
-            // can only run while no guest holds the store.
-            if !self.guard.is_free() {
-                *self.import.borrow_mut() = Some(import);
-                self.guard.wait(cx.waker());
-                return;
-            }
-            let outcome = {
-                let _scope = PollScope::enter(Some(store));
-                let _mark = self.guard.mark();
-                import.as_mut().poll(cx)
-            };
-            if self.state.get() != State::Waiting {
-                // The poll dropped the call.
-                let _scope = PollScope::enter(Some(store));
-                drop(import);
-                return;
-            }
-            match outcome {
-                Poll::Ready(Ok(results)) => {
-                    {
-                        let _scope = PollScope::enter(Some(store));
-                        drop(import);
-                    }
-                    // A direct call returns them as they are, to no guest.
-                    if !self.direct {
-                        let deliverable = deliverable(&results);
-                        if self.state.get() != State::Waiting {
-                            // Reading the results dropped the call.
-                            return;
-                        }
-                        if let Err(error) = deliverable {
-                            *self.error.borrow_mut() = Some(error);
-                            return self.unwind();
-                        }
-                    }
-                    *self.results.borrow_mut() = Some(results);
-                }
-                Poll::Ready(Err(error)) => {
-                    {
-                        let _scope = PollScope::enter(Some(store));
-                        drop(import);
-                    }
-                    *self.error.borrow_mut() = Some(error);
-                    return self.unwind();
-                }
-                Poll::Pending => {
-                    *self.import.borrow_mut() = Some(import);
-                    return;
-                }
-            }
-        }
-        match self.try_slice() {
-            Some(slice) => self.resume(slice, now),
-            // Another guest has the store: this one goes on when it leaves.
-            None => self.guard.wait(cx.waker()),
-        }
-    }
-
-    /// Wakes the guest with the results of its import, with its store. Those
-    /// of a direct call are kept for the call, which returns them as they are:
-    /// JavaScript would take some for others, or not take them at all.
-    fn resume(self: &Rc<Self>, slice: StoreSlice, now: bool) {
-        let values = self.results.take().unwrap_or_default();
-        let value = if self.direct {
-            *self.returned.borrow_mut() = Some(values);
-            JsValue::UNDEFINED
-        } else {
-            let _mark = self.guard.mark();
-            // Safety: the slice is the only holder of the store.
-            let store = unsafe { StoreMut::from_raw(slice.ptr()) };
-            results(&values, &store)
-        };
-        self.switch_in(slice);
-        self.accepted.set(false);
-        self.wake(&value, now);
-    }
-
-    /// Wakes the guest with a trap: it unwinds without running guest code.
-    fn unwind(self: &Rc<Self>) {
-        self.drop_import();
-        drop(self.results.take());
-        self.switch_out(State::Unwinding);
-        shim_unwind(self.token);
-    }
-
-    /// The end of the activation: its promise settled.
-    fn retire(self: &Rc<Self>, result: Result<JsValue, JsValue>) {
-        ACTIVATIONS.with(|activations| {
-            let mut activations = activations.borrow_mut();
-            activations.slots[(self.token - FIRST_TOKEN) as usize] = None;
-            activations.free.push(self.token);
-        });
-        self.switch_out(State::Done);
-        self.drop_import();
-        drop(self.results.take());
-        self.finish_call();
-        drop(self.store.take());
-        self.guard.leave_guest();
-        *self.result.borrow_mut() = Some(result);
-        self.wake_caller();
-    }
-
-    /// Drops the host future, with the store in reach of its destructor.
-    fn drop_import(&self) {
-        if let Some(import) = self.import.take() {
-            let _scope = PollScope::enter(self.poll_store());
-            let _mark = self.guard.mark();
-            drop(import);
-        }
-    }
 }
 
-fn activation(token: i32) -> Option<Rc<Activation>> {
-    ACTIVATIONS.with(|activations| {
-        activations
-            .borrow()
-            .slots
-            .get((token - FIRST_TOKEN) as usize)?
-            .clone()
-    })
+/// Drops a host future with its store in reach of its destructor. What
+/// JavaScript throws from there has nowhere to go.
+fn dispose(store: Option<PollStore>, future: ImportFuture) {
+    let _scope = PollScope::enter(store);
+    let mut future = Some(future);
+    let _ = boundary::catching(|| drop(future.take()));
 }
 
-/// The activation whose guest is running in the store `id`.
-fn running(id: StoreId) -> Option<Rc<Activation>> {
-    RUNNING.with(|running| {
-        let running = running.borrow();
-        running.iter().find(|activation| activation.store_id == id).cloned()
-    })
-}
-
-/// A host function's hold on the store a guest of `call_async` holds: see
-/// [`hold_running`].
+/// A host function's hold on the store of a guest of `call_async` that the
+/// engine resumed: see [`hold_running`].
 pub(crate) struct Held {
-    activation: Rc<Activation>,
-    _mark: crate::js::guard::SliceMark,
+    // Dropped in this order: the slice is of the store the handle keeps.
+    _slice: StoreSlice,
+    guard: Rc<GuestGuard>,
+    _shared: Option<SharedStore>,
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
-        self.activation.held.set(false);
+        self.guard.set_held(false);
     }
 }
 
-/// The store whose raw id is `id`, if a guest entered by `call_async` runs
-/// in it, as that guest holds it, and a hold on it: what a host function of
-/// the store runs with in a slice of the guest that JavaScript resumed, which
-/// no call lends it the store (see `lent`). An error if another host function
-/// holds it.
-///
-/// Only a guest that can be on the stack lends its store: one that runs, or
-/// whose wait the engine may still refuse. Dropping the call of either keeps
-/// the store with the activation (see `Call::drop`). A woken guest is off the
-/// stack until its microtask, and dropping its call gives the store up, which
-/// a host function holding it would go on using.
-pub(crate) fn hold_running(
-    id: usize,
-) -> Option<Result<(*mut StoreInner, Held), RuntimeError>> {
-    let activation = RUNNING.with(|running| {
-        let running = running.borrow();
-        let mut running = running.iter();
-        running.find(|activation| activation.store_id.as_raw().get() == id).cloned()
-    })?;
-    let on_stack = match activation.state.get() {
-        State::Running => true,
-        State::Waiting => !activation.accepted.get(),
-        _ => false,
-    };
-    if !on_stack {
-        return None;
-    }
+/// The store whose raw id is `id`, for one of its host functions to run with
+/// in a guest of `call_async` that the engine resumed, which no call lends
+/// the store (see `lent`), and a hold on it. `None` if no such guest runs in
+/// that store; an error if its call was dropped, or if host code holds the
+/// store already.
+pub(crate) fn hold_running(id: usize) -> Option<Result<(*mut StoreInner, Held), RuntimeError>> {
+    let activation = current(id)?;
     // The call was dropped: nothing may touch the store on its guest's behalf.
     if activation.cancelled.get() {
         return Some(Err(RuntimeError::new(
             "a host function of a guest whose call was dropped cannot use the store",
         )));
     }
-    // Before the store is reached at all: the host function that holds it
-    // goes on with its borrow.
-    if activation.held.get() {
-        return Some(Err(crate::js::lent::held()));
-    }
-    let store = activation.store_ptr()?;
-    activation.held.set(true);
-    let _mark = activation.guard.mark();
-    Some(Ok((store, Held { activation, _mark })))
+    let store = activation.store.get()?;
+    let guard = &activation.guard;
+    let slice = (!guard.is_held()).then(|| store.try_enter_slice()).flatten();
+    let Some(slice) = slice else {
+        return Some(Err(lent::held()));
+    };
+    guard.set_held(true);
+    let held = Held {
+        guard: Rc::clone(guard),
+        _shared: activation.shared.borrow().clone(),
+        _slice: slice,
+    };
+    Some(Ok((held._slice.ptr(), held)))
 }
 
 /// The error of an async host function whose guest cannot be suspended: it
@@ -946,205 +563,94 @@ fn cannot_suspend() -> JsValue {
 }
 
 /// The error of a guest the engine refused to suspend, if `error` is the
-/// engine's `WebAssembly.SuspendError`: the engine refuses before the body
-/// of an async host function runs, or after, on some engines.
+/// engine's `WebAssembly.SuspendError`.
 pub(crate) fn refusal(error: &JsValue) -> Option<RuntimeError> {
     shim_is_suspend_error(error).then(cannot_suspend_error)
 }
 
-/// The activation of a guest of the store `id` that calls an async host
-/// function: one entered by `call_async`. A guest whose call was dropped is
-/// unwound instead.
-///
-/// The engine refuses to suspend a guest that was entered by a synchronous
-/// call since, or that has any other JavaScript frame on the stack since it
-/// was entered. Some engines refuse before the body of the import runs, and
-/// others after. A guest entered by a synchronous call of this crate, or from
-/// inside a host function it made or a JavaScript function it was given,
-/// refuses itself here, before it makes a wait. Only JavaScript this crate
-/// never saw, an import of a module instantiated without it, can enter a
-/// guest that makes a wait the engine then refuses. That wait is forgotten
-/// once the guest goes on, and the store, which the activation holds until
-/// the wait is confirmed, is never given up for it, unless the guest is
-/// suspended next somewhere else before its slice is over: nothing tells
-/// that from a wait. Entering guests from such JavaScript while a guest of
-/// the store runs is not supported (see `Function::call_async`).
-fn suspendable(id: StoreId) -> Result<Rc<Activation>, JsValue> {
-    if entered_synchronously() {
-        return Err(cannot_suspend());
-    }
-    let activation = running(id).ok_or_else(cannot_suspend)?;
-    activation.forget_refused_wait();
-    if activation.cancelled.get() {
-        activation.switch_out(State::Unwinding);
-        return Err(trap_error());
-    }
-    Ok(activation)
+/// A direct call of an async host function, by `call_async`: no guest, and
+/// nothing for the engine to suspend. The body hands its host future over,
+/// and the call runs it itself.
+enum Direct {
+    /// The function is being called.
+    Called,
+    /// Its body ran: this is its host future.
+    Started(ImportFuture),
 }
 
 /// The body of an async host function of the store `id`. Returns the promise
-/// the guest waits on; nothing of the host function runs here.
+/// its guest waits on; nothing of the host function runs here.
+///
+/// A guest that was entered synchronously cannot be suspended, and some
+/// engines run this body before they refuse to: it refuses first. Synchronous
+/// calls of this crate mark the guest they enter, and so do its host
+/// functions for whatever they run.
 pub(crate) fn start(
     id: StoreId,
     import: impl FnOnce() -> ImportFuture,
 ) -> Result<JsValue, JsValue> {
-    let activation = match DIRECT.with(|direct| direct.borrow_mut().take()) {
-        Some(activation) if activation.store_id == id => activation,
-        Some(_) => return Err(Trap::user(Box::new(foreign_store_error())).into()),
-        None => suspendable(id)?,
-    };
-    *activation.import.borrow_mut() = Some(import());
-    Ok(activation.wait())
-}
-
-/// The microtask after the slice in which a guest started its `wait`th wait:
-/// by then the guest has left the stack. If it still waits there, the engine
-/// suspended it: the store is given up, and what the guest waits for is
-/// driven at once. The promise of a guest that was refused and returned has
-/// settled by then.
-fn check(token: i32, wait: i32) {
-    let Some(activation) = activation(token) else {
-        return;
-    };
-    if activation.waits.get() != wait as u32
-        || activation.state.get() != State::Waiting
-        || activation.accepted.get()
-    {
-        return;
+    if DIRECT.with(|direct| direct.borrow().is_some()) {
+        DIRECT.with(|direct| *direct.borrow_mut() = Some(Direct::Started(import())));
+        return Ok(JsValue::UNDEFINED);
     }
-    if activation.cancelled.get() {
-        // The call was dropped before it was known that the engine had
-        // suspended the guest: it is unwound now that it is.
-        activation.accepted.set(true);
-        return activation.unwind();
+    if entered_synchronously() {
+        return Err(cannot_suspend());
     }
-    activation.accept();
-    let caller = activation.caller.borrow().clone();
-    match caller {
-        Some(caller) => activation.drive(&mut Context::from_waker(&caller), true),
-        None => activation.wake_caller(),
+    let activation = current(id.as_raw().get()).ok_or_else(cannot_suspend)?;
+    // A guest whose call is over is unwound instead.
+    if activation.cancelled.get() || activation.store.get().is_none() {
+        return Err(trap_error());
     }
-}
-
-/// The microtask that wakes a guest woken a microtask later (see
-/// [`Activation::wake`]) resolved its promise: nothing stops the engine
-/// resuming it now, and it runs, with its store, from here on.
-fn woken(token: i32) {
-    if let Some(activation) = activation(token)
-        && activation.state.get() == State::Woken
-    {
-        activation.state.set(State::Running);
-    }
-}
-
-/// The reaction on the promise of every guest: `token` says whose it is.
-fn done(token: i32, rejected: i32, value: JsValue) {
-    if let Some(activation) = activation(token) {
-        activation.retire(if rejected == 0 { Ok(value) } else { Err(value) });
-    }
-}
-
-/// Makes the error of a trap, the first time: compiling its module is the one
-/// thing an unwind needs that can fail.
-fn prepare_trap() -> Result<(), JsValue> {
-    if !TRAP_READY.get() {
-        shim_prepare_trap()?;
-        TRAP_READY.set(true);
-    }
-    Ok(())
-}
-
-/// What a call returns.
-pub(crate) enum Returned {
-    /// What the promise of the guest settled with.
-    Guest(JsValue),
-    /// What the host function of a direct call returned.
-    Host(Vec<Value>),
+    Ok(activation.wait_for(import()))
 }
 
 /// The caller's side of an activation. Dropping it cancels the call.
-pub(crate) struct Call(Rc<Activation>);
+struct Call(Rc<Activation>);
 
 impl Call {
-    /// Enters a guest of `store` through `enter`, which calls a promising
-    /// function. The guest runs with `slice`, the store for its first slice.
-    ///
-    /// With `direct`, `enter` calls an async host function itself, which
-    /// returns the promise it waits on as a guest would.
-    ///
-    /// The error of a trap, which unwinds a guest, is made first: the call
-    /// fails without entering anything if it cannot be, or if calls nest too
-    /// deeply on the thread already (see `lent`).
+    /// Enters a guest of the store `store` through `enter`, which calls a
+    /// promising function. The guest's first slice runs here, with `slice`
+    /// lent to its host functions as a synchronous call lends its store.
     fn enter(
         store_id: StoreId,
-        store: ActivationStore,
-        guard: Rc<GuestGuard>,
+        store: PollStore,
         slice: StoreSlice,
-        direct: bool,
         enter: impl FnOnce() -> Result<JsValue, JsValue>,
     ) -> Self {
-        let exclusive = store.poll.is_exclusive();
-        SHIM.with(|_| ());
-        let activation = ACTIVATIONS.with(|activations| {
-            let mut activations = activations.borrow_mut();
-            let token = activations.free.pop().unwrap_or_else(|| {
-                activations.slots.push(None);
-                activations.slots.len() as i32 - 1 + FIRST_TOKEN
-            });
-            let activation = Rc::new(Activation {
-                token,
-                store_id,
-                direct,
-                state: Cell::new(State::Running),
-                cancelled: Cell::new(false),
-                store: RefCell::new(Some(store)),
-                guard: guard.clone(),
-                counted: Cell::new(exclusive),
-                slice: RefCell::new(None),
-                import: RefCell::new(None),
-                results: RefCell::new(None),
-                returned: RefCell::new(None),
-                error: RefCell::new(None),
-                result: RefCell::new(None),
-                caller: RefCell::new(None),
-                entering: Cell::new(true),
-                waits: Cell::new(0),
-                accepted: Cell::new(false),
-                driving: Cell::new(false),
-                redrive: Cell::new(false),
-                held: Cell::new(false),
-            });
-            activations.slots[(token - FIRST_TOKEN) as usize] = Some(activation.clone());
-            activation
-        });
-        guard.enter_guest();
-        if exclusive {
+        let guard = store.keeper().unwrap_js().0;
+        let counted = store.is_exclusive();
+        if counted {
             guard.begin_call();
         }
-        activation.switch_in(slice);
-        // A promising function returns a promise, or throws before it enters
-        // the guest. The reaction is attached here, before anything else can
-        // run: a rejection nobody handles ends the process on some hosts.
-        let store_ptr = activation.store_ptr().expect("the activation holds its store");
-        let lent = prepare_trap()
-            .map_err(|error| {
-                RuntimeError::new(format!(
-                    "the error of a trap, which unwinds a guest, cannot be made: {}",
-                    RuntimeError::from(error).message()
-                ))
-            })
-            .and_then(|()| crate::js::lent::lend_raw(store_id, store_ptr));
-        let entered = match lent {
-            // The first slice of the guest runs here, with the store lent to
-            // its host functions as the activation holds it.
+        let activation = Rc::new(Activation {
+            store_id,
+            guard,
+            store: Cell::new(Some(store)),
+            shared: RefCell::new(store.shared()),
+            counted: Cell::new(counted),
+            cancelled: Cell::new(false),
+            done: Cell::new(false),
+            wait: RefCell::new(None),
+            waits: Cell::new(0),
+            error: RefCell::new(None),
+            result: RefCell::new(None),
+            caller: RefCell::new(None),
+            resumed: RefCell::new(None),
+        });
+        let entered = match lent::lend_raw(store_id, slice.ptr()) {
             Ok(_lent) => {
-                let _mark = guard.mark();
+                // A sync host function of this guest holds the store, and
+                // must not find it published for a host future as well.
+                let _hidden = PollScope::enter(None);
                 let _entered = enter_async();
-                if direct {
-                    DIRECT.with(|slot| *slot.borrow_mut() = Some(activation.clone()));
-                }
+                let before = set_current(&activation);
                 let entered = enter();
-                DIRECT.with(|slot| slot.borrow_mut().take());
+                // A guest this call was made in, from a host function, goes
+                // on. With none, this one stays: it may be suspended where
+                // this module does not see it resumed.
+                if let Some(before) = before {
+                    set_current(&before);
+                }
                 entered
             }
             Err(error) => {
@@ -1152,47 +658,41 @@ impl Call {
                 Err(JsValue::UNDEFINED)
             }
         };
+        // The guest left the stack.
+        drop(slice);
         match entered {
-            Ok(promise) => shim_settle(&promise, activation.token),
+            // A promising function returns a promise, or throws before it
+            // enters the guest. The reaction is attached here, before
+            // anything else can run: a rejection nobody handles ends the
+            // process on some hosts.
+            Ok(promise) => {
+                let this = Rc::clone(&activation);
+                let done = Closure::once_into_js(move |rejected: bool, value: JsValue| {
+                    this.retire(if rejected { Err(value) } else { Ok(value) });
+                });
+                shim_settle(&promise, &done);
+            }
             Err(error) => activation.retire(Err(error)),
         }
-        // No engine is involved in calling a host function directly, so it
-        // waits: what it waits for is driven from the first poll. A guest
-        // that waits is looked at once its slice is over: an engine may have
-        // refused to suspend it after the import ran. A guest that returned
-        // keeps its store until its promise settles.
-        if direct && activation.state.get() == State::Waiting {
-            activation.accept();
-        }
-        activation.entering.set(false);
         Self(activation)
     }
 }
 
 impl Future for Call {
-    type Output = Result<Returned, RuntimeError>;
+    type Output = Result<JsValue, RuntimeError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let activation = &self.0;
-        {
-            let mut caller = activation.caller.borrow_mut();
-            if !caller.as_ref().is_some_and(|caller| caller.will_wake(cx.waker())) {
-                *caller = Some(cx.waker().clone());
-            }
-        }
-        activation.drive(cx, false);
-        let Some(result) = activation.result.take() else {
-            return Poll::Pending;
-        };
-        activation.finish_call();
-        Poll::Ready(match result {
-            Ok(value) => Ok(match activation.returned.take() {
-                Some(values) => Returned::Host(values),
-                None => Returned::Guest(value),
-            }),
+        if let Some(result) = activation.result.take() {
             // The trap of a failed host function stands for its error.
-            Err(error) => Err(activation.error.take().unwrap_or_else(|| error.into())),
-        })
+            let error = |error: JsValue| activation.error.take().unwrap_or_else(|| error.into());
+            return Poll::Ready(result.map_err(error));
+        }
+        let mut caller = activation.caller.borrow_mut();
+        if !caller.as_ref().is_some_and(|caller| caller.will_wake(cx.waker())) {
+            *caller = Some(cx.waker().clone());
+        }
+        Poll::Pending
     }
 }
 
@@ -1200,50 +700,59 @@ impl Drop for Call {
     fn drop(&mut self) {
         let activation = &self.0;
         drop(activation.caller.take());
-        activation.finish_call();
-        // Whether the engine suspended a guest that waits is known only once
-        // its slice is over: until then it may be running on, refused, and
-        // keeps its store. `check` unwinds it if it was suspended.
-        let unconfirmed = activation.state.get() == State::Waiting && !activation.accepted.get();
-        match activation.state.get() {
-            State::Done => return,
-            // The guest will not run again: it is woken with a trap, also if
-            // it was about to be given its results. So the host future goes
-            // now, and with it everything that keeps the store from being
-            // taken back.
-            State::Waiting if !unconfirmed => activation.unwind(),
-            State::Woken if shim_cancel_wake(activation.token) => activation.unwind(),
-            // A guest that was given its results is running, and goes on
-            // until it leaves the stack or calls an async import, which traps.
-            State::Woken => activation.state.set(State::Running),
-            _ => {}
+        if activation.done.get() {
+            return;
         }
+        // A guest suspended in an async import is unwound. One the engine
+        // resumed already runs on until its next import, which fails.
         activation.cancelled.set(true);
-        if activation.state.get() == State::Running || unconfirmed {
-            // The engine can no longer be stopped from running this guest.
-            // Its host functions now fail without touching the store, which
-            // is usable at once. A new guest waits for this one to leave.
-            drop(activation.slice.take());
-            if running(activation.store_id).is_some_and(|other| Rc::ptr_eq(&other, activation)) {
-                activation.guard.mark_cancelled();
+        activation.cancel_wait();
+        activation.release();
+    }
+}
+
+/// The host future of an async host function that `call_async` calls
+/// directly, run by the future of that call.
+struct HostCall<'s, 'a> {
+    store: &'s CallStore<'a>,
+    future: Option<ImportFuture>,
+}
+
+impl Future for HostCall<'_, '_> {
+    type Output = Result<Vec<Value>, RuntimeError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let store = self.store.resolve();
+        let mut future = self.future.take().expect("polled after it finished");
+        let outcome = {
+            let _scope = PollScope::enter(Some(store));
+            boundary::catching(|| future.as_mut().poll(cx))
+        };
+        match outcome {
+            Ok(Poll::Pending) => {
+                self.future = Some(future);
+                Poll::Pending
             }
-        } else {
-            drop(activation.store.take());
+            Ok(Poll::Ready(result)) => {
+                dispose(Some(store), future);
+                Poll::Ready(result)
+            }
+            Err(error) => {
+                // Left part way through: it can be neither resumed nor
+                // dropped.
+                std::mem::forget(future);
+                Poll::Ready(Err(error.into()))
+            }
         }
     }
 }
 
-/// Waits until no guest is on the stack of this store.
-async fn guest_left(guard: &GuestGuard) {
-    std::future::poll_fn(|cx| {
-        if guard.is_free() {
-            Poll::Ready(())
-        } else {
-            guard.wait(cx.waker());
-            Poll::Pending
+impl Drop for HostCall<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(future) = self.future.take() {
+            dispose(self.store.try_resolve(), future);
         }
-    })
-    .await
+    }
 }
 
 /// `Function::call_async` on this backend.
@@ -1258,104 +767,88 @@ pub(crate) async fn call<'a, X: 'static>(
     } = request;
     let handle = function.as_js().handle.clone();
     let id = store.id();
-    // A host function reaches the store it was made for, which may be gone,
-    // through a pointer: it runs with that store only.
+    // A host function runs with the store it was made for only.
     if !belongs_to(&handle.function, id) {
         return Err(foreign_store_error());
     }
-    let poll = store.try_resolve().unwrap_or_else(|| store.resolve());
-    let guard = poll.guard();
-    guest_left(&guard).await;
 
     // The store, for the slice that converts the arguments and enters.
     let poll = store.resolve();
     let slice = poll.enter_slice();
-    let mark = guard.mark();
     // Safety: the slice is the only holder of the store until it is dropped.
     let mut store_mut = unsafe { StoreMut::from_raw(slice.ptr()) };
     let params = params(&mut store_mut)?;
     // As on other backends: an async host function, which this calls
     // directly, could not take them, and nothing converts them.
     let signature = &handle.ty;
-    if params.len() != signature.params().len()
-        || params
-            .iter()
-            .zip(signature.params())
-            .any(|(param, ty)| param.ty() != *ty)
-    {
+    if !crate::js::function::values_match(&params, signature.params()) {
         let types: Vec<String> = params.iter().map(|param| param.ty().to_string()).collect();
         return Err(RuntimeError::new(format!(
             "Parameters of type [{}] did not match signature {signature}",
             types.join(", "),
         )));
     }
-    if !enters_a_guest(&handle.function) {
-        // JavaScript that runs to the end: a host function, or one an
-        // embedder gave. It is called as `call` calls it.
-        let results = function.call(&mut store_mut, &params)?;
-        return finish(&mut store_mut, &results);
-    }
     let arguments = Array::new_with_length(params.len() as u32);
     for (index, param) in params.iter().enumerate() {
         arguments.set(index as u32, param.as_jsvalue(&store_mut));
     }
-    let promising = handle.promising().map_err(RuntimeError::from)?;
-    let direct = AsRef::<JsValue>::as_ref(&promising) == AsRef::<JsValue>::as_ref(&*handle.function);
-    drop(mark);
 
-    // The guest runs with the store, in this span and in every later one.
-    // Dropping this future while it waits cancels the call.
-    let activation_store = ActivationStore {
-        poll,
-        _shared: poll.shared(),
+    let results: Vec<Value> = if shim_is_host(&handle.function) {
+        // An async host function: its body hands its host future over, and
+        // this call runs it. Its results are what it returned, as they are.
+        DIRECT.with(|direct| *direct.borrow_mut() = Some(Direct::Called));
+        let called = Reflect::apply(&handle.function, &JsValue::NULL, &arguments);
+        let started = DIRECT.with(|direct| direct.borrow_mut().take());
+        called?;
+        let Some(Direct::Started(future)) = started else {
+            unreachable!("the body of an async host function runs when it is called");
+        };
+        drop(slice);
+        let future = Some(future);
+        let values = HostCall { store: &store, future }.await?;
+        // They were checked against the signature the host function was made
+        // with; this handle may give it another (`Function::from_jsvalue`),
+        // by which its caller reads them.
+        if !crate::js::function::values_match(&values, signature.results()) {
+            let types: Vec<String> = values.iter().map(|value| value.ty().to_string()).collect();
+            return Err(RuntimeError::new(format!(
+                "an async host function returned values of type [{}], which do not match \
+                 the signature it is called with, {signature}",
+                types.join(", "),
+            )));
+        }
+        values
+    } else if let Some(promising) = handle.promising() {
+        // A guest. Dropping this future while it waits cancels the call.
+        let enter = || Reflect::apply(&promising, &JsValue::NULL, &arguments);
+        let result = Call::enter(id, poll, slice, enter).await?;
+        let slice = store.resolve().enter_slice();
+        // Safety: as above.
+        let mut store_mut = unsafe { StoreMut::from_raw(slice.ptr()) };
+        let types = signature.results();
+        match types.len() {
+            0 => Vec::new(),
+            1 => vec![js_value_to_wasmer(&mut store_mut, &types[0], &result)],
+            _ => {
+                let result: Array = result.into();
+                let types = types.iter().enumerate();
+                types
+                    .map(|(index, ty)| {
+                        js_value_to_wasmer(&mut store_mut, ty, &result.get(index as u32))
+                    })
+                    .collect()
+            }
+        }
+    } else {
+        // JavaScript that runs to the end: a host function, or one an
+        // embedder gave. It is called as `call` calls it.
+        let results = function.call(&mut store_mut, &params)?;
+        return finish(&mut store_mut, &results);
     };
-    let returned = Call::enter(id, activation_store, guard.clone(), slice, direct, || {
-        Reflect::apply(&promising, &JsValue::NULL, &arguments)
-    })
-    .await?;
 
-    guest_left(&guard).await;
     let slice = store.resolve().enter_slice();
-    let _mark = guard.mark();
     // Safety: as above.
     let mut store_mut = unsafe { StoreMut::from_raw(slice.ptr()) };
-    let results: Vec<Value> = match returned {
-        // What an async host function called directly returned, as it
-        // returned it. That was checked against the signature the host
-        // function was made with; this handle may give it another
-        // (`Function::from_jsvalue`), by which its caller reads them.
-        Returned::Host(values) => {
-            let expected = handle.ty.results();
-            if !crate::js::function::values_match(&values, expected) {
-                let types: Vec<String> =
-                    values.iter().map(|value| value.ty().to_string()).collect();
-                return Err(RuntimeError::new(format!(
-                    "an async host function returned values of type [{}], which do not \
-                     match the signature it is called with, {}",
-                    types.join(", "),
-                    handle.ty,
-                )));
-            }
-            values
-        }
-        Returned::Guest(result) => {
-            let types = handle.ty.results();
-            match types.len() {
-                0 => Vec::new(),
-                1 => vec![js_value_to_wasmer(&mut store_mut, &types[0], &result)],
-                _ => {
-                    let result: Array = result.into();
-                    types
-                        .iter()
-                        .enumerate()
-                        .map(|(index, ty)| {
-                            js_value_to_wasmer(&mut store_mut, ty, &result.get(index as u32))
-                        })
-                        .collect()
-                }
-            }
-        }
-    };
     finish(&mut store_mut, &results)
 }
 
@@ -1370,11 +863,8 @@ pub(crate) fn is_supported() -> bool {
 }
 
 /// The function `call_async` calls to enter `function`: its promising form,
-/// or, for an async host function, the function itself.
-pub(crate) fn promising(function: &Function) -> Result<Function, JsValue> {
-    if shim_is_host(function) {
-        return Ok(function.clone());
-    }
+/// made once. `None` for a function that is not a WebAssembly one.
+pub(crate) fn promising(function: &Function) -> Option<Function> {
     shim_promising(function)
 }
 
@@ -1392,16 +882,13 @@ mod tests {
             .unwrap();
     }
 
-    /// The activations there are, and how many of them hold their store.
-    fn live() -> (usize, usize) {
-        let activations =
-            ACTIVATIONS.with(|activations| activations.borrow().slots.iter().flatten().count());
-        (activations, RUNNING.with(|running| running.borrow().len()))
+    /// The guests this module takes for running.
+    fn running() -> usize {
+        CURRENT.with(|current| current.borrow().len())
     }
 
-    /// However a call ends, nothing of it stays in this module's state, and
-    /// its token is used again. A call that never waits holds its store until
-    /// the engine has settled its promise.
+    /// However a call ends, nothing of it stays in this module's state.
+    #[cfg(feature = "wat")]
     #[wasm_bindgen_test]
     async fn a_call_that_ended_leaves_nothing_behind() {
         let mut store = Store::default();
@@ -1421,126 +908,47 @@ mod tests {
                 Ok(vec![])
             },
         );
-        let ready = Function::new_typed_async(
-            &mut store,
-            &env,
-            async |_: &mut crate::AsyncEnv<()>| 7,
-        );
+        let module = crate::Module::new(
+            &store,
+            r#"(module
+              (import "h" "f" (func $f (param i32)))
+              (func (export "run") (param i32) (call $f (local.get 0))))"#,
+        )
+        .unwrap();
+        let imports = crate::imports! { "h" => { "f" => host.clone() } };
+        let instance = crate::Instance::new(&mut store, &module, &imports).unwrap();
+        let run = instance.exports.get_function("run").unwrap().clone();
         let store = store.into_shared();
-        assert_eq!(live(), (0, 0));
+        assert_eq!(running(), 0);
 
-        for round in 0..2 {
-            let call = |fail: i32| {
-                Box::pin(host.call_async(&mut store.clone(), &[Value::I32(fail)]))
-            };
+        for function in [&run, &host] {
+            let call =
+                |fail: i32| Box::pin(function.call_async(&mut store.clone(), &[Value::I32(fail)]));
 
             // Returns.
-            let mut returning = call(0);
-            let mut cx = Context::from_waker(Waker::noop());
-            assert!(returning.as_mut().poll(&mut cx).is_pending());
-            assert_eq!(live(), (1, 0), "round {round}: suspended, the store is free");
-            returning.await.unwrap();
-            assert_eq!(live(), (0, 0), "round {round}: returned");
+            call(0).await.unwrap();
+            assert_eq!(running(), 0, "returned");
 
             // Fails.
-            call(1).await.unwrap_err();
-            assert_eq!(live(), (0, 0), "round {round}: failed");
+            let error = call(1).await.unwrap_err();
+            assert!(error.message().contains("failed"), "{error}");
+            assert_eq!(running(), 0, "failed");
 
-            // Is cancelled: its guest is still to be unwound.
+            // Is cancelled: its guest is unwound in a microtask.
             let mut cancelled = call(0);
+            let mut cx = Context::from_waker(Waker::noop());
             assert!(cancelled.as_mut().poll(&mut cx).is_pending());
             drop(cancelled);
-            assert_eq!(live(), (1, 0), "round {round}: cancelled");
             for _ in 0..3 {
                 tick().await;
             }
-            assert_eq!(live(), (0, 0), "round {round}: unwound");
+            assert_eq!(running(), 0, "cancelled");
 
             // Cannot be suspended.
-            store
-                .try_with(|mut lock| host.call(&mut lock, &[Value::I32(0)]).unwrap_err())
-                .unwrap();
-            assert_eq!(live(), (0, 0), "round {round}: refused");
+            let refused = store.try_with(|mut lock| function.call(&mut lock, &[Value::I32(0)]));
+            refused.unwrap().unwrap_err();
+            assert_eq!(running(), 0, "refused");
         }
-        let tokens = ACTIVATIONS.with(|activations| activations.borrow().slots.len());
-        assert_eq!(tokens, 1, "tokens are not used again");
-
-        // Ready at once: given its results in a microtask, with its store.
-        let mut call = Box::pin(ready.call_async(&mut store.clone(), &[]));
-        let mut cx = Context::from_waker(Waker::noop());
-        assert!(call.as_mut().poll(&mut cx).is_pending());
-        assert_eq!(live(), (1, 1), "returned without waiting");
-        assert_eq!(call.await.unwrap().to_vec(), [Value::I32(7)]);
-        assert_eq!(live(), (0, 0));
-    }
-
-    #[wasm_bindgen(inline_js = r#"
-    let compile;
-    export function denyCompilation(deny) {
-      if (deny) {
-        compile = WebAssembly.Module;
-        WebAssembly.Module = function () {
-          throw new WebAssembly.CompileError("compilation denied");
-        };
-      } else {
-        WebAssembly.Module = compile;
-      }
-    }
-    "#)]
-    extern "C" {
-        /// Has `new WebAssembly.Module` throw, as in a host that compiled the
-        /// guest and refuses to compile anything since, or not.
-        #[wasm_bindgen(js_name = denyCompilation)]
-        fn deny_compilation(deny: bool);
-    }
-
-    /// A host may refuse to compile WebAssembly once the guest is compiled.
-    /// The error of a trap, which unwinds a guest, is then made before a call
-    /// enters anything, and a call that cannot make it fails there, with its
-    /// store free, rather than when its guest has to be unwound, as one whose
-    /// host function fails does, past every handler.
-    #[cfg(feature = "wat")]
-    #[wasm_bindgen_test]
-    async fn a_call_that_cannot_make_a_trap_fails_before_it_enters() {
-        let mut store = Store::default();
-        let ty = FunctionType::new([], []);
-        let env = crate::FunctionEnv::new(&mut store, ());
-        let fail = Function::new_async(
-            &mut store,
-            &env,
-            ty,
-            async |_: &mut crate::AsyncEnv<()>, _: &[Value]| {
-                tick().await;
-                Err(RuntimeError::new("failed"))
-            },
-        );
-        let module = crate::Module::new(
-            &store,
-            r#"(module (import "h" "f" (func $f)) (func (export "run") (call $f)))"#,
-        )
-        .unwrap();
-        let imports = crate::imports! { "h" => { "f" => fail.clone() } };
-        let instance = crate::Instance::new(&mut store, &module, &imports).unwrap();
-        let run = instance.exports.get_function("run").unwrap().clone();
-        let mut store = store.into_shared();
-
-        shim_forget_trap();
-        TRAP_READY.set(false);
-        deny_compilation(true);
-        let through_guest = run.call_async(&mut store, &[]).await;
-        let direct = fail.call_async(&mut store, &[]).await;
-        deny_compilation(false);
-        for result in [through_guest, direct] {
-            let error = result.unwrap_err();
-            assert!(error.message().contains("cannot be made"), "{error}");
-            assert!(error.message().contains("compilation denied"), "{error}");
-        }
-        assert_eq!(live(), (0, 0));
-
-        // The host compiles again: the guest fails as its host function does.
-        let error = run.call_async(&mut store, &[]).await.unwrap_err();
-        assert!(error.message().contains("failed"), "{error}");
-        assert!(!error.message().contains("cannot be made"), "{error}");
         assert!(store.into_store().is_ok());
     }
 
