@@ -267,3 +267,49 @@ fn a_forgotten_call_on_an_exited_thread_is_not_signalled() -> Result<()> {
     ));
     Ok(())
 }
+
+/// A waker is the caller's: its destructor is user code, and may panic. A
+/// call dropped while its guest waits drops the waker it registered last,
+/// when nothing of the call is left to put in order, so the panic leaves the
+/// store usable.
+#[test]
+fn a_waker_whose_destructor_panics_leaves_a_cancelled_call_in_order() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use wasmer::{AsyncEnv, FunctionEnv};
+
+    struct PanicOnDrop;
+    impl Wake for PanicOnDrop {
+        fn wake(self: Arc<Self>) {}
+    }
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("waker destructor panic");
+        }
+    }
+
+    let mut store = Store::default();
+    let env = FunctionEnv::new(&mut store, ());
+    let wait = Function::new_typed_async(&mut store, &env, async |_: &mut AsyncEnv<()>| {
+        std::future::pending::<()>().await;
+    });
+    let module = Module::new(
+        &store,
+        r#"(module
+          (import "h" "wait" (func $wait))
+          (func (export "run") call $wait)
+          (func (export "plain")))"#,
+    )
+    .unwrap();
+    let imports = imports! { "h" => { "wait" => wait } };
+    let instance = Instance::new(&mut store, &module, &imports).unwrap();
+    let run = instance.exports.get_function("run").unwrap();
+    let waker = Waker::from(Arc::new(PanicOnDrop));
+    let mut call = Box::pin(run.call_async(&mut store, &[]));
+    let poll = call.as_mut().poll(&mut Context::from_waker(&waker));
+    assert!(poll.is_pending());
+    // The call holds the last handle to the waker now.
+    drop(waker);
+    assert!(catch_unwind(AssertUnwindSafe(|| drop(call))).is_err());
+    let plain = instance.exports.get_function("plain").unwrap();
+    plain.call(&mut store, &[]).unwrap();
+}

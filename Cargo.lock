@@ -4682,7 +4682,6 @@ dependencies = [
  "bindgen",
  "bytes",
  "cmake",
- "corosensei",
  "crossbeam-channel",
  "crossbeam-skiplist",
  "dashmap",

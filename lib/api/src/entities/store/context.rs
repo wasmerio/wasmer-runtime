@@ -14,10 +14,9 @@
 //! a nested entry's borrows are children of the borrow its caller still
 //! holds. Only the top entry is ever used.
 //!
-//! A suspended `call_async` takes its entries with it: the switch to its
-//! coroutine puts them back, and the switch away takes them off, so a call
-//! never finds another call's entries, whichever order they resume in. See
-//! `sys::async_runtime`.
+//! A `call_async` installs its entry for as long as its guest runs, and takes
+//! it off when the guest waits or returns, so a call never finds another
+//! call's entries, whichever order they resume in. See `sys::async_runtime`.
 
 use std::cell::RefCell;
 
@@ -71,63 +70,6 @@ impl StoreContext {
                 top.borrow_count = borrow_count;
             }
         });
-    }
-
-    /// Whether the thread still has what unwinding a call suspended in Wasm
-    /// needs of it: false once its thread locals are being destroyed, as it
-    /// exits, and always with `baremetal`. A call suspended then is forgotten
-    /// rather than unwound.
-    #[cfg(all(feature = "sys", feature = "experimental-async"))]
-    pub(crate) fn thread_can_unwind() -> bool {
-        // With `baremetal`, what a guest frame raises leaves through the
-        // embedder's unwinder, which would take the unwind of a suspended
-        // coroutine off its stack: such a coroutine is forgotten instead.
-        !cfg!(feature = "baremetal")
-            && STORE_CONTEXT_STACK.try_with(|_| ()).is_ok()
-            && wasmer_vm::ActivationState::thread_is_usable()
-    }
-
-    /// Puts the entries of a suspended call back on the thread, on top of
-    /// whatever runs there, and returns where they start.
-    ///
-    /// `store` is the pointer the call holds for this slice. It replaces the
-    /// entries' own, which were derived before other code last used the
-    /// store. It is `None` when the coroutine is being discarded: that never
-    /// touches the store, so the old pointers are only compared.
-    #[cfg(all(feature = "sys", feature = "experimental-async"))]
-    pub(crate) fn resume_entries(entries: &mut Vec<Self>, store: Option<*mut StoreInner>) -> usize {
-        STORE_CONTEXT_STACK.with(|cell| {
-            let mut stack = cell.borrow_mut();
-            let base = stack.len();
-            stack.extend(entries.drain(..).map(|mut entry| {
-                if let Some(store) = store {
-                    entry.ptr = store;
-                }
-                entry
-            }));
-            base
-        })
-    }
-
-    /// Takes the entries of a call off the thread again: everything above
-    /// `base`. Never panics, because it runs while a panic may be unwinding.
-    #[cfg(all(feature = "sys", feature = "experimental-async"))]
-    pub(crate) fn suspend_entries(entries: &mut Vec<Self>, base: usize) {
-        let _ = STORE_CONTEXT_STACK.try_with(|cell| {
-            if let Ok(mut stack) = cell.try_borrow_mut()
-                && base <= stack.len()
-            {
-                entries.extend(stack.drain(base..));
-            }
-        });
-    }
-
-    /// Whether a coroutine whose entries start at `base` can suspend: it has
-    /// its own call's entry and nothing above it. Another entry belongs to a
-    /// synchronous call made by a host frame, which must not be parked.
-    #[cfg(all(feature = "sys", feature = "experimental-async"))]
-    pub(crate) fn can_suspend(base: usize) -> bool {
-        STORE_CONTEXT_STACK.with(|cell| cell.borrow().len() == base + 1)
     }
 
     /// Install `store_ptr` as this thread's executing store until the returned
@@ -505,58 +447,5 @@ mod unwinding {
             assert!(StoreContext::try_get_lent(id).is_some());
         });
         assert!(StoreContext::try_get_lent(id).is_none());
-    }
-}
-
-/// What a `call_async` switch does with the entries of its coroutine.
-#[cfg(all(test, feature = "sys", feature = "experimental-async"))]
-mod suspended {
-    use super::*;
-    use crate::{AsStoreMut, Store};
-
-    fn depth() -> usize {
-        STORE_CONTEXT_STACK.with(|cell| cell.borrow().len())
-    }
-
-    #[test]
-    fn a_suspended_call_takes_its_entry_with_it() {
-        let mut store = Store::default();
-        let id = store.id();
-        let ptr: *mut StoreInner = store.as_store_mut().inner;
-        let mut saved = Vec::new();
-
-        let base = StoreContext::resume_entries(&mut saved, Some(ptr));
-        assert!(!StoreContext::can_suspend(base), "nothing entered yet");
-        let guard = unsafe { StoreContext::install(ptr) };
-        assert!(StoreContext::can_suspend(base));
-        StoreContext::suspend_entries(&mut saved, base);
-        assert_eq!((depth(), saved.len()), (base, 1));
-
-        // Another store runs meanwhile, and the call resumes on top of it.
-        let mut other = Store::default();
-        let other_ptr: *mut StoreInner = other.as_store_mut().inner;
-        let other_guard = unsafe { StoreContext::install(other_ptr) };
-        let base = StoreContext::resume_entries(&mut saved, Some(ptr));
-        assert_eq!(depth(), base + 1);
-        assert_eq!(unsafe { StoreContext::get_current_transient(id) }, ptr);
-        drop(guard);
-        StoreContext::suspend_entries(&mut saved, base);
-        assert!(saved.is_empty());
-        drop(other_guard);
-    }
-
-    /// A synchronous call made by a host frame cannot be suspended.
-    #[test]
-    fn only_the_calls_own_entry_can_suspend() {
-        let mut store = Store::default();
-        let ptr: *mut StoreInner = store.as_store_mut().inner;
-        let base = StoreContext::resume_entries(&mut Vec::new(), None);
-        let outer = unsafe { StoreContext::install(ptr) };
-        assert!(StoreContext::can_suspend(base));
-        let nested = unsafe { StoreContext::install(ptr) };
-        assert!(!StoreContext::can_suspend(base));
-        drop(nested);
-        assert!(StoreContext::can_suspend(base));
-        drop(outer);
     }
 }

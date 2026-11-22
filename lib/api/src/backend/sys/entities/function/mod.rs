@@ -7,7 +7,7 @@ pub(crate) mod typed;
 use crate::{
     AsyncEnv,
     entities::function::async_host::HostFuture,
-    sys::async_runtime::{AsyncRuntimeError, block_on_host_future},
+    sys::async_runtime::{HostWait, take_host_result, wait_for_host_future},
 };
 use crate::{
     BackendFunction, CallWrapper, FunctionEnv, FunctionEnvMut, FunctionType, HostFunction,
@@ -425,6 +425,46 @@ impl Function {
         Ok(())
     }
 
+    /// What `call_async` needs to enter the function on a stack of its own:
+    /// its parts, and `params` as its trampoline takes them.
+    #[cfg(feature = "experimental-async")]
+    pub(crate) fn raw_entry(
+        &self,
+        store: &mut impl AsStoreMut,
+        params: &[Value],
+    ) -> Result<RawEntry, RuntimeError> {
+        let signature = self.ty(store);
+        let types = |values: &[Value]| {
+            let types = values.iter().map(|value| value.ty().to_string());
+            types.collect::<Vec<String>>().join(", ")
+        };
+        if signature.params().len() != params.len()
+            || params.iter().zip(signature.params()).any(|(param, ty)| param.ty() != *ty)
+        {
+            return Err(RuntimeError::new(format!(
+                "Parameters of type [{}] did not match signature {signature}",
+                types(params),
+            )));
+        }
+        if params.iter().any(|param| !param.is_from_store(store)) {
+            return Err(RuntimeError::new("cross-`Store` values are not supported"));
+        }
+        let mut values =
+            vec![RawValue { i32: 0 }; max(params.len(), signature.results().len())];
+        for (param, slot) in params.iter().zip(&mut values) {
+            *slot = param.as_raw(store);
+        }
+        let function = self.handle.get(store.objects_mut().as_sys());
+        let anyfunc = unsafe { function.anyfunc.as_ptr().as_ref() };
+        Ok(RawEntry {
+            vmctx: anyfunc.vmctx,
+            trampoline: anyfunc.call_trampoline,
+            callee: anyfunc.func_ptr,
+            values,
+            results: signature.results().to_vec(),
+        })
+    }
+
     pub(crate) fn result_arity(&self, store: &impl AsStoreRef) -> usize {
         self.ty(store).results().len()
     }
@@ -591,6 +631,18 @@ fn finalize_dynamic_call(
     }
 }
 
+/// See [`Function::raw_entry`].
+#[cfg(feature = "experimental-async")]
+pub(crate) struct RawEntry {
+    pub(crate) vmctx: wasmer_vm::VMFunctionContext,
+    pub(crate) trampoline: VMTrampoline,
+    pub(crate) callee: *const wasmer_vm::VMFunctionBody,
+    /// The arguments, which the trampoline overwrites with the results.
+    pub(crate) values: Vec<RawValue>,
+    /// The types of the results.
+    pub(crate) results: Vec<wasmer_types::Type>,
+}
+
 pub(crate) enum HostCallOutcome {
     Ready(Result<Vec<Value>, RuntimeError>),
     #[cfg(feature = "experimental-async")]
@@ -618,33 +670,52 @@ where
         this: &mut VMDynamicFunctionContext<Self>,
         values_vec: *mut RawValue,
     ) {
-        let result = on_host_stack(|| {
+        // Asked here, on the Wasm stack: whether this is the stack of a
+        // `call_async`, which an async import may suspend.
+        #[cfg(feature = "experimental-async")]
+        let suspendable = wasmer_vm::wasm_call_is_suspendable();
+        // `None` if the guest is to wait for the host future of the import.
+        #[allow(unused_mut)]
+        let mut result = on_host_stack(|| {
             panic::catch_unwind(AssertUnwindSafe(|| match (this.ctx.func)(values_vec) {
-                HostCallOutcome::Ready(result) => to_invocation_result(finalize_dynamic_call(
-                    this.ctx.store_id,
-                    &this.ctx.func_ty,
-                    values_vec,
-                    result,
+                HostCallOutcome::Ready(result) => Some(to_invocation_result(
+                    finalize_dynamic_call(this.ctx.store_id, &this.ctx.func_ty, values_vec, result),
                 )),
                 #[cfg(feature = "experimental-async")]
                 HostCallOutcome::Future { future, store_id } => {
-                    let awaited = block_on_host_future(store_id, future);
-                    let result = match awaited {
-                        Ok(value) => Ok(value),
-                        Err(AsyncRuntimeError::RuntimeError(e)) => Err(e),
-                        Err(AsyncRuntimeError::YieldOutsideAsyncContext) => {
-                            return InvocationResult::YieldOutsideAsyncContext;
+                    match wait_for_host_future(store_id, future, suspendable) {
+                        HostWait::Ready(result) => {
+                            Some(to_invocation_result(finalize_dynamic_call(
+                                this.ctx.store_id,
+                                &this.ctx.func_ty,
+                                values_vec,
+                                result,
+                            )))
                         }
-                    };
-                    to_invocation_result(finalize_dynamic_call(
-                        this.ctx.store_id,
-                        &this.ctx.func_ty,
-                        values_vec,
-                        result,
-                    ))
+                        HostWait::Suspend => None,
+                        HostWait::CannotSuspend => Some(InvocationResult::YieldOutsideAsyncContext),
+                    }
                 }
             }))
         });
+        #[cfg(feature = "experimental-async")]
+        if matches!(result, Ok(None)) {
+            // The guest waits here, with nothing on this frame to release: its
+            // call polls the host future, and resumes it with what the future
+            // returned, or drops it.
+            unsafe { wasmer_vm::suspend_wasm_call() };
+            result = on_host_stack(|| {
+                panic::catch_unwind(AssertUnwindSafe(|| {
+                    Some(to_invocation_result(finalize_dynamic_call(
+                        this.ctx.store_id,
+                        &this.ctx.func_ty,
+                        values_vec,
+                        take_host_result(),
+                    )))
+                }))
+            });
+        }
+        let result = result.map(|result| result.expect("a guest that waited was resumed"));
 
         // IMPORTANT: DO NOT ALLOCATE ON THE STACK,
         // AS WE ARE IN THE WASM STACK, NOT ON THE HOST ONE.

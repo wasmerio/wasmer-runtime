@@ -44,8 +44,9 @@ impl<R> std::fmt::Debug for AsyncCall<'_, R> {
     }
 }
 
-type CallParams = Box<dyn FnOnce(&mut StoreMut<'_>) -> Result<Vec<Value>, RuntimeError>>;
-type CallFinish<X> = Box<dyn FnOnce(&mut StoreMut<'_>, &[Value]) -> Result<X, RuntimeError>>;
+pub(crate) type CallParams = Box<dyn FnOnce(&mut StoreMut<'_>) -> Result<Vec<Value>, RuntimeError>>;
+pub(crate) type CallFinish<X> =
+    Box<dyn FnOnce(&mut StoreMut<'_>, &[Value]) -> Result<X, RuntimeError>>;
 
 /// What a typed or dynamic call needs its backend to run.
 ///

@@ -28,7 +28,7 @@ the API was replaced directly.
 
 | Area | State |
 | --- | --- |
-| `sys` Level 1 and Level 2 | Done |
+| `sys` Level 1 and Level 2 | Done. A call suspends its guest on the VM's Wasm stack (`wasmer_vm::SuspendableCall`); the second coroutine, its stack pool and the state it carried are gone |
 | JavaScript and the guest guard | Done, in `lib/api/src/backend/js/guard.rs`. The engine drives the call: host futures run on the microtask queue, and a guest holds nothing while it runs or waits |
 | V8 | Done. `poll` blocks during an exclusive call's import, so another thread must wake it. A synchronous entry or a `SharedStore` task fails if its import must wait |
 | WASIX and NAPI ports | **Not done.** They live on `next` |

@@ -15,7 +15,7 @@ use bytesize::ByteSize;
 use core::ptr::{read, read_unaligned};
 use corosensei::stack::{DefaultStack, Stack};
 use corosensei::trap::{CoroutineTrapHandler, TrapHandlerRegs};
-use corosensei::{CoroutineResult, ScopedCoroutine, Yielder};
+use corosensei::{Coroutine, CoroutineResult, ScopedCoroutine, Yielder};
 use scopeguard::defer;
 use std::any::Any;
 use std::cell::Cell;
@@ -142,6 +142,16 @@ fn acquire_stack(min_size: usize) -> DefaultStack {
 fn release_stack(stack: DefaultStack) {
     let displaced = TLS_STACK.with(|cache| cache.0.replace(Some(stack)));
     if let Some(displaced) = displaced {
+        STACK_POOL.push(displaced);
+    }
+}
+
+/// [`release_stack`], for a stack that can be released while the thread's
+/// locals are destroyed, as it exits: it then goes to the shared pool.
+fn release_stack_of_dropped_call(stack: DefaultStack) {
+    let mut stack = Some(stack);
+    let displaced = TLS_STACK.try_with(|cache| cache.0.replace(stack.take()));
+    if let Some(displaced) = displaced.ok().flatten().or(stack) {
         STACK_POOL.push(displaced);
     }
 }
@@ -895,29 +905,40 @@ where
 // We also do per-thread signal stack initialization on the first time
 // TRAP_HANDLER is accessed.
 thread_local! {
-    static YIELDER: Cell<Option<NonNull<Yielder<(), UnwindReason>>>> = const { Cell::new(None) };
+    static YIELDER: Cell<Option<NonNull<WasmYielder>>> = const { Cell::new(None) };
     static TRAP_HANDLER: AtomicPtr<TrapHandlerContext> = const { AtomicPtr::new(ptr::null_mut()) };
+    /// The yielder of the [`SuspendableCall`] that is being resumed on this
+    /// thread, if one is. The Wasm stack that is running may be suspended
+    /// only if it is that call's own: a call made from a host function it
+    /// reached runs on another stack, with that host function beneath it.
+    static SUSPENDABLE: Cell<Option<NonNull<WasmYielder>>> = const { Cell::new(None) };
 }
 
-/// The thread-local state of one *activation*: a chain of Wasm entries whose
-/// frames all live on one host stack. It is what the signal handler consults
-/// to find the Wasm code that is running: the trap handler and, with
-/// `experimental-host-interrupt`, the interrupt registry's active stores.
+/// Why a Wasm stack gives control back to the host stack that resumed it,
+/// short of returning.
+enum WasmYield {
+    /// To unwind: the stack is reset, and none of it runs again.
+    Unwind(UnwindReason),
+    /// To wait, in a [`SuspendableCall`]: the stack is resumed later.
+    Suspend,
+}
+
+type WasmYielder = Yielder<(), WasmYield>;
+
+/// What a suspended [`SuspendableCall`] keeps registered beyond its thread:
+/// with `experimental-host-interrupt`, the stores it entered, which an
+/// interrupt has to find while their guest waits. Without that feature it
+/// holds nothing.
 ///
-/// A thread that runs all its Wasm calls on one host stack never needs this
-/// type: its calls nest, and each entry restores what it found. It is for
-/// code that keeps several host stacks on one thread and switches between
-/// them while they have Wasm frames on them, as `Function::call_async` in the
-/// API crate does with one coroutine per call. Suspended activations can be
-/// resumed in any order, so the state has to follow the stack that is
-/// running: an activation that is not running keeps its state here, and
-/// [`Self::swap`] exchanges it with the thread's at every switch, in both
-/// directions. An embedder that switches such stacks itself has to do the
-/// same around its own switches.
+/// The registrations are on the thread while the call runs, and here while
+/// it waits: [`Self::swap`] exchanges them with the thread's around every
+/// resumption, in both directions, so that suspended calls can be resumed in
+/// any order. The trap handler needs none of this: each resumption installs
+/// it and takes it off again.
 pub struct ActivationState {
-    trap_handler: *mut TrapHandlerContext,
     #[cfg(feature = "experimental-host-interrupt")]
     active_stores: interrupt_registry::ActiveStores,
+    _not_send: std::marker::PhantomData<*mut ()>,
 }
 
 impl Default for ActivationState {
@@ -930,9 +951,9 @@ impl ActivationState {
     /// The state of an activation that has not entered Wasm.
     pub const fn new() -> Self {
         Self {
-            trap_handler: ptr::null_mut(),
             #[cfg(feature = "experimental-host-interrupt")]
             active_stores: interrupt_registry::ActiveStores::new(),
+            _not_send: std::marker::PhantomData,
         }
     }
 
@@ -940,45 +961,30 @@ impl ActivationState {
     ///
     /// # Safety
     ///
-    /// The state holds pointers into the host stack its activation runs on,
-    /// and the signal handler follows whichever of them the thread holds.
-    ///
-    /// - Calls come in pairs on one thread: one immediately before switching
-    ///   to the stack that owns this state, and one immediately after control
-    ///   comes back from it, whether it suspended, returned or unwound.
-    /// - It is called from host code, never while running on a Wasm stack
-    ///   (host functions run inside [`on_host_stack`], so they qualify).
-    /// - A state that is not empty (see [`Self::is_empty`]) must not be
-    ///   swapped in once the stack that owns it is gone, nor on another
-    ///   thread.
+    /// Calls come in pairs on one thread, from host code: one immediately
+    /// before resuming the call that owns this state, and one immediately
+    /// after control comes back from it, whether it waits or is over. A
+    /// state that is not empty (see [`Self::is_empty`]) must not be swapped
+    /// in on another thread.
     pub unsafe fn swap(&mut self) {
-        // The Wasm stack's yielder is not part of the exchange because it is
-        // unset on both sides: `on_host_stack` takes it for as long as host
-        // code runs, and `on_wasm_stack` clears it on the way out.
         debug_assert!(
             YIELDER.with(|cell| cell.get()).is_none(),
-            "activation switched while running on the Wasm stack"
+            "registrations switched while running on the Wasm stack"
         );
-        compiler_fence(Ordering::Release);
-        TRAP_HANDLER.with(|ptr| {
-            self.trap_handler = ptr.swap(self.trap_handler, Ordering::Relaxed);
-        });
-        compiler_fence(Ordering::Acquire);
         #[cfg(feature = "experimental-host-interrupt")]
         self.active_stores.swap();
     }
 
-    /// Whether this activation, while it is not running, has entered
-    /// `store_id` and the store was interrupted.
+    /// Whether this call, while it is not running, has entered `store_id`
+    /// and the store was interrupted.
     #[cfg(feature = "experimental-host-interrupt")]
     pub fn is_interrupted(&self, store_id: wasmer_types::StoreId) -> bool {
         self.active_stores.is_interrupted(store_id)
     }
 
-    /// Whether the calling thread still has what swapping a state in, and
-    /// unwinding a stack suspended in Wasm, need of it: false once its thread
-    /// locals are being destroyed, as it exits. A stack suspended then is to
-    /// be forgotten rather than unwound.
+    /// Whether the calling thread still has what swapping a state in needs of
+    /// it: false once its thread locals are being destroyed, as it exits. A
+    /// state is then abandoned (see [`Self::abandon`]).
     pub fn thread_is_usable() -> bool {
         let usable = TLS_STACK.try_with(|_| ()).is_ok();
         #[cfg(feature = "experimental-host-interrupt")]
@@ -986,25 +992,22 @@ impl ActivationState {
         usable
     }
 
-    /// Whether nothing is installed: true before an activation first runs and
-    /// after it has finished, when nothing may be left pointing into its stack.
+    /// Whether nothing is registered: true before a call first runs and after
+    /// it is over.
     pub fn is_empty(&self) -> bool {
         #[cfg(feature = "experimental-host-interrupt")]
         if !self.active_stores.is_empty() {
             return false;
         }
-        self.trap_handler.is_null()
+        true
     }
 
-    /// Forgets the state of an activation whose stack is forgotten rather
-    /// than unwound, while the state is not swapped in: its calls never
-    /// return. What they keep beyond the thread is given up as their return
-    /// would, the interrupt registrations of the stores they entered, which
-    /// would otherwise keep those stores interrupted, and aimed at this
-    /// thread, for good. The thread's own state is not touched: it may be
-    /// gone (see [`Self::thread_is_usable`]).
+    /// Gives up the registrations of a call that is dropped while they are
+    /// not swapped in, and cannot be: the interrupt registrations of the
+    /// stores it entered, which would otherwise keep those stores
+    /// interrupted, and aimed at this thread, for good. The thread's own
+    /// state is not touched: it may be gone (see [`Self::thread_is_usable`]).
     pub fn abandon(&mut self) {
-        self.trap_handler = ptr::null_mut();
         #[cfg(feature = "experimental-host-interrupt")]
         self.active_stores.abandon();
     }
@@ -1176,7 +1179,7 @@ unsafe fn unwind_with(reason: UnwindReason) -> ! {
             .with(|cell| cell.replace(None))
             .expect("not running on Wasm stack");
 
-        yielder.as_ref().suspend(reason);
+        yielder.as_ref().suspend(WasmYield::Unwind(reason));
 
         // on_wasm_stack will forcibly reset the coroutine stack after yielding.
         unreachable!();
@@ -1218,7 +1221,7 @@ fn on_wasm_stack<F: FnOnce() -> T + 'static, T: 'static>(
         // execution. This is restored to its previous value afterwards.
         TrapHandlerContext::install(trap_handler, coro_ref.trap_handler(), || {
             match coro_ref.resume(()) {
-                CoroutineResult::Yield(trap) => {
+                CoroutineResult::Yield(WasmYield::Unwind(trap)) => {
                     // This came from unwind_with which requires that there be only
                     // Wasm code on the stack.
                     unsafe {
@@ -1226,10 +1229,169 @@ fn on_wasm_stack<F: FnOnce() -> T + 'static, T: 'static>(
                     }
                     Err(trap)
                 }
+                CoroutineResult::Yield(WasmYield::Suspend) => {
+                    unreachable!("a Wasm call that cannot be suspended was")
+                }
                 CoroutineResult::Return(result) => result,
             }
         })
     })
+}
+
+/// What a [`SuspendableCall`] did when it was resumed.
+pub enum CallStep {
+    /// It waits: an import it called suspended it (see
+    /// [`suspend_wasm_call`]). It goes on when it is resumed again.
+    Suspended,
+    /// It is over: it returned, or trapped.
+    Finished(Result<(), Trap>),
+}
+
+/// A Wasm call on a stack of its own that an import can suspend, and its
+/// caller resume later, as `Function::call_async` in the API crate does.
+///
+/// Nothing of the call stays on the thread while it is suspended: each
+/// [`resume`](Self::resume) installs what the signal handler needs and takes
+/// it off when control comes back, as a synchronous call does. Suspended
+/// calls can therefore be resumed in any order.
+///
+/// A suspended stack holds the frames of the guest and of the import that
+/// suspended it, which keeps nothing a destructor would have to release.
+/// Dropping the call resets the stack: none of it runs again.
+pub struct SuspendableCall {
+    coroutine: Option<Coroutine<(), WasmYield, Result<(), UnwindReason>, DefaultStack>>,
+    /// The coroutine's yielder, once it has started. Boxed: the coroutine
+    /// writes it through a pointer, wherever the call is moved.
+    yielder: Box<Cell<Option<NonNull<WasmYielder>>>>,
+}
+
+impl SuspendableCall {
+    /// A call of `callee` through `trampoline`, which starts when it is first
+    /// resumed.
+    ///
+    /// # Safety
+    /// All pointer arguments must be valid until the call is finished or
+    /// dropped.
+    pub unsafe fn new(
+        config: &VMConfig,
+        vmctx: crate::VMFunctionContext,
+        trampoline: crate::VMTrampoline,
+        callee: *const crate::VMFunctionBody,
+        values_vec: *mut u8,
+    ) -> Result<Self, Trap> {
+        // Ensure that per-thread initialization is done.
+        lazy_per_thread_init()?;
+        let stack_size = config
+            .wasm_stack_size
+            .unwrap_or_else(|| DEFAULT_STACK_SIZE.load(Ordering::Relaxed));
+        let yielder = Box::new(Cell::new(None));
+        let started: *const Cell<Option<NonNull<WasmYielder>>> = &*yielder;
+        let coroutine = Coroutine::with_stack(
+            acquire_stack(stack_size),
+            move |yielder: &WasmYielder, ()| {
+                let yielder = NonNull::from(yielder);
+                // Safety: the call owns the cell, and outlives its coroutine.
+                unsafe { (*started).set(Some(yielder)) };
+                SUSPENDABLE.with(|cell| cell.set(Some(yielder)));
+                YIELDER.with(|cell| cell.set(Some(yielder)));
+                unsafe {
+                    // pointer types are ABI-compatible; transmute to unsafe fn to preserve unsafety
+                    std::mem::transmute::<
+                        unsafe extern "C" fn(
+                            *mut crate::VMContext,
+                            *const crate::VMFunctionBody,
+                            *mut wasmer_types::RawValue,
+                        ),
+                        unsafe extern "C" fn(
+                            crate::VMFunctionContext,
+                            *const crate::VMFunctionBody,
+                            *mut u8,
+                        ),
+                    >(trampoline)(vmctx, callee, values_vec);
+                }
+                Ok(())
+            },
+        );
+        Ok(Self {
+            coroutine: Some(coroutine),
+            yielder,
+        })
+    }
+
+    /// Runs the call until it waits or is over.
+    ///
+    /// # Safety
+    /// Called from host code, on the thread the call was made on, and not
+    /// again once it is finished. `trap_handler` must be valid for the
+    /// duration of the resumption.
+    pub unsafe fn resume(
+        &mut self,
+        trap_handler: Option<*const TrapHandlerFn<'static>>,
+    ) -> CallStep {
+        let coroutine = self.coroutine.as_mut().expect("the call is not over");
+        // Which Wasm stack may suspend, for as long as this one runs.
+        let outer = SUSPENDABLE.with(|cell| cell.replace(self.yielder.get()));
+        defer! {
+            SUSPENDABLE.with(|cell| cell.set(outer));
+            // A stack that suspended cleared it; one that is over did not.
+            YIELDER.with(|cell| cell.set(None));
+        }
+        let resumed = TrapHandlerContext::install(trap_handler, coroutine.trap_handler(), || {
+            coroutine.resume(())
+        });
+        let result = match resumed {
+            CoroutineResult::Yield(WasmYield::Suspend) => return CallStep::Suspended,
+            CoroutineResult::Yield(WasmYield::Unwind(reason)) => {
+                // This came from unwind_with which requires that there be only
+                // Wasm code on the stack.
+                unsafe { coroutine.force_reset() };
+                Err(reason)
+            }
+            CoroutineResult::Return(result) => result,
+        };
+        CallStep::Finished(result.map_err(UnwindReason::into_trap))
+    }
+}
+
+impl Drop for SuspendableCall {
+    fn drop(&mut self) {
+        let Some(mut coroutine) = self.coroutine.take() else {
+            return;
+        };
+        if !coroutine.started() {
+            // Never resumed: there is only its function to drop.
+            coroutine.force_unwind();
+        } else if !coroutine.done() {
+            // Safety: a suspended stack holds nothing to release (see the
+            // type), and is never resumed.
+            unsafe { coroutine.force_reset() };
+        }
+        release_stack_of_dropped_call(coroutine.into_stack());
+    }
+}
+
+/// Whether the Wasm stack that is running is that of the [`SuspendableCall`]
+/// being resumed: whether an import called from it may suspend it.
+pub fn wasm_call_is_suspendable() -> bool {
+    let yielder = YIELDER.with(|cell| cell.get());
+    yielder.is_some() && yielder == SUSPENDABLE.with(|cell| cell.get())
+}
+
+/// Suspends the Wasm call that is running, from an import it called, until
+/// it is resumed.
+///
+/// # Safety
+/// Called on the Wasm stack, only if [`wasm_call_is_suspendable`], with
+/// nothing on the stack that a destructor would have to release: the call may
+/// be dropped while it waits.
+pub unsafe fn suspend_wasm_call() {
+    unsafe {
+        let yielder = YIELDER
+            .with(|cell| cell.replace(None))
+            .expect("not running on Wasm stack");
+        yielder.as_ref().suspend(WasmYield::Suspend);
+        YIELDER.with(|cell| cell.set(Some(yielder)));
+    }
 }
 
 /// When executing on the Wasm stack, temporarily switch back to the host stack

@@ -81,7 +81,10 @@ reading the code, not by running it.
 
 PR 16 got three things right, and this proposal keeps them:
 
-- Call state moves with its stack through `ActivationState`.
+- Nothing a call leaves on the thread outlives the slice that put it there.
+  PR 16 moved it with the stack, through `ActivationState`. Since the guest
+  suspends on the VM's own Wasm stack, with no host frames on it, each
+  resumption installs it and takes it off instead.
 - Host futures are polled on the executor's stack.
 - A guest suspends only where no host function holds its store.
 
@@ -316,7 +319,7 @@ Misuse of the public API is either a compile error or a safe runtime failure.
 | 1. One mutator | `&'a mut` on the call; `&mut self` on `AsyncEnv` | Overlapping calls, store use or drop during a call (E0499, E0505) | `StoreBusy` on a shared store |
 | 2. No borrow crosses a suspension | `with` takes a synchronous closure with a higher-ranked lifetime | `.await` inside `with` (E0728); returning a store borrow | None |
 | 3. No host frames on suspended stacks | Host futures live in the call future; sync frames cannot suspend | Not expressible in types | `YieldOutsideAsyncContext` trap |
-| 4. Call state lives with its stack | One private switch point | Not expressible in types | Internal assertion |
+| 4. Call state does not outlive its slice | Installed and removed around each resumption | Not expressible in types | Internal assertion |
 | 5. Cancel and leak are safe | Follows from 3 and 4 | Not expressible in types | Stack is discarded or leaked |
 | 6. Thread affinity | `Store: !Send` carries into every future | Sending a call future (E0277) | None |
 | 7. Interleaving is opt-in | Only `SharedStore` can overlap calls | Overlapping calls on a plain store (E0499) | Guest correctness is the embedder's under `SharedStore` |
@@ -344,8 +347,9 @@ The hard cases follow directly:
 
 Six obligations remain in private `unsafe` code and need Miri and direct tests:
 
-1. State is exchanged at exactly one switch point, including when control
-   returns by unwinding.
+1. A suspended stack holds guest frames and the frame of the import that
+   suspended it, with nothing a destructor would have to release: it is
+   reset, not unwound.
 2. `AsyncEnv` holds a store pointer only during a poll by its own call.
 3. Discarding a suspended stack never touches the store.
 4. A shared store hands out at most one slice at a time, including across
@@ -372,7 +376,7 @@ view, and V8's C API cannot switch stacks.
 
 |  | `sys` | JavaScript (JSPI) | V8 |
 | --- | --- | --- | --- |
-| Guest stack | `corosensei` coroutine owned by the call future | Engine-owned JSPI stack | The calling OS stack, never suspended |
+| Guest stack | The VM's Wasm stack, owned by the call future while its guest waits | Engine-owned JSPI stack | The calling OS stack, never suspended |
 | Level 1 | Full | Full, with the guest guard below. The engine drives the call: host futures run on the microtask queue | Yes: `poll` blocks while a pending import's future is driven |
 | Level 2 overlap | Full | Full, with the guest guard below | Lexical nesting only; stacks cannot resume out of order, so a task whose import must wait fails with a trap |
 | Cancellation | Drop the host future, then discard the stack | Drop the host future and unwind with an uncatchable trap. A guest already resumed runs until its next import, which is refused | Not possible during an import, because `poll` has not returned |

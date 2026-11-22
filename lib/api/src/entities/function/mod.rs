@@ -387,9 +387,9 @@ impl Function {
     /// host code, and leaves the instance usable with partial guest state, as
     /// a trap does.
     ///
-    /// On `sys`, the coroutine has a fixed stack of 1 MiB, on which the host
-    /// functions the guest calls run. Host futures are polled on the
-    /// executor's stack. On `js`, the engine suspends the guest's stack
+    /// On `sys`, the guest runs on a Wasm stack of its own, which an async
+    /// import suspends. Host functions and host futures run on the stack of
+    /// whoever polls the call. On `js`, the engine suspends the guest's stack
     /// (JSPI) and runs the call: after its first poll it makes progress
     /// whether or not it is polled again, host futures run on the microtask
     /// queue, an async import never works for a guest that was entered
