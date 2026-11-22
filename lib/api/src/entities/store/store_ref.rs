@@ -183,30 +183,14 @@ impl StoreMut<'_> {
         // through a reference it was handed — picks up a borrow derived from
         // *this* one. The new entry starts unborrowed, which is what makes the
         // store lendable for as long as it is on top.
+        let keeper = self.inner.store.keeper();
         let ptr: *mut StoreInner = &mut *self.inner;
         // SAFETY: `ptr` comes from `&mut *self.inner`, which `&mut self` keeps
         // alive and unreachable for every frame on this thread until `f`
         // returns and the guard is dropped.
         let guard = unsafe { super::StoreContext::install(ptr) };
-        holding(guard, |_| f())
+        keeper.holding(guard, |_| f())
     }
-}
-
-/// Runs `f` and then drops `guard`, also if a JavaScript exception unwinds
-/// through `f`, which skips the destructors of the frames it crosses.
-#[inline]
-pub(crate) fn holding<G, R>(mut guard: G, f: impl FnOnce(&mut G) -> R) -> R {
-    #[cfg(all(feature = "js", feature = "experimental-async", target_arch = "wasm32"))]
-    {
-        let result = crate::backend::js::boundary::catching(|| f(&mut guard));
-        drop(guard);
-        match result {
-            Ok(value) => value,
-            Err(error) => wasm_bindgen::throw_val(error),
-        }
-    }
-    #[cfg(not(all(feature = "js", feature = "experimental-async", target_arch = "wasm32")))]
-    f(&mut guard)
 }
 
 /// Helper trait for a value that is convertible to a [`StoreRef`].
@@ -224,14 +208,14 @@ pub trait AsStoreMut: AsStoreRef {
     fn objects_mut(&mut self) -> &mut StoreObjects;
 }
 
-/// On JavaScript, a handle from the store's owner must not reach the store
-/// while the guest of a forgotten call can still run. A handle lent to a slice
-/// of that call can, and cannot outlive the slice.
+/// A handle from the store's owner asks the store's backend before it
+/// reaches the store: on a backend where a call can outlive its borrow, the
+/// owner must wait for it. A handle lent to a slice of a call does not ask,
+/// and cannot outlive the slice.
 #[inline]
-fn check_guest_guard(_inner: &StoreInner, _origin: HandleOrigin) {
-    #[cfg(all(feature = "js", feature = "experimental-async"))]
-    if !_origin.from_slice {
-        _inner.guard.check_owner();
+fn check_guest_guard(inner: &StoreInner, origin: HandleOrigin) {
+    if !origin.from_slice {
+        inner.store.check_owner();
     }
 }
 

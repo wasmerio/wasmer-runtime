@@ -20,10 +20,6 @@ pub(crate) struct StoreInner {
     /// finds it. A back-reference here keeps `T` in a `FunctionEnv` `Send`.
     #[cfg(feature = "experimental-async")]
     pub(crate) shared: std::rc::Weak<super::SharedState>,
-    /// Keeps a JavaScript guest that can outlive its call from reaching a
-    /// freed or aliased store.
-    #[cfg(all(feature = "js", feature = "experimental-async"))]
-    pub(crate) guard: std::rc::Rc<crate::backend::js::guard::GuestGuard>,
     /// Releases what forgotten calls left registered for this store.
     #[cfg(all(
         feature = "sys",
@@ -62,7 +58,95 @@ gen_rt_ty! {
     pub BackendStore(entities::store::Store);
 }
 
+gen_rt_ty! {
+    /// What the backend of a store keeps beside the store's allocation: in
+    /// its owner, and in every shared handle. It has a say in who may use the
+    /// store, and in when its memory goes.
+    #[derive(derive_more::From, Clone)]
+    pub(crate) BackendStoreKeeper(entities::store::StoreKeeper);
+}
+
+/// What the `StoreKeeper` of a backend answers. By default it keeps nothing:
+/// on most backends a call cannot outlive the borrow of the store it was made
+/// with, and nothing unwinds through Rust frames without running them.
+pub(crate) trait KeepsStore {
+    /// The owner of the store, or a handle taken from it, is about to use
+    /// it. This cannot reach the store: host code may be using it.
+    #[inline]
+    fn check_owner(&self) {}
+
+    /// Whether a call holds the store while no slice of it runs.
+    #[inline]
+    fn holds_store(&self) -> bool {
+        false
+    }
+
+    /// Takes the allocation of a store whose last owner is gone.
+    #[inline]
+    fn dispose(&self, inner: Box<StoreInner>) {
+        drop(inner);
+    }
+
+    /// Runs `f`, and then drops `guard`, whatever the host of the backend
+    /// lets unwind through `f`.
+    #[inline]
+    fn holding<G, R>(&self, mut guard: G, f: impl FnOnce(&mut G) -> R) -> R {
+        f(&mut guard)
+    }
+}
+
+impl BackendStoreKeeper {
+    /// See [`KeepsStore::check_owner`].
+    #[inline]
+    pub(crate) fn check_owner(&self) {
+        match_rt!(on self => k {
+            k.check_owner()
+        })
+    }
+
+    /// See [`KeepsStore::holds_store`].
+    #[inline]
+    pub(crate) fn holds_store(&self) -> bool {
+        match_rt!(on self => k {
+            k.holds_store()
+        })
+    }
+
+    /// See [`KeepsStore::dispose`].
+    #[inline]
+    pub(crate) fn dispose(&self, inner: Box<StoreInner>) {
+        match_rt!(on self => k {
+            k.dispose(inner)
+        })
+    }
+
+    /// See [`KeepsStore::holding`].
+    #[inline]
+    pub(crate) fn holding<G, R>(&self, guard: G, f: impl FnOnce(&mut G) -> R) -> R {
+        match_rt!(on self => k {
+            k.holding(guard, f)
+        })
+    }
+}
+
 impl BackendStore {
+    /// What the backend keeps beside this store's allocation.
+    #[inline]
+    pub(crate) fn keeper(&self) -> BackendStoreKeeper {
+        match_rt!(on self => s {
+            s.keeper().clone().into()
+        })
+    }
+
+    /// See [`KeepsStore::check_owner`]. Unlike the keeper beside the
+    /// allocation, this is reached through the store.
+    #[inline]
+    pub(crate) fn check_owner(&self) {
+        match_rt!(on self => s {
+            s.keeper().check_owner()
+        })
+    }
+
     #[inline]
     pub(crate) fn engine(&self) -> &Engine {
         match_rt!(on self => s {

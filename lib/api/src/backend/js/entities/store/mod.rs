@@ -6,14 +6,38 @@ pub(crate) mod obj;
 pub(crate) use handle::*;
 pub(crate) use obj::*;
 
+/// What this backend keeps beside a store's allocation: the store's guest
+/// guard, with `experimental-async`. The engine can resume a guest once its
+/// call's borrow of the store is over (see `guard`).
+#[cfg(feature = "experimental-async")]
+pub(crate) use crate::backend::js::guard::StoreKeeper;
+
+/// What this backend keeps beside a store's allocation: nothing, without
+/// `experimental-async`.
+#[cfg(not(feature = "experimental-async"))]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StoreKeeper {}
+
+#[cfg(not(feature = "experimental-async"))]
+impl crate::entities::store::KeepsStore for StoreKeeper {}
+
 #[derive(Debug)]
 pub(crate) struct Store {
     pub(crate) engine: Engine,
+    keeper: StoreKeeper,
 }
 
 impl Store {
     pub(crate) fn new(engine: Engine) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            keeper: StoreKeeper::default(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn keeper(&self) -> &StoreKeeper {
+        &self.keeper
     }
 
     pub(crate) fn engine(&self) -> &Engine {
@@ -64,11 +88,7 @@ impl crate::BackendStore {
 impl crate::Store {
     /// Consume [`self`] into [`crate::backend::js::store::Store`].
     pub(crate) fn into_js(self) -> crate::backend::js::store::Store {
-        #[cfg(feature = "experimental-async")]
-        let inner = self.inner.into_box();
-        #[cfg(not(feature = "experimental-async"))]
-        let inner = self.inner;
-        inner.store.into_js()
+        self.inner.into_box().store.into_js()
     }
 
     /// Convert a reference to [`self`] into a reference [`crate::backend::js::store::Store`].

@@ -10,7 +10,8 @@ pub(crate) use async_::is_published;
 pub(crate) use async_::{CallStore, PollScope, PollStore, SharedState, StoreSlice, WithSlice};
 #[cfg(feature = "experimental-async")]
 pub use async_::{SharedStore, StoreBusy, WeakSharedStore};
-#[cfg(all(feature = "experimental-async", feature = "js"))]
+#[cfg(feature = "experimental-async")]
+#[allow(unused_imports)]
 pub(crate) use async_::{publish_store, published_store};
 
 /// Defines the [`StoreContext`] type.
@@ -24,6 +25,7 @@ mod store_ref;
 
 use std::{
     boxed::Box,
+    mem::ManuallyDrop,
     ops::{Deref, DerefMut},
 };
 
@@ -54,12 +56,61 @@ pub struct Store {
     pub(crate) inner: StoreBox,
 }
 
-/// What owns a store's allocation. On JavaScript, a guest can outlive its
-/// call, so the owner cooperates with the guest guard.
-#[cfg(not(all(feature = "js", feature = "experimental-async")))]
-pub(crate) type StoreBox = Box<StoreInner>;
-#[cfg(all(feature = "js", feature = "experimental-async"))]
-pub(crate) type StoreBox = crate::backend::js::guard::GuardedStore;
+/// What owns a store's allocation, with what the store's backend keeps
+/// beside it. The keeper is asked before the allocation is reached, and is
+/// given the allocation when its owner is gone: on a backend where a call
+/// can outlive its borrow, host code may still be using the store.
+pub(crate) struct StoreBox {
+    inner: ManuallyDrop<Box<StoreInner>>,
+    keeper: BackendStoreKeeper,
+}
+
+impl StoreBox {
+    pub(crate) fn new(inner: Box<StoreInner>) -> Self {
+        let keeper = inner.store.keeper();
+        Self {
+            inner: ManuallyDrop::new(inner),
+            keeper,
+        }
+    }
+
+    /// Gives the allocation up to another owner.
+    pub(crate) fn into_box(self) -> Box<StoreInner> {
+        self.keeper.check_owner();
+        let mut this = ManuallyDrop::new(self);
+        // Safety: `this` is never dropped, so each field is taken once.
+        unsafe {
+            std::ptr::drop_in_place(&mut this.keeper);
+            ManuallyDrop::take(&mut this.inner)
+        }
+    }
+}
+
+impl Deref for StoreBox {
+    type Target = StoreInner;
+
+    #[inline]
+    fn deref(&self) -> &StoreInner {
+        self.keeper.check_owner();
+        &self.inner
+    }
+}
+
+impl DerefMut for StoreBox {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut StoreInner {
+        self.keeper.check_owner();
+        &mut self.inner
+    }
+}
+
+impl Drop for StoreBox {
+    fn drop(&mut self) {
+        // Safety: dropped once, here.
+        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
+        self.keeper.dispose(inner);
+    }
+}
 
 impl Store {
     /// Creates a new `Store` with a specific [`Engine`].
@@ -99,13 +150,8 @@ impl Store {
             _teardown,
             #[cfg(feature = "experimental-async")]
             shared: std::rc::Weak::new(),
-            #[cfg(all(feature = "js", feature = "experimental-async"))]
-            guard: Default::default(),
         });
         Self {
-            #[cfg(not(all(feature = "js", feature = "experimental-async")))]
-            inner,
-            #[cfg(all(feature = "js", feature = "experimental-async"))]
             inner: StoreBox::new(inner),
         }
     }
@@ -213,11 +259,7 @@ impl Store {
     /// for it.
     #[cfg(feature = "experimental-async")]
     pub fn into_shared(self) -> SharedStore {
-        #[cfg(not(feature = "js"))]
-        let inner = self.inner;
-        #[cfg(feature = "js")]
-        let inner = self.inner.into_box();
-        SharedStore::new(inner)
+        SharedStore::new(self.inner.into_box())
     }
 }
 

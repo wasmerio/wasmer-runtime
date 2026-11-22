@@ -16,7 +16,7 @@ use std::{
 
 use wasmer_types::StoreId;
 
-use super::store_ref::holding;
+use super::BackendStoreKeeper;
 use crate::{Store, StoreContext, StoreInner, StoreMut};
 
 /// How one poll reaches the store of its call.
@@ -36,14 +36,15 @@ pub(crate) struct PollStore {
     access: StoreAccess,
 }
 
-/// The store published on this thread, for a JavaScript exception boundary.
-#[cfg(feature = "js")]
+/// The store published on this thread: for a backend whose host can unwind
+/// through Rust frames without running them, to put it back.
+#[allow(dead_code)]
 pub(crate) fn published_store() -> Option<PollStore> {
     POLL_STORE.get()
 }
 
 /// Puts back what [`published_store`] returned.
-#[cfg(feature = "js")]
+#[allow(dead_code)]
 pub(crate) fn publish_store(store: Option<PollStore>) {
     POLL_STORE.set(store);
 }
@@ -63,76 +64,11 @@ thread_local! {
 impl PollStore {
     /// The store for a poll made by a synchronous entry, whose host frame
     /// holds `ptr` for as long as the poll runs.
-    #[cfg(any(feature = "sys", feature = "v8", feature = "js"))]
     pub(crate) fn exclusive(id: StoreId, ptr: *mut StoreInner) -> Self {
         Self {
             id,
             access: StoreAccess::Exclusive(ptr),
         }
-    }
-
-    /// Whether a guest with this access holds the store through a borrow,
-    /// rather than slice by slice through a shared handle.
-    #[cfg(feature = "js")]
-    pub(crate) fn is_exclusive(self) -> bool {
-        matches!(self.access, StoreAccess::Exclusive(_))
-    }
-
-    /// The guest guard of this store.
-    #[cfg(feature = "js")]
-    pub(crate) fn guard(self) -> Rc<crate::backend::js::guard::GuestGuard> {
-        // Safety: the store outlives whoever published this access, and no
-        // other reference to it is in use during the call's own poll.
-        unsafe {
-            match self.access {
-                StoreAccess::Exclusive(ptr) => Rc::clone(&(*ptr).guard),
-                StoreAccess::Shared(state) => Rc::clone(&(*state).guard),
-            }
-        }
-    }
-
-    /// A handle that keeps a shared store alive, if this is one.
-    #[cfg(feature = "js")]
-    pub(crate) fn shared(self) -> Option<SharedStore> {
-        match self.access {
-            StoreAccess::Exclusive(_) => None,
-            // Safety: as for `guard`.
-            StoreAccess::Shared(state) => {
-                unsafe { (*(*state).ptr).shared.upgrade() }.map(SharedStore)
-            }
-        }
-    }
-
-    /// Whether a shared store is in a slice. `None` for an exclusive one.
-    #[cfg(feature = "js")]
-    pub(crate) fn busy(self) -> Option<bool> {
-        match self.access {
-            StoreAccess::Exclusive(_) => None,
-            // Safety: as for `guard`.
-            StoreAccess::Shared(state) => Some(unsafe { &*state }.busy.get()),
-        }
-    }
-
-    /// Puts back what [`Self::busy`] returned, after a JavaScript exception
-    /// skipped the slice that would have.
-    #[cfg(feature = "js")]
-    pub(crate) fn set_busy(self, busy: bool) {
-        if let StoreAccess::Shared(state) = self.access {
-            // Safety: as for `guard`.
-            unsafe { &*state }.busy.set(busy);
-        }
-    }
-
-    /// [`Self::enter_slice`], or `None` if the store is in a slice.
-    #[cfg(feature = "js")]
-    pub(crate) fn try_enter_slice(self) -> Option<StoreSlice> {
-        if let StoreAccess::Shared(state) = self.access
-            // Safety: as for `guard`.
-            && unsafe { &*state }.busy.get()
-        {
-            return None;
-        }
-        Some(self.enter_slice())
     }
 
     /// Takes the store for one slice.
@@ -156,6 +92,69 @@ impl PollStore {
                 }
             }
         }
+    }
+}
+
+/// What a backend needs of the store of a call when its engine, and not
+/// `poll`, runs the call: who holds the store, and how to put its state back.
+#[allow(dead_code)]
+impl PollStore {
+    /// Whether a guest with this access holds the store through a borrow,
+    /// rather than slice by slice through a shared handle.
+    pub(crate) fn is_exclusive(self) -> bool {
+        matches!(self.access, StoreAccess::Exclusive(_))
+    }
+
+    /// What the backend keeps beside this store's allocation.
+    pub(crate) fn keeper(self) -> BackendStoreKeeper {
+        // Safety: the store outlives whoever published this access, and no
+        // other reference to it is in use during the call's own poll.
+        unsafe {
+            match self.access {
+                StoreAccess::Exclusive(ptr) => (*ptr).store.keeper(),
+                StoreAccess::Shared(state) => (*state).keeper.clone(),
+            }
+        }
+    }
+
+    /// A handle that keeps a shared store alive, if this is one.
+    pub(crate) fn shared(self) -> Option<SharedStore> {
+        match self.access {
+            StoreAccess::Exclusive(_) => None,
+            // Safety: as for `keeper`.
+            StoreAccess::Shared(state) => {
+                unsafe { (*(*state).ptr).shared.upgrade() }.map(SharedStore)
+            }
+        }
+    }
+
+    /// Whether a shared store is in a slice. `None` for an exclusive one.
+    pub(crate) fn busy(self) -> Option<bool> {
+        match self.access {
+            StoreAccess::Exclusive(_) => None,
+            // Safety: as for `keeper`.
+            StoreAccess::Shared(state) => Some(unsafe { &*state }.busy.get()),
+        }
+    }
+
+    /// Puts back what [`Self::busy`] returned, after an unwind skipped the
+    /// slice that would have.
+    pub(crate) fn set_busy(self, busy: bool) {
+        if let StoreAccess::Shared(state) = self.access {
+            // Safety: as for `keeper`.
+            unsafe { &*state }.busy.set(busy);
+        }
+    }
+
+    /// [`Self::enter_slice`], or `None` if the store is in a slice.
+    pub(crate) fn try_enter_slice(self) -> Option<StoreSlice> {
+        if let StoreAccess::Shared(state) = self.access
+            // Safety: as for `keeper`.
+            && unsafe { &*state }.busy.get()
+        {
+            return None;
+        }
+        Some(self.enter_slice())
     }
 }
 
@@ -318,20 +317,16 @@ pub(crate) struct SharedState {
     ptr: *mut StoreInner,
     /// A slice is running.
     busy: Cell<bool>,
-    /// The guest guard, kept here because a guest may hold `StoreInner`.
-    #[cfg(feature = "js")]
-    guard: Rc<crate::backend::js::guard::GuestGuard>,
+    /// What the backend keeps beside the allocation: kept here, and not
+    /// reached through the store, because host code may be using the store.
+    keeper: BackendStoreKeeper,
 }
 
 impl Drop for SharedState {
     fn drop(&mut self) {
         // Safety: the last handle is gone, and every slice holds one.
         let inner = unsafe { Box::from_raw(self.ptr) };
-        // A JavaScript guest can outlive its call, and co-owns the store.
-        #[cfg(feature = "js")]
-        crate::backend::js::guard::GuestGuard::dispose(inner);
-        #[cfg(not(feature = "js"))]
-        drop(inner);
+        self.keeper.dispose(inner);
     }
 }
 
@@ -363,8 +358,7 @@ impl std::error::Error for StoreBusy {}
 impl SharedStore {
     pub(crate) fn new(inner: Box<StoreInner>) -> Self {
         let id = inner.objects.id();
-        #[cfg(feature = "js")]
-        let guard = Rc::clone(&inner.guard);
+        let keeper = inner.store.keeper();
         let ptr = Box::into_raw(inner);
         Self(Rc::new_cyclic(|weak| {
             // Safety: `ptr` was just made and nothing else holds it.
@@ -373,8 +367,7 @@ impl SharedStore {
                 id,
                 ptr,
                 busy: Cell::new(false),
-                #[cfg(feature = "js")]
-                guard,
+                keeper,
             }
         }))
     }
@@ -394,24 +387,21 @@ impl SharedStore {
     pub fn try_with<R>(&self, f: impl FnOnce(StoreMut<'_>) -> R) -> Result<R, StoreBusy> {
         if self.is_held() {
             let lent = StoreContext::try_get_lent(self.0.id).ok_or(StoreBusy)?;
-            return Ok(holding(lent, |lent| f(lent.as_mut())));
+            return Ok(self.0.keeper.holding(lent, |lent| f(lent.as_mut())));
         }
         let slice = self.poll_store().enter_slice();
         // Safety: the slice is the only holder of the store until it drops,
         // after `f` and every borrow `f` was given are gone.
-        Ok(holding(slice, |slice| {
-            f(unsafe { StoreMut::from_raw(slice.ptr()) })
-        }))
+        Ok(self
+            .0
+            .keeper
+            .holding(slice, |slice| f(unsafe { StoreMut::from_raw(slice.ptr()) })))
     }
 
-    /// Whether a slice, or on JavaScript a guest or an unfinished exclusive
-    /// call made from a slice of this store, holds the store.
+    /// Whether a slice holds the store, or a call of its backend does while
+    /// none runs.
     fn is_held(&self) -> bool {
-        #[cfg(feature = "js")]
-        if self.0.guard.holds_store() {
-            return true;
-        }
-        self.0.busy.get()
+        self.0.busy.get() || self.0.keeper.holds_store()
     }
 
     /// Takes the [`Store`] back, if this is its last handle and no slice is
@@ -427,9 +417,9 @@ impl SharedStore {
                 // dropped, so the box has one owner again.
                 let mut inner = unsafe { Box::from_raw(state.ptr) };
                 inner.shared = Weak::new();
-                #[cfg(feature = "js")]
-                let inner = crate::StoreBox::new(inner);
-                Ok(Store { inner })
+                Ok(Store {
+                    inner: crate::StoreBox::new(inner),
+                })
             }
             Err(state) => Err(Self(state)),
         }

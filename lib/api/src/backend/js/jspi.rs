@@ -617,7 +617,7 @@ impl Call {
         slice: StoreSlice,
         enter: impl FnOnce() -> Result<JsValue, JsValue>,
     ) -> Self {
-        let guard = store.guard();
+        let guard = store.keeper().unwrap_js().0;
         let counted = store.is_exclusive();
         if counted {
             guard.begin_call();

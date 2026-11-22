@@ -16,12 +16,10 @@
 
 use std::{
     cell::{Cell, RefCell},
-    mem::ManuallyDrop,
-    ops::{Deref, DerefMut},
     rc::Rc,
 };
 
-use crate::StoreInner;
+use crate::{StoreInner, backend::js::boundary, entities::store::KeepsStore};
 
 /// One per store. The store and every call made with a borrow of it share it.
 #[derive(Default)]
@@ -73,15 +71,6 @@ impl GuestGuard {
     pub(crate) fn set_held(&self, held: bool) {
         self.held.set(held);
     }
-
-    /// Takes ownership of a store whose last owner is gone: it is freed now,
-    /// or when the last call that can reach it is over.
-    pub(crate) fn dispose(inner: Box<StoreInner>) {
-        let guard = Rc::clone(&inner.guard);
-        if guard.calls.get() > 0 {
-            *guard.orphan.borrow_mut() = Some(inner);
-        }
-    }
 }
 
 #[cold]
@@ -93,55 +82,45 @@ fn store_is_held() -> ! {
     )
 }
 
-/// The owner of a store's allocation on this backend.
-pub(crate) struct GuardedStore {
-    inner: ManuallyDrop<Box<StoreInner>>,
-    guard: Rc<GuestGuard>,
+/// What this backend keeps beside a store's allocation, in the store's
+/// owner and in every shared handle: the guard, which they ask without
+/// reaching the store.
+#[derive(Clone, Default)]
+pub(crate) struct StoreKeeper(pub(crate) Rc<GuestGuard>);
+
+impl std::fmt::Debug for StoreKeeper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StoreKeeper")
+    }
 }
 
-impl GuardedStore {
-    pub(crate) fn new(inner: Box<StoreInner>) -> Self {
-        let guard = Rc::clone(&inner.guard);
-        Self {
-            inner: ManuallyDrop::new(inner),
-            guard,
+impl KeepsStore for StoreKeeper {
+    #[inline]
+    fn check_owner(&self) {
+        self.0.check_owner();
+    }
+
+    fn holds_store(&self) -> bool {
+        self.0.holds_store()
+    }
+
+    /// The store is freed now, or when the last call that can reach it is
+    /// over.
+    fn dispose(&self, inner: Box<StoreInner>) {
+        if self.0.calls.get() > 0 {
+            *self.0.orphan.borrow_mut() = Some(inner);
         }
     }
 
-    /// Gives the allocation up to another owner.
-    pub(crate) fn into_box(self) -> Box<StoreInner> {
-        self.guard.check_owner();
-        let mut this = ManuallyDrop::new(self);
-        // Safety: `this` is never dropped, so each field is taken once.
-        unsafe {
-            std::ptr::drop_in_place(&mut this.guard);
-            ManuallyDrop::take(&mut this.inner)
+    /// A JavaScript exception unwinds through `f` without running the
+    /// destructors of the frames it crosses: `guard` is dropped all the same,
+    /// and the exception goes on.
+    fn holding<G, R>(&self, mut guard: G, f: impl FnOnce(&mut G) -> R) -> R {
+        let result = boundary::catching(|| f(&mut guard));
+        drop(guard);
+        match result {
+            Ok(value) => value,
+            Err(error) => wasm_bindgen::throw_val(error),
         }
-    }
-}
-
-impl Deref for GuardedStore {
-    type Target = StoreInner;
-
-    #[inline]
-    fn deref(&self) -> &StoreInner {
-        self.guard.check_owner();
-        &self.inner
-    }
-}
-
-impl DerefMut for GuardedStore {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut StoreInner {
-        self.guard.check_owner();
-        &mut self.inner
-    }
-}
-
-impl Drop for GuardedStore {
-    fn drop(&mut self) {
-        // Safety: dropped once, here.
-        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
-        GuestGuard::dispose(inner);
     }
 }

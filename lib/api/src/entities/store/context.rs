@@ -49,8 +49,10 @@ thread_local! {
 }
 
 impl StoreContext {
-    /// The depth of the stack, and the borrows of its top entry.
-    #[cfg(all(feature = "js", feature = "experimental-async"))]
+    /// The depth of the stack, and the borrows of its top entry: for a
+    /// backend whose host can unwind through Rust frames without running
+    /// them.
+    #[allow(dead_code)]
     pub(crate) fn checkpoint() -> (usize, u32) {
         STORE_CONTEXT_STACK.with(|cell| {
             let stack = cell.borrow();
@@ -58,9 +60,9 @@ impl StoreContext {
         })
     }
 
-    /// Puts the stack back as [`Self::checkpoint`] found it, after a
-    /// JavaScript exception skipped the frames that held its entries.
-    #[cfg(all(feature = "js", feature = "experimental-async"))]
+    /// Puts the stack back as [`Self::checkpoint`] found it, after an unwind
+    /// skipped the frames that held its entries.
+    #[allow(dead_code)]
     pub(crate) fn restore_checkpoint((depth, borrow_count): (usize, u32)) {
         STORE_CONTEXT_STACK.with(|cell| {
             let mut stack = cell.borrow_mut();
