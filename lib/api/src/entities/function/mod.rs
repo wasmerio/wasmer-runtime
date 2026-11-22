@@ -14,16 +14,19 @@ pub(crate) mod call_wrapper;
 pub use call_wrapper::{CallWrapper, WasmCall};
 
 #[cfg(feature = "experimental-async")]
-pub(crate) mod async_host;
+pub(crate) mod async_call;
 #[cfg(feature = "experimental-async")]
-pub use async_host::{AsyncFunctionEnv, AsyncHostFunction};
-
-use std::{future::Future, pin::Pin};
+pub(crate) mod async_host;
+#[doc(hidden)]
+#[cfg(feature = "experimental-async")]
+pub use async_call::AsyncCallRequest;
+#[cfg(feature = "experimental-async")]
+pub use async_call::{AsyncCall, AsyncCallStore};
+#[cfg(feature = "experimental-async")]
+pub use async_host::{AsyncEnv, AsyncHostFunction};
 
 use wasmer_types::{FunctionType, RawValue};
 
-#[cfg(feature = "experimental-async")]
-use crate::AsStoreAsync;
 use crate::{
     AsStoreMut, AsStoreRef, ExportError, Exportable, Extern, StoreMut, StoreRef, TypedFunction,
     Value, WasmTypeList,
@@ -160,75 +163,57 @@ impl Function {
     }
 
     /// Creates a new async host `Function` (dynamic) with the provided
-    /// signature.
+    /// signature and environment.
     ///
     /// If you know the signature of the host function at compile time,
     /// consider using [`Self::new_typed_async`] for less runtime overhead.
     ///
-    /// The provided closure returns a future that resolves to the function results.
-    /// When invoked synchronously (via [`Function::call`]) the future will run to
-    /// completion immediately, provided it doesn't suspend. When invoked through
-    /// [`Function::call_async`], the future may suspend and resume as needed.
+    /// The function reaches the store with [`AsyncEnv::with`]. Called through
+    /// [`Function::call_async`], it may wait. Called synchronously, it must be
+    /// ready at once, or the guest traps with `YieldOutsideAsyncContext`.
     #[cfg(feature = "experimental-async")]
-    pub fn new_async<FT, F, Fut>(store: &mut impl AsStoreMut, ty: FT, func: F) -> Self
-    where
-        FT: Into<FunctionType>,
-        F: Fn(&[Value]) -> Fut + 'static,
-        Fut: Future<Output = Result<Vec<Value>, RuntimeError>> + 'static,
-    {
-        Self(BackendFunction::new_async(store, ty, func))
-    }
-
-    /// Creates a new async host `Function` (dynamic) with the provided
-    /// signature and environment.
-    ///
-    /// If you know the signature of the host function at compile time,
-    /// consider using [`Self::new_typed_with_env_async`] for less runtime overhead.
-    ///
-    /// Takes an [`AsyncFunctionEnvMut`] that is passed into func. If
-    /// that is not required, [`Self::new_async`] might be an option as well.
-    #[cfg(feature = "experimental-async")]
-    pub fn new_with_env_async<FT, F, Fut, T: 'static>(
+    pub fn new_async<T, FT, F>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
         ty: FT,
         func: F,
     ) -> Self
     where
+        T: Send + 'static,
         FT: Into<FunctionType>,
-        F: Fn(AsyncFunctionEnvMut<T>, &[Value]) -> Fut + 'static,
-        Fut: Future<Output = Result<Vec<Value>, RuntimeError>> + 'static,
+        F: for<'e> AsyncFn(&'e mut AsyncEnv<T>, &'e [Value]) -> Result<Vec<Value>, RuntimeError>
+            + 'static,
     {
-        Self(BackendFunction::new_with_env_async(store, env, ty, func))
+        let func = std::rc::Rc::new(func);
+        let body = move |mut cx: AsyncEnv<T>, values: Vec<Value>| -> async_host::HostFuture {
+            let func = std::rc::Rc::clone(&func);
+            Box::pin(async move {
+                let func: &F = &func;
+                func(&mut cx, &values).await
+            })
+        };
+        Self(BackendFunction::new_async(store, env, ty, body))
     }
 
-    /// Creates a new async host `Function` from a native typed function.
+    /// Creates a new async host `Function` from a typed async function.
     ///
-    /// The future can return either the raw result tuple or any type that implements
-    /// [`IntoResult`](crate::IntoResult) for the result tuple (e.g. `Result<Rets, E>`).
+    /// The function takes `&mut AsyncEnv<T>` and its Wasm arguments, and
+    /// returns the results, or any type that implements
+    /// [`IntoResult`](crate::IntoResult) for them, such as `Result<Rets, E>`.
     #[cfg(feature = "experimental-async")]
-    pub fn new_typed_async<F, Args, Rets>(store: &mut impl AsStoreMut, func: F) -> Self
-    where
-        Rets: WasmTypeList + 'static,
-        Args: WasmTypeList + 'static,
-        F: AsyncHostFunction<(), Args, Rets, WithoutEnv> + 'static,
-    {
-        Self(BackendFunction::new_typed_async(store, func))
-    }
-
-    /// Creates a new async host `Function` with an environment from a typed function.
-    #[cfg(feature = "experimental-async")]
-    pub fn new_typed_with_env_async<T: 'static, F, Args, Rets>(
+    pub fn new_typed_async<T, Args, Rets>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
-        func: F,
+        func: impl AsyncHostFunction<T, Args, Rets>,
     ) -> Self
     where
-        Rets: WasmTypeList + 'static,
+        T: Send + 'static,
         Args: WasmTypeList + 'static,
-        F: AsyncHostFunction<T, Args, Rets, WithEnv> + 'static,
+        Rets: WasmTypeList + 'static,
     {
-        Self(BackendFunction::new_typed_with_env_async(store, env, func))
+        let ty = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
+        let body = async_host::typed_host_body::<T, _, Args, Rets>(func, ty.clone());
+        Self(BackendFunction::new_async(store, env, ty, body))
     }
 
     /// Returns the [`FunctionType`] of the `Function`.
@@ -378,78 +363,43 @@ impl Function {
 
     /// Calls the function asynchronously.
     ///
-    /// The returned future drives execution of the WebAssembly function on a
-    /// coroutine stack. Host functions created with [`Function::new_async`] may
-    /// suspend execution by awaiting futures, and their completion will resume
-    /// the Wasm instance according to the JSPI proposal.
+    /// `store` is a store, the [`AsyncEnv`] of an async host function, or a
+    /// [`SharedStore`](crate::SharedStore):
     ///
-    /// On the `sys` backend that coroutine has a fixed stack of 1 MiB. The
-    /// host functions the guest calls run on it; one that needs more stack
-    /// runs into the stack's guard page, and the process is killed. The
-    /// guest's own frames are on a stack of their own, whose size
-    /// `wasmer_vm::set_stack_size` sets. The future of an async host function
-    /// is polled by the future of the call, on the executor's stack.
+    /// ```ignore
+    /// f.call_async(&mut store, &params).await?;  // exclusive call
+    /// f.call_async(cx, &params).await?;          // inside an async host function
+    /// f.call_async(&mut shared, &params).await?; // 'static guest task
+    /// ```
     ///
-    /// On `sys`, as on `js`, a guest suspends only where no host function
-    /// holds a borrow of its store: a guest that a synchronous host function
-    /// calls, on its own store or another, cannot be suspended, and an async
-    /// host function it calls fails with `TrapCode::YieldOutsideAsyncContext`
-    /// unless its future is ready at once. An async host function that needs
-    /// to wait for a call into a guest awaits that guest's `call_async`.
+    /// The call borrows a store or `AsyncEnv` exclusively until it finishes or
+    /// is dropped. A call on a `SharedStore` keeps its own handle, and its
+    /// future borrows nothing.
     ///
-    /// On `sys`, dropping the call while its guest waits in an async host
-    /// function unwinds the coroutine with a panic: guest frames are
-    /// discarded, and the frames of the call between them run their
-    /// destructors; none of them is a host function's. A call dropped while
-    /// its thread exits, from a thread local, or with `baremetal`, is
-    /// forgotten instead, with its stack.
+    /// A guest suspends only where no host function holds its store. A guest
+    /// called by a synchronous host function cannot suspend, and an async
+    /// import it calls traps with `YieldOutsideAsyncContext` unless it is
+    /// ready at once. A host function that needs to wait must be async and
+    /// pass its `AsyncEnv` here.
     ///
-    /// On the `js` backend the engine suspends the guest's stack (JSPI). A
-    /// function that is neither a WebAssembly function nor an async host
-    /// function, a synchronous host function or JavaScript an embedder gave,
-    /// is called as [`Function::call`] calls it, and an async host function
-    /// called directly returns the values its future returned, as they are.
-    /// The first call on a thread compiles a small WebAssembly module, whose
-    /// trap unwinds a guest that must not run again: on a host that refuses
-    /// to compile it, the call fails before it enters anything. The
-    /// call holds the store's write lock while its guest runs, and gives it
-    /// up while the guest waits in an async host function. Dropping the call
-    /// while its guest waits unwinds the guest, which runs no more code, and
-    /// gives the store back. The call keeps the store for as long as the
-    /// engine may still resume the guest where Wasmer does not see it, also
-    /// once the call is dropped, since nothing can stop the engine then:
+    /// Dropping the call discards the guest's stack without running guest or
+    /// host code, and leaves the instance usable with partial guest state, as
+    /// a trap does.
     ///
-    /// * while the guest is suspended in a `WebAssembly.Suspending` function
-    ///   that Wasmer did not make;
-    /// * while the promise the guest waits on waits for a thenable: an
-    ///   `externref` result of an async host function whose `then` reads
-    ///   differently the second time, as a `Proxy` can make it, which the
-    ///   promise takes for a thenable (any other thenable result fails the
-    ///   import);
-    /// * on JavaScriptCore, while a thenable the guest returned is pending:
-    ///   the engine resolves the call's promise with it, and the call ends
-    ///   with what it settles with.
-    ///
-    /// A thenable that never settles keeps the store for good: it cannot be
-    /// taken back with `StoreAsync::into_store`.
-    ///
-    /// A guest entered while another guest of the same store runs, by a
-    /// synchronous call, a host function, or a JavaScript function given with
-    /// `Function::from_jsvalue`, cannot be suspended: an async host function
-    /// it calls fails with `TrapCode::YieldOutsideAsyncContext`. JavaScript
-    /// that Wasmer never saw, an import of a module instantiated without it,
-    /// must not call a guest's export while a guest of the same store runs:
-    /// on engines that run an async import before they refuse to suspend its
-    /// guest (Node.js 24, and JavaScriptCore beneath a JavaScript frame),
-    /// Wasmer cannot tell the refused import from one that waits.
-    #[must_use = "This function spawns a future that must be awaited to produce results"]
+    /// On `sys`, the coroutine has a fixed stack of 1 MiB, on which the host
+    /// functions the guest calls run. Host futures are polled on the
+    /// executor's stack. On `js`, the engine suspends the guest's stack
+    /// (JSPI), and JavaScript that Wasmer never saw must not call a guest's
+    /// export while a guest of the same store runs. On `v8`, the guest stays
+    /// on the calling stack, so `poll` blocks while an import's future is
+    /// driven.
     #[cfg(feature = "experimental-async")]
-    pub fn call_async(
-        &self,
-        store: &impl AsStoreAsync,
-        params: Vec<Value>,
-    ) -> impl Future<Output = Result<Box<[Value]>, RuntimeError>> + 'static {
-        self.0.call_async(store, params)
+    pub fn call_async<'a, S: AsyncCallStore>(
+        &'a self,
+        store: &'a mut S,
+        params: &'a [Value],
+    ) -> S::Call<'a, Result<Box<[Value]>, RuntimeError>> {
+        store.start_call(AsyncCallRequest::dynamic(self.clone(), params))
     }
 
     #[doc(hidden)]

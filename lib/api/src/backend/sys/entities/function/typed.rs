@@ -10,9 +10,6 @@ use crate::{
     entities::function::call_wrapper::call_wrapped,
     store::{AsStoreMut, AsStoreRef},
 };
-#[cfg(feature = "experimental-async")]
-use crate::{StoreAsync, store::AsStoreAsync};
-use std::future::Future;
 use wasmer_types::{FunctionType, RawValue, Type};
 
 macro_rules! impl_native_traits {
@@ -90,9 +87,6 @@ macro_rules! impl_native_traits {
                     let storeref = store.as_store_ref();
                     let config = storeref.engine().tunables().vmconfig();
                     unsafe {
-                        // Safety: This is the intended use-case for StoreContext::pause, as
-                        // documented in the function's doc comments.
-                        let _pause_guard = StoreContext::pause(store_id);
                         wasmer_vm::wasmer_call_trampoline(
                             storeref.signal_handler(),
                             config,
@@ -134,38 +128,6 @@ macro_rules! impl_native_traits {
                 //     }).map_err(RuntimeError::from_trap)?
                 // };
                 // Ok(Rets::from_c_struct(results))
-            }
-
-            /// Call the typed func asynchronously.
-            #[allow(unused_mut)]
-            #[allow(clippy::too_many_arguments)]
-            #[cfg(feature = "experimental-async")]
-            pub(crate) fn call_async_sys(
-                func: Function,
-                store: StoreAsync,
-                $( $x: $x, )*
-            ) -> impl Future<Output = Result<Rets, RuntimeError>> + 'static
-            where
-                $( $x: FromToNativeWasmType + 'static, )*
-            {
-                async move {
-                    let mut write = store.write_lock().await;
-                    let func_ty = func.ty(&mut write);
-                    let mut params_raw = [ $( $x.to_native().into_raw(&mut write) ),* ];
-                    let mut params_values = Vec::with_capacity(params_raw.len());
-                    {
-                        for (raw, ty) in params_raw.iter().zip(func_ty.params()) {
-                            unsafe {
-                                params_values.push(Value::from_raw(&mut write, *ty, *raw));
-                            }
-                        }
-                    }
-                    drop(write);
-
-                    let results = func.call_async(&store, params_values).await?;
-                    let mut write = store.write_lock().await;
-                    convert_results::<Rets>(&mut write, func_ty, &results)
-                }
             }
 
             #[doc(hidden)]
@@ -216,9 +178,6 @@ macro_rules! impl_native_traits {
                     let storeref = store.as_store_ref();
                     let config = storeref.engine().tunables().vmconfig();
                     unsafe {
-                        // Safety: This is the intended use-case for StoreContext::pause, as
-                        // documented in the function's doc comments.
-                        let _pause_guard = StoreContext::pause(store_id);
                         wasmer_vm::wasmer_call_trampoline(
                             storeref.signal_handler(),
                             config,
@@ -299,52 +258,3 @@ impl_native_traits!(
 impl_native_traits!(
     A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18, A19, A20
 );
-
-fn convert_results<Rets>(
-    store: &mut impl AsStoreMut,
-    ty: FunctionType,
-    results: &[Value],
-) -> Result<Rets, RuntimeError>
-where
-    Rets: WasmTypeList,
-{
-    if results.len() != ty.results().len() {
-        return Err(RuntimeError::new("result arity mismatch"));
-    }
-    let mut raw_array = Rets::empty_array();
-    for ((slot, value_ty), value) in raw_array
-        .as_mut()
-        .iter_mut()
-        .zip(ty.results().iter())
-        .zip(results.iter())
-    {
-        // `Rets::from_array` reads each raw value as the field of its type.
-        if value.ty() != *value_ty {
-            return Err(RuntimeError::new(format!(
-                "a result of type {} where the signature has {value_ty}",
-                value.ty()
-            )));
-        }
-        *slot = value.as_raw(store);
-    }
-    unsafe { Ok(Rets::from_array(store, raw_array)) }
-}
-
-
-/// The results of a typed call are read as the raw values of their types:
-/// values of another type are refused, not read as such.
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{Store, Value};
-
-    #[test]
-    fn results_of_another_type_are_refused() {
-        let mut store = Store::default();
-        let ty = FunctionType::new([], [Type::I64]);
-        let error = convert_results::<i64>(&mut store, ty.clone(), &[Value::I32(7)]).unwrap_err();
-        assert!(error.message().contains("I64"), "{error}");
-        let result = convert_results::<i64>(&mut store, ty, &[Value::I64(7)]).unwrap();
-        assert_eq!(result, 7);
-    }
-}

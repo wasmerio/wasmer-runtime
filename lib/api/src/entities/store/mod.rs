@@ -1,11 +1,13 @@
 //! Defines the [`Store`] data type and various useful traits and data types to interact with a
 //! store.
 
-/// Defines the [`AsStoreAsync`] trait and its supporting types.
+/// Defines [`SharedStore`] and how async calls reach their store.
 #[cfg(feature = "experimental-async")]
 mod async_;
 #[cfg(feature = "experimental-async")]
-pub use async_::*;
+pub(crate) use async_::{CallStore, PollScope, PollStore, SharedState, StoreSlice, WithSlice};
+#[cfg(feature = "experimental-async")]
+pub use async_::{SharedStore, StoreBusy, WeakSharedStore};
 
 /// Defines the [`StoreContext`] type.
 mod context;
@@ -15,12 +17,6 @@ mod inner;
 
 /// Create temporary handles to engines.
 mod store_ref;
-
-/// Single-threaded async-aware RwLock.
-#[cfg(feature = "experimental-async")]
-mod local_rwlock;
-#[cfg(feature = "experimental-async")]
-pub(crate) use local_rwlock::*;
 
 use std::{
     boxed::Box,
@@ -33,8 +29,6 @@ mod obj;
 pub use obj::*;
 
 use crate::{AsEngineRef, BackendEngine, Engine, EngineRef};
-#[cfg(feature = "unsafe-cothread")]
-pub use context::Cothread;
 pub(crate) use context::*;
 pub(crate) use inner::*;
 use wasmer_types::StoreId;
@@ -53,8 +47,15 @@ use wasmer_vm::TrapHandlerFn;
 /// For more information, check out the [related WebAssembly specification]
 /// [related WebAssembly specification]: <https://webassembly.github.io/spec/core/exec/runtime.html#store>
 pub struct Store {
-    pub(crate) inner: Box<StoreInner>,
+    pub(crate) inner: StoreBox,
 }
+
+/// What owns a store's allocation. On JavaScript, a guest can outlive its
+/// call, so the owner cooperates with the guest guard.
+#[cfg(not(all(feature = "js", feature = "experimental-async")))]
+pub(crate) type StoreBox = Box<StoreInner>;
+#[cfg(all(feature = "js", feature = "experimental-async"))]
+pub(crate) type StoreBox = crate::backend::js::guard::GuardedStore;
 
 impl Store {
     /// Creates a new `Store` with a specific [`Engine`].
@@ -76,11 +77,19 @@ impl Store {
             }
         };
 
+        let inner = Box::new(StoreInner {
+            objects: StoreObjects::from_store_ref(&store),
+            store,
+            #[cfg(feature = "experimental-async")]
+            shared: std::rc::Weak::new(),
+            #[cfg(all(feature = "js", feature = "experimental-async"))]
+            guard: Default::default(),
+        });
         Self {
-            inner: Box::new(StoreInner {
-                objects: StoreObjects::from_store_ref(&store),
-                store,
-            }),
+            #[cfg(not(all(feature = "js", feature = "experimental-async")))]
+            inner,
+            #[cfg(all(feature = "js", feature = "experimental-async"))]
+            inner: StoreBox::new(inner),
         }
     }
 
@@ -178,14 +187,20 @@ impl Store {
         self.inner.objects.interrupter()
     }
 
+    /// Makes this store shareable by several guest stacks.
+    ///
+    /// Most embedders do not need this: [`Function::call_async`](crate::Function::call_async)
+    /// on a plain store already suspends and resumes. A [`SharedStore`] is for
+    /// a guest that runs several stacks at once. Two stacks on one instance
+    /// share its globals and memory, so this is only correct for guests built
+    /// for it.
     #[cfg(feature = "experimental-async")]
-    /// Transforms this store into a [`StoreAsync`] which can be used
-    /// to invoke [`Function::call_async`](crate::Function::call_async).
-    pub fn into_async(self) -> StoreAsync {
-        StoreAsync {
-            id: self.id(),
-            inner: LocalRwLock::new(self.inner),
-        }
+    pub fn into_shared(self) -> SharedStore {
+        #[cfg(not(feature = "js"))]
+        let inner = self.inner;
+        #[cfg(feature = "js")]
+        let inner = self.inner.into_box();
+        SharedStore::new(inner)
     }
 }
 

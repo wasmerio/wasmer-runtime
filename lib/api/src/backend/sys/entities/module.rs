@@ -198,11 +198,10 @@ impl Module {
                 objects.as_sys_mut(),
             )?;
 
-            let store_id = objects.id();
             // Before the store takes the instance: one refused here has put
             // nothing anywhere, and is dropped.
             #[cfg(feature = "experimental-host-interrupt")]
-            let interrupt_guard = match interrupt_registry::install(store_id) {
+            let interrupt_guard = match interrupt_registry::install(objects.id()) {
                 Ok(x) => x,
                 Err(interrupt_registry::InstallError::AlreadyInterrupted) => {
                     return Err(InstantiationError::Start(
@@ -228,15 +227,10 @@ impl Module {
             // the data, call the start function and so. If any of these steps
             // traps, the instance stays with the store.
             //
-            // The store is paused while the start function runs, as for any
-            // other entry into Wasm: an async import it calls can then
-            // suspend the call of a host function that instantiates.
-            let finished = {
-                let _pause_guard = StoreContext::pause(store_id);
-                self.artifact
-                    .finish_instantiation(config, signal_handler, &mut instance)
-            };
-            finished?;
+            // A start function cannot suspend its caller: an async import it
+            // calls works if it is ready and traps if it has to wait.
+            self.artifact
+                .finish_instantiation(config, signal_handler, &mut instance)?;
 
             drop(store_install_guard);
             #[cfg(feature = "experimental-host-interrupt")]

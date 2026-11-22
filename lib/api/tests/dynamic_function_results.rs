@@ -44,15 +44,33 @@ fn a_dynamic_function_returns_what_its_type_says() {
 #[test]
 fn an_async_dynamic_function_returns_what_its_type_says() {
     let mut store = Store::default();
-    let right = Function::new_async(&mut store, i32_to_i32(), |args| {
-        let value = args[0].unwrap_i32();
-        async move { Ok(vec![Value::I32(value + 1)]) }
-    });
-    let wrong_type = Function::new_async(&mut store, i32_to_i32(), |_| async {
-        Ok(vec![Value::I64(1)])
-    });
-    let too_few = Function::new_async(&mut store, i32_to_i32(), |_| async { Ok(vec![]) });
-    let typed = Function::new_typed_async(&mut store, async |value: i32| value + 1);
+    let env = wasmer::FunctionEnv::new(&mut store, ());
+    let right = Function::new_async(
+        &mut store,
+        &env,
+        i32_to_i32(),
+        async |_: &mut wasmer::AsyncEnv<()>, args: &[Value]| {
+            let value = args[0].unwrap_i32();
+            Ok(vec![Value::I32(value + 1)])
+        },
+    );
+    let wrong_type = Function::new_async(
+        &mut store,
+        &env,
+        i32_to_i32(),
+        async |_: &mut wasmer::AsyncEnv<()>, _: &[Value]| Ok(vec![Value::I64(1)]),
+    );
+    let too_few = Function::new_async(
+        &mut store,
+        &env,
+        i32_to_i32(),
+        async |_: &mut wasmer::AsyncEnv<()>, _: &[Value]| Ok(vec![]),
+    );
+    let typed = Function::new_typed_async(
+        &mut store,
+        &env,
+        async |_: &mut wasmer::AsyncEnv<()>, value: i32| value + 1,
+    );
 
     // Called synchronously, where a ready future completes in place...
     let args = [Value::I32(7)];
@@ -61,9 +79,8 @@ fn an_async_dynamic_function_returns_what_its_type_says() {
     assert_wrong_signature("too few", too_few.call(&mut store, &args));
 
     // ...and on a coroutine.
-    let store = store.into_async();
-    let call = |function: &Function| {
-        futures::executor::block_on(function.call_async(&store, vec![Value::I32(7)]))
+    let mut call = |function: &Function| {
+        futures::executor::block_on(function.call_async(&mut store, &[Value::I32(7)]))
     };
     for _ in 0..2 {
         assert_eq!(call(&right).unwrap()[0].unwrap_i32(), 8);

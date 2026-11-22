@@ -16,6 +16,14 @@ use wasmer_vm::TrapHandlerFn;
 pub(crate) struct StoreInner {
     pub(crate) objects: StoreObjects,
     pub(crate) store: BackendStore,
+    /// The shared handle of this store, if it has one: how a host function
+    /// finds it. A back-reference here keeps `T` in a `FunctionEnv` `Send`.
+    #[cfg(feature = "experimental-async")]
+    pub(crate) shared: std::rc::Weak<super::SharedState>,
+    /// Keeps a JavaScript guest that can outlive its call from reaching a
+    /// freed or aliased store.
+    #[cfg(all(feature = "js", feature = "experimental-async"))]
+    pub(crate) guard: std::rc::Rc<crate::backend::js::guard::GuestGuard>,
 }
 
 impl std::fmt::Debug for StoreInner {

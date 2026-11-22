@@ -2,9 +2,9 @@ pub(crate) mod inner;
 pub(crate) use inner::*;
 
 #[cfg(feature = "experimental-async")]
-use crate::AsStoreAsync;
-use crate::{AsStoreMut, AsStoreRef, StoreMut, StoreRef, macros::backend::match_rt};
-use std::{any::Any, fmt::Debug, marker::PhantomData};
+use crate::SharedStore;
+use crate::{AsStoreMut, AsStoreRef, StoreMut, StoreRef};
+use std::any::Any;
 
 #[derive(Debug, derive_more::From)]
 /// An opaque reference to a function environment.
@@ -31,8 +31,12 @@ impl<T> FunctionEnv<T> {
     //    todo!()
     //}
 
-    /// Get the data as reference
-    pub fn as_ref<'a>(&self, store: &'a impl AsStoreRef) -> &'a T
+    /// Get the data as reference.
+    ///
+    /// This needs a mutable store view: a [`StoreRef`] can coexist with the
+    /// `&mut T` returned by [`FunctionEnvMut::data_and_store`], and must not
+    /// reach `T`.
+    pub fn as_ref<'a>(&self, store: &'a impl AsStoreMut) -> &'a T
     where
         T: Any + Send + 'static + Sized,
     {
@@ -81,16 +85,29 @@ impl<T: Send + 'static> FunctionEnvMut<'_, T> {
         self.0.as_mut()
     }
 
-    /// Borrows a new mutable reference of both the attached Store and host state
-    pub fn data_and_store_mut(&mut self) -> (&mut T, StoreMut<'_>) {
-        self.0.data_and_store_mut()
+    /// Borrows the host state mutably and the rest of the store immutably.
+    ///
+    /// The [`StoreRef`] can read memories, globals and tables, but cannot reach
+    /// `T` or run a guest. Clone a handle out of [`Self::data`] first when an
+    /// operation needs a mutable store.
+    pub fn data_and_store(&mut self) -> (&mut T, StoreRef<'_>) {
+        self.0.data_and_store()
     }
 
-    /// Creates an [`AsStoreAsync`] from this [`FunctionEnvMut`] if the current
-    /// context is async.
+    /// The store's shared handle, if it has one: see [`Store::into_shared`](crate::Store::into_shared).
     #[cfg(feature = "experimental-async")]
-    pub fn as_store_async(&self) -> Option<impl AsStoreAsync + 'static> {
-        self.0.as_store_async()
+    pub fn shared(&self) -> Option<SharedStore> {
+        self.as_store_ref().inner.shared.upgrade().map(SharedStore)
+    }
+
+    /// Lets a [`SharedStore`] handle use the store while `f` runs.
+    ///
+    /// This borrow is unreachable until `f` returns, so the store can be lent
+    /// to code that holds no reference to it. Inside `f`,
+    /// [`SharedStore::try_with`] succeeds once at a time.
+    #[cfg(feature = "experimental-async")]
+    pub fn release<R>(&mut self, f: impl FnOnce() -> R) -> R {
+        self.as_store_mut().parked(f)
     }
 }
 
@@ -116,105 +133,5 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
-    }
-}
-
-/// A shared handle to a [`FunctionEnv`], suitable for use
-/// in async imports.
-#[cfg(feature = "experimental-async")]
-pub struct AsyncFunctionEnvMut<T>(pub(crate) BackendAsyncFunctionEnvMut<T>);
-
-/// A read-only handle to the [`FunctionEnv`] in an [`AsyncFunctionEnvMut`].
-#[cfg(feature = "experimental-async")]
-pub struct AsyncFunctionEnvHandle<T>(pub(crate) BackendAsyncFunctionEnvHandle<T>);
-
-/// A mutable handle to the [`FunctionEnv`] in an [`AsyncFunctionEnvMut`].
-#[cfg(feature = "experimental-async")]
-pub struct AsyncFunctionEnvHandleMut<T>(pub(crate) BackendAsyncFunctionEnvHandleMut<T>);
-
-#[cfg(feature = "experimental-async")]
-impl<T: 'static> AsyncFunctionEnvMut<T> {
-    /// Waits for a store lock and returns a read-only handle to the
-    /// function environment.
-    pub async fn read(&self) -> AsyncFunctionEnvHandle<T> {
-        AsyncFunctionEnvHandle(self.0.read().await)
-    }
-
-    /// Waits for a store lock and returns a mutable handle to the
-    /// function environment.
-    pub async fn write(&self) -> AsyncFunctionEnvHandleMut<T> {
-        AsyncFunctionEnvHandleMut(self.0.write().await)
-    }
-
-    /// Borrows a new immmutable reference
-    pub fn as_ref(&self) -> FunctionEnv<T> {
-        FunctionEnv(self.0.as_ref())
-    }
-
-    /// Borrows a new mutable reference
-    pub fn as_mut(&mut self) -> Self {
-        Self(self.0.as_mut())
-    }
-
-    /// Creates an [`AsStoreAsync`] from this [`AsyncFunctionEnvMut`].
-    pub fn as_store_async(&self) -> impl AsStoreAsync + 'static {
-        self.0.as_store_async()
-    }
-}
-
-#[cfg(feature = "experimental-async")]
-impl<T: 'static> AsyncFunctionEnvHandle<T> {
-    /// Returns a reference to the host state in this function environment.
-    pub fn data(&self) -> &T {
-        self.0.data()
-    }
-
-    /// Returns both the host state and the attached StoreRef
-    pub fn data_and_store(&self) -> (&T, &impl AsStoreRef) {
-        self.0.data_and_store()
-    }
-}
-
-#[cfg(feature = "experimental-async")]
-impl<T: 'static> AsStoreRef for AsyncFunctionEnvHandle<T> {
-    fn as_store_ref(&self) -> StoreRef<'_> {
-        AsStoreRef::as_store_ref(&self.0)
-    }
-}
-
-#[cfg(feature = "experimental-async")]
-impl<T: 'static> AsyncFunctionEnvHandleMut<T> {
-    /// Returns a mutable reference to the host state in this function environment.
-    pub fn data_mut(&mut self) -> &mut T {
-        self.0.data_mut()
-    }
-
-    /// Returns both the host state and the attached StoreMut
-    pub fn data_and_store_mut(&mut self) -> (&mut T, &mut impl AsStoreMut) {
-        self.0.data_and_store_mut()
-    }
-
-    /// Borrows a new [`FunctionEnvMut`] from this
-    /// [`AsyncFunctionEnvHandleMut`].
-    pub fn as_function_env_mut(&mut self) -> FunctionEnvMut<'_, T> {
-        FunctionEnvMut(self.0.as_function_env_mut())
-    }
-}
-
-#[cfg(feature = "experimental-async")]
-impl<T: 'static> AsStoreRef for AsyncFunctionEnvHandleMut<T> {
-    fn as_store_ref(&self) -> StoreRef<'_> {
-        AsStoreRef::as_store_ref(&self.0)
-    }
-}
-
-#[cfg(feature = "experimental-async")]
-impl<T: 'static> AsStoreMut for AsyncFunctionEnvHandleMut<T> {
-    fn as_store_mut(&mut self) -> StoreMut<'_> {
-        AsStoreMut::as_store_mut(&mut self.0)
-    }
-
-    fn objects_mut(&mut self) -> &mut crate::StoreObjects {
-        AsStoreMut::objects_mut(&mut self.0)
     }
 }

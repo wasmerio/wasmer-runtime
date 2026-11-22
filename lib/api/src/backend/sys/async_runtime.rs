@@ -1,3 +1,13 @@
+//! Native async calls: one `corosensei` coroutine per `Function::call_async`.
+//!
+//! The call future owns the coroutine, and lends it the store for one slice at
+//! a time. When the guest waits in an async import, the coroutine suspends
+//! with only engine and guest frames on its stack, and the future polls the
+//! host future on the executor's stack.
+//!
+//! Everything a call leaves on the thread moves with its stack, at the single
+//! switch point in [`AsyncCallFuture::switch_to_coroutine`].
+
 #[cfg(feature = "experimental-host-interrupt")]
 use std::{
     collections::HashMap,
@@ -6,37 +16,23 @@ use std::{
 use std::{
     cell::{Cell, RefCell},
     future::Future,
-    marker::PhantomData,
     pin::Pin,
     ptr,
     rc::Rc,
-    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    task::{Context, Poll, Waker},
 };
 
 use corosensei::{Coroutine, CoroutineResult, Yielder, stack::DefaultStack};
 #[cfg(feature = "experimental-host-interrupt")]
 use dashmap::DashMap;
 
-use super::entities::function::Function as SysFunction;
 use crate::{
-    AsStoreAsync, AsStoreMut, AsStoreRef, ForcedStoreInstallGuard, LocalRwLock,
-    LocalRwLockWriteGuard, RuntimeError, Store, StoreAsync, StoreContext, StoreInner, StoreMut,
-    StoreRef, Value,
+    AsStoreMut, AsStoreRef, AsyncCallRequest, CallStore, PollScope, PollStore, RuntimeError,
+    StoreContext, StoreInner, StoreMut, StoreRef, Value,
+    entities::function::async_host::HostFuture,
 };
 use wasmer_types::StoreId;
 use wasmer_vm::ActivationState;
-
-pub(crate) type HostFuture =
-    Pin<Box<dyn Future<Output = Result<Vec<Value>, RuntimeError>> + 'static>>;
-type CallResult = Result<Box<[Value]>, RuntimeError>;
-
-pub(crate) fn call_function_async(
-    function: SysFunction,
-    store: StoreAsync,
-    params: Vec<Value>,
-) -> AsyncCallFuture {
-    AsyncCallFuture::new(function, store, params)
-}
 
 /// Why a coroutine suspended: for the poller to drive this host future. See
 /// [`CoroutineContext::block_on_future`].
@@ -55,28 +51,32 @@ static NEXT_ASYNC_CALL_FUTURE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// The wakers of the calls that are in progress, by store, for
 /// [`notify_pending_futures_of_interrupt`]: a host interrupt is the only
-/// thing that wakes a call from outside. Everything else a call waits for,
-/// the store's lock or a host future, has the waker itself.
+/// thing that wakes a call from outside. Everything else a call waits for
+/// is a host future, which has the waker itself.
 #[cfg(feature = "experimental-host-interrupt")]
 static ASYNC_CALL_FUTURE_WAKERS: LazyLock<DashMap<StoreId, HashMap<AsyncCallFutureId, Waker>>> =
     LazyLock::new(DashMap::new);
 
-#[allow(clippy::type_complexity)]
-pub(crate) struct AsyncCallFuture {
+/// The future of one call. `'a` is its borrow of the store, if it has one.
+pub(crate) struct AsyncCallFuture<'a, X: 'static> {
     #[cfg(feature = "experimental-host-interrupt")]
     id: AsyncCallFutureId,
 
-    coroutine: Option<Coroutine<AsyncResume, AsyncYield, CallResult>>,
-    pending_store_install: Option<Pin<Box<dyn Future<Output = ForcedStoreInstallGuard>>>>,
+    coroutine: Option<Coroutine<AsyncResume, AsyncYield, Result<X, RuntimeError>>>,
     pending_future: Option<HostFuture>,
     next_resume: Option<AsyncResume>,
-    result: Option<CallResult>,
+    result: Option<Result<X, RuntimeError>>,
 
-    // Store handle we can use to lock the store down
-    store: StoreAsync,
+    store: CallStore<'a>,
+    /// Where the coroutine finds the store for the slice it runs in.
+    current: Rc<Cell<*mut StoreInner>>,
 
     activation: Activation,
 }
+
+// Nothing here relies on being pinned: the coroutine's frames are on its own
+// stack, and the host future is boxed.
+impl<X> Unpin for AsyncCallFuture<'_, X> {}
 
 /// How many coroutine stacks a thread keeps for its next `call_async`s.
 const STACK_POOL_CAPACITY: usize = 16;
@@ -124,6 +124,8 @@ fn give_stack_back(stack: DefaultStack) {
 thread_local! {
     /// The `call_async` coroutine this thread is running on, if any.
     static CURRENT_COROUTINE: Cell<*const CoroutineContext> = const { Cell::new(ptr::null()) };
+    /// Where the store context entries of that coroutine start.
+    static COROUTINE_BASE: Cell<usize> = const { Cell::new(0) };
 }
 
 /// A [`CURRENT_COROUTINE`] while it is off the thread: that of a coroutine
@@ -132,7 +134,7 @@ thread_local! {
 /// started runs on no `call_async` coroutine, whatever the thread that starts
 /// it runs on, and a host function on its stack must not suspend that one
 /// from there.
-pub(crate) struct CoroutineSlot(*const CoroutineContext);
+struct CoroutineSlot(*const CoroutineContext);
 
 impl Default for CoroutineSlot {
     fn default() -> Self {
@@ -144,7 +146,7 @@ impl CoroutineSlot {
     /// Exchanges the slot with the thread's [`CURRENT_COROUTINE`]: once when
     /// the thread switches to the coroutine the slot belongs to, and again
     /// when it switches back.
-    pub(crate) fn swap(&mut self) {
+    fn swap(&mut self) {
         CURRENT_COROUTINE.with(|cell| self.0 = cell.replace(self.0));
     }
 }
@@ -161,76 +163,48 @@ struct Activation {
     /// The trap handler the signal handler consults and the interrupt
     /// registry's active stores.
     vm: ActivationState,
+    /// The store context entries of the calls on the coroutine's stack.
+    entries: Vec<StoreContext>,
     /// [`CURRENT_COROUTINE`].
     coroutine: CoroutineSlot,
 }
 
-impl Activation {
-    /// # Safety
-    /// See [`ActivationState::swap`].
-    unsafe fn swap(&mut self) {
-        unsafe { self.vm.swap() };
-        self.coroutine.swap();
-    }
-}
-
-// We can't use any of the existing AsStoreMut types here, since we keep
-// changing the store context underneath us while the coroutine yields.
-// To work around it, we use this dummy struct, which just grabs the store
-// from the store context. Since we always have a store context installed
-// when resuming the coroutine, this is safe in that it can access the store
-// through the store context. HOWEVER, references returned from this struct
-// CAN NOT BE HELD ACROSS A YIELD POINT. We don't do this anywhere in the
-// `Function::call` code.
+/// The store of a call, as the code on its coroutine reaches it. It is not
+/// one of the `AsStoreMut` types because the pointer is refreshed for every
+/// slice. References it returns must not be held across a yield, and
+/// `Function::call` holds none.
 struct AsyncCallStoreMut {
-    store_id: StoreId,
+    current: Rc<Cell<*mut StoreInner>>,
 }
 
 impl AsStoreRef for AsyncCallStoreMut {
     fn as_store_ref(&self) -> StoreRef<'_> {
-        // Safety: This is only used with Function::call, which doesn't store
-        // the returned reference anywhere, including when calling into WASM
-        // code.
-        unsafe {
-            StoreRef {
-                inner: StoreContext::get_current_transient(self.store_id)
-                    .as_ref()
-                    .unwrap(),
-            }
+        // Safety: the call lends this pointer to its coroutine for the slice
+        // that is running.
+        StoreRef {
+            inner: unsafe { &*self.current.get() },
         }
     }
 }
 
 impl AsStoreMut for AsyncCallStoreMut {
     fn as_store_mut(&mut self) -> StoreMut<'_> {
-        // Safety: This is only used with Function::call, which doesn't store
-        // the returned reference anywhere, including when calling into WASM
-        // code.
-        unsafe {
-            StoreMut {
-                inner: StoreContext::get_current_transient(self.store_id)
-                    .as_mut()
-                    .unwrap(),
-            }
+        // Safety: as for `as_store_ref`; `&mut self` is the only way to it.
+        StoreMut {
+            inner: unsafe { &mut *self.current.get() },
         }
     }
 
     fn objects_mut(&mut self) -> &mut crate::StoreObjects {
-        // Safety: This is only used with Function::call, which doesn't store
-        // the returned reference anywhere, including when calling into WASM
-        // code.
-        unsafe {
-            &mut StoreContext::get_current_transient(self.store_id)
-                .as_mut()
-                .unwrap()
-                .objects
-        }
+        // Safety: as for `as_store_mut`.
+        unsafe { &mut (*self.current.get()).objects }
     }
 }
 
-impl AsyncCallFuture {
-    pub(crate) fn new(function: SysFunction, store: StoreAsync, params: Vec<Value>) -> Self {
-        let store_id = store.id;
+impl<'a, X: 'static> AsyncCallFuture<'a, X> {
+    pub(crate) fn new(store: CallStore<'a>, request: AsyncCallRequest<X>) -> Self {
+        let current = Rc::new(Cell::new(ptr::null_mut()));
+        let coroutine_store = Rc::clone(&current);
         let coroutine = Coroutine::with_stack(
             take_stack(),
             move |yielder: &Yielder<AsyncResume, AsyncYield>, resume| {
@@ -238,8 +212,17 @@ impl AsyncCallFuture {
 
                 let ctx_state = CoroutineContext { yielder };
                 CURRENT_COROUTINE.with(|cell| cell.set(&ctx_state));
-                let mut store_mut = AsyncCallStoreMut { store_id };
-                function.call(&mut store_mut, &params)
+                let mut store = AsyncCallStoreMut {
+                    current: coroutine_store,
+                };
+                let AsyncCallRequest {
+                    function,
+                    params,
+                    finish,
+                } = request;
+                let params = params(&mut store.as_store_mut())?;
+                let results = function.call(&mut store, &params)?;
+                finish(&mut store.as_store_mut(), &results)
             },
         );
 
@@ -247,13 +230,14 @@ impl AsyncCallFuture {
             #[cfg(feature = "experimental-host-interrupt")]
             id: NEXT_ASYNC_CALL_FUTURE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
             coroutine: Some(coroutine),
-            pending_store_install: None,
             pending_future: None,
             next_resume: Some(AsyncResume::Start),
             result: None,
             store,
+            current,
             activation: Activation {
                 vm: ActivationState::new(),
+                entries: Vec::new(),
                 coroutine: CoroutineSlot::default(),
             },
         }
@@ -269,32 +253,44 @@ impl AsyncCallFuture {
     fn switch_to_coroutine(
         &mut self,
         resume: Option<AsyncResume>,
-    ) -> Option<CoroutineResult<AsyncYield, CallResult>> {
-        struct SwitchBack<'a> {
-            activation: &'a mut Activation,
+        store: Option<*mut StoreInner>,
+    ) -> Option<CoroutineResult<AsyncYield, Result<X, RuntimeError>>> {
+        struct SwitchBack<'s> {
+            activation: &'s mut Activation,
+            base: usize,
+            outer_base: usize,
             suspended: bool,
         }
         impl Drop for SwitchBack<'_> {
             fn drop(&mut self) {
                 // Safety: the second half of the pair below; the thread is
                 // back on the stack it switched from.
-                unsafe { self.activation.swap() };
+                unsafe { self.activation.vm.swap() };
+                self.activation.coroutine.swap();
+                COROUTINE_BASE.set(self.outer_base);
+                StoreContext::suspend_entries(&mut self.activation.entries, self.base);
                 if !self.suspended {
                     // The coroutine returned or was unwound: nothing may be
                     // left pointing into a stack that is gone.
                     self.activation.coroutine = CoroutineSlot::default();
+                    self.activation.entries.clear();
                     debug_assert!(self.activation.vm.is_empty());
                 }
             }
         }
 
+        let base = StoreContext::resume_entries(&mut self.activation.entries, store);
+        let outer_base = COROUTINE_BASE.replace(base);
         // Safety: host code is about to switch to the coroutine that owns the
         // activation, on the thread that runs it; `SwitchBack` swaps again as
         // soon as control is back, also when it comes back by unwinding. The
         // state is not used again once the coroutine is gone.
-        unsafe { self.activation.swap() };
+        unsafe { self.activation.vm.swap() };
+        self.activation.coroutine.swap();
         let mut switch_back = SwitchBack {
             activation: &mut self.activation,
+            base,
+            outer_base,
             suspended: false,
         };
         let result = match resume {
@@ -314,127 +310,27 @@ impl AsyncCallFuture {
 
     #[cfg(feature = "experimental-host-interrupt")]
     fn remove_from_wakers_list(&self) {
-        let mut wakers_entry = match ASYNC_CALL_FUTURE_WAKERS.entry(self.store.id) {
+        let mut wakers_entry = match ASYNC_CALL_FUTURE_WAKERS.entry(self.store.id()) {
             dashmap::Entry::Occupied(o) => o,
-            dashmap::Entry::Vacant(v) => return,
+            dashmap::Entry::Vacant(_) => return,
         };
 
-        let mut waker_map_ref = wakers_entry.get_mut();
+        let waker_map_ref = wakers_entry.get_mut();
         waker_map_ref.remove(&self.id);
         if waker_map_ref.is_empty() {
             wakers_entry.remove();
         }
     }
-}
 
-impl Future for AsyncCallFuture {
-    type Output = Result<Box<[Value]>, RuntimeError>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        loop {
-            #[cfg(feature = "experimental-host-interrupt")]
-            let store_id = self.store.id;
-
-            #[cfg(feature = "experimental-host-interrupt")]
-            {
-                if super::vm::interrupt_registry::is_interrupted(store_id)
-                    || self.activation.vm.is_interrupted(store_id)
-                {
-                    self.remove_from_wakers_list();
-                    // The call ends here, so its coroutine goes now, and with
-                    // it the installations that keep the store interrupted.
-                    self.cancel();
-                    self.pending_future = None;
-                    return Poll::Ready(Err(super::vm::Trap::lib(
-                        super::vm::TrapCode::HostInterrupt,
-                    )
-                    .into()));
-                }
-            }
-
-            if let Some(future) = self.pending_future.as_mut() {
-                match future.as_mut().poll(cx) {
-                    Poll::Ready(result) => {
-                        self.pending_future = None;
-                        self.next_resume = Some(AsyncResume::HostFutureReady(result));
-                    }
-                    Poll::Pending => return Poll::Pending,
-                }
-            }
-
-            // If we're ready, return early
-            if self.coroutine.is_none() {
-                self.remove_from_wakers_list();
-                return Poll::Ready(self.result.take().expect("polled after completion"));
-            }
-
-            #[cfg(feature = "experimental-host-interrupt")]
-            {
-                let mut wakers_entry = ASYNC_CALL_FUTURE_WAKERS.entry(store_id).or_default();
-                wakers_entry.insert(self.id, cx.waker().clone());
-            }
-
-            // Acquiring a store lock should be the last step before resuming
-            // the coroutine, to minimize the time we hold the lock.
-            //
-            // A store that is free is locked on the spot. It cannot be the
-            // store this thread is running, which is locked, so there is
-            // nothing for `install_store_context` to check. A call that is
-            // already waiting for the store leaves it to the future that
-            // holds its place among the waiters.
-            let free_store = match self.pending_store_install {
-                None => self.store.inner.try_write(),
-                Some(_) => None,
-            };
-            let store_context_guard = match free_store {
-                Some(store_guard) => StoreContext::install_async(store_guard),
-                None => {
-                    let this = &mut *self;
-                    let store = &this.store;
-                    let install = this.pending_store_install.get_or_insert_with(|| {
-                        Box::pin(install_store_context(StoreAsync {
-                            id: store.id,
-                            inner: store.inner.clone(),
-                        }))
-                    });
-                    match install.as_mut().poll(cx) {
-                        Poll::Ready(guard) => {
-                            this.pending_store_install = None;
-                            guard
-                        }
-                        Poll::Pending => return Poll::Pending,
-                    }
-                }
-            };
-
-            let resume_arg = self.next_resume.take().expect("no resume arg available");
-            match self.switch_to_coroutine(Some(resume_arg)) {
-                Some(CoroutineResult::Yield(AsyncYield(future))) => {
-                    self.pending_future = Some(future);
-                }
-                Some(CoroutineResult::Return(result)) => {
-                    give_stack_back(self.coroutine.take().unwrap().into_stack());
-                    self.result = Some(result);
-                }
-                None => unreachable!("resumed with an argument"),
-            }
-
-            // The coroutine has no store context entry of its own: a store it
-            // enters synchronously stays on top until that call returns, and
-            // cannot suspend in between (see `block_on_host_future`). So the
-            // entry installed above is on top again.
-            debug_assert!(
-                StoreContext::top_is_async(),
-                "a call_async coroutine left a store context entry behind"
-            );
-            // Uninstall the store context to unlock the store after the
-            // coroutine yields or returns.
-            drop(store_context_guard);
+    /// Drops a host future the call is waiting on, while it can still reach
+    /// the store if its destructor asks.
+    fn drop_pending_future(&mut self) {
+        if let Some(future) = self.pending_future.take() {
+            let _scope = PollScope::enter(self.store.try_resolve());
+            drop(future);
         }
     }
-}
 
-impl AsyncCallFuture {
     /// Ends a call whose coroutine will not be resumed. A suspended coroutine
     /// is unwound: guest frames are discarded without running, and the
     /// frames of the call between them run their destructors. The unwind
@@ -456,55 +352,104 @@ impl AsyncCallFuture {
                 self.activation.vm.abandon();
                 return;
             }
-            self.switch_to_coroutine(None);
+            self.switch_to_coroutine(None, None);
         }
         self.coroutine = None;
     }
 }
 
-impl Drop for AsyncCallFuture {
-    fn drop(&mut self) {
-        self.remove_from_wakers_list();
-        // The pending host future is dropped afterwards, with the other
-        // fields.
-        self.cancel();
+impl<X: 'static> Future for AsyncCallFuture<'_, X> {
+    type Output = Result<X, RuntimeError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        loop {
+            #[cfg(feature = "experimental-host-interrupt")]
+            {
+                let store_id = this.store.id();
+                if super::vm::interrupt_registry::is_interrupted(store_id)
+                    || this.activation.vm.is_interrupted(store_id)
+                {
+                    this.remove_from_wakers_list();
+                    // The call ends here, so its coroutine goes now, and with
+                    // it the installations that keep the store interrupted.
+                    this.drop_pending_future();
+                    this.cancel();
+                    return Poll::Ready(Err(super::vm::Trap::lib(
+                        super::vm::TrapCode::HostInterrupt,
+                    )
+                    .into()));
+                }
+            }
+
+            // If we're ready, return early
+            if this.coroutine.is_none() {
+                this.remove_from_wakers_list();
+                return Poll::Ready(this.result.take().expect("polled after completion"));
+            }
+
+            let store: PollStore = this.store.resolve();
+
+            if let Some(future) = this.pending_future.as_mut() {
+                let result = {
+                    let _scope = PollScope::enter(Some(store));
+                    let result = future.as_mut().poll(cx);
+                    if result.is_ready() {
+                        // Its destructors run with the store in reach too.
+                        this.pending_future = None;
+                    }
+                    result
+                };
+                match result {
+                    Poll::Ready(result) => {
+                        this.next_resume = Some(AsyncResume::HostFutureReady(result));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+
+            #[cfg(feature = "experimental-host-interrupt")]
+            {
+                let mut wakers_entry = ASYNC_CALL_FUTURE_WAKERS
+                    .entry(this.store.id())
+                    .or_default();
+                wakers_entry.insert(this.id, cx.waker().clone());
+            }
+
+            // The store is taken for as long as the guest runs, and given up
+            // as soon as it suspends or returns.
+            let slice = store.enter_slice();
+            this.current.set(slice.ptr());
+            let resume_arg = this.next_resume.take().expect("no resume arg available");
+            match this.switch_to_coroutine(Some(resume_arg), Some(slice.ptr())) {
+                Some(CoroutineResult::Yield(AsyncYield(future))) => {
+                    this.pending_future = Some(future);
+                }
+                Some(CoroutineResult::Return(result)) => {
+                    give_stack_back(this.coroutine.take().unwrap().into_stack());
+                    this.result = Some(result);
+                }
+                None => unreachable!("resumed with an argument"),
+            }
+            drop(slice);
+        }
     }
 }
 
-async fn install_store_context(store: StoreAsync) -> ForcedStoreInstallGuard {
-    // Looks at the thread's entries without borrowing them: a borrow taken
-    // here would still be taken after the panic below is caught. A store with
-    // an entry is held by a call beneath whatever polls this, on this thread,
-    // which cannot give the store up before that returns: the active one, or
-    // one that entered another store since.
-    match crate::StoreContext::is_held(store.id) {
-        false => {
-            // We always need to acquire a new write lock on the store.
-            let store_guard = store.inner.write().await;
-            unsafe { crate::StoreContext::install_async(store_guard) }
+impl<X: 'static> Drop for AsyncCallFuture<'_, X> {
+    fn drop(&mut self) {
+        // Runs even if a host future's destructor panics: a coroutine must
+        // never be dropped without its state on the thread.
+        struct Cancel<'c, 'a, X: 'static>(&'c mut AsyncCallFuture<'a, X>);
+        impl<X: 'static> Drop for Cancel<'_, '_, X> {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
         }
-        true => {
-            // If we're already in a store context, it is unsafe to reuse
-            // the existing store ref since it'll also be accessible from
-            // the imported function that tried to poll us, which is a
-            // double mutable borrow.
-            // Note to people who discover this code: this *would* be safe
-            // if we had a separate variation of call_async that just
-            // used the existing coroutine context instead of spawning a
-            // new coroutine. However, the current call_async always spawns
-            // a new coroutine, so we can't allow this; every coroutine
-            // needs to own its write lock on the store to make sure there
-            // are no overlapping mutable borrows. If this is something
-            // you're interested in, feel free to open a GitHub issue outlining
-            // your use-case.
-            panic!(
-                "Function::call_async futures cannot be polled recursively \
-                from within another imported function. If you need to await \
-                a recursive call_async, consider spawning the future into \
-                your async runtime and awaiting the resulting task; \
-                e.g. tokio::task::spawn(func.call_async(...)).await"
-            );
-        }
+
+        self.remove_from_wakers_list();
+        let cancel = Cancel(self);
+        cancel.0.drop_pending_future();
     }
 }
 
@@ -513,23 +458,20 @@ pub enum AsyncRuntimeError {
     RuntimeError(RuntimeError),
 }
 
-pub(crate) fn block_on_host_future(future: HostFuture) -> Result<Vec<Value>, AsyncRuntimeError> {
+pub(crate) fn block_on_host_future(
+    store_id: StoreId,
+    future: HostFuture,
+) -> Result<Vec<Value>, AsyncRuntimeError> {
     match CoroutineContext::get_current() {
-        None => {
-            // If there is no async context or we haven't entered it,
-            // we can still directly run a future that doesn't block
-            // inline.
-            run_immediate(future)
+        // A store entered synchronously from inside a coroutine is a sync
+        // context too: the host function that entered it holds a borrow of
+        // its store across the call, which must not be parked.
+        Some(context) if StoreContext::can_suspend(COROUTINE_BASE.get()) => {
+            unsafe { context.as_ref().expect("valid context pointer") }
+                .block_on_future(future)
+                .map_err(AsyncRuntimeError::RuntimeError)
         }
-        // A store entered synchronously from inside a coroutine (another
-        // store, called by a host function) is a sync context too, and so is
-        // a guest call a host function made on its own store: the host
-        // function holds a borrow of the store across it, which the store
-        // must not be given up under (see `StoreContext::top_can_suspend`).
-        Some(_) if !StoreContext::top_can_suspend() => run_immediate(future),
-        Some(context) => unsafe { context.as_ref().expect("valid context pointer") }
-            .block_on_future(future)
-            .map_err(AsyncRuntimeError::RuntimeError),
+        _ => run_immediate(store_id, future),
     }
 }
 
@@ -576,7 +518,17 @@ impl CoroutineContext {
     }
 }
 
-fn run_immediate(mut future: HostFuture) -> Result<Vec<Value>, AsyncRuntimeError> {
+/// Polls a host future once, where the guest cannot suspend. The store is
+/// reachable through the entry of the synchronous call beneath, whose borrow
+/// this holds so that nothing else can take it meanwhile.
+fn run_immediate(
+    store_id: StoreId,
+    mut future: HostFuture,
+) -> Result<Vec<Value>, AsyncRuntimeError> {
+    // Safety: the entry's pointer is used only for the duration of this poll,
+    // in the slices the future takes, while the wrapper's borrow stands.
+    let wrapper = unsafe { StoreContext::get_current(store_id) };
+    let _scope = PollScope::enter(Some(PollStore::exclusive(store_id, wrapper.as_ptr())));
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
     match future.as_mut().poll(&mut cx) {
@@ -588,8 +540,8 @@ fn run_immediate(mut future: HostFuture) -> Result<Vec<Value>, AsyncRuntimeError
 /// A store of this backend, whichever backend `Store::default` picks: the
 /// Windows test lane makes V8 the default, which has no async host functions.
 #[cfg(test)]
-fn sys_store() -> Store {
-    Store::new(crate::backend::sys::entities::engine::default_engine())
+fn sys_store() -> crate::Store {
+    crate::Store::new(crate::backend::sys::entities::engine::default_engine())
 }
 
 #[cfg(test)]
@@ -601,7 +553,17 @@ mod stack_pool {
     use super::*;
     use crate::{Function, FunctionType};
 
+    type CallResult = Result<Box<[Value]>, RuntimeError>;
     type Call = Pin<Box<dyn Future<Output = CallResult>>>;
+
+    struct OnOneThread<T>(T);
+    unsafe impl<T> Send for OnOneThread<T> {}
+    unsafe impl<T> Sync for OnOneThread<T> {}
+    impl<T> OnOneThread<T> {
+        fn get(&self) -> &T {
+            &self.0
+        }
+    }
 
     /// Pending until its flag is set.
     struct Gate(Rc<Cell<bool>>);
@@ -617,9 +579,11 @@ mod stack_pool {
     }
 
     struct Host {
-        store: StoreAsync,
+        store: crate::SharedStore,
         /// Waits for the gate, then returns.
         wait: Function,
+        /// Notes where on the stack it runs.
+        on_stack: Function,
         /// Panics.
         panic: Function,
         gate: Rc<Cell<bool>>,
@@ -635,22 +599,28 @@ mod stack_pool {
             let gate = Rc::new(Cell::new(false));
             let ran_at = Rc::new(Cell::new(0));
             let ty = FunctionType::new(vec![], vec![]);
-            let wait = Function::new_async(&mut store, ty.clone(), {
-                let (gate, ran_at) = (gate.clone(), ran_at.clone());
+            let env = crate::FunctionEnv::new(&mut store, ());
+            let on_stack = crate::Function::new(&mut store, ty.clone(), {
+                let ran_at = OnOneThread(ran_at.clone());
                 move |_| {
                     let local = 0u8;
-                    ran_at.set(ptr::from_ref(&local) as usize);
-                    let gate = gate.clone();
-                    async move {
-                        Gate(gate).await;
-                        Ok(vec![])
-                    }
+                    ran_at.get().set(ptr::from_ref(&local) as usize);
+                    Ok(vec![])
+                }
+            });
+            let wait = Function::new_async(&mut store, &env, ty.clone(), {
+                let gate = gate.clone();
+                async move |cx: &mut crate::AsyncEnv<()>, _: &[Value]| {
+                    Gate(gate.clone()).await;
+                    let _ = cx;
+                    Ok(vec![])
                 }
             });
             let panic = Function::new(&mut store, ty, |_| panic!("host function panicked"));
             Self {
-                store: store.into_async(),
+                store: store.into_shared(),
                 wait,
+                on_stack,
                 panic,
                 gate,
                 ran_at,
@@ -658,7 +628,7 @@ mod stack_pool {
         }
 
         fn call(&self, function: &Function) -> Call {
-            Box::pin(function.call_async(&self.store, vec![]))
+            Box::pin(function.call_async(&mut self.store.clone(), &[]))
         }
     }
 
@@ -680,26 +650,22 @@ mod stack_pool {
     #[test]
     fn a_finished_call_leaves_its_stack_to_the_next_one() {
         let host = Host::new();
-        host.gate.set(true);
-        assert!(matches!(poll(&mut host.call(&host.wait)), Poll::Ready(Ok(_))));
+        assert!(matches!(poll(&mut host.call(&host.on_stack)), Poll::Ready(Ok(_))));
         let first = pooled();
         assert_eq!(first.len(), 1, "the stack of the finished call is kept");
         assert!(first[0].contains(&host.ran_at.get()));
 
-        host.gate.set(false);
         host.ran_at.set(0);
         let mut call = host.call(&host.wait);
         assert!(pooled().is_empty(), "the next call took it");
         assert!(poll(&mut call).is_pending());
-        assert!(first[0].contains(&host.ran_at.get()), "and runs on it");
         // A call that overlaps it gets a stack of its own.
-        let mut overlapping = host.call(&host.wait);
-        assert!(poll(&mut overlapping).is_pending());
+        let mut overlapping = host.call(&host.on_stack);
+        assert!(matches!(poll(&mut overlapping), Poll::Ready(Ok(_))));
         assert!(!first[0].contains(&host.ran_at.get()));
 
         host.gate.set(true);
         assert!(matches!(poll(&mut call), Poll::Ready(Ok(_))));
-        assert!(matches!(poll(&mut overlapping), Poll::Ready(Ok(_))));
         assert_eq!(pooled().len(), 2);
         assert!(pooled().contains(&first[0]));
     }
@@ -779,7 +745,7 @@ mod instantiation {
     use crate::{Function, FunctionEnv, FunctionEnvMut, FunctionType, Imports, Instance, Module};
 
     /// The instances the store owns.
-    fn instances(store: &Store) -> usize {
+    fn instances(store: &crate::Store) -> usize {
         let objects = store.as_store_ref().objects().as_sys();
         <wasmer_vm::VMInstance as wasmer_vm::StoreObject>::list(objects).len()
     }
@@ -800,13 +766,28 @@ mod instantiation {
         )
         .unwrap();
         let unit = FunctionType::new(vec![], vec![]);
-        let wait = Function::new_async(&mut store, unit.clone(), |_| std::future::pending());
         let env = FunctionEnv::new(&mut store, ());
+        let wait = Function::new_async(
+            &mut store,
+            &env,
+            unit.clone(),
+            async |_: &mut crate::AsyncEnv<()>, _: &[Value]| std::future::pending().await,
+        );
+        struct OnOneThread<T>(T);
+        unsafe impl<T> Send for OnOneThread<T> {}
+        unsafe impl<T> Sync for OnOneThread<T> {}
+        impl<T> OnOneThread<T> {
+            fn get(&self) -> &T {
+                &self.0
+            }
+        }
+        let imported = OnOneThread((wait, module));
         let instantiate = Function::new_with_env(&mut store, &env, unit, {
             move |mut env: FunctionEnvMut<()>, _: &[Value]| {
+                let (wait, module) = imported.get();
                 let mut imports = Imports::new();
                 imports.define("h", "wait", wait.clone());
-                match Instance::new(&mut env, &module, &imports) {
+                match Instance::new(&mut env, module, &imports) {
                     Ok(_) => Ok(vec![]),
                     Err(crate::InstantiationError::Start(error)) => Err(error),
                     Err(error) => Err(RuntimeError::new(error.to_string())),
@@ -814,9 +795,7 @@ mod instantiation {
             }
         });
         let before = instances(&store);
-        let store = store.into_async();
-        let mut call: Pin<Box<dyn Future<Output = CallResult>>> =
-            Box::pin(instantiate.call_async(&store, vec![]));
+        let mut call = Box::pin(instantiate.call_async(&mut store, &[]));
         let waker = futures::task::noop_waker();
         let Poll::Ready(Err(error)) = call.as_mut().poll(&mut Context::from_waker(&waker)) else {
             panic!("the start function suspended the call");
@@ -826,9 +805,6 @@ mod instantiation {
             Some(crate::sys::vm::TrapCode::YieldOutsideAsyncContext)
         );
         drop(call);
-        let Ok(store) = store.into_store() else {
-            panic!("the store is still shared");
-        };
         assert_eq!(instances(&store), before + 1, "the instance is not the store's");
     }
 }

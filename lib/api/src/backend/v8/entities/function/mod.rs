@@ -74,6 +74,49 @@ impl Function {
     }
 
     #[allow(clippy::cast_ptr_alignment)]
+    /// Creates an async host function from its body. The guest cannot
+    /// suspend on this backend, so the import blocks its stack until the
+    /// future is ready (see `v8::async_call`).
+    #[cfg(feature = "experimental-async")]
+    pub(crate) fn new_async<FT, F, T>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        ty: FT,
+        func: F,
+    ) -> Self
+    where
+        FT: Into<FunctionType>,
+        F: Fn(crate::AsyncEnv<T>, Vec<Value>) -> crate::entities::function::async_host::HostFuture
+            + 'static,
+        T: Send + 'static,
+    {
+        /// The body and environment handle of an import. V8 requires a host
+        /// function to be `Send + Sync`, but this one only runs on the thread
+        /// of the store's isolate, which `check_isolate` enforces.
+        struct OnStoreThread<B>(B);
+        unsafe impl<B> Send for OnStoreThread<B> {}
+        unsafe impl<B> Sync for OnStoreThread<B> {}
+        impl<B> OnStoreThread<B> {
+            fn get(&self) -> &B {
+                &self.0
+            }
+        }
+
+        let store_id = store.objects_mut().id();
+        let state = OnStoreThread((func, env.clone()));
+        Self::new_with_env(
+            store,
+            env,
+            ty,
+            move |mut env: FunctionEnvMut<'_, T>, args: &[Value]| {
+                let (func, handle) = state.get();
+                let future = func(crate::AsyncEnv::new(handle.clone(), store_id), args.to_vec());
+                let mut store = env.as_store_mut();
+                crate::backend::v8::async_call::block_on_host(&mut store, future)
+            },
+        )
+    }
+
     pub fn new_with_env<FT, F, T: Send + 'static>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,

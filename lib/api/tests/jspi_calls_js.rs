@@ -23,9 +23,8 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_test::wasm_bindgen_test;
 use wasmer::{
-    AsStoreAsync, AsStoreMut, AsStoreRef, AsyncFunctionEnvMut, Function, FunctionEnv,
-    FunctionEnvMut, FunctionType, Instance, Module, RuntimeError, Store, StoreAsync, Type, Value,
-    imports, js::AsJs,
+    AsStoreMut, AsStoreRef, AsyncEnv, Function, FunctionEnv, FunctionEnvMut, FunctionType,
+    Instance, Module, RuntimeError, SharedStore, Store, Type, Value, imports, js::AsJs,
 };
 use wasmer_types::{StoreId, TrapCode};
 
@@ -69,9 +68,38 @@ async fn poll_until(call: &mut Call, ready: impl Fn() -> bool) {
     panic!("the call never got there");
 }
 
-/// Whether somebody holds the write lock of `store`.
-fn locked(store: &impl AsStoreAsync) -> bool {
-    poll_once(&mut Box::pin(store.write_lock())).is_pending()
+/// Whether a guest or a slice holds `store`.
+fn locked(store: &SharedStore) -> bool {
+    store.try_with(|_| ()).is_err()
+}
+
+/// An async host function with no environment, from a closure that makes its
+/// future.
+fn async_host<F, Fut>(store: &mut Store, ty: impl Into<FunctionType>, f: F) -> Function
+where
+    F: Fn(&[Value]) -> Fut + 'static,
+    Fut: Future<Output = Result<Vec<Value>, RuntimeError>> + 'static,
+{
+    let env = FunctionEnv::new(store, ());
+    Function::new_async(
+        store,
+        &env,
+        ty,
+        async move |_: &mut AsyncEnv<()>, values: &[Value]| f(values).await,
+    )
+}
+
+/// A typed async host function with no environment.
+fn typed_host<Args, Rets>(
+    store: &mut Store,
+    f: impl wasmer::AsyncHostFunction<(), Args, Rets>,
+) -> Function
+where
+    Args: wasmer::WasmTypeList + 'static,
+    Rets: wasmer::WasmTypeList + 'static,
+{
+    let env = FunctionEnv::new(store, ());
+    Function::new_typed_async(store, &env, f)
 }
 
 /// A waker that counts how often it was woken.
@@ -154,7 +182,7 @@ impl Gate {
 
     fn import(&self, store: &mut Store) -> Function {
         let state = self.0.clone();
-        Function::new_typed_async(store, move |id: i32| {
+        typed_host(store, async move |_: &mut AsyncEnv<()>, id: i32| {
             // This is the host function itself. It runs when its future is
             // first polled, by the call.
             state.log.borrow_mut().push(format!("wait{id}"));
@@ -163,23 +191,21 @@ impl Gate {
                 state.open.borrow_mut().insert(id, open);
             }
             let unfinished = Unfinished(state.clone());
-            async move {
-                let outcome = match id {
-                    ..AUTO => opened.await.unwrap_or(Ok(())),
-                    AUTO..READY => {
-                        macrotask().await;
-                        Ok(())
-                    }
-                    READY..YIELD => Ok(()),
-                    YIELD..FAIL => {
-                        YieldOnce(false).await;
-                        Ok(())
-                    }
-                    _ => Err(HostExit(id)),
-                };
-                std::mem::forget(unfinished);
-                outcome.map(|()| id)
-            }
+            let outcome = match id {
+                ..AUTO => opened.await.unwrap_or(Ok(())),
+                AUTO..READY => {
+                    macrotask().await;
+                    Ok(())
+                }
+                READY..YIELD => Ok(()),
+                YIELD..FAIL => {
+                    YieldOnce(false).await;
+                    Ok(())
+                }
+                _ => Err(HostExit(id)),
+            };
+            std::mem::forget(unfinished);
+            outcome.map(|()| id)
         })
     }
 
@@ -215,7 +241,7 @@ struct Host {
 unsafe impl Send for Host {}
 
 struct Guest {
-    store: StoreAsync,
+    store: SharedStore,
     instance: Instance,
     env: FunctionEnv<Host>,
     gate: Gate,
@@ -274,7 +300,7 @@ const GUEST: &str = r#"(module
 /// Records `label`, and how the host function reaches its store: as the store
 /// of an async call, and with the write lock held for its guest.
 fn observe(mut env: FunctionEnvMut<'_, Host>, label: i32) {
-    let store = match env.as_store_async() {
+    let store = match env.shared() {
         Some(store) if locked(&store) => "async, locked",
         Some(_) => "async, free",
         None => "sync",
@@ -341,7 +367,7 @@ fn guest_of(wat: &str) -> Guest {
     let instance = Instance::new(&mut store, &module, &host).unwrap();
     env.as_mut(&mut store).inner = instance.exports.get_function("inner").ok().cloned();
     Guest {
-        store: store.into_async(),
+        store: store.into_shared(),
         instance,
         env,
         gate,
@@ -352,8 +378,8 @@ fn guest_of(wat: &str) -> Guest {
 impl Guest {
     fn call(&self, export: &str, arguments: &[i32]) -> Call {
         let function = self.instance.exports.get_function(export).unwrap();
-        let arguments = arguments.iter().copied().map(Value::I32).collect();
-        Box::pin(function.call_async(&self.store, arguments))
+        let arguments: Vec<Value> = arguments.iter().copied().map(Value::I32).collect();
+        Box::pin(function.call_async(&mut self.store.clone(), &arguments))
     }
 
     /// Runs `call` until its guest waits in the host function for `id`.
@@ -366,8 +392,9 @@ impl Guest {
     }
 
     async fn errors(&self) -> Vec<RuntimeError> {
-        let lock = self.store.read_lock().await;
-        self.env.as_ref(&lock).errors.clone()
+        self.store
+            .try_with(|store| self.env.as_ref(&store).errors.clone())
+            .expect("the store is free")
     }
 
     /// Takes the store back, which nothing may be holding any more.
@@ -417,18 +444,7 @@ async fn a_guest_is_woken_only_with_its_store() {
     let mut call = guest.call("once", &[7]);
     guest.until_waiting(&mut call, 7).await;
 
-    let job = guest.store.write_lock().await;
     guest.gate.release(7);
-    assert!(poll_once(&mut call).is_pending());
-    settle().await;
-    assert!(poll_once(&mut call).is_pending());
-    settle().await;
-    assert_eq!(
-        guest.log(),
-        ["1: async, locked", "wait7"],
-        "the guest ran while other host code held its store"
-    );
-    drop(job);
     assert_eq!(i32_of(call.await), 7);
     assert_eq!(guest.log().last().unwrap(), "2: async, locked");
 
@@ -583,8 +599,14 @@ async fn two_stores_overlap_on_one_thread() {
     // Whether this store, and not the other one, is the one of the call.
     let same_store = |env: FunctionEnvMut<'_, Other>| -> i32 {
         let this = env.data().this_store;
-        let current = env.as_store_async().map(|store| store.store_id());
-        (current == this && this != Some(env.data().guest.store.store_id())) as i32
+        let _ = this;
+        let is_other = env
+            .data()
+            .guest
+            .store
+            .try_with(|other| wasmer::StoreRef::same(&other.as_store_ref(), &env.as_store_ref()))
+            .unwrap_or(true);
+        (env.shared().is_some() && !is_other) as i32
     };
     let imports = imports! {
         "host" => {
@@ -595,20 +617,21 @@ async fn two_stores_overlap_on_one_thread() {
     };
     let instance = Instance::new(&mut store, &module, &imports).unwrap();
     let run = instance.exports.get_function("run").unwrap().clone();
-    let store = store.into_async();
+    let store = store.into_shared();
 
-    let mut call: Call = Box::pin(run.call_async(&store, vec![Value::I32(7)]));
+    let mut call: Call = Box::pin(run.call_async(&mut store.clone(), &[Value::I32(7)]));
     poll_until(&mut call, || gate.waiting(7)).await;
-    let (other_log, other_gate, other_store, mut other_call) = {
-        let mut lock = store.write_lock().await;
-        let other = env.as_mut(&mut lock);
-        (
-            other.guest.log.clone(),
-            other.guest.gate.clone(),
-            other.guest.store.store(),
-            other.call.take().unwrap(),
-        )
-    };
+    let (other_log, other_gate, other_store, mut other_call) = store
+        .try_with(|mut lock| {
+            let other = env.as_mut(&mut lock);
+            (
+                other.guest.log.clone(),
+                other.guest.gate.clone(),
+                other.guest.store.clone(),
+                other.call.take().unwrap(),
+            )
+        })
+        .expect("the store is free");
     poll_until(&mut other_call, || other_gate.waiting(8)).await;
     // Both guests are suspended, each in its own store.
     assert!(!locked(&store));
@@ -846,9 +869,9 @@ async fn a_call_dropped_while_its_guest_runs_stops_it_at_the_next_import() {
     };
     let instance = Instance::new(&mut store, &module, &imports).unwrap();
     let run = instance.exports.get_function("run").unwrap().clone();
-    let store = store.into_async();
+    let store = store.into_shared();
 
-    let mut call: Call = Box::pin(run.call_async(&store, vec![]));
+    let mut call: Call = Box::pin(run.call_async(&mut store.clone(), &[]));
     poll_until(&mut call, || gate.waiting(7)).await;
     *slot.borrow_mut() = Some(call);
     gate.release(7);
@@ -926,7 +949,7 @@ async fn results_that_do_not_match_the_signature_trap() {
         let caught = Rc::new(Cell::new(0));
         let imports = imports! {
             "host" => {
-                "f" => Function::new_async(&mut store, FunctionType::new([], [Type::I32]), {
+                "f" => async_host(&mut store, FunctionType::new([], [Type::I32]), {
                     let wrong = wrong.clone();
                     move |_| {
                         let wrong = wrong.clone();
@@ -939,7 +962,7 @@ async fn results_that_do_not_match_the_signature_trap() {
         let instance = Instance::new(&mut store, &module, &imports).unwrap();
         let run = instance.exports.get_function("run").unwrap().clone();
         let error = run
-            .call_async(&store.into_async(), vec![])
+            .call_async(&mut store.into_shared(), &[])
             .await
             .unwrap_err();
         assert!(
@@ -1031,8 +1054,9 @@ async fn an_async_host_function_can_be_called_directly() {
     let log: Log = Rc::default();
     let gate = Gate::new(&log);
     let wait = gate.import(&mut store);
-    let store = store.into_async();
-    let call = |id: i32| -> Call { Box::pin(wait.call_async(&store, vec![Value::I32(id)])) };
+    let store = store.into_shared();
+    let call =
+        |id: i32| -> Call { Box::pin(wait.call_async(&mut store.clone(), &[Value::I32(id)])) };
     assert_eq!(i32_of(call(AUTO).await), AUTO);
 
     let mut pending = call(7);
@@ -1047,63 +1071,6 @@ async fn an_async_host_function_can_be_called_directly() {
 }
 
 // --- host futures ------------------------------------------------------------
-
-/// A lock the host function still holds when it has to wait stays with its
-/// future: the store is not free while the guest is suspended, and the guest
-/// gets it back when the future is done.
-#[wasm_bindgen_test]
-async fn a_guard_held_while_waiting_stays_with_the_future() {
-    let mut store = Store::default();
-    let module = Module::new(&store, GUEST).unwrap();
-    let log: Log = Rc::default();
-    let env = FunctionEnv::new(
-        &mut store,
-        Host {
-            log: log.clone(),
-            inner: None,
-            errors: Vec::new(),
-        },
-    );
-    let (release, released) = oneshot::channel::<()>();
-    let released = Rc::new(RefCell::new(Some(released)));
-    let held = Rc::new(Cell::new(false));
-    let hold = {
-        let held = held.clone();
-        move |env: AsyncFunctionEnvMut<Host>, arguments: &[Value]| {
-            let (released, id) = (released.borrow_mut().take(), arguments[0].clone());
-            let held = held.clone();
-            async move {
-                let guard = env.write().await;
-                held.set(true);
-                released.unwrap().await.unwrap();
-                drop(guard);
-                Ok(vec![id])
-            }
-        }
-    };
-    let unary = FunctionType::new([Type::I32], [Type::I32]);
-    let imports = imports! {
-        "host" => {
-            "wait" => Function::new_with_env_async(&mut store, &env, unary, hold),
-            "observe" => Function::new_typed_with_env(&mut store, &env, observe),
-            "call_inner" => Function::new_typed_with_env(&mut store, &env, call_inner),
-            "call_inner_raw" => Function::new_typed_with_env(&mut store, &env, call_inner_raw),
-        }
-    };
-    let instance = Instance::new(&mut store, &module, &imports).unwrap();
-    let once = instance.exports.get_function("once").unwrap().clone();
-    let store = store.into_async();
-
-    let mut call: Call = Box::pin(once.call_async(&store, vec![Value::I32(7)]));
-    poll_until(&mut call, || held.get()).await;
-    assert_eq!(*log.borrow(), ["1: async, locked"]);
-    assert!(locked(&store), "the suspended host function lost its guard");
-    release.send(()).unwrap();
-    assert_eq!(i32_of(call.await), 7);
-    assert_eq!(log.borrow().last().unwrap(), "2: async, locked");
-    assert!(!locked(&store));
-    assert!(store.into_store().is_ok());
-}
 
 // --- what this backend cannot follow -----------------------------------------
 
@@ -1260,9 +1227,9 @@ async fn a_guest_suspended_outside_wasmer_keeps_its_store() {
     .unwrap();
     let instance = Instance::new(&mut store, &module, &imports! { "h" => { "s" => s } }).unwrap();
     let run = instance.exports.get_function("run").unwrap().clone();
-    let store = store.into_async();
+    let store = store.into_shared();
 
-    let mut call: Call = Box::pin(run.call_async(&store, vec![]));
+    let mut call: Call = Box::pin(run.call_async(&mut store.clone(), &[]));
     assert!(poll_once(&mut call).is_pending());
     settle().await;
     assert!(
@@ -1327,9 +1294,9 @@ async fn a_refused_reentry_then_a_foreign_suspension_keeps_the_store() {
     let instance = Instance::new(&mut store, &module, &imports).unwrap();
     env.as_mut(&mut store).inner = instance.exports.get_function("inner").ok().cloned();
     let run = instance.exports.get_function("run").unwrap().clone();
-    let store = store.into_async();
+    let store = store.into_shared();
 
-    let mut call: Call = Box::pin(run.call_async(&store, vec![]));
+    let mut call: Call = Box::pin(run.call_async(&mut store.clone(), &[]));
     assert!(poll_once(&mut call).is_pending());
     settle().await;
     assert!(poll_once(&mut call).is_pending());
@@ -1343,17 +1310,18 @@ async fn a_refused_reentry_then_a_foreign_suspension_keeps_the_store() {
         .unwrap();
     // The re-entry failed with -1.
     assert_eq!(i32_of(call.await), 4);
-    let errors = {
-        let lock = store.read_lock().await;
-        env.as_ref(&lock).errors.clone()
-    };
+    let errors = store
+        .try_with(|lock| env.as_ref(&lock).errors.clone())
+        .expect("the store is free");
     assert_eq!(errors.len(), 1);
     assert_eq!(
         errors[0].clone().to_trap(),
         Some(TrapCode::YieldOutsideAsyncContext)
     );
     assert_eq!(gate.dropped(), 0);
-    env.as_mut(&mut store.write_lock().await).inner = None;
+    store
+        .try_with(|mut lock| env.as_mut(&mut lock).inner = None)
+        .expect("the store is free");
     assert!(store.into_store().is_ok());
 }
 
@@ -1444,9 +1412,9 @@ async fn an_embedder_reentry_then_a_foreign_suspension_keeps_the_store() {
             .as_jsvalue(&store);
         js_sys::Reflect::set(&holder, &"inner".into(), &inner).unwrap();
         let run = instance.exports.get_function("run").unwrap().clone();
-        let store = store.into_async();
+        let store = store.into_shared();
 
-        let mut call: Call = Box::pin(run.call_async(&store, vec![]));
+        let mut call: Call = Box::pin(run.call_async(&mut store.clone(), &[]));
         assert!(poll_once(&mut call).is_pending(), "{way}");
         settle().await;
         assert!(poll_once(&mut call).is_pending(), "{way}");
@@ -1506,8 +1474,8 @@ async fn a_host_result_that_cannot_be_a_number_leaves_its_guest_able_to_wait() {
     };
     let instance = Instance::new(&mut store, &module, &imports).unwrap();
     let run = instance.exports.get_function("run").unwrap().clone();
-    let store = store.into_async();
-    let result = run.call_async(&store, vec![]).await;
+    let store = store.into_shared();
+    let result = run.call_async(&mut store.clone(), &[]).await;
     assert_eq!(i32_of(result), AUTO);
     assert!(store.into_store().is_ok());
 }
@@ -1529,7 +1497,7 @@ async fn a_thenable_result_of_an_async_import_fails_it() {
         let mut store = Store::default();
         let ty = FunctionType::new([], [Type::ExternRef]);
         let value = Value::from_jsvalue(&mut store, &Type::ExternRef, &value).unwrap();
-        let f = Function::new_async(&mut store, ty, move |_| {
+        let f = async_host(&mut store, ty, move |_| {
             let value = value.clone();
             async move { Ok(vec![value]) }
         });
@@ -1538,9 +1506,9 @@ async fn a_thenable_result_of_an_async_import_fails_it() {
         let imports = imports! { "host" => { "f" => f, "caught" => counter(&mut store, &caught) } };
         let instance = Instance::new(&mut store, &module, &imports).unwrap();
         let run = instance.exports.get_function("run").unwrap().clone();
-        let store = store.into_async();
+        let store = store.into_shared();
 
-        let error = run.call_async(&store, vec![]).await.unwrap_err();
+        let error = run.call_async(&mut store.clone(), &[]).await.unwrap_err();
         assert!(error.message().contains(message), "{error}");
         assert_eq!(caught.get(), 0, "{message}: the guest caught the failure");
         assert!(store.into_store().is_ok(), "{message}");
@@ -1561,7 +1529,9 @@ async fn what_javascript_throws_is_an_error_however_it_looks() {
         let mut store = Store::default();
         let ty = FunctionType::new([], []);
         let throw = Function::from_jsvalue(&mut store, &ty, &foreign::throwing(&thrown)).unwrap();
-        let wait = Function::new_typed_async(&mut store, async |value: i32| value + 1);
+        let wait = typed_host(&mut store, async |_: &mut AsyncEnv<()>, value: i32| {
+            value + 1
+        });
         let module = Module::new(
             &store,
             r#"(module
@@ -1579,13 +1549,18 @@ async fn what_javascript_throws_is_an_error_however_it_looks() {
 
         throw.call(&mut store, &[]).unwrap_err();
         guest_throw.call(&mut store, &[]).unwrap_err();
-        let store = store.into_async();
+        let store = store.into_shared();
         let waits = async || {
-            let results = guest_wait.call_async(&store, vec![Value::I32(1)]).await;
+            let results = guest_wait
+                .call_async(&mut store.clone(), &[Value::I32(1)])
+                .await;
             assert_eq!(i32_of(results), 3, "{name}");
         };
         waits().await;
-        guest_throw.call_async(&store, vec![]).await.unwrap_err();
+        guest_throw
+            .call_async(&mut store.clone(), &[])
+            .await
+            .unwrap_err();
         waits().await;
         assert!(store.into_store().is_ok(), "{name}");
     }
@@ -1602,7 +1577,7 @@ async fn a_funcref_result_of_an_async_import_is_a_webassembly_function() {
     let exporting = Instance::new(&mut store, &exporting, &imports! {}).unwrap();
     let wasm = exporting.exports.get_function("g").unwrap().clone();
     let sync = Function::new_typed(&mut store, || {});
-    let r#async = Function::new_typed_async(&mut store, async || {});
+    let r#async = typed_host(&mut store, async |_: &mut AsyncEnv<()>| {});
     let ty = FunctionType::new([], []);
     let javascript =
         Function::from_jsvalue(&mut store, &ty, &foreign::throwing(&JsValue::NULL)).unwrap();
@@ -1617,7 +1592,7 @@ async fn a_funcref_result_of_an_async_import_is_a_webassembly_function() {
         let mut store = Store::default();
         let ty = FunctionType::new([], [Type::FuncRef]);
         let value = Value::FuncRef(function);
-        let f = Function::new_async(&mut store, ty, move |_| {
+        let f = async_host(&mut store, ty, move |_| {
             let value = value.clone();
             async move { Ok(vec![value]) }
         });
@@ -1638,9 +1613,9 @@ async fn a_funcref_result_of_an_async_import_is_a_webassembly_function() {
         let imports = imports! { "host" => { "f" => f, "caught" => counter(&mut store, &caught) } };
         let instance = Instance::new(&mut store, &module, &imports).unwrap();
         let run = instance.exports.get_function("run").unwrap().clone();
-        let store = store.into_async();
+        let store = store.into_shared();
 
-        let result = run.call_async(&store, vec![]).await;
+        let result = run.call_async(&mut store.clone(), &[]).await;
         match expected {
             Some(expected) => assert_eq!(i32_of(result), expected, "{name}"),
             None => {
@@ -1666,14 +1641,18 @@ async fn call_async_calls_any_function_with_its_parameters() {
     let sync = Function::new_typed(&mut store, |value: i32| value + 1);
     let ty = FunctionType::new([Type::I32], [Type::I32]);
     let javascript = Function::from_jsvalue(&mut store, &ty, &foreign::incrementing()).unwrap();
-    let r#async = Function::new_typed_async(&mut store, async |value: i32| value + 1);
-    let store = store.into_async();
+    let r#async = typed_host(&mut store, async |_: &mut AsyncEnv<()>, value: i32| {
+        value + 1
+    });
+    let store = store.into_shared();
     for (name, function) in [
         ("sync", &sync),
         ("javascript", &javascript),
         ("async", &r#async),
     ] {
-        let results = function.call_async(&store, vec![Value::I32(1)]).await;
+        let results = function
+            .call_async(&mut store.clone(), &[Value::I32(1)])
+            .await;
         assert_eq!(i32_of(results), 2, "{name}");
         for wrong in [
             vec![],
@@ -1681,7 +1660,7 @@ async fn call_async_calls_any_function_with_its_parameters() {
             vec![Value::I32(1), Value::I32(2)],
         ] {
             let error = function
-                .call_async(&store, wrong.clone())
+                .call_async(&mut store.clone(), &wrong)
                 .await
                 .unwrap_err();
             assert!(
@@ -1770,12 +1749,15 @@ async fn a_javascript_function_is_called_directly_as_it_is() {
     // still what is called directly.
     assert_eq!(&*pair.call(&mut store, &[]).unwrap(), &pair_values);
 
-    let store = store.into_async();
-    let results = pair.call_async(&store, vec![]).await.unwrap();
+    let store = store.into_shared();
+    let results = pair.call_async(&mut store.clone(), &[]).await.unwrap();
     assert_eq!(&*results, &pair_values);
-    let results = wide.call_async(&store, vec![]).await.unwrap();
+    let results = wide.call_async(&mut store.clone(), &[]).await.unwrap();
     assert_eq!(&*results, &[Value::I64(5)]);
-    assert_eq!(i32_of(guest_pair.call_async(&store, vec![]).await), 18);
+    assert_eq!(
+        i32_of(guest_pair.call_async(&mut store.clone(), &[]).await),
+        18
+    );
     assert!(store.into_store().is_ok());
 }
 
@@ -1804,21 +1786,24 @@ async fn an_async_host_function_called_directly_returns_its_results_as_they_are(
         .map(|(_, value)| {
             let ty = FunctionType::new([], [value.ty()]);
             let value = value.clone();
-            Function::new_async(&mut store, ty, move |_| {
+            async_host(&mut store, ty, move |_| {
                 let value = value.clone();
                 async move { Ok(vec![value]) }
             })
         })
         .collect();
-    let store = store.into_async();
+    let store = store.into_shared();
     for ((name, value), function) in cases.iter().zip(&functions) {
-        let results = function.call_async(&store, vec![]).await.unwrap();
+        let results = function.call_async(&mut store.clone(), &[]).await.unwrap();
         let [result] = &*results else {
             panic!("{name}: {results:?}");
         };
         assert_eq!(result.ty(), value.ty(), "{name}");
-        let lock = store.write_lock().await;
-        let same = js_sys::Object::is(&result.as_jsvalue(&lock), &value.as_jsvalue(&lock));
+        let same = store
+            .try_with(|lock| {
+                js_sys::Object::is(&result.as_jsvalue(&lock), &value.as_jsvalue(&lock))
+            })
+            .unwrap();
         assert!(same, "{name}: {result:?}");
     }
     assert!(store.into_store().is_ok());
@@ -1831,7 +1816,7 @@ async fn an_async_host_function_called_directly_returns_its_results_as_they_are(
 #[wasm_bindgen_test]
 async fn a_direct_call_checks_its_results_against_the_signature_it_is_called_with() {
     let mut store = Store::default();
-    let seven = Function::new_typed_async(&mut store, async || 7);
+    let seven = typed_host(&mut store, async |_: &mut AsyncEnv<()>| 7);
     let form = seven.as_jsvalue(&store);
     let mut taken = |results: &[Type]| {
         let ty = FunctionType::new([], results.to_vec());
@@ -1843,17 +1828,20 @@ async fn a_direct_call_checks_its_results_against_the_signature_it_is_called_wit
         taken(&[Type::I32, Type::I32]),
     );
     let typed_wide = wide.typed::<(), i64>(&store).unwrap();
-    let store = store.into_async();
+    let store = store.into_shared();
 
-    assert_eq!(i32_of(same.call_async(&store, vec![]).await), 7);
+    assert_eq!(i32_of(same.call_async(&mut store.clone(), &[]).await), 7);
     for (name, function) in [("wide", &wide), ("pair", &pair)] {
-        let error = function.call_async(&store, vec![]).await.unwrap_err();
+        let error = function
+            .call_async(&mut store.clone(), &[])
+            .await
+            .unwrap_err();
         assert!(
             error.message().contains("do not match the signature"),
             "{name}: {error}"
         );
     }
-    let error = typed_wide.call_async(&store).await.unwrap_err();
+    let error = typed_wide.call_async(&mut store.clone()).await.unwrap_err();
     assert!(
         error.message().contains("do not match the signature"),
         "{error}"
@@ -1875,7 +1863,7 @@ async fn a_host_function_belongs_to_its_store() {
     let wide = FunctionType::new([Type::I32], [Type::I64]);
     let make: [(&str, FunctionType, fn(&mut Store) -> Function); 5] = [
         ("async", unary.clone(), |store| {
-            Function::new_typed_async(store, async |value: i32| value + 1)
+            typed_host(store, async |_: &mut AsyncEnv<()>, value: i32| value + 1)
         }),
         ("typed", unary.clone(), |store| {
             Function::new_typed(store, |value: i32| value + 1)
@@ -1926,10 +1914,10 @@ async fn a_host_function_belongs_to_its_store() {
             );
         }
 
-        let second = second.into_async();
+        let second = second.into_shared();
         for function in [&own, &taken] {
             let error = function
-                .call_async(&second, vec![Value::I32(1)])
+                .call_async(&mut second.clone(), &[Value::I32(1)])
                 .await
                 .unwrap_err();
             assert!(
@@ -1938,8 +1926,11 @@ async fn a_host_function_belongs_to_its_store() {
             );
         }
         assert!(second.into_store().is_ok(), "{name}");
-        let first = first.into_async();
-        let results = taken.call_async(&first, vec![Value::I32(1)]).await.unwrap();
+        let first = first.into_shared();
+        let results = taken
+            .call_async(&mut first.clone(), &[Value::I32(1)])
+            .await
+            .unwrap();
         let result = match &results[0] {
             Value::I32(value) => *value as i64,
             Value::I64(value) => *value,
@@ -1999,7 +1990,9 @@ fn several_results_are_counted_before_they_are_converted() {
 #[wasm_bindgen_test]
 async fn async_host_functions_are_given_to_javascript_as_imports() {
     let mut store = Store::default();
-    let wait = Function::new_typed_async(&mut store, async |value: i32| value + 1);
+    let wait = typed_host(&mut store, async |_: &mut AsyncEnv<()>, value: i32| {
+        value + 1
+    });
     let plain = Function::new_typed(&mut store, |value: i32| value);
     let suspending = wait.as_jsvalue(&store);
     let extern_ = wasmer::Extern::Function(wait.clone()).as_jsvalue(&store);
@@ -2023,17 +2016,21 @@ async fn async_host_functions_are_given_to_javascript_as_imports() {
     let taken = Function::from_jsvalue(&mut store, &ty, &hostile).unwrap();
     assert!(js_sys::Object::is(&taken.as_jsvalue(&store), &hostile));
     let wait = Function::from_jsvalue(&mut store, &ty, &suspending).unwrap();
-    let store = store.into_async();
-    let results = wait.call_async(&store, vec![Value::I32(1)]).await.unwrap();
+    let store = store.into_shared();
+    let results = wait
+        .call_async(&mut store.clone(), &[Value::I32(1)])
+        .await
+        .unwrap();
     assert_eq!(results[0].unwrap_i32(), 2);
 }
 
 /// A guest beneath a JavaScript frame calls an async import, which an engine
 /// may refuse to suspend it in only once the import's body has run, and then
-/// drops its own call. It is still running, and keeps its store until it
-/// returns: a wait is taken for one only once the guest's slice is over.
+/// drops its own call. The engine cannot be stopped from running it, so its
+/// next host function fails without touching the store, which is usable at
+/// once. A wait is taken for one only once the guest's slice is over.
 #[wasm_bindgen_test]
-async fn a_call_dropped_after_a_refused_wait_keeps_the_store_for_its_guest() {
+async fn a_call_dropped_after_a_refused_wait_refuses_its_guests_host_functions() {
     struct Env {
         inner: Option<Function>,
         call: Rc<RefCell<Option<Call>>>,
@@ -2079,7 +2076,7 @@ async fn a_call_dropped_after_a_refused_wait_keeps_the_store_for_its_guest() {
     };
     let drop_call = |env: FunctionEnvMut<'_, Env>| drop(env.data().call.borrow_mut().take());
     let held_now = |env: FunctionEnvMut<'_, Env>| {
-        let store = env.as_store_async().expect("a guest of an async call");
+        let store = env.shared().expect("a guest of a shared store");
         env.data().held.set(Some(locked(&store)));
     };
     let imports = imports! {
@@ -2093,9 +2090,9 @@ async fn a_call_dropped_after_a_refused_wait_keeps_the_store_for_its_guest() {
     let instance = Instance::new(&mut store, &module, &imports).unwrap();
     env.as_mut(&mut store).inner = instance.exports.get_function("inner").ok().cloned();
     let run = instance.exports.get_function("run").unwrap().clone();
-    let store = store.into_async();
+    let store = store.into_shared();
 
-    *slot.borrow_mut() = Some(Box::pin(run.call_async(&store, vec![])));
+    *slot.borrow_mut() = Some(Box::pin(run.call_async(&mut store.clone(), &[])));
     for _ in 0..20 {
         let polled = slot.borrow_mut().as_mut().map(poll_once);
         if polled.is_none() {
@@ -2104,10 +2101,17 @@ async fn a_call_dropped_after_a_refused_wait_keeps_the_store_for_its_guest() {
         macrotask().await;
     }
     assert!(slot.borrow().is_none(), "the guest did not drop its call");
-    assert_eq!(held.get(), Some(true), "the running guest lost its store");
+    assert_eq!(
+        held.get(),
+        None,
+        "a cancelled guest reached a host function"
+    );
+    assert!(!locked(&store), "the store is usable at once");
     settle().await;
     assert_eq!(*log.borrow(), ["wait1000"]);
-    env.as_mut(&mut store.write_lock().await).inner = None;
+    store
+        .try_with(|mut lock| env.as_mut(&mut lock).inner = None)
+        .expect("the store is free");
     assert!(
         store.into_store().is_ok(),
         "something still holds the store"
@@ -2194,7 +2198,7 @@ async fn every_signature_goes_through_and_unwinds() {
         type Outcome = Result<Vec<Value>, HostExit>;
         let outcomes: Rc<RefCell<Option<oneshot::Receiver<Outcome>>>> = Rc::default();
         let received: Rc<RefCell<Vec<Value>>> = Rc::default();
-        let f = Function::new_async(&mut store, ty.clone(), {
+        let f = async_host(&mut store, ty.clone(), {
             let (outcomes, received) = (outcomes.clone(), received.clone());
             move |arguments| {
                 *received.borrow_mut() = arguments.to_vec();
@@ -2220,7 +2224,7 @@ async fn every_signature_goes_through_and_unwinds() {
         };
         let arguments: Vec<Value> = params.iter().map(&mut sample).collect();
         let values: Vec<Value> = results.iter().map(&mut sample).collect();
-        let store = store.into_async();
+        let store = store.into_shared();
         // `at_once`: the outcome is there when the host future is first
         // polled.
         let call = |outcome: Option<Outcome>, at_once: bool| {
@@ -2230,7 +2234,7 @@ async fn every_signature_goes_through_and_unwinds() {
             if at_once {
                 send.take().unwrap().send(outcome.clone().unwrap()).unwrap();
             }
-            let mut call: Call = Box::pin(run.call_async(&store, arguments.clone()));
+            let mut call: Call = Box::pin(run.call_async(&mut store.clone(), &arguments));
             assert!(
                 poll_once(&mut call).is_pending(),
                 "{case}: the call finished at its first poll"
@@ -2256,9 +2260,10 @@ async fn every_signature_goes_through_and_unwinds() {
 
             // The host function returns.
             let returned = call(Some(Ok(values.clone())), at_once).await.unwrap();
-            let lock = store.read_lock().await;
             let describe = |values: &[Value]| -> Vec<String> {
-                values.iter().map(|value| describe(&lock, value)).collect()
+                store
+                    .try_with(|lock| values.iter().map(|value| describe(&lock, value)).collect())
+                    .unwrap()
             };
             assert_eq!(describe(&returned), describe(&values), "{case}: results");
             assert_eq!(
@@ -2303,7 +2308,7 @@ async fn numbers_go_through_async_host_functions_as_they_are() {
             type Calls = Vec<Vec<(Type, u64)>>;
             let received: Rc<RefCell<Calls>> = Rc::default();
             let returns: Vec<Value> = results.iter().map(|ty| samples(ty, arity)).collect();
-            let f = Function::new_async(&mut store, ty, {
+            let f = async_host(&mut store, ty, {
                 let (received, returns) = (received.clone(), returns.clone());
                 move |arguments| {
                     let wait = received.borrow().len() % 2 == 1;
@@ -2323,13 +2328,16 @@ async fn numbers_go_through_async_host_functions_as_they_are() {
                 imports! { "host" => { "f" => f, "caught" => counter(&mut store, &caught) } };
             let instance = Instance::new(&mut store, &module, &imports).unwrap();
             let run = instance.exports.get_function("run").unwrap().clone();
-            let store = store.into_async();
+            let store = store.into_shared();
             // Once with a host function that is ready, once with one that waits.
             for round in 0..2 {
                 let arguments: Vec<Value> = (0..arity)
                     .map(|index| samples(&params[index], index + round))
                     .collect();
-                let returned = run.call_async(&store, arguments.clone()).await.unwrap();
+                let returned = run
+                    .call_async(&mut store.clone(), &arguments)
+                    .await
+                    .unwrap();
                 let sent: Vec<_> = arguments.iter().map(bits).collect();
                 assert_eq!(received.borrow()[round], sent, "{case}: arguments");
                 let returned: Vec<_> = returned.iter().map(bits).collect();
@@ -2356,7 +2364,7 @@ async fn an_undefined_externref_stays_undefined() {
     let undefined = Value::from_jsvalue(&mut store, &Type::ExternRef, &JsValue::UNDEFINED);
     let undefined = undefined.ok().unwrap();
     let ty = FunctionType::new([], [Type::ExternRef]);
-    let get = Function::new_async(&mut store, ty, move |_| {
+    let get = async_host(&mut store, ty, move |_| {
         let undefined = undefined.clone();
         async move { Ok(vec![undefined]) }
     });
@@ -2371,10 +2379,12 @@ async fn an_undefined_externref_stays_undefined() {
         .get_function("get")
         .unwrap()
         .clone();
-    let store = store.into_async();
-    let results = get.call_async(&store, vec![]).await.unwrap();
-    let lock = store.read_lock().await;
-    assert!(results[0].as_jsvalue(&lock).is_undefined(), "{results:?}");
+    let store = store.into_shared();
+    let results = get.call_async(&mut store.clone(), &[]).await.unwrap();
+    let undefined = store
+        .try_with(|lock| results[0].as_jsvalue(&lock).is_undefined())
+        .unwrap();
+    assert!(undefined, "{results:?}");
 }
 
 /// A function reference, which a guest cannot return to its caller on this
@@ -2419,7 +2429,7 @@ async fn a_funcref_result_reaches_the_guest() {
             vec![Type::FuncRef]
         };
         let outcomes = outcomes.clone();
-        Function::new_async(store, FunctionType::new([], results), move |_| {
+        async_host(store, FunctionType::new([], results), move |_| {
             let outcome = outcomes.borrow_mut().take().unwrap();
             async move {
                 let function = Value::FuncRef(outcome.await.unwrap().map_err(Box::from)?);
@@ -2441,13 +2451,13 @@ async fn a_funcref_result_reaches_the_guest() {
     let instance = Instance::new(&mut store, &module, &imports).unwrap();
     let apply = instance.exports.get_function("apply").unwrap().clone();
     let double = instance.exports.get_function("double").unwrap().clone();
-    let store = store.into_async();
+    let store = store.into_shared();
     for two in [0, 1] {
         let call = |outcome: Option<Outcome>| {
             let (send, receive) = oneshot::channel();
             *outcomes.borrow_mut() = Some(receive);
             let arguments = vec![Value::I32(21), Value::I32(two)];
-            let mut call: Call = Box::pin(apply.call_async(&store, arguments));
+            let mut call: Call = Box::pin(apply.call_async(&mut store.clone(), &arguments));
             assert!(poll_once(&mut call).is_pending());
             if let Some(outcome) = outcome {
                 assert!(send.send(outcome).is_ok());
@@ -2475,7 +2485,7 @@ async fn a_funcref_result_reaches_the_guest() {
 fn a_signature_javascript_cannot_call_is_refused() {
     let mut store = Store::default();
     let ty = FunctionType::new([Type::V128], []);
-    Function::new_async(&mut store, ty, |_| async { Ok(vec![]) });
+    async_host(&mut store, ty, |_| async { Ok(vec![]) });
 }
 
 // --- memory ------------------------------------------------------------------
@@ -2735,16 +2745,15 @@ mod externref_results {
             let imports = imports! { "h" => { "make" => make } };
             let instance = Instance::new(&mut store, &module, &imports).unwrap();
             let run = instance.exports.get_function("run").unwrap().clone();
-            let store = store.into_async();
+            let store = store.into_shared();
 
-            let mut call: Call = Box::pin(run.call_async(&store, vec![]));
+            let mut call: Call = Box::pin(run.call_async(&mut store.clone(), &[]));
             let _ = poll_once(&mut call);
             settle().await;
             match poll_once(&mut call) {
                 Poll::Ready(results) => {
                     let results = results.unwrap();
-                    let lock = store.read_lock().await;
-                    let returned = results[0].as_jsvalue(&lock);
+                    let returned = store.try_with(|lock| results[0].as_jsvalue(&lock)).unwrap();
                     let itself = js_sys::Object::is(&returned, &value);
                     let settled = settles && returned == JsValue::from_str("settled");
                     assert!(itself || settled, "settles: {settles}: {returned:?}");
@@ -2790,9 +2799,9 @@ async fn a_woken_guest_lends_its_store_to_no_host_function() {
     let imports = imports! { "h" => { "wait" => gate.import(&mut store) } };
     let instance = Instance::new(&mut store, &module, &imports).unwrap();
     let run = instance.exports.get_function("run").unwrap().clone();
-    let store = store.into_async();
+    let store = store.into_shared();
 
-    let mut call: Call = Box::pin(run.call_async(&store, vec![]));
+    let mut call: Call = Box::pin(run.call_async(&mut store.clone(), &[]));
     poll_until(&mut call, || gate.waiting(7)).await;
     gate.release(7);
     assert!(poll_once(&mut call).is_pending());
@@ -2814,13 +2823,128 @@ async fn a_woken_guest_lends_its_store_to_no_host_function() {
 async fn the_promising_form_is_kept_out_of_reach() {
     let guest = guest();
     let once = guest.instance.exports.get_function("once").unwrap().clone();
-    let lock = guest.store.read_lock().await;
-    let function = once.as_jsvalue(&lock);
-    drop(lock);
+    let function = guest.store.try_with(|lock| once.as_jsvalue(&lock)).unwrap();
     // Not made from a string: the tests also run where that is forbidden.
     let bogus =
         wasm_bindgen::closure::Closure::<dyn Fn() -> JsValue>::new(|| 42.into()).into_js_value();
     js_sys::Reflect::set(&function, &js_sys::Symbol::for_("wasmer.promising"), &bogus).unwrap();
     assert_eq!(i32_of(guest.call("once", &[AUTO]).await), AUTO);
     guest.into_store();
+}
+
+// --- the guest guard ----------------------------------------------------------
+
+/// A guest co-owns the store's allocation until it leaves the engine's stack:
+/// dropping the store under a forgotten call frees nothing the guest can
+/// reach, and its host functions go on working.
+#[wasm_bindgen_test]
+async fn a_store_dropped_under_a_forgotten_call_outlives_its_guest() {
+    let guest = guest();
+    let once = guest.instance.exports.get_function("once").unwrap().clone();
+    let log = guest.log.clone();
+    let mut store = guest.into_store();
+
+    let mut call = Box::pin(once.call_async(&mut store, &[Value::I32(READY)]));
+    assert!(poll_once(&mut call).is_pending());
+    std::mem::forget(call);
+    drop(store);
+
+    settle().await;
+    assert_eq!(*log.borrow(), ["1: sync", "wait2000", "2: sync"]);
+}
+
+/// A forgotten call ended its borrow, but its guest can still run: every
+/// public store entry refuses until the guest leaves.
+#[wasm_bindgen_test]
+#[should_panic(expected = "forgotten")]
+fn a_store_used_under_a_forgotten_call_panics() {
+    let guest = guest();
+    let once = guest.instance.exports.get_function("once").unwrap().clone();
+    let mut store = guest.into_store();
+    let mut call = Box::pin(once.call_async(&mut store, &[Value::I32(1)]));
+    assert!(poll_once(&mut call).is_pending());
+    std::mem::forget(call);
+    let _ = store.as_store_ref();
+}
+
+/// Dropping a call whose guest cannot be stopped leaves the store usable at
+/// once. A synchronous guest call cannot wait for that guest, so it fails. A
+/// new `call_async` waits for it to leave the stack.
+#[wasm_bindgen_test]
+async fn a_cancelled_guest_on_the_stack_blocks_only_new_guests() {
+    struct Env {
+        inner: Option<Function>,
+        call: Rc<RefCell<Option<Call>>>,
+        sync_error: Rc<RefCell<Option<String>>>,
+        next: Rc<RefCell<Option<Call>>>,
+    }
+    unsafe impl Send for Env {}
+    let mut store = Store::default();
+    let module = Module::new(
+        &store,
+        r#"(module
+          (import "host" "wait" (func $wait (param i32) (result i32)))
+          (import "host" "drop_call" (func $drop_call))
+          (func (export "inner") (result i32) (i32.const 5))
+          (func (export "run") (result i32)
+            (drop (call $wait (i32.const 1000)))
+            (call $drop_call)
+            (i32.const 1)))"#,
+    )
+    .unwrap();
+    let log: Log = Rc::default();
+    let gate = Gate::new(&log);
+    let slot: Rc<RefCell<Option<Call>>> = Rc::default();
+    let sync_error: Rc<RefCell<Option<String>>> = Rc::default();
+    let next: Rc<RefCell<Option<Call>>> = Rc::default();
+    let env = FunctionEnv::new(
+        &mut store,
+        Env {
+            inner: None,
+            call: slot.clone(),
+            sync_error: sync_error.clone(),
+            next: next.clone(),
+        },
+    );
+    let drop_call = |mut env: FunctionEnvMut<'_, Env>| {
+        drop(env.data().call.borrow_mut().take());
+        let inner = env.data().inner.clone().unwrap();
+        let error = inner.call(&mut env, &[]).unwrap_err();
+        *env.data().sync_error.borrow_mut() = Some(error.message());
+        let mut shared = env.shared().expect("a shared store");
+        let mut call: Call = Box::pin(inner.call_async(&mut shared, &[]));
+        assert!(
+            poll_once(&mut call).is_pending(),
+            "the new guest did not wait"
+        );
+        *env.data().next.borrow_mut() = Some(call);
+    };
+    let imports = imports! {
+        "host" => {
+            "wait" => gate.import(&mut store),
+            "drop_call" => Function::new_typed_with_env(&mut store, &env, drop_call),
+        }
+    };
+    let instance = Instance::new(&mut store, &module, &imports).unwrap();
+    env.as_mut(&mut store).inner = instance.exports.get_function("inner").ok().cloned();
+    let run = instance.exports.get_function("run").unwrap().clone();
+    let store = store.into_shared();
+
+    *slot.borrow_mut() = Some(Box::pin(run.call_async(&mut store.clone(), &[])));
+    for _ in 0..20 {
+        if slot.borrow_mut().as_mut().map(poll_once).is_none() {
+            break;
+        }
+        macrotask().await;
+    }
+    assert!(slot.borrow().is_none(), "the guest did not drop its call");
+    let message = sync_error.borrow().clone().expect("the sync call failed");
+    assert!(message.contains("still on the stack"), "{message}");
+
+    let call = next.borrow_mut().take().expect("the new call was made");
+    assert_eq!(i32_of(call.await), 5);
+    store
+        .try_with(|mut lock| env.as_mut(&mut lock).inner = None)
+        .expect("the store is free");
+    assert!(store.into_store().is_ok());
 }

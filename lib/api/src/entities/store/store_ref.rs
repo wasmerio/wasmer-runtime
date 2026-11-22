@@ -2,8 +2,6 @@ use std::ops::{Deref, DerefMut};
 
 use super::{StoreObjects, inner::StoreInner};
 use crate::entities::engine::{AsEngineRef, Engine, EngineRef};
-#[cfg(feature = "experimental-async")]
-use crate::{AsStoreAsync, StoreAsync};
 use wasmer_types::ExternType;
 //use wasmer_vm::{StoreObjects, TrapHandlerFn};
 
@@ -127,17 +125,6 @@ impl StoreMut<'_> {
 pub trait AsStoreRef {
     /// Returns a `StoreRef` pointing to the underlying context.
     fn as_store_ref(&self) -> StoreRef<'_>;
-
-    /// Returns a [`StoreAsync`] if the current
-    /// context is asynchronous. The store will be locked since
-    /// it's already active in the current context, but can be used
-    /// to spawn new coroutines via
-    /// [`Function::call_async`](crate::Function::call_async).
-    #[cfg(feature = "experimental-async")]
-    fn as_store_async(&self) -> Option<impl AsStoreAsync + 'static> {
-        let id = self.as_store_ref().inner.objects.id();
-        StoreAsync::from_context(id)
-    }
 }
 
 /// Helper trait for a value that is convertible to a [`StoreMut`].
@@ -149,8 +136,17 @@ pub trait AsStoreMut: AsStoreRef {
     fn objects_mut(&mut self) -> &mut StoreObjects;
 }
 
+/// On JavaScript, a handle made before a call that was then forgotten must
+/// not reach the store while that call's guest can still run.
+#[inline]
+fn check_guest_guard(_inner: &StoreInner) {
+    #[cfg(all(feature = "js", feature = "experimental-async"))]
+    _inner.guard.check();
+}
+
 impl AsStoreRef for StoreRef<'_> {
     fn as_store_ref(&self) -> StoreRef<'_> {
+        check_guest_guard(self.inner);
         StoreRef { inner: self.inner }
     }
 }
@@ -163,15 +159,18 @@ impl AsEngineRef for StoreRef<'_> {
 
 impl AsStoreRef for StoreMut<'_> {
     fn as_store_ref(&self) -> StoreRef<'_> {
+        check_guest_guard(self.inner);
         StoreRef { inner: self.inner }
     }
 }
 impl AsStoreMut for StoreMut<'_> {
     fn as_store_mut(&mut self) -> StoreMut<'_> {
+        check_guest_guard(self.inner);
         StoreMut { inner: self.inner }
     }
 
     fn objects_mut(&mut self) -> &mut StoreObjects {
+        check_guest_guard(self.inner);
         &mut self.inner.objects
     }
 }

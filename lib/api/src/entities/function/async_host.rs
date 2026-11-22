@@ -1,178 +1,226 @@
-use std::{future::Future, marker::PhantomData, pin::Pin};
+//! Async host functions: [`AsyncEnv`] and [`AsyncHostFunction`].
+
+use std::{future::Future, marker::PhantomData, pin::Pin, rc::Rc};
+
+use wasmer_types::{FunctionType, StoreId};
 
 use crate::{
-    AsyncFunctionEnvMut, HostFunctionKind, RuntimeError, WasmTypeList, WithEnv, WithoutEnv,
+    AsStoreMut, FunctionEnv, FunctionEnvMut, RuntimeError, StoreMut, Value, WasmTypeList,
+    WithSlice,
     utils::{FromToNativeWasmType, IntoResult},
 };
 
-/// Wrapper conveying whether an async host function receives an environment.
-pub enum AsyncFunctionEnv<T, Kind> {
-    /// Used by host functions without an environment.
-    WithoutEnv(PhantomData<(T, Kind)>),
-    /// Used by host functions that capture an environment.
-    WithEnv(AsyncFunctionEnvMut<T>),
+/// The future of one call of an async host function.
+pub(crate) type HostFuture =
+    Pin<Box<dyn Future<Output = Result<Vec<Value>, RuntimeError>> + 'static>>;
+
+/// What an async host function holds across `.await`. It contains no borrow of
+/// the store.
+///
+/// The store is reachable only through [`with`](Self::with), a synchronous
+/// closure, so no store borrow can cross an `.await`:
+///
+/// ```ignore
+/// async fn fetch(cx: &mut AsyncEnv<State>, key: i32) -> Result<i32, RuntimeError> {
+///     let client = cx.with(|env| env.data().client.clone());
+///     let value = client.get(key).await?;
+///     cx.with(|mut env| env.data_mut().last = value);
+///     Ok(value)
+/// }
+/// ```
+///
+/// To call a guest and wait for it, pass `cx` to
+/// [`Function::call_async`](crate::Function::call_async). A guest called
+/// synchronously, with `cx.with(|mut env| f.call(&mut env, &params))`, cannot
+/// suspend.
+pub struct AsyncEnv<T> {
+    env: FunctionEnv<T>,
+    store_id: StoreId,
+    _not_send: PhantomData<*mut ()>,
 }
 
-impl<T> AsyncFunctionEnv<T, WithoutEnv> {
-    /// Create an environment wrapper for functions without host state.
-    pub fn new() -> Self {
-        Self::WithoutEnv(PhantomData)
-    }
-}
-
-impl<T> AsyncFunctionEnv<T, WithEnv> {
-    /// Create an environment wrapper carrying [`AsyncFunctionEnvMut`].
-    pub fn with_env(env: AsyncFunctionEnvMut<T>) -> Self {
-        Self::WithEnv(env)
-    }
-
-    /// Extract the underlying [`AsyncFunctionEnvMut`].
-    pub fn into_env(self) -> AsyncFunctionEnvMut<T> {
-        match self {
-            Self::WithEnv(env) => env,
-            Self::WithoutEnv(_) => unreachable!("with-env async function called without env"),
+impl<T> AsyncEnv<T> {
+    pub(crate) fn new(env: FunctionEnv<T>, store_id: StoreId) -> Self {
+        Self {
+            env,
+            store_id,
+            _not_send: PhantomData,
         }
     }
+
+    pub(crate) fn store_id(&self) -> StoreId {
+        self.store_id
+    }
+
+    /// Borrows the store for one synchronous slice of a poll.
+    ///
+    /// # Panics
+    /// Panics outside a poll of the call this host function belongs to: for
+    /// example from a destructor that runs after the call was dropped inside
+    /// another slice of a shared store.
+    pub fn with<R>(&mut self, f: impl FnOnce(FunctionEnvMut<'_, T>) -> R) -> R {
+        let slice = WithSlice::enter(self.store_id);
+        // Safety: the slice is the only holder of the store until it drops,
+        // after `f`, and `f` cannot keep a borrow it was given.
+        let store = unsafe { StoreMut::from_raw(slice.ptr()) };
+        f(self.env.0.on_store(store))
+    }
 }
 
-/// Async counterpart to [`HostFunction`](super::host::HostFunction).
-pub trait AsyncHostFunction<T, Args, Rets, Kind>
+mod sealed {
+    pub trait Sealed<T, Args, Rets> {}
+}
+
+/// A typed host function's future, which gives its environment back for the
+/// results to be converted.
+type InvokeFuture<T, Rets> =
+    Pin<Box<dyn Future<Output = (AsyncEnv<T>, Result<Rets, RuntimeError>)>>>;
+
+/// An async function usable as a typed host function.
+///
+/// Implemented for `for<'e> AsyncFn(&'e mut AsyncEnv<T>, Args..) -> Rets`,
+/// where `Rets` may be a `Result`. The trait is sealed.
+pub trait AsyncHostFunction<T, Args, Rets>: sealed::Sealed<T, Args, Rets> + 'static
 where
-    Args: WasmTypeList + 'static,
+    Args: WasmTypeList,
     Rets: WasmTypeList,
-    Kind: HostFunctionKind,
 {
-    /// Invoke the host function asynchronously.
-    fn call_async(
-        &self,
-        env: AsyncFunctionEnv<T, Kind>,
-        args: Args,
-    ) -> Pin<Box<dyn Future<Output = Result<Rets, RuntimeError>>>>;
+    #[doc(hidden)]
+    fn invoke(self: Rc<Self>, env: AsyncEnv<T>, args: Args) -> InvokeFuture<T, Rets>;
 }
 
-macro_rules! impl_async_host_function_without_env {
+macro_rules! impl_async_host_function {
     ( $( $x:ident ),* ) => {
-        impl<$( $x, )* Rets, RetsAsResult, F, Fut > AsyncHostFunction<(), ( $( $x ),* ), Rets, WithoutEnv> for F
+        impl<$( $x, )* Rets, RetsAsResult, T, F> sealed::Sealed<T, ( $( $x ),* ), Rets> for F
         where
-            F: Fn($( $x ),*) -> Fut + 'static,
-            Fut: Future<Output = RetsAsResult> + 'static,
+            F: for<'e> AsyncFn(&'e mut AsyncEnv<T>, $( $x ),*) -> RetsAsResult + 'static,
             RetsAsResult: IntoResult<Rets>,
             Rets: WasmTypeList,
-            ( $( $x ),* ): WasmTypeList + 'static,
+            ( $( $x ),* ): WasmTypeList,
             $( $x: FromToNativeWasmType + 'static, )*
         {
-            fn call_async(
-                &self,
-                _env: AsyncFunctionEnv<(), WithoutEnv>,
-                args: ( $( $x ),* ),
-            ) -> Pin<Box<dyn Future<Output = Result<Rets, RuntimeError>>>> {
-                #[allow(non_snake_case)]
-                let ( $( $x ),* ) = args;
-                let fut = (self)( $( $x ),* );
-                Box::pin(async move {
-                    fut.await
-                        .into_result()
-                        .map_err(|err| RuntimeError::from_dyn(Box::new(err)))
-                })
-            }
         }
-    };
-}
 
-macro_rules! impl_async_host_function_with_env {
-    ( $( $x:ident ),* ) => {
-        impl<$( $x, )* Rets, RetsAsResult,  T, F, Fut > AsyncHostFunction<T, ( $( $x ),* ), Rets, WithEnv> for F
+        impl<$( $x, )* Rets, RetsAsResult, T, F> AsyncHostFunction<T, ( $( $x ),* ), Rets> for F
         where
             T: 'static,
-            F: Fn(AsyncFunctionEnvMut<T>, $( $x ),*) -> Fut + 'static,
-            Fut: Future<Output = RetsAsResult> + 'static,
-            RetsAsResult: IntoResult<Rets>,
-            Rets: WasmTypeList,
+            F: for<'e> AsyncFn(&'e mut AsyncEnv<T>, $( $x ),*) -> RetsAsResult + 'static,
+            RetsAsResult: IntoResult<Rets> + 'static,
+            Rets: WasmTypeList + 'static,
             ( $( $x ),* ): WasmTypeList + 'static,
             $( $x: FromToNativeWasmType + 'static, )*
         {
-            fn call_async(
-                &self,
-                env: AsyncFunctionEnv<T, WithEnv>,
+            #[allow(non_snake_case)]
+            fn invoke(
+                self: Rc<Self>,
+                mut env: AsyncEnv<T>,
                 args: ( $( $x ),* ),
-            ) -> Pin<Box<dyn Future<Output = Result<Rets, RuntimeError>>>> {
-                #[allow(non_snake_case)]
+            ) -> InvokeFuture<T, Rets> {
                 let ( $( $x ),* ) = args;
-                let fut = (self)(env.into_env(), $( $x ),* );
                 Box::pin(async move {
-                    fut.await
+                    let func: &F = &self;
+                    let result = func(&mut env, $( $x ),*)
+                        .await
                         .into_result()
-                        .map_err(|err| RuntimeError::from_dyn(Box::new(err)))
+                        .map_err(|err| RuntimeError::from_dyn(Box::new(err)));
+                    (env, result)
                 })
             }
         }
     };
 }
 
-impl_async_host_function_without_env!();
-impl_async_host_function_without_env!(A1);
-impl_async_host_function_without_env!(A1, A2);
-impl_async_host_function_without_env!(A1, A2, A3);
-impl_async_host_function_without_env!(A1, A2, A3, A4);
-impl_async_host_function_without_env!(A1, A2, A3, A4, A5);
-impl_async_host_function_without_env!(A1, A2, A3, A4, A5, A6);
-impl_async_host_function_without_env!(A1, A2, A3, A4, A5, A6, A7);
-impl_async_host_function_without_env!(A1, A2, A3, A4, A5, A6, A7, A8);
-impl_async_host_function_without_env!(A1, A2, A3, A4, A5, A6, A7, A8, A9);
-impl_async_host_function_without_env!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10);
-impl_async_host_function_without_env!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11);
-impl_async_host_function_without_env!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12);
-impl_async_host_function_without_env!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13);
-impl_async_host_function_without_env!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14);
-impl_async_host_function_without_env!(
+impl_async_host_function!();
+impl_async_host_function!(A1);
+impl_async_host_function!(A1, A2);
+impl_async_host_function!(A1, A2, A3);
+impl_async_host_function!(A1, A2, A3, A4);
+impl_async_host_function!(A1, A2, A3, A4, A5);
+impl_async_host_function!(A1, A2, A3, A4, A5, A6);
+impl_async_host_function!(A1, A2, A3, A4, A5, A6, A7);
+impl_async_host_function!(A1, A2, A3, A4, A5, A6, A7, A8);
+impl_async_host_function!(A1, A2, A3, A4, A5, A6, A7, A8, A9);
+impl_async_host_function!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10);
+impl_async_host_function!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11);
+impl_async_host_function!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12);
+impl_async_host_function!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13);
+impl_async_host_function!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14);
+impl_async_host_function!(
     A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15
 );
-impl_async_host_function_without_env!(
+impl_async_host_function!(
     A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16
 );
-impl_async_host_function_without_env!(
+impl_async_host_function!(
     A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17
 );
-impl_async_host_function_without_env!(
+impl_async_host_function!(
     A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18
 );
-impl_async_host_function_without_env!(
+impl_async_host_function!(
     A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18, A19
 );
-impl_async_host_function_without_env!(
+impl_async_host_function!(
     A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18, A19, A20
 );
 
-impl_async_host_function_with_env!();
-impl_async_host_function_with_env!(A1);
-impl_async_host_function_with_env!(A1, A2);
-impl_async_host_function_with_env!(A1, A2, A3);
-impl_async_host_function_with_env!(A1, A2, A3, A4);
-impl_async_host_function_with_env!(A1, A2, A3, A4, A5);
-impl_async_host_function_with_env!(A1, A2, A3, A4, A5, A6);
-impl_async_host_function_with_env!(A1, A2, A3, A4, A5, A6, A7);
-impl_async_host_function_with_env!(A1, A2, A3, A4, A5, A6, A7, A8);
-impl_async_host_function_with_env!(A1, A2, A3, A4, A5, A6, A7, A8, A9);
-impl_async_host_function_with_env!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10);
-impl_async_host_function_with_env!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11);
-impl_async_host_function_with_env!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12);
-impl_async_host_function_with_env!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13);
-impl_async_host_function_with_env!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14);
-impl_async_host_function_with_env!(
-    A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15
-);
-impl_async_host_function_with_env!(
-    A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16
-);
-impl_async_host_function_with_env!(
-    A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17
-);
-impl_async_host_function_with_env!(
-    A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18
-);
-impl_async_host_function_with_env!(
-    A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18, A19
-);
-impl_async_host_function_with_env!(
-    A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18, A19, A20
-);
+/// Turns a typed async host function into the body of a dynamic one.
+pub(crate) fn typed_host_body<T, F, Args, Rets>(
+    func: F,
+    ty: FunctionType,
+) -> impl Fn(AsyncEnv<T>, Vec<Value>) -> HostFuture + 'static
+where
+    T: 'static,
+    F: AsyncHostFunction<T, Args, Rets>,
+    Args: WasmTypeList + 'static,
+    Rets: WasmTypeList + 'static,
+{
+    let func = Rc::new(func);
+    let ty = Rc::new(ty);
+    move |mut cx, values| -> HostFuture {
+        let func = Rc::clone(&func);
+        let ty = Rc::clone(&ty);
+        Box::pin(async move {
+            let args = cx.with(|mut env| args_from_values::<Args>(&mut env, &ty, &values))?;
+            let (mut cx, result) = func.invoke(cx, args).await;
+            let rets = result?;
+            Ok(cx.with(|mut env| results_to_values::<Rets>(&mut env, &ty, rets)))
+        })
+    }
+}
+
+fn args_from_values<Args: WasmTypeList>(
+    store: &mut impl AsStoreMut,
+    ty: &FunctionType,
+    values: &[Value],
+) -> Result<Args, RuntimeError> {
+    if values.len() != ty.params().len() {
+        return Err(RuntimeError::new(
+            "typed host function received wrong number of parameters",
+        ));
+    }
+    let mut raw_array = Args::empty_array();
+    for ((slot, value), expected) in raw_array.as_mut().iter_mut().zip(values).zip(ty.params()) {
+        debug_assert_eq!(
+            value.ty(),
+            *expected,
+            "wasm should only call host functions with matching signatures"
+        );
+        *slot = value.as_raw(store);
+    }
+    // Safety: the raw values were read from values of the parameter types.
+    Ok(unsafe { Args::from_array(store, raw_array) })
+}
+
+fn results_to_values<Rets: WasmTypeList>(
+    store: &mut impl AsStoreMut,
+    ty: &FunctionType,
+    rets: Rets,
+) -> Vec<Value> {
+    // Safety: the raw values are read back as the result types of `Rets`.
+    let mut raw_array = unsafe { rets.into_array(store) };
+    let results = raw_array.as_mut().iter().zip(ty.results());
+    results
+        .map(|(raw, ty)| unsafe { Value::from_raw(store, *ty, *raw) })
+        .collect()
+}

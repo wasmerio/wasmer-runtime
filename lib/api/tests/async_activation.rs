@@ -27,15 +27,15 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
-    task::{Context, Poll, Wake, Waker},
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use wasmer::{
-    AsStoreAsync, Function, FunctionType, Instance, Module, RuntimeError, Store, StoreAsync,
-    StoreAsyncWriteLock, Table, TableType, Type, TypedFunction, Value, imports,
+    AsyncEnv, Function, FunctionEnv, FunctionEnvMut, FunctionType, Instance, Module, RuntimeError,
+    SharedStore, Store, StoreBusy, Table, TableType, Type, TypedFunction, Value, imports,
 };
 use wasmer_vm::TrapCode;
 
@@ -104,17 +104,14 @@ impl Drop for SetOnDrop {
     }
 }
 
-/// A waker that counts how often it is used.
-#[derive(Default)]
-struct Wakes(AtomicUsize);
-impl Wake for Wakes {
-    fn wake(self: Arc<Self>) {
-        self.0.fetch_add(1, Ordering::SeqCst);
-    }
-}
-impl Wakes {
-    fn count(&self) -> usize {
-        self.0.load(Ordering::SeqCst)
+/// Lets a sync host function, which must be `Send`, hold single-threaded test
+/// state. These tests run the store on one thread.
+struct OnOneThread<T>(T);
+unsafe impl<T> Send for OnOneThread<T> {}
+unsafe impl<T> Sync for OnOneThread<T> {}
+impl<T> OnOneThread<T> {
+    fn get(&self) -> &T {
+        &self.0
     }
 }
 
@@ -127,7 +124,7 @@ struct Spin {
 }
 
 type Gates = [Rc<Cell<bool>>; 2];
-type CallFuture = Pin<Box<dyn Future<Output = Result<Box<[Value]>, RuntimeError>>>>;
+type CallFuture<'a> = Pin<Box<dyn Future<Output = Result<Box<[Value]>, RuntimeError>> + 'a>>;
 type HostHook = Box<dyn FnMut() -> Result<(), RuntimeError>>;
 
 fn gates() -> Gates {
@@ -135,7 +132,7 @@ fn gates() -> Gates {
 }
 
 struct Guest {
-    store: StoreAsync,
+    store: SharedStore,
     instance: Instance,
     /// Set when the host future of `wait(i)` is dropped.
     host_future_dropped: Gates,
@@ -154,32 +151,33 @@ impl Guest {
         let mut store = Store::default();
         let module = Module::new(&store, WAT).unwrap();
         let host_future_dropped = self::gates();
+        let env = FunctionEnv::new(&mut store, ());
         let wait = {
             let gates = gates.clone();
             let dropped = host_future_dropped.clone();
             Function::new_async(
                 &mut store,
+                &env,
                 FunctionType::new(vec![Type::I32], vec![]),
-                move |vals| {
+                async move |_cx: &mut AsyncEnv<()>, vals: &[Value]| {
                     let idx = vals[0].unwrap_i32() as usize;
-                    let gate = gates[idx].clone();
-                    let dropped = SetOnDrop(dropped[idx].clone());
-                    async move {
-                        let _dropped = dropped;
-                        Gate(gate).await;
-                        Ok(vec![])
-                    }
+                    let _dropped = SetOnDrop(dropped[idx].clone());
+                    Gate(gates[idx].clone()).await;
+                    Ok(vec![])
                 },
             )
         };
         let host: Rc<RefCell<Option<HostHook>>> = Default::default();
         let host_import = {
-            let host = host.clone();
-            // The hook runs in the body, on the stack of the call; the
-            // returned future is ready.
-            Function::new_async(&mut store, FunctionType::new(vec![], vec![]), move |_| {
-                let result = host.borrow_mut().as_mut().map_or(Ok(()), |hook| hook());
-                async move { result.map(|()| vec![]) }
+            let host = OnOneThread(host.clone());
+            // The hook runs on the stack of the call, under a host frame.
+            Function::new(&mut store, FunctionType::new(vec![], vec![]), move |_| {
+                let result = host
+                    .get()
+                    .borrow_mut()
+                    .as_mut()
+                    .map_or(Ok(()), |hook| hook());
+                result.map(|()| vec![])
             })
         };
         let spin = Arc::new(Spin::default());
@@ -207,7 +205,7 @@ impl Guest {
             id: store.id(),
             #[cfg(all(unix, feature = "experimental-host-interrupt"))]
             spin,
-            store: store.into_async(),
+            store: store.into_shared(),
             instance,
             host_future_dropped,
             host,
@@ -218,14 +216,14 @@ impl Guest {
         *self.host.borrow_mut() = Some(Box::new(hook));
     }
 
-    fn run(&self, gate: i32, how: i32) -> CallFuture {
+    fn run(&self, gate: i32, how: i32) -> CallFuture<'static> {
         self.call("run", &[gate, how])
     }
 
-    fn call(&self, name: &str, args: &[i32]) -> CallFuture {
-        let f = self.instance.exports.get_function(name).unwrap().clone();
-        let args = args.iter().map(|v| Value::I32(*v)).collect();
-        Box::pin(f.call_async(&self.store, args))
+    fn call(&self, name: &str, args: &[i32]) -> CallFuture<'static> {
+        let f = self.instance.exports.get_function(name).unwrap();
+        let args: Vec<Value> = args.iter().map(|v| Value::I32(*v)).collect();
+        Box::pin(f.call_async(&mut self.store.clone(), &args))
     }
 
     /// For synchronous calls.
@@ -234,51 +232,38 @@ impl Guest {
         (store, self.instance)
     }
 
-    fn try_write(&self) -> Option<StoreAsyncWriteLock> {
-        match Box::pin(self.store.write_lock())
-            .as_mut()
-            .poll(&mut Context::from_waker(&futures::task::noop_waker()))
-        {
-            Poll::Ready(guard) => Some(guard),
-            Poll::Pending => None,
-        }
-    }
-
     fn after(&self) -> i32 {
-        let mut guard = self.try_write().expect("store is not locked");
-        self.instance
-            .exports
-            .get_global("after")
-            .unwrap()
-            .get(&mut guard)
-            .unwrap_i32()
+        let after = self.instance.exports.get_global("after").unwrap().clone();
+        self.store
+            .try_with(|mut store| after.get(&mut store).unwrap_i32())
+            .expect("store is not busy")
     }
 }
 
-fn poll_once<T>(f: &mut Pin<Box<dyn Future<Output = T>>>) -> Poll<T> {
+fn poll_once<T>(f: &mut Pin<Box<dyn Future<Output = T> + '_>>) -> Poll<T> {
     f.as_mut()
         .poll(&mut Context::from_waker(&futures::task::noop_waker()))
 }
 
-fn expect_pending(what: &str, f: &mut CallFuture) {
+fn expect_pending(what: &str, f: &mut CallFuture<'_>) {
     assert!(poll_once(f).is_pending(), "{what} should be suspended");
 }
 
-fn expect_value(what: &str, f: &mut CallFuture, value: i32) {
+fn expect_value(what: &str, f: &mut CallFuture<'_>, value: i32) {
     match poll_once(f) {
         Poll::Ready(Ok(v)) => assert_eq!(v[0].unwrap_i32(), value, "{what}"),
         other => panic!("{what}: expected {value}, got {other:?}"),
     }
 }
 
-fn expect_trap(what: &str, f: &mut CallFuture, code: TrapCode) {
+fn expect_trap(what: &str, f: &mut CallFuture<'_>, code: TrapCode) {
     match poll_once(f) {
         Poll::Ready(Err(e)) => assert_trap(what, &e, code),
         other => panic!("{what}: expected trap {code:?}, got {other:?}"),
     }
 }
 
-fn expect_host_panic(f: &mut CallFuture) {
+fn expect_host_panic(f: &mut CallFuture<'_>) {
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| poll_once(f)));
     assert!(caught.is_err(), "the host panic reaches the poller");
 }
@@ -310,8 +295,8 @@ fn interleaved_trap(order: &str, stores: &str, trap_name: &str) {
     let g = gates();
     let guest_a = Guest::new(&g);
     let other = (stores == "two_stores").then(|| Guest::new(&g));
-    // With one store both calls share it; its lock is released whenever the
-    // running call suspends, which is what lets the other one run.
+    // With one store both calls share it: each takes it only for the slice
+    // it runs, which is what lets the other one run.
     let guest_b = other.as_ref().unwrap_or(&guest_a);
 
     let (how_a, how_b) = match order {
@@ -361,7 +346,7 @@ fn poller_in_wasm(poller: &str, trap_name: &str) {
     let g = gates();
     let guest_a = Guest::new(&g);
     let guest_b = Guest::new(&g);
-    let left_suspended: Rc<RefCell<Option<CallFuture>>> = Default::default();
+    let left_suspended: Rc<RefCell<Option<CallFuture<'static>>>> = Default::default();
     let outer = Guest::new(&g);
     outer.on_host({
         let (g, left_suspended) = (g.clone(), left_suspended.clone());
@@ -464,7 +449,7 @@ fn interrupt_while_another_call_is_suspended(target: &str) {
     let interrupter = if at_running { &guest_a } else { &guest_b }
         .interrupter
         .clone();
-    let store_b = guest_b.store.store_id();
+    let store_b = guest_b.id;
     let other = std::thread::spawn(move || {
         while !spin.started.load(Ordering::SeqCst) {
             std::thread::yield_now();
@@ -507,7 +492,7 @@ const SCENARIO_COMPLETED: &str = "scenario completed:";
 /// at the thread that is gone.
 fn suspended_call_dropped_as_its_thread_exits() {
     thread_local! {
-        static KEPT: RefCell<Option<CallFuture>> = const { RefCell::new(None) };
+        static KEPT: RefCell<Option<CallFuture<'static>>> = const { RefCell::new(None) };
     }
     let _id = std::thread::spawn(|| {
         KEPT.with(|_| ());
@@ -675,7 +660,10 @@ fn dropping_a_suspended_call_unwinds_it() {
     let mut call = guest.run(0, 0);
     expect_pending("call", &mut call);
     assert!(!guest.host_future_dropped[0].get());
-    assert!(guest.try_write().is_some(), "lock released at suspension");
+    assert!(
+        guest.store.try_with(|_| ()).is_ok(),
+        "store is free at suspension"
+    );
 
     drop(call);
     assert!(guest.host_future_dropped[0].get(), "host future dropped");
@@ -687,132 +675,50 @@ fn dropping_a_suspended_call_unwinds_it() {
     guest.into_store();
 }
 
-/// A call that had to wait for the store takes it through the lock future
-/// that holds its place among the waiters, also when the store is free by the
-/// time the call is polled again. That place is given up when the call gets
-/// the store: dropping the call later must not clear a waiter that has taken
-/// the same place since.
+/// A typed call works on a shared store, with no lock to wait for: the store
+/// is free whenever no slice runs.
 #[test]
-fn a_call_that_waited_for_the_store_gives_up_its_place_among_the_waiters() {
-    let g = gates();
-    g[0].set(true);
-    let guest = Guest::new(&g);
-
-    let holder = guest.try_write().expect("store is free");
-    let mut call = guest.run(0, 0);
-    expect_pending("the call waits for the store", &mut call);
-    drop(holder);
-    expect_value("call", &mut call, 42);
-
-    let holder = guest.try_write().expect("store is free");
-    let wakes = Arc::new(Wakes::default());
-    let mut waiter = Box::pin(guest.store.write_lock());
-    let poll = waiter
-        .as_mut()
-        .poll(&mut Context::from_waker(&Waker::from(wakes.clone())));
-    assert!(poll.is_pending());
-    drop(call);
-    drop(holder);
-    assert_eq!(wakes.count(), 1, "the waiter is told the store is free");
-}
-
-/// Three waiters for a store: B waits, is woken, and finds the store taken
-/// again; C starts waiting meanwhile. Both are woken when the store is
-/// released, C again when B is done with it, and the store can be taken
-/// back out of its async handle afterwards.
-#[test]
-fn every_waiter_for_the_store_is_woken() {
+fn a_typed_call_takes_the_store_for_its_slices() {
     let g = gates();
     let guest = Guest::new(&g);
-    let lock = |wakes: &Arc<Wakes>| {
-        let mut lock = Box::pin(guest.store.write_lock());
-        let waker = Waker::from(wakes.clone());
-        let poll = lock.as_mut().poll(&mut Context::from_waker(&waker));
-        (lock, poll)
-    };
-    let (wakes_b, wakes_c) = (Arc::new(Wakes::default()), Arc::new(Wakes::default()));
-
-    let a = guest.try_write().expect("the store is free");
-    let (mut b, poll) = lock(&wakes_b);
-    assert!(poll.is_pending());
-    drop(a);
-    assert_eq!(wakes_b.count(), 1);
-
-    let a = guest.try_write().expect("the store is free");
-    let (mut c, poll) = lock(&wakes_c);
-    assert!(poll.is_pending());
-    let waker_b = Waker::from(wakes_b.clone());
-    assert!(
-        b.as_mut()
-            .poll(&mut Context::from_waker(&waker_b))
-            .is_pending()
-    );
-    drop(a);
-    assert_eq!((wakes_b.count(), wakes_c.count()), (2, 1));
-
-    let Poll::Ready(guard_b) = b.as_mut().poll(&mut Context::from_waker(&waker_b)) else {
-        panic!("B should have the store");
-    };
-    let waker_c = Waker::from(wakes_c.clone());
-    assert!(
-        c.as_mut()
-            .poll(&mut Context::from_waker(&waker_c))
-            .is_pending()
-    );
-    drop(guard_b);
-    assert_eq!(wakes_c.count(), 2);
-    let Poll::Ready(guard_c) = c.as_mut().poll(&mut Context::from_waker(&waker_c)) else {
-        panic!("C should have the store");
-    };
-    drop((guard_c, b, c));
-    guest.into_store();
-}
-
-/// A typed `call_async` waits for the store as a reader, `Function::call_async`
-/// as a writer. Releasing the store wakes only the writer; when that call is
-/// dropped before it is polled again, the typed call is woken in its place.
-#[test]
-fn a_call_waiting_behind_a_dropped_call_is_woken() {
-    let g = gates();
-    let guest = Guest::new(&g);
-    let typed: TypedFunction<i32, i32> = {
-        let guard = guest.try_write().expect("the store is free");
-        guest
-            .instance
-            .exports
-            .get_typed_function(&guard, "via_host")
-            .unwrap()
-    };
-    let (wakes_typed, wakes_untyped) = (Arc::new(Wakes::default()), Arc::new(Wakes::default()));
-    let waker_typed = Waker::from(wakes_typed.clone());
-    let waker_untyped = Waker::from(wakes_untyped.clone());
-
-    let holder = guest.try_write().expect("the store is free");
-    let mut typed_call = Box::pin(typed.call_async(&guest.store, 0));
-    let poll = typed_call
+    let typed: TypedFunction<i32, i32> = guest
+        .store
+        .try_with(|store| {
+            guest
+                .instance
+                .exports
+                .get_typed_function(&store, "via_host")
+                .unwrap()
+        })
+        .unwrap();
+    let mut store = guest.store.clone();
+    let mut call = Box::pin(typed.call_async(&mut store, 0));
+    let poll = call
         .as_mut()
-        .poll(&mut Context::from_waker(&waker_typed));
-    assert!(poll.is_pending());
-    let mut untyped_call = guest.call("via_host", &[0]);
-    let poll = untyped_call
-        .as_mut()
-        .poll(&mut Context::from_waker(&waker_untyped));
-    assert!(poll.is_pending());
-    drop(holder);
-    assert_eq!((wakes_untyped.count(), wakes_typed.count()), (1, 0));
-
-    drop(untyped_call);
-    assert_eq!(
-        wakes_typed.count(),
-        1,
-        "the typed call is told the store is free"
-    );
-    let poll = typed_call
-        .as_mut()
-        .poll(&mut Context::from_waker(&waker_typed));
+        .poll(&mut Context::from_waker(&futures::task::noop_waker()));
     assert!(matches!(poll, Poll::Ready(Ok(7))), "{poll:?}");
-    drop(typed_call);
+    drop(call);
+    drop(store);
     guest.into_store();
+}
+
+/// A busy shared store fails at once: the holder is below on the same stack.
+#[test]
+fn a_busy_shared_store_fails_at_once() {
+    let g = gates();
+    let guest = Guest::new(&g);
+    let store = guest.store.clone();
+    let seen: Rc<Cell<Option<StoreBusy>>> = Rc::default();
+    guest.on_host({
+        let seen = seen.clone();
+        move || {
+            seen.set(store.try_with(|_| ()).err());
+            Ok(())
+        }
+    });
+    expect_value("outer", &mut guest.call("via_host", &[0]), 7);
+    assert_eq!(seen.get(), Some(StoreBusy));
+    assert!(guest.store.try_with(|_| ()).is_ok());
 }
 
 /// A call polled from inside the store it runs in, by a host function of
@@ -824,29 +730,29 @@ fn a_call_polled_from_inside_its_own_store_is_refused() {
     let guest = Guest::new(&g);
     let refusal: Rc<RefCell<Option<String>>> = Rc::default();
     guest.on_host({
-        let store = guest.store.store();
+        let mut store = guest.store.clone();
         let run = guest.instance.exports.get_function("run").unwrap().clone();
         let refusal = refusal.clone();
         move || {
-            let args = vec![Value::I32(0), Value::I32(0)];
-            let mut call: CallFuture = Box::pin(run.call_async(&store, args));
+            let args = [Value::I32(0), Value::I32(0)];
+            let mut call: CallFuture<'_> = Box::pin(run.call_async(&mut store, &args));
             let panic =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| poll_once(&mut call)))
                     .expect_err("the poll is refused");
-            *refusal.borrow_mut() = panic.downcast_ref::<&str>().map(|s| s.to_string());
+            *refusal.borrow_mut() = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()));
             Ok(())
         }
     });
     let mut outer = guest.call("via_host", &[0]);
     expect_value("outer", &mut outer, 7);
     let refusal = refusal.borrow().clone().expect("a panic with a message");
-    assert!(
-        refusal.contains("cannot be polled recursively"),
-        "{refusal}"
-    );
+    assert!(refusal.contains("from inside a slice"), "{refusal}");
     drop(outer);
     expect_value("next call", &mut guest.call("via_host", &[0]), 7);
-    assert!(guest.try_write().is_some(), "the store is free");
+    assert!(guest.store.try_with(|_| ()).is_ok(), "the store is free");
 }
 
 /// A host function running on the coroutine of a call instantiates a module
@@ -866,24 +772,24 @@ fn a_start_function_run_by_a_host_function_cannot_suspend() {
     let gate = Rc::new(Cell::new(false));
     let mut store = Store::default();
     let module = Module::new(&store, START).unwrap();
-    let wait = Function::new_async(&mut store, FunctionType::new(vec![], vec![]), {
+    let env = FunctionEnv::new(&mut store, ());
+    let wait = Function::new_async(&mut store, &env, FunctionType::new(vec![], vec![]), {
         let gate = gate.clone();
-        move |_| {
-            let gate = gate.clone();
-            async move {
-                Gate(gate).await;
-                Ok(vec![])
-            }
+        async move |_: &mut AsyncEnv<()>, _: &[Value]| {
+            Gate(gate.clone()).await;
+            Ok(vec![])
         }
     });
-    let env = wasmer::FunctionEnv::new(&mut store, ());
     let created: Arc<std::sync::Mutex<Option<Instance>>> = Arc::default();
     let instantiate =
         Function::new_with_env(&mut store, &env, FunctionType::new(vec![], vec![]), {
             let created = created.clone();
-            move |mut env: wasmer::FunctionEnvMut<()>, _: &[Value]| {
+            let wait = OnOneThread(wait);
+            let module = OnOneThread(module);
+            move |mut env: FunctionEnvMut<()>, _: &[Value]| {
+                let (wait, module) = (wait.get(), module.get());
                 let imports = imports! { "h" => { "wait" => wait.clone() } };
-                let instance = match Instance::new(&mut env, &module, &imports) {
+                let instance = match Instance::new(&mut env, module, &imports) {
                     Ok(instance) => instance,
                     Err(wasmer::InstantiationError::Start(error)) => return Err(error),
                     Err(error) => return Err(RuntimeError::new(error.to_string())),
@@ -892,19 +798,15 @@ fn a_start_function_run_by_a_host_function_cannot_suspend() {
                 Ok(vec![])
             }
         });
-    let store = store.into_async();
 
-    let mut failed: CallFuture = Box::pin(instantiate.call_async(&store, vec![]));
+    let mut failed: CallFuture<'_> = Box::pin(instantiate.call_async(&mut store, &[]));
     expect_trap("waiting", &mut failed, TrapCode::YieldOutsideAsyncContext);
     drop(failed);
     assert!(created.lock().unwrap().is_none());
     gate.set(true);
-    let mut call: CallFuture = Box::pin(instantiate.call_async(&store, vec![]));
+    let mut call: CallFuture<'_> = Box::pin(instantiate.call_async(&mut store, &[]));
     assert!(matches!(poll_once(&mut call), Poll::Ready(Ok(_))));
     drop(call);
-    let Ok(mut store) = store.into_store() else {
-        panic!("the store is still shared");
-    };
     let instance = created
         .lock()
         .unwrap()
@@ -942,32 +844,34 @@ fn a_start_function_that_fails_as_it_waits_leaves_its_functions_working() {
     let mut store = Store::default();
     let module = Module::new(&store, START).unwrap();
     let other = Module::new(&store, OTHER).unwrap();
-    let wait = Function::new_async(&mut store, FunctionType::new(vec![], vec![]), |_| async {
-        Gate(Rc::new(Cell::new(false))).await;
-        Ok(vec![])
-    });
+    let env = FunctionEnv::new(&mut store, ());
+    let wait = Function::new_async(
+        &mut store,
+        &env,
+        FunctionType::new(vec![], vec![]),
+        async |_: &mut AsyncEnv<()>, _: &[Value]| {
+            Gate(Rc::new(Cell::new(false))).await;
+            Ok(vec![])
+        },
+    );
     let table_type = TableType::new(Type::FuncRef, 1, None);
     let table = Table::new(&mut store, table_type, Value::FuncRef(None)).unwrap();
-    let env = wasmer::FunctionEnv::new(&mut store, ());
     let instantiate =
         Function::new_with_env(&mut store, &env, FunctionType::new(vec![], vec![]), {
-            let (wait, table) = (wait.clone(), table.clone());
-            move |mut env: wasmer::FunctionEnvMut<()>, _: &[Value]| {
+            let imported = OnOneThread((wait.clone(), table.clone(), module));
+            move |mut env: FunctionEnvMut<()>, _: &[Value]| {
+                let (wait, table, module) = imported.get();
                 let imports =
                     imports! { "h" => { "wait" => wait.clone(), "table" => table.clone() } };
-                Instance::new(&mut env, &module, &imports)
+                Instance::new(&mut env, module, &imports)
                     .map_err(|e| RuntimeError::new(e.to_string()))?;
                 Ok(vec![])
             }
         });
-    let store = store.into_async();
 
-    let mut call: CallFuture = Box::pin(instantiate.call_async(&store, vec![]));
+    let mut call: CallFuture<'_> = Box::pin(instantiate.call_async(&mut store, &[]));
     assert!(matches!(poll_once(&mut call), Poll::Ready(Err(_))));
     drop(call);
-    let Ok(mut store) = store.into_store() else {
-        panic!("the store is still shared");
-    };
     for _ in 0..64 {
         let table = Table::new(&mut store, table_type, Value::FuncRef(None)).unwrap();
         let imports = imports! { "h" => { "wait" => wait.clone(), "table" => table } };
@@ -986,8 +890,6 @@ fn a_start_function_that_fails_as_it_waits_leaves_its_functions_working() {
 /// panic unwinds through.
 mod caught_panics {
     use std::panic::{AssertUnwindSafe, catch_unwind};
-
-    use wasmer::{AsyncFunctionEnvMut, FunctionEnv, FunctionEnvMut};
 
     use super::*;
 
@@ -1026,7 +928,7 @@ mod caught_panics {
 
     thread_local! {
         /// A call for `drop_sync` to drop.
-        static TO_DROP_SYNC: RefCell<Option<CallFuture>> = const { RefCell::new(None) };
+        static TO_DROP_SYNC: RefCell<Option<CallFuture<'static>>> = const { RefCell::new(None) };
     }
 
     #[derive(Default)]
@@ -1040,7 +942,7 @@ mod caught_panics {
         store: Store,
         instance: Instance,
         /// A call for `drop_call` to drop.
-        to_drop: Rc<RefCell<Option<CallFuture>>>,
+        to_drop: Rc<RefCell<Option<CallFuture<'static>>>>,
     }
 
     impl Guest {
@@ -1054,24 +956,32 @@ mod caught_panics {
                 panic!("typed host function")
             }
             let typed = Function::new_typed(&mut store, typed_panics);
-            let async_body = Function::new_with_env_async(
+            let async_body = Function::new_async(
                 &mut store,
                 &env,
                 unit.clone(),
-                |_: AsyncFunctionEnvMut<Env>, _: &[Value]| -> std::future::Ready<_> {
+                async |_: &mut AsyncEnv<Env>, _: &[Value]| -> Result<Vec<Value>, RuntimeError> {
                     panic!("async host function")
                 },
             );
-            let async_future = Function::new_with_env_async(
+            let async_future = Function::new_async(
                 &mut store,
                 &env,
                 unit.clone(),
-                |_: AsyncFunctionEnvMut<Env>, _: &[Value]| async { panic!("host future") },
+                async |_: &mut AsyncEnv<Env>, _: &[Value]| -> Result<Vec<Value>, RuntimeError> {
+                    std::future::ready(()).await;
+                    panic!("host future")
+                },
             );
-            let wait = Function::new_async(&mut store, unit.clone(), |_| async {
-                Gate(Rc::new(Cell::new(false))).await;
-                Ok(vec![])
-            });
+            let wait = Function::new_async(
+                &mut store,
+                &env,
+                unit.clone(),
+                async |_: &mut AsyncEnv<Env>, _: &[Value]| {
+                    Gate(Rc::new(Cell::new(false))).await;
+                    Ok(vec![])
+                },
+            );
             // Calls the export `NESTED[i]` and catches a panic from it. Returns
             // how many times it went on after catching one, or -1 if there was
             // none to catch.
@@ -1094,12 +1004,12 @@ mod caught_panics {
                     Ok(vec![Value::I32(if caught { went_on } else { -1 })])
                 },
             );
-            let to_drop: Rc<RefCell<Option<CallFuture>>> = Rc::default();
-            let drop_call = Function::new_async(&mut store, unit.clone(), {
+            let to_drop: Rc<RefCell<Option<CallFuture<'static>>>> = Rc::default();
+            let drop_call = Function::new_async(&mut store, &env, unit.clone(), {
                 let to_drop = to_drop.clone();
-                move |_| {
+                async move |_: &mut AsyncEnv<Env>, _: &[Value]| {
                     drop(to_drop.borrow_mut().take());
-                    async { Ok(vec![]) }
+                    Ok(vec![])
                 }
             });
             let drop_sync = Function::new(&mut store, unit, |_| {
@@ -1137,9 +1047,9 @@ mod caught_panics {
         }
     }
 
-    fn call(store: &StoreAsync, f: &Function, args: &[i32]) -> CallFuture {
-        let args = args.iter().map(|v| Value::I32(*v)).collect();
-        Box::pin(f.call_async(store, args))
+    fn call(store: &SharedStore, f: &Function, args: &[i32]) -> CallFuture<'static> {
+        let args: Vec<Value> = args.iter().map(|v| Value::I32(*v)).collect();
+        Box::pin(f.call_async(&mut store.clone(), &args))
     }
 
     /// A guest a host function calls cannot be suspended, so the future of
@@ -1150,7 +1060,7 @@ mod caught_panics {
         for (i, nested) in NESTED[..4].iter().enumerate() {
             let guest = Guest::new();
             let catch = guest.export("catch");
-            let store = guest.store.into_async();
+            let store = guest.store.into_shared();
             for round in 1..=2 {
                 expect_value(nested, &mut call(&store, &catch, &[i as i32]), round);
             }
@@ -1166,7 +1076,7 @@ mod caught_panics {
     fn a_host_future_panics_in_the_poller() {
         let guest = Guest::new();
         let (catch, async_future) = (guest.export("catch"), guest.export("async_future"));
-        let store = guest.store.into_async();
+        let store = guest.store.into_shared();
         let mut panicking = call(&store, &async_future, &[]);
         expect_host_panic(&mut panicking);
         drop(panicking);
@@ -1198,7 +1108,7 @@ mod caught_panics {
     fn a_guest_a_host_function_calls_does_not_suspend() {
         let guest = Guest::new();
         let catch = guest.export("catch");
-        let store = guest.store.into_async();
+        let store = guest.store.into_shared();
         // `catch` returns -1: the nested call failed rather than panicked.
         expect_value("nested wait", &mut call(&store, &catch, &[4]), -1);
         assert!(store.into_store().is_ok());
@@ -1211,7 +1121,7 @@ mod caught_panics {
         let guest = Guest::new();
         let (wait, drop_call) = (guest.export("wait"), guest.export("drop_call"));
         let to_drop = guest.to_drop.clone();
-        let store = guest.store.into_async();
+        let store = guest.store.into_shared();
         let mut suspended = call(&store, &wait, &[]);
         expect_pending("suspended", &mut suspended);
         *to_drop.borrow_mut() = Some(suspended);
@@ -1233,7 +1143,7 @@ mod caught_panics {
         let (a, b) = (Guest::new(), Guest::new());
         let wait_a = a.export("wait");
         let catch_b = b.export("catch");
-        let (store_a, store_b) = (a.store.into_async(), b.store.into_async());
+        let (store_a, store_b) = (a.store.into_shared(), b.store.into_shared());
         let mut suspended = call(&store_a, &wait_a, &[]);
         expect_pending("suspended", &mut suspended);
         TO_DROP_SYNC.set(Some(suspended));
