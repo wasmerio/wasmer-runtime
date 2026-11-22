@@ -336,14 +336,21 @@ fn the_results_of_a_dynamic_async_host_function_are_checked() {
     }
 }
 
-/// An async host function called with another store than its own fails.
+/// An async host function is refused with another store than its own, at
+/// the entry, as any function is.
 #[test]
 fn an_async_host_function_is_refused_with_another_store() {
     let mut first = Store::default();
     let mut second = Store::default();
     let env = FunctionEnv::new(&mut first, ());
     let function = Function::new_typed_async(&mut first, &env, async |_: &mut AsyncEnv<()>| {});
-    futures::executor::block_on(function.call_async(&mut second, &[])).unwrap_err();
+    assert!(!function.is_from_store(&second));
+    let panic = catch_unwind(AssertUnwindSafe(|| {
+        futures::executor::block_on(function.call_async(&mut second, &[]))
+    }))
+    .unwrap_err();
+    let message = panic.downcast_ref::<String>().expect("a message");
+    assert!(message.contains("wrong context"), "{message}");
 }
 
 /// A wake of an import's future that arrives while a nested call drives its

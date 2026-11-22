@@ -1,4 +1,4 @@
-use wasmer_types::{ExternType, FunctionType, Mutability, Type};
+use wasmer_types::{ExternType, FunctionType, Mutability, StoreId, Type};
 
 /// Utilities to convert between `v8` and `wasmer` values
 use crate::{
@@ -66,12 +66,12 @@ impl IntoCApiValue for Value {
 }
 
 pub trait IntoWasmerValue {
-    /// Consume [`self`] to produce a [`Value`].
-    fn into_wv(self) -> Value;
+    /// Consume [`self`], a value of the store `store`, to produce a [`Value`].
+    fn into_wv(self, store: StoreId) -> Value;
 }
 
 impl IntoWasmerValue for wasm_val_t {
-    fn into_wv(self) -> Value {
+    fn into_wv(self, store: StoreId) -> Value {
         match self.kind as _ {
             bindings::wasm_valkind_enum_WASM_I32 => Value::I32(unsafe { self.of.i32_ }),
             bindings::wasm_valkind_enum_WASM_I64 => Value::I64(unsafe { self.of.i64_ }),
@@ -83,6 +83,7 @@ impl IntoWasmerValue for wasm_val_t {
             bindings::wasm_valkind_enum_WASM_FUNCREF => Value::FuncRef(Some(Function(
                 BackendFunction::V8(crate::backend::v8::function::Function {
                     handle: unsafe { self.of.ref_ as _ },
+                    store_id: store,
                 }),
             ))),
             bindings::wasm_valkind_enum_WASM_EXTERNREF => {

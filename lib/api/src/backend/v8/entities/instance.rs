@@ -116,6 +116,10 @@ impl Instance {
         externs: &[Extern],
     ) -> Result<(Self, Exports), InstantiationError> {
         check_isolate(store);
+        // V8 takes an import of another store for one of this store's.
+        if externs.iter().any(|extern_| !extern_.is_from_store(store)) {
+            return Err(InstantiationError::DifferentStores);
+        }
         let store_ref = store.as_store_ref();
         let externs: Vec<VMExtern> = externs
             .iter()

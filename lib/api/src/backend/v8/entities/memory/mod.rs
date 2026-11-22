@@ -3,7 +3,7 @@ use std::{marker::PhantomData, mem::MaybeUninit};
 
 use tracing::warn;
 pub use wasmer_types::MemoryError;
-use wasmer_types::{MemoryType, Pages, WASM_PAGE_SIZE};
+use wasmer_types::{MemoryType, Pages, WASM_PAGE_SIZE, StoreId};
 
 use crate::{
     AsStoreMut, AsStoreRef, BackendMemory, MemoryAccessError, SharedMemory,
@@ -14,12 +14,14 @@ use crate::{
 pub(crate) mod view;
 pub use view::*;
 
-use super::check_isolate;
+use super::{check_isolate, check_owner};
 
 #[derive(Debug, Clone)]
 /// A WebAssembly `memory` in the `v8` runtime.
 pub struct Memory {
     pub(crate) handle: VMMemory,
+    /// The store it belongs to: V8 does not know.
+    pub(crate) store_id: StoreId,
 }
 
 impl Memory {
@@ -64,13 +66,17 @@ impl Memory {
 
         Ok(Self {
             handle: VMMemory(c_memory),
+            store_id: store_mut.inner.objects.id(),
         })
     }
 
     pub fn new_from_existing(new_store: &mut impl AsStoreMut, memory: VMMemory) -> Self {
         check_isolate(new_store);
         let store_mut = new_store.as_store_mut();
-        Self { handle: memory }
+        Self {
+            handle: memory,
+            store_id: store_mut.inner.objects.id(),
+        }
     }
 
     pub(crate) fn to_vm_extern(&self) -> VMExtern {
@@ -78,7 +84,7 @@ impl Memory {
     }
 
     pub fn ty(&self, store: &impl AsStoreRef) -> MemoryType {
-        check_isolate(store);
+        check_owner(store, self.store_id);
         let store = store.as_store_ref();
 
         let memory_type: *mut wasm_memorytype_t = unsafe { wasm_memory_type(self.handle.0) };
@@ -98,13 +104,13 @@ impl Memory {
     }
 
     pub fn size(&self, store: &impl AsStoreRef) -> Pages {
-        check_isolate(store);
+        check_owner(store, self.store_id);
         let size = unsafe { wasm_memory_size(self.handle.0) };
         Pages(size)
     }
 
     pub fn view<'a>(&self, store: &'a impl AsStoreRef) -> MemoryView<'a> {
-        check_isolate(store);
+        check_owner(store, self.store_id);
         let store_ref = store.as_store_ref();
         MemoryView::new(self, store)
     }
@@ -118,7 +124,7 @@ impl Memory {
     where
         IntoPages: Into<Pages>,
     {
-        check_isolate(store);
+        check_owner(store, self.store_id);
         let store_mut = store.as_store_mut();
         unsafe {
             let delta: Pages = delta.into();
@@ -140,7 +146,7 @@ impl Memory {
         store: &mut impl AsStoreMut,
         min_size: u64,
     ) -> Result<(), MemoryError> {
-        check_isolate(store);
+        check_owner(store, self.store_id);
         let store_mut = store.as_store_mut();
         let min_size = Pages::from_bytes_rounded_up(min_size).ok_or_else(|| {
             MemoryError::Generic("could not represent {min_size} in Pages".to_owned())
@@ -157,7 +163,7 @@ impl Memory {
     }
 
     pub fn reset(&self, store: &mut impl AsStoreMut) -> Result<(), MemoryError> {
-        check_isolate(store);
+        check_owner(store, self.store_id);
         Err(MemoryError::UnsupportedOperation {
             message: "reset not supported for V8 memory".to_owned(),
         })
@@ -167,11 +173,12 @@ impl Memory {
         check_isolate(store);
         Self {
             handle: VMMemory(internal.unwrap_v_8()),
+            store_id: store.objects_mut().id(),
         }
     }
 
     pub fn copy(&self, store: &impl AsStoreRef) -> Result<SharedMemory, MemoryError> {
-        check_isolate(store);
+        check_owner(store, self.store_id);
 
         let ty = self.ty(store);
         if !ty.shared {
@@ -200,6 +207,7 @@ impl Memory {
 
         let copied = Self {
             handle: VMMemory(copied_memory),
+            store_id: self.store_id,
         };
 
         let src_view = self.view(store);
@@ -233,11 +241,11 @@ impl Memory {
 
     pub fn is_from_store(&self, store: &impl AsStoreRef) -> bool {
         check_isolate(store);
-        true
+        self.store_id == store.as_store_ref().objects().id()
     }
 
     pub fn as_shared(&self, store: &impl AsStoreRef) -> Result<SharedMemory, MemoryError> {
-        check_isolate(store);
+        check_owner(store, self.store_id);
         Ok(SharedMemory::new(crate::vm::VMSharedMemory::V8(
             self.handle.as_shared()?,
         )))

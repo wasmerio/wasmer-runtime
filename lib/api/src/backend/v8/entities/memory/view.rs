@@ -23,6 +23,7 @@ pub struct MemoryView<'a> {
 
 impl<'a> MemoryView<'a> {
     pub(crate) fn new(memory: &Memory, store: &'a (impl AsStoreRef + ?Sized)) -> Self {
+        crate::backend::v8::entities::check_owner(&store.as_store_ref(), memory.store_id);
         let c_memory: *mut wasm_memory_t = memory.handle.0;
 
         let len = unsafe { wasm_memory_data_size(c_memory as _) };
