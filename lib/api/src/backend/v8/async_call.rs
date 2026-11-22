@@ -9,9 +9,7 @@
 //! until this one returns.
 
 use std::{
-    any::Any,
-    cell::{Cell, RefCell},
-    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    cell::Cell,
     sync::{Arc, Condvar, Mutex},
     task::{Context, Poll, Wake, Waker},
 };
@@ -37,16 +35,15 @@ struct Entry {
 thread_local! {
     /// Set by a call that may wait, for the guest entry it is about to make.
     static NEXT_ENTRY_MAY_WAIT: Cell<Option<StoreId>> = const { Cell::new(None) };
-    /// The innermost guest entry on this thread.
+    /// The innermost guest entry on this thread. V8 runs a host function on
+    /// the thread that entered its guest, and entries nest, so one saved
+    /// record is enough.
     static ENTRY: Cell<Option<Entry>> = const { Cell::new(None) };
-    /// A host function's panic, on its way past V8's frames.
-    static PANIC: RefCell<Option<Box<dyn Any + Send>>> = const { RefCell::new(None) };
 }
 
 /// Runs one guest entry through V8's C API. Every entry goes through here, so
 /// that a synchronous one never inherits the right to wait from its caller,
-/// an async import finds the store its caller lends, and a host function's
-/// panic resumes once V8's frames are gone.
+/// and an async import finds the store its caller lends.
 pub(crate) fn guest_entry<R>(store: &mut impl AsStoreMut, enter: impl FnOnce() -> R) -> R {
     struct Restore(Option<Entry>);
     impl Drop for Restore {
@@ -61,20 +58,8 @@ pub(crate) fn guest_entry<R>(store: &mut impl AsStoreMut, enter: impl FnOnce() -
         store: &mut *store.inner,
         may_wait: NEXT_ENTRY_MAY_WAIT.take() == Some(id),
     };
-    let result = {
-        let _restore = Restore(ENTRY.replace(Some(entry)));
-        enter()
-    };
-    if let Some(panic) = PANIC.take() {
-        resume_unwind(panic);
-    }
-    result
-}
-
-/// Keeps the panic of a host function, which cannot unwind through V8's
-/// frames, for the guest entry it ran in to resume.
-pub(crate) fn keep_panic(panic: Box<dyn Any + Send>) {
-    PANIC.set(Some(panic));
+    let _restore = Restore(ENTRY.replace(Some(entry)));
+    enter()
 }
 
 /// What wakes the driver of one import. Each driver has its own: the one
@@ -121,8 +106,8 @@ fn cannot_wait(message: &str) -> RuntimeError {
 /// Drives the future of an async import of the store `id` on this stack. The
 /// store is published for its slices, as the caller of the guest entry lends
 /// it: an import called with another store than its own fails. A panic
-/// cannot unwind through V8's frames, so it is kept for [`guest_entry`] to
-/// resume.
+/// unwinds to the host function this runs in, whose trap carries it past
+/// V8's frames.
 pub(crate) fn run_import(
     id: StoreId,
     future: impl FnOnce() -> HostFuture,
@@ -132,11 +117,7 @@ pub(crate) fn run_import(
             "a host function was called with a store it does not belong to",
         ));
     };
-    let outcome = catch_unwind(AssertUnwindSafe(|| drive(entry, future)));
-    outcome.unwrap_or_else(|panic| {
-        keep_panic(panic);
-        Err(RuntimeError::new("an async host function panicked"))
-    })
+    drive(entry, future)
 }
 
 fn drive(entry: Entry, future: impl FnOnce() -> HostFuture) -> Result<Vec<Value>, RuntimeError> {

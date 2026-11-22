@@ -104,8 +104,6 @@ impl Function {
 
         let store_id = store.objects_mut().id();
         let state = OnStoreThread((func, env.clone()));
-        let ty: FunctionType = ty.into();
-        let results = ty.results().to_vec();
         Self::new_with_env(
             store,
             env,
@@ -113,17 +111,7 @@ impl Function {
             move |_: FunctionEnvMut<'_, T>, args: &[Value]| {
                 let (func, handle) = state.get();
                 let future = || func(crate::AsyncEnv::new(handle.clone(), store_id), args.to_vec());
-                let values = crate::backend::v8::async_call::run_import(store_id, future)?;
-                // Checked here: V8 takes what it is given for the results of
-                // the signature.
-                if values.len() != results.len()
-                    || values.iter().zip(&results).any(|(value, ty)| value.ty() != *ty)
-                {
-                    return Err(RuntimeError::new(
-                        "an async host function returned values that do not match its signature",
-                    ));
-                }
-                Ok(values)
+                crate::backend::v8::async_call::run_import(store_id, future)
             },
         )
     }
@@ -185,9 +173,23 @@ impl Function {
         let mut store = store.as_store_mut();
         let inner = store.inner.store.as_v8().inner;
 
+        // V8 takes what a host function gives it for the results of the
+        // signature, whatever their types: they are checked first.
+        let results = results.to_vec();
+        let func = move |env: FunctionEnvMut<'_, T>, args: &[Value]| {
+            let values = func(env, args)?;
+            if values.iter().map(Value::ty).ne(results.iter().copied()) {
+                return Err(RuntimeError::new(format!(
+                    "Dynamic function returned wrong signature. Expected {:?} but got {:?}",
+                    results,
+                    values.iter().map(Value::ty).collect::<Vec<_>>()
+                )));
+            }
+            Ok(values)
+        };
         let callback: CCallback = make_fn_callback(&func, param_types.len());
 
-        let mut callback_env: *mut FunctionCallbackEnv<'_, F> =
+        let mut callback_env: *mut FunctionCallbackEnv<'_, _> =
             Box::leak(Box::new(FunctionCallbackEnv {
                 store,
                 func,
@@ -502,26 +504,14 @@ impl Function {
     }
 }
 
-/// The trap of a host function that panicked. A C callback cannot unwind, so
-/// the panic is kept for the guest entry the host function ran in, which
-/// resumes it once V8's frames are gone: a host function that made that
-/// entry relays it the same way.
-#[cfg(feature = "experimental-async")]
+/// The trap of a host function that panicked: it carries the panic to the
+/// Rust caller of the guest (see `Trap::from_panic`). A host function that is
+/// that caller relays it the same way.
 fn panic_trap(
     store: &mut impl AsStoreMut,
     panic: Box<dyn std::any::Any + Send>,
 ) -> *mut wasm_trap_t {
-    crate::backend::v8::async_call::keep_panic(panic);
-    let trap = Trap::user(Box::new(RuntimeError::new("a host function panicked")));
-    unsafe { trap.into_wasm_trap(store) }
-}
-
-#[cfg(not(feature = "experimental-async"))]
-fn panic_trap(
-    _store: &mut impl AsStoreMut,
-    _panic: Box<dyn std::any::Any + Send>,
-) -> *mut wasm_trap_t {
-    unimplemented!("host function panicked");
+    unsafe { Trap::from_panic(store, panic) }
 }
 
 fn make_fn_callback<F, T: Send + 'static>(func: &F, args: usize) -> CCallback

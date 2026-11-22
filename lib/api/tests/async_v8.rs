@@ -331,7 +331,7 @@ fn the_results_of_a_dynamic_async_host_function_are_checked() {
             }
             .unwrap_err();
             let message = error.to_string();
-            assert!(message.contains("do not match its signature"), "{message}");
+            assert!(message.contains("wrong signature"), "{message}");
         }
     }
 }

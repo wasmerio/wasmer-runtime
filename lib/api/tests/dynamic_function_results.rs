@@ -1,10 +1,4 @@
-// With `v8-default` (the Windows test lane) `Store::default()` is a V8 store,
-// which checks the results of a host function in its own way.
-#![cfg(all(
-    feature = "sys",
-    not(feature = "v8-default"),
-    not(target_arch = "wasm32")
-))]
+#![cfg(all(any(feature = "sys", feature = "v8"), not(target_arch = "wasm32")))]
 //! What a dynamic host function returns is checked against the type the
 //! function was created with, on every call.
 
