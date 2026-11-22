@@ -443,6 +443,10 @@ compile_error!(
 );
 
 cfg_compiler! {
+    #[cfg(feature = "experimental-async")]
+    mod async_runtime;
+    #[cfg(feature = "experimental-async")]
+    pub use async_runtime::{AsyncCall, AsyncCallStore, AsyncEnv, AsyncHostFunction, SharedStore, StoreBusy, WeakSharedStore};
     mod utils;
     pub use utils::*;
     pub use entities::memory::{MemoryView, location::MemoryLocation};

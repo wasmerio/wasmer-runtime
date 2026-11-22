@@ -10,12 +10,12 @@ use crate::{
 #[cfg(feature = "sys")]
 use wasmer_vm::TrapHandlerFn;
 
-/// We require the context to have a fixed memory address for its lifetime since
-/// various bits of the VM have raw pointers that point back to it. Hence we
-/// wrap the actual context in a box.
+/// The context stays at a fixed address inside its allocation because the VM
+/// keeps raw pointers that point back to it.
 pub(crate) struct StoreInner {
     pub(crate) objects: StoreObjects,
     pub(crate) store: BackendStore,
+    pub(crate) allocation: std::rc::Weak<super::AllocationInner>,
 }
 
 impl std::fmt::Debug for StoreInner {

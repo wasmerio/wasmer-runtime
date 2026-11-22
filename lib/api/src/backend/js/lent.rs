@@ -67,6 +67,9 @@ struct Lends {
     depth: Cell<usize>,
     stack: [Lent; MAX_DEPTH],
     held: [Cell<bool>; MAX_DEPTH],
+    // Metadata is cached before entering Wasm, so callback admission never
+    // inspects a StoreInner through a parent borrow.
+    allocations: [Cell<*const crate::store::AllocationInner>; MAX_DEPTH],
 }
 
 thread_local! {
@@ -75,8 +78,40 @@ thread_local! {
             depth: Cell::new(0),
             stack: [const { Cell::new((0, std::ptr::null_mut())) }; MAX_DEPTH],
             held: [const { Cell::new(false) }; MAX_DEPTH],
+            allocations: [const { Cell::new(std::ptr::null()) }; MAX_DEPTH],
         }
     };
+}
+
+/// State restored by a synchronous JavaScript host boundary, whose `finally`
+/// runs even when a JavaScript exception skips Rust destructors.
+#[cfg(feature = "experimental-async")]
+pub(crate) fn checkpoint() -> u32 {
+    LENDS.with(|lends| {
+        let depth = lends.depth.get();
+        let held = depth.checked_sub(1).is_some_and(|at| lends.held[at].get());
+        (depth as u32) * 2 + u32::from(held)
+    })
+}
+
+#[cfg(feature = "experimental-async")]
+pub(crate) fn restore(checkpoint: u32) {
+    LENDS.with(|lends| {
+        let depth = (checkpoint / 2) as usize;
+        lends.depth.set(depth);
+        if let Some(at) = depth.checked_sub(1) {
+            lends.held[at].set(checkpoint & 1 != 0);
+        }
+    });
+}
+
+#[cfg(feature = "experimental-async")]
+pub(crate) fn allocation(id: usize) -> Option<*const crate::store::AllocationInner> {
+    LENDS.with(|lends| {
+        let at = lends.depth.get().checked_sub(1)?;
+        let (lent, ptr) = lends.stack[at].get();
+        (lent == id && !ptr.is_null()).then(|| lends.allocations[at].get())
+    })
 }
 
 /// A lend of a store, taken back when dropped.
@@ -89,6 +124,8 @@ pub(crate) struct Lend {
 /// deeply already.
 pub(crate) fn lend(store: &mut StoreMut<'_>) -> Result<Lend, RuntimeError> {
     let id = store.objects_mut().id();
+    #[cfg(feature = "experimental-async")]
+    crate::js::async_runtime::check_sync_entry(id)?;
     lend_raw(id, &mut *store.inner)
 }
 
@@ -99,6 +136,9 @@ pub(crate) fn lend_raw(id: StoreId, ptr: *mut StoreInner) -> Result<Lend, Runtim
         let depth = lends.depth.get();
         let lent = lends.stack.get(depth).ok_or_else(too_deep)?;
         lent.set((id.as_raw().get(), ptr));
+        // SAFETY: lend_raw's caller owns this exact store loan until its lend
+        // ends. The allocation metadata is outside StoreInner's borrow tree.
+        lends.allocations[depth].set(unsafe { (*ptr).allocation.as_ptr() });
         lends.held[depth].set(false);
         lends.depth.set(depth + 1);
         Ok(Lend { depth })
@@ -120,7 +160,7 @@ pub(crate) enum Hold {
     Lend(*const Cell<bool>),
     /// The store a guest of `call_async` that JavaScript resumed holds.
     #[cfg(feature = "experimental-async")]
-    Running(crate::js::jspi::Held),
+    Scoped(crate::js::async_runtime::Held),
 }
 
 impl Drop for Hold {
@@ -134,7 +174,7 @@ impl Drop for Hold {
             // this.
             Self::Lend(held) => unsafe { (*held).set(false) },
             #[cfg(feature = "experimental-async")]
-            Self::Running(_) => {}
+            Self::Scoped(_) => {}
         }
     }
 }
@@ -160,8 +200,8 @@ pub(crate) fn hold(id: usize) -> Result<(*mut StoreInner, Hold), RuntimeError> {
         Some(result) => result,
         None => {
             #[cfg(feature = "experimental-async")]
-            if let Some(running) = crate::js::jspi::hold_running(id) {
-                return running.map(|(store, held)| (store, Hold::Running(held)));
+            if let Some(running) = crate::js::async_runtime::hold_running(id) {
+                return running.map(|(store, held)| (store, Hold::Scoped(held)));
             }
             Err(not_lent())
         }
@@ -396,7 +436,7 @@ mod tests {
     #[cfg(feature = "experimental-async")]
     thread_local! {
         /// What a host function of another store hands a test below.
-        static OTHER: RefCell<Option<(Function, crate::StoreAsync)>> =
+        static OTHER: RefCell<Option<(Function, crate::SharedStore)>> =
             const { RefCell::new(None) };
         /// The call that host function starts, for the test to wait for.
         #[allow(clippy::type_complexity)]
@@ -414,12 +454,12 @@ mod tests {
         let mut other = Store::default();
         let (function, ty) = host_functions(&mut other).remove(0);
         let run_other = guest(&mut other, function, ty);
-        OTHER.with(|slot| *slot.borrow_mut() = Some((run_other, other.into_async())));
+        OTHER.with(|slot| *slot.borrow_mut() = Some((run_other, other.into_shared())));
 
         let mut store = Store::default();
         let start = Function::new_typed(&mut store, |x: i32| -> i32 {
-            let (run, store) = OTHER.with(|slot| slot.borrow_mut().take()).unwrap();
-            let mut call = Box::pin(run.call_async(&store, vec![Value::I32(x)]));
+            let (run, mut store) = OTHER.with(|slot| slot.borrow_mut().take()).unwrap();
+            let mut call = Box::pin(run.call_async(&mut store, &[Value::I32(x)]));
             // Runs the guest's slice, which does not wait.
             let waker = futures::task::noop_waker();
             let poll = call
@@ -448,13 +488,18 @@ mod tests {
     async fn a_resumed_guest_runs_its_host_functions_with_its_store() {
         let mut store = Store::default();
         let (function, _) = host_functions(&mut store).remove(0);
-        let wait = Function::new_typed_async(&mut store, async || -> i32 {
-            let resolved = js_sys::Promise::resolve(&JsValue::from(3));
-            wasm_bindgen_futures::JsFuture::from(resolved)
-                .await
-                .unwrap();
-            3
-        });
+        let env = FunctionEnv::new(&mut store, ());
+        let wait = Function::new_typed_async(
+            &mut store,
+            &env,
+            async |_: &mut crate::AsyncEnv<()>| -> i32 {
+                let resolved = js_sys::Promise::resolve(&JsValue::from(3));
+                wasm_bindgen_futures::JsFuture::from(resolved)
+                    .await
+                    .unwrap();
+                3
+            },
+        );
         let module = Module::new(
             &store,
             r#"(module
@@ -466,9 +511,8 @@ mod tests {
         let imports = imports! { "env" => { "wait" => wait, "f" => function } };
         let instance = Instance::new(&mut store, &module, &imports).unwrap();
         let run = instance.exports.get_function("run").unwrap().clone();
-        let store = store.into_async();
         RAN.set(0);
-        let results = run.call_async(&store, vec![]).await.unwrap();
+        let results = run.call_async(&mut store, &[]).await.unwrap();
         assert_eq!(results.to_vec(), vec![Value::I32(3)]);
         assert_eq!(RAN.get(), 1);
         assert_eq!(lent(), 0);
@@ -529,7 +573,9 @@ mod tests {
             };
             let ran = RAN.get();
             let result = export.call1(&JsValue::UNDEFINED, &argument);
-            let error = result.err().map(|error| RuntimeError::from(error).message());
+            let error = result
+                .err()
+                .map(|error| RuntimeError::from(error).message());
             (error, RAN.get() - ran)
         };
         let first = through_javascript();
@@ -631,13 +677,18 @@ mod tests {
         let run = guest(&mut store, function, ty);
         let export = run.as_jsvalue(&store).unchecked_into();
         EXPORT.with(|slot| *slot.borrow_mut() = Some((run, export, ty)));
-        let wait = Function::new_typed_async(&mut store, async || -> i32 {
-            let resolved = js_sys::Promise::resolve(&JsValue::from(3));
-            wasm_bindgen_futures::JsFuture::from(resolved)
-                .await
-                .unwrap();
-            3
-        });
+        let env = FunctionEnv::new(&mut store, ());
+        let wait = Function::new_typed_async(
+            &mut store,
+            &env,
+            async |_: &mut crate::AsyncEnv<()>| -> i32 {
+                let resolved = js_sys::Promise::resolve(&JsValue::from(3));
+                wasm_bindgen_futures::JsFuture::from(resolved)
+                    .await
+                    .unwrap();
+                3
+            },
+        );
         let env = FunctionEnv::new(&mut store, ());
         let holds = Function::new_typed_with_env(&mut store, &env, |mut env: FunctionEnvMut<()>| {
             reenter(&mut env)
@@ -653,8 +704,7 @@ mod tests {
         let imports = imports! { "env" => { "wait" => wait, "holds" => holds } };
         let instance = Instance::new(&mut store, &module, &imports).unwrap();
         let run = instance.exports.get_function("run").unwrap().clone();
-        let store = store.into_async();
-        let results = run.call_async(&store, vec![]).await.unwrap();
+        let results = run.call_async(&mut store, &[]).await.unwrap();
         assert_eq!(results.to_vec(), vec![Value::I32(3)]);
         assert_seen("in a resumed guest");
         assert_eq!(lent(), 0);

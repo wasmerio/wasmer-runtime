@@ -1,6 +1,6 @@
 //! Thread-local storage for storing the current store context,
 //! i.e. the currently active [`Store`]s. When
-//! a function is called, a pointer to the [`StoreInner`] in placed
+//! a function is called, a pointer to the [`StoreInner`] is placed
 //! inside the store context so it can be retrieved when needed.
 //! This lets code that needs access to the store get it with
 //! just the store ID.
@@ -11,14 +11,9 @@
 //! For sync contexts, we just store a raw pointer
 //! to the `StoreInner`, which is owned by the embedder's stack.
 //!
-//! For async contexts, we store a write guard taken from the
-//! `StoreAsync`; This achieves two goals:
-//!   * Makes the `StoreAsync` available
-//!     to whoever needs it, including when code needs to spawn
-//!     new coroutines
-//!   * Makes sure a write lock is held on the store as long as
-//!     the context is active, preventing other tasks from
-//!     accessing the store concurrently.
+//! An async poll installs one raw context for its coroutine resume. The root
+//! coroutine call uses that entry directly. Host trampolines relinquish their
+//! store borrows before suspension; synchronous nested entries cannot suspend.
 //!
 //! We maintain a stack because it is technically possible to
 //! have nested `Function::call` invocations that use different
@@ -30,9 +25,9 @@
 //! calls and the async_runtime to reflect the exact WASM
 //! functions running on a given thread at any moment in
 //! time. If a function suspends, its store context is
-//! cleared and later reinstalled when it resumes. This lets
-//! us use thread-local storage for the context without
-//! requiring that async tasks are tied to specific threads.
+//! cleared and later reinstalled when it resumes. This keeps
+//! thread-local state specific to the running stack. Async calls remain
+//! bound to their thread through their non-Send store capabilities.
 //!
 //! When something needs the "currently active" store context,
 //! they will only look at the top entry in the stack. It is
@@ -47,9 +42,6 @@ use std::{
     mem::MaybeUninit,
 };
 
-#[cfg(feature = "experimental-async")]
-use crate::{LocalRwLock, LocalRwLockWriteGuard};
-
 use super::{AsStoreMut, AsStoreRef, StoreInner, StoreMut, StoreRef};
 
 use wasmer_types::StoreId;
@@ -58,91 +50,61 @@ enum StoreContextEntry {
     Sync(*mut StoreInner),
 
     #[cfg(feature = "experimental-async")]
-    Async {
-        guard: LocalRwLockWriteGuard<Box<StoreInner>>,
-        /// The store, taken from `guard` once, when the entry is made. Every
-        /// borrow the entry hands out comes from this pointer, rather than
-        /// from a shared reference it would then write through. A call from
-        /// a host function lends its own borrow here while it runs (see
-        /// [`StoreContext::install`]).
+    BorrowedAsync {
         ptr: *mut StoreInner,
-        /// Tells this entry from those installed for the same store when the
-        /// call resumes, whose `ptr` a call lent before is not restored into.
-        serial: u64,
     },
 }
 
 impl StoreContextEntry {
-    #[cfg(feature = "experimental-async")]
-    fn new_async(mut guard: LocalRwLockWriteGuard<Box<StoreInner>>) -> Self {
-        // A raw pointer to the box's contents, taken once: every borrow the
-        // entry hands out comes from it, but while a host function lends it
-        // its own (see `install`). Unlike those of a synchronous entry, they
-        // are siblings of one another, and of the borrows taken through the
-        // entry made when the call resumes: none of them nests in another.
-        let ptr: *mut StoreInner = &raw mut **guard;
-        let serial = ASYNC_ENTRY_SERIAL.get();
-        ASYNC_ENTRY_SERIAL.set(serial.wrapping_add(1));
-        Self::Async { guard, ptr, serial }
-    }
-
     fn as_ptr(&self) -> *mut StoreInner {
         match self {
             Self::Sync(ptr) => *ptr,
             #[cfg(feature = "experimental-async")]
-            Self::Async { ptr, .. } => *ptr,
+            Self::BorrowedAsync { ptr, .. } => *ptr,
         }
     }
 }
 
 pub(crate) struct StoreContext {
     id: StoreId,
+    // Cached outside StoreInner's borrow tree, so safe callback admission can
+    // inspect the slice flag without accessing a store already borrowed.
+    allocation: *const super::AllocationInner,
 
-    // StoreContexts can be used recursively when Function::call
-    // is used in an imported function. In the scenario, we're
-    // essentially passing a mutable borrow of the store into
-    // Function::call. However, entering the WASM code loses the
-    // reference, and it needs to be re-acquired from the
-    // StoreContext. This is why we use an UnsafeCell to allow
-    // multiple mutable references to the StoreMut; we do however
-    // keep track of how many borrows there are so we don't drop
-    // it prematurely.
+    // Host trampolines recover the loan passed into Wasm through this entry.
+    // The count prevents public callbacks from borrowing a loan already held
+    // by a host frame. A nested call installs its own derived pointer, leaving
+    // the outer loan unreachable until that call returns.
     borrow_count: u32,
-    /// How many of those borrows are paused (see [`Self::pause`]): held by a
-    /// host function across a guest call it made, which runs on the borrow.
-    paused: u32,
     entry: UnsafeCell<StoreContextEntry>,
+}
+
+pub(crate) struct CurrentStoreGuard {
+    store: StorePtrWrapper,
+    allocation: *const super::AllocationInner,
+}
+
+impl CurrentStoreGuard {
+    pub(crate) fn as_mut(&mut self) -> StoreMut<'_> {
+        self.store.as_mut()
+    }
+}
+
+impl Drop for CurrentStoreGuard {
+    fn drop(&mut self) {
+        // The installed context keeps its store allocation alive through this
+        // callback. No user code runs between releasing the two borrow checks.
+        unsafe {
+            (*self.allocation).busy.set(false);
+        }
+    }
 }
 
 pub(crate) struct StorePtrWrapper {
     store_ptr: *mut StoreInner,
-    /// The store's id, so that giving the borrow back does not use
-    /// `store_ptr`, which may have been invalidated since: lent by a host
-    /// function whose call suspended (see [`StoreContext::install`]).
+    /// The store's id, so giving the borrow back never reborrows the store
+    /// through `store_ptr` while another frame may hold its derived loan.
     id: StoreId,
-}
-
-#[cfg(feature = "experimental-async")]
-pub(crate) struct StoreAsyncGuardWrapper {
-    pub(crate) guard: *mut LocalRwLockWriteGuard<Box<StoreInner>>,
-    /// The entry's pointer to the store, to borrow it through rather than
-    /// through `guard`.
-    pub(crate) store_ptr: *mut StoreInner,
-    /// The store's id: see [`StorePtrWrapper`].
-    id: StoreId,
-}
-
-pub(crate) struct StorePtrPauseGuard {
-    store_id: StoreId,
-    ptr: *mut StoreInner,
-    ref_count_decremented: bool,
-}
-
-#[cfg(feature = "experimental-async")]
-pub(crate) enum GetStoreAsyncGuardResult {
-    Ok(StoreAsyncGuardWrapper),
-    NotAsync(StorePtrWrapper),
-    NotInstalled,
 }
 
 pub(crate) struct ForcedStoreInstallGuard {
@@ -152,34 +114,48 @@ pub(crate) struct ForcedStoreInstallGuard {
 pub(crate) enum StoreInstallGuard {
     /// An entry of its own was pushed for the store.
     Pushed(StoreId),
-    /// The pointer of the async entry `serial` was lent, and is restored to
-    /// `previous` — see [`StoreContext::install`].
-    #[cfg(feature = "experimental-async")]
-    Lent {
-        serial: u64,
-        previous: *mut StoreInner,
-    },
 }
 
 thread_local! {
     static STORE_CONTEXT_STACK: RefCell<Vec<StoreContext>> = const { RefCell::new(Vec::new()) };
 }
 
-#[cfg(feature = "experimental-async")]
-thread_local! {
-    /// The `serial` of the next async entry made on this thread.
-    static ASYNC_ENTRY_SERIAL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(feature = "unsafe-cothread")]
-thread_local! {
-    /// How many entries of the store context stack lie beneath the
-    /// [`Cothread`] that runs: they belong to the calls of whatever resumed
-    /// it, which the coroutine does not run in.
-    static COTHREAD_BASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 impl StoreContext {
+    /// Snapshot synchronous callback loans before entering a JavaScript host
+    /// function. JavaScript exceptions may skip the Rust guards inside it.
+    #[cfg(all(feature = "js", feature = "experimental-async"))]
+    pub(crate) fn checkpoint() -> (usize, u32) {
+        STORE_CONTEXT_STACK.with(|cell| {
+            let stack = cell.borrow();
+            (
+                stack.len(),
+                stack.last().map_or(0, |entry| entry.borrow_count),
+            )
+        })
+    }
+
+    /// Recover callback loans after a JavaScript host function exits.
+    ///
+    /// # Safety
+    /// The checkpoint belongs to this thread and the enclosing JavaScript
+    /// `finally` boundary. All Rust frames and references created inside that
+    /// boundary have returned or been unwound before this is called. Frames
+    /// below it, including the entry at `depth - 1`, remain alive and unchanged.
+    #[cfg(all(feature = "js", feature = "experimental-async"))]
+    pub(crate) unsafe fn restore_checkpoint(depth: usize, borrow_count: u32) {
+        STORE_CONTEXT_STACK.with(|cell| {
+            let mut stack = cell.borrow_mut();
+            assert!(
+                stack.len() >= depth,
+                "mismatched JavaScript store checkpoint"
+            );
+            stack.truncate(depth);
+            if let Some(entry) = stack.last_mut() {
+                entry.borrow_count = borrow_count;
+            }
+        });
+    }
+
     /// Whether `id`'s entry is the active one.
     pub(crate) fn is_active(id: StoreId) -> bool {
         STORE_CONTEXT_STACK.with(|cell| {
@@ -190,10 +166,7 @@ impl StoreContext {
 
     /// Whether `id` has an entry on the thread's stack, active or not: a call
     /// on this thread, beneath whatever runs, holds the store.
-    #[cfg(all(
-        feature = "sys",
-        any(feature = "experimental-async", feature = "unsafe-cothread")
-    ))]
+    #[cfg(all(feature = "sys", feature = "experimental-async"))]
     pub(crate) fn is_held(id: StoreId) -> bool {
         STORE_CONTEXT_STACK.with(|cell| cell.borrow().iter().any(|ctx| ctx.id == id))
     }
@@ -202,10 +175,7 @@ impl StoreContext {
     /// needs of it: false once its thread locals are being destroyed, as it
     /// exits, and always with `baremetal`. A call suspended then is forgotten
     /// rather than unwound.
-    #[cfg(all(
-        feature = "sys",
-        any(feature = "experimental-async", feature = "unsafe-cothread")
-    ))]
+    #[cfg(all(feature = "sys", feature = "experimental-async"))]
     pub(crate) fn thread_can_unwind() -> bool {
         // With `baremetal`, what a guest frame raises leaves through the
         // embedder's unwinder, which would take the unwind of a suspended
@@ -216,12 +186,15 @@ impl StoreContext {
     }
 
     fn push(id: StoreId, entry: StoreContextEntry) {
+        // SAFETY: every entry is installed from a live store loan or owner.
+        // This pointer names allocation metadata, not the borrowed StoreInner.
+        let allocation = unsafe { (*entry.as_ptr()).allocation.as_ptr() };
         STORE_CONTEXT_STACK.with(|cell| {
             let mut stack = cell.borrow_mut();
             stack.push(Self {
                 id,
+                allocation,
                 borrow_count: 0,
-                paused: 0,
                 entry: UnsafeCell::new(entry),
             });
         })
@@ -235,14 +208,15 @@ impl StoreContext {
         })
     }
 
-    /// The write guard ensures this is the only reference to the store,
-    /// so installation can never fail.
+    /// Install an exclusively lent async slice. No lock or waiter is involved.
+    ///
+    /// # Safety
+    /// The caller owns the slice until the guard is dropped. No host frame
+    /// may retain a reference when the coroutine suspends.
     #[cfg(feature = "experimental-async")]
-    pub(crate) fn install_async(
-        guard: LocalRwLockWriteGuard<Box<StoreInner>>,
-    ) -> ForcedStoreInstallGuard {
-        let store_id = guard.objects.id();
-        Self::push(store_id, StoreContextEntry::new_async(guard));
+    pub(crate) unsafe fn install_async_raw(ptr: *mut StoreInner) -> ForcedStoreInstallGuard {
+        let store_id = unsafe { (*ptr).objects.id() };
+        Self::push(store_id, StoreContextEntry::BorrowedAsync { ptr });
         ForcedStoreInstallGuard { store_id }
     }
 
@@ -256,7 +230,7 @@ impl StoreContext {
             cell.borrow().last().is_some_and(|top| {
                 matches!(
                     unsafe { top.entry.get().as_ref().unwrap() },
-                    StoreContextEntry::Async { .. }
+                    StoreContextEntry::BorrowedAsync { .. }
                 )
             })
         })
@@ -272,37 +246,12 @@ impl StoreContext {
     pub(crate) fn top_can_suspend() -> bool {
         STORE_CONTEXT_STACK.with(|cell| {
             cell.borrow().last().is_some_and(|top| {
-                top.paused == 0
+                top.borrow_count == 0
                     && matches!(
                         unsafe { top.entry.get().as_ref().unwrap() },
-                        StoreContextEntry::Async { .. }
+                        StoreContextEntry::BorrowedAsync { .. }
                     )
             })
-        })
-    }
-
-    /// Whether the active entry is `id`'s, held by an async context that the
-    /// running coroutine can lend: not one beneath a `Cothread` that was
-    /// resumed since, whose frames would otherwise borrow the store through
-    /// an entry the coroutine does not take with it when it suspends.
-    #[cfg(feature = "experimental-async")]
-    fn active_is_async(id: StoreId) -> bool {
-        STORE_CONTEXT_STACK.with(|cell| {
-            let stack = cell.borrow();
-            let Some(top) = stack.last() else {
-                return false;
-            };
-            if top.id != id {
-                return false;
-            }
-            #[cfg(feature = "unsafe-cothread")]
-            if stack.len() <= COTHREAD_BASE.get() {
-                return false;
-            }
-            matches!(
-                unsafe { top.entry.get().as_ref().unwrap() },
-                StoreContextEntry::Async { .. }
-            )
         })
     }
 
@@ -322,22 +271,8 @@ impl StoreContext {
     /// `borrow_provenance` tests, which fail under Miri if this re-uses the
     /// outer entry.
     ///
-    /// An async context is the exception, and pushes nothing: its entry holds
-    /// the write guard, which async host functions reach by inspecting the
-    /// active entry, and through which the call suspends. A second entry
-    /// would hide it from them. Instead, the async entry's pointer is
-    /// replaced with `store_ptr` until the guard is dropped, which nests the
-    /// borrows taken through it in the caller's, as a second entry would: a
-    /// host function that calls its guest back goes on with its own store
-    /// afterwards. Such a guest call cannot suspend: its caller's borrow is
-    /// paused, and a suspension would give the store up while the borrow is
-    /// held (see [`Self::top_can_suspend`]). The guest call of the coroutine
-    /// itself lends a pointer nobody holds, and may suspend: it resumes with a
-    /// new entry, which keeps its own pointer. One beneath a `Cothread` that
-    /// was resumed since is shadowed all
-    /// the same: the coroutine's calls need an entry of their own, which it
-    /// takes with it when it suspends, and the call that holds the guard
-    /// cannot be suspended from the coroutine's stack.
+    /// The root async coroutine uses the poller's raw entry directly. Every
+    /// synchronous nested call pushes a normal entry, so it cannot suspend.
     ///
     /// # Safety
     /// `store_ptr` must be derived from a mutable borrow of the store that
@@ -357,61 +292,20 @@ impl StoreContext {
                 }),
             "Store context pointer mismatch"
         );
-        #[cfg(feature = "experimental-async")]
-        if Self::active_is_async(store_id) {
-            return STORE_CONTEXT_STACK.with(|cell| {
-                let mut stack = cell.borrow_mut();
-                let top = stack.last_mut().expect("the active entry is async");
-                match top.entry.get_mut() {
-                    StoreContextEntry::Async { ptr, serial, .. } => StoreInstallGuard::Lent {
-                        serial: *serial,
-                        previous: std::mem::replace(ptr, store_ptr),
-                    },
-                    StoreContextEntry::Sync(_) => unreachable!("the active entry is async"),
-                }
-            });
-        }
         Self::push(store_id, StoreContextEntry::Sync(store_ptr));
         StoreInstallGuard::Pushed(store_id)
     }
 
-    /// "Pause" one borrow of the store context.
+    /// Install a parked synchronous loan as a separate entry, even underneath
+    /// an async call. The parked borrow is unreachable, and the new entry's
+    /// count starts at zero so callbacks can acquire its derived loan.
     ///
     /// # Safety
-    /// Code must ensure it does not use the StorePtrWrapper or
-    /// StoreAsyncGuardWrapper that it owns, or any StoreRef/StoreMut
-    /// derived from them, while the store context is paused.
-    ///
-    /// The safe, correct use-case for this method is to
-    /// pause the store context while executing WASM code, which
-    /// cannot use the store context directly. This allows an async
-    /// context to uninstall the store context when suspending if it's
-    /// called from a sync imported function. The imported function
-    /// will have borrowed the store context in its trampoline, which
-    /// will prevent the async context from uninstalling the store.
-    /// However, since the imported function passes a mutable borrow
-    /// of its store into `Function::call`, it will expect the store
-    /// to change before the call returns.
-    pub(crate) unsafe fn pause(id: StoreId) -> StorePtrPauseGuard {
-        STORE_CONTEXT_STACK.with(|cell| {
-            let mut stack = cell.borrow_mut();
-            let top = stack
-                .last_mut()
-                .expect("No store context installed on this thread");
-            assert_eq!(top.id, id, "Mismatched store context access");
-            let ref_count_decremented = if top.borrow_count > 0 {
-                top.borrow_count -= 1;
-                top.paused += 1;
-                true
-            } else {
-                false
-            };
-            StorePtrPauseGuard {
-                store_id: id,
-                ptr: unsafe { top.entry.get().as_ref().unwrap().as_ptr() },
-                ref_count_decremented,
-            }
-        })
+    /// `ptr` is an exclusive store borrow unreachable until the guard drops.
+    pub(crate) unsafe fn install_lent(ptr: *mut StoreInner) -> StoreInstallGuard {
+        let id = unsafe { (*ptr).objects.id() };
+        Self::push(id, StoreContextEntry::Sync(ptr));
+        StoreInstallGuard::Pushed(id)
     }
 
     /// The active entry's store, if no frame on this thread's stack is holding
@@ -423,17 +317,26 @@ impl StoreContext {
     /// ([`StoreMut::parked`]) installed an entry of its own, whose count is
     /// zero until somebody takes it — which is how an imported function lends
     /// its store to code it calls into.
-    pub(crate) fn try_get_current_unborrowed() -> Option<StorePtrWrapper> {
+    pub(crate) fn try_get_current_unborrowed() -> Option<CurrentStoreGuard> {
         STORE_CONTEXT_STACK.with(|cell| {
             let mut stack = cell.borrow_mut();
             let top = stack.last_mut()?;
             if top.borrow_count != 0 {
                 return None;
             }
+            // Inspect cached allocation metadata before producing a StoreMut.
+            // SharedStore and AsyncEnv slices use the same admission flag.
+            let allocation = unsafe { &*top.allocation };
+            if allocation.busy.replace(true) {
+                return None;
+            }
             top.borrow_count += 1;
-            Some(StorePtrWrapper {
-                store_ptr: unsafe { top.entry.get().as_mut().unwrap().as_ptr() },
-                id: top.id,
+            Some(CurrentStoreGuard {
+                store: StorePtrWrapper {
+                    store_ptr: unsafe { top.entry.get().as_mut().unwrap().as_ptr() },
+                    id: top.id,
+                },
+                allocation: top.allocation,
             })
         })
     }
@@ -492,263 +395,6 @@ impl StoreContext {
             })
         })
     }
-
-    /// Safety: See [`Self::get_current`].
-    #[cfg(feature = "experimental-async")]
-    pub(crate) unsafe fn try_get_current_async(id: StoreId) -> GetStoreAsyncGuardResult {
-        STORE_CONTEXT_STACK.with(|cell| {
-            let mut stack = cell.borrow_mut();
-            let Some(top) = stack.last_mut() else {
-                return GetStoreAsyncGuardResult::NotInstalled;
-            };
-            if top.id != id {
-                return GetStoreAsyncGuardResult::NotInstalled;
-            }
-            top.borrow_count += 1;
-            match unsafe { top.entry.get().as_mut().unwrap() } {
-                StoreContextEntry::Async { guard, ptr, .. } => {
-                    GetStoreAsyncGuardResult::Ok(StoreAsyncGuardWrapper {
-                        guard: guard as *mut _,
-                        store_ptr: *ptr,
-                        id,
-                    })
-                }
-                StoreContextEntry::Sync(ptr) => {
-                    GetStoreAsyncGuardResult::NotAsync(StorePtrWrapper {
-                        store_ptr: *ptr,
-                        id,
-                    })
-                }
-            }
-        })
-    }
-}
-
-/// A coroutine that an embedder switches itself and that can suspend while
-/// it runs Wasm, kept with the thread state of the calls it is suspended in.
-///
-/// A call into Wasm keeps state on its thread while it runs: the entry its
-/// host functions find the store through, and the trap handler the signal
-/// handler consults (with `experimental-host-interrupt`, also the stores the
-/// interrupt registry sees running). A coroutine suspended inside a call,
-/// from a host function, has to take that state with it, or a call resumed in
-/// another order than the calls entered Wasm finds another call's: its traps
-/// are handled on the wrong stack. `Cothread` takes the coroutine's state
-/// off the thread whenever control comes back from it, keeps it, and puts it
-/// back for the next resume, as `Function::call_async` does for its own
-/// coroutines.
-///
-/// The state belongs to the coroutine and to nothing else, so it cannot be
-/// installed for another coroutine. Dropping a `Cothread` drops the
-/// coroutine, which unwinds it if it is suspended, with its state installed;
-/// forgetting one forgets the state with the coroutine. So the `Cothread`
-/// must own the coroutine (see [`Cothread::new`]). A suspended coroutine that
-/// cannot be unwound when its `Cothread` is dropped, because a store of the
-/// calls it is suspended in is in use on the thread, or because the thread is
-/// exiting, is forgotten instead, with its stack and its state.
-///
-/// Every coroutine that can suspend while a call into Wasm is on its stack
-/// must be a `Cothread`, and be resumed only through [`Cothread::resume`].
-/// A `Cothread` stays on the thread that made it.
-///
-/// The coroutine runs on no `Function::call_async` coroutine but those it
-/// starts itself, also when it is resumed from a host function of one: an
-/// async import it calls runs as one called synchronously does, and fails
-/// with `YieldOutsideAsyncContext` if it has to wait. It enters a store that a
-/// call beneath the resume holds, which it may be lent, as a call from a host
-/// function does: with an entry of its own, whichever kind of call holds the
-/// store, which goes with the coroutine when it suspends.
-///
-/// ```ignore
-/// // Safety: the `Coroutine` is owned by the `Cothread`.
-/// let mut cothread = unsafe {
-///     Cothread::new(Coroutine::new(move |yielder, ()| {
-///         // A host function of `run` suspends the coroutine with `yielder`.
-///         run.call(&mut store, 0)
-///     }))
-/// };
-/// unsafe { cothread.resume(|coroutine| coroutine.resume(())) };
-/// ```
-#[cfg(feature = "unsafe-cothread")]
-pub struct Cothread<C> {
-    coroutine: std::mem::ManuallyDrop<C>,
-    state: CothreadState,
-}
-
-/// The thread state of a [`Cothread`]'s coroutine, while it is off the
-/// thread.
-#[cfg(feature = "unsafe-cothread")]
-#[derive(Default)]
-struct CothreadState {
-    /// The entries the coroutine left on the store context stack when it
-    /// last suspended, bottom first: those of the calls it is suspended in.
-    /// The vector keeps its capacity while the entries are on the thread.
-    entries: Vec<StoreContext>,
-    /// The trap handler and active stores of those calls.
-    activation: wasmer_vm::ActivationState,
-    /// The `call_async` coroutine the thread runs on, as the coroutine left
-    /// it: none until it starts one of its own. While the coroutine runs,
-    /// that of whatever resumed it, which cannot be suspended from the
-    /// coroutine's stack.
-    #[cfg(feature = "experimental-async")]
-    coroutine: crate::backend::sys::async_runtime::CoroutineSlot,
-}
-
-#[cfg(feature = "unsafe-cothread")]
-impl CothreadState {
-    fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.activation.is_empty()
-    }
-
-    /// Whether [`Self::install`] can put the state on the thread: none of
-    /// its stores is in use there, and the thread is not exiting.
-    fn can_install(&self) -> bool {
-        StoreContext::thread_can_unwind()
-            && !self
-                .entries
-                .iter()
-                .any(|entry| StoreContext::is_held(entry.id))
-    }
-
-    /// Puts the state on the thread until the returned guard is dropped.
-    ///
-    /// # Panics
-    /// Panics if a store whose call the coroutine is suspended in is on the
-    /// thread's context stack: something on the thread is using it.
-    ///
-    /// # Safety
-    /// Until the guard is dropped, the thread runs nothing but the
-    /// coroutine the state belongs to: the state holds pointers into its
-    /// stack, and borrows of the stores its frames hold.
-    unsafe fn install(&mut self) -> InstalledCothreadState<'_> {
-        let base = STORE_CONTEXT_STACK.with(|cell| {
-            let mut stack = cell.borrow_mut();
-            for entry in &self.entries {
-                assert!(
-                    !stack.iter().any(|ctx| ctx.id == entry.id),
-                    "a store the coroutine is suspended in is already on the current \
-                     thread's context stack"
-                );
-            }
-            let base = stack.len();
-            stack.extend(self.entries.drain(..));
-            base
-        });
-        let outer_base = COTHREAD_BASE.replace(base);
-        // Safety: the first of a pair; the guard swaps again as soon as
-        // control is back from the coroutine, however it comes back.
-        unsafe { self.activation.swap() };
-        #[cfg(feature = "experimental-async")]
-        self.coroutine.swap();
-        InstalledCothreadState {
-            state: self,
-            base,
-            outer_base,
-        }
-    }
-}
-
-/// Takes a [`CothreadState`] off the thread again when dropped.
-#[cfg(feature = "unsafe-cothread")]
-struct InstalledCothreadState<'a> {
-    /// Holds the thread's own activation state while the coroutine's is
-    /// installed.
-    state: &'a mut CothreadState,
-    /// Where the coroutine's entries start on the store context stack.
-    base: usize,
-    /// [`COTHREAD_BASE`] for whatever resumed the coroutine.
-    outer_base: usize,
-}
-
-#[cfg(feature = "unsafe-cothread")]
-impl Drop for InstalledCothreadState<'_> {
-    fn drop(&mut self) {
-        // Safety: the second of the pair `install` started.
-        unsafe { self.state.activation.swap() };
-        #[cfg(feature = "experimental-async")]
-        self.state.coroutine.swap();
-        COTHREAD_BASE.set(self.outer_base);
-        // Whatever is left above `base` belongs to the calls the coroutine
-        // is suspended in. A coroutine that returned or unwound left nothing
-        // behind: each of its calls took its entry and its trap handler off
-        // on the way out.
-        let (base, entries) = (self.base, &mut self.state.entries);
-        let taken = STORE_CONTEXT_STACK.try_with(|cell| {
-            let mut stack = cell.try_borrow_mut().ok()?;
-            (base <= stack.len()).then(|| entries.extend(stack.drain(base..)))
-        });
-        match taken {
-            Ok(Some(())) => {}
-            _ if std::thread::panicking() => {}
-            _ => panic!(
-                "Cothread: the store context stack is shorter than when the coroutine \
-                 was resumed; the store context stack is corrupted"
-            ),
-        }
-    }
-}
-
-#[cfg(feature = "unsafe-cothread")]
-impl<C> Cothread<C> {
-    /// Wraps a coroutine that has not run yet.
-    ///
-    /// # Safety
-    /// `coroutine` must own the coroutine, and be the only way to resume it:
-    /// dropping it must unwind the coroutine if it is suspended, and drop it
-    /// there and then, as dropping a `corosensei::Coroutine` does. A borrow of
-    /// a coroutine, or a handle shared with something else, would leave it
-    /// suspended when the `Cothread` is dropped, with its thread state gone,
-    /// for whoever unwinds it later to unwind without.
-    pub unsafe fn new(coroutine: C) -> Self {
-        Self {
-            coroutine: std::mem::ManuallyDrop::new(coroutine),
-            state: CothreadState::default(),
-        }
-    }
-
-    /// The coroutine, to look at; it is resumed only by [`Self::resume`].
-    pub fn get(&self) -> &C {
-        &self.coroutine
-    }
-
-    /// Puts the coroutine's thread state on the thread, calls `resume`, and
-    /// takes the state off again once `resume` returns or unwinds.
-    ///
-    /// # Panics
-    /// Panics if a store whose call the coroutine is suspended in is on the
-    /// current thread's context stack, as it is while another call on that
-    /// store runs on the thread.
-    ///
-    /// # Safety
-    /// `resume` must resume the coroutine, on the thread that made the
-    /// `Cothread`, and do nothing else with the stores of the calls the
-    /// coroutine is suspended in: their entries are installed for the
-    /// coroutine, whose frames hold borrows of them.
-    pub unsafe fn resume<R>(&mut self, resume: impl FnOnce(&mut C) -> R) -> R {
-        let _installed = unsafe { self.state.install() };
-        resume(&mut self.coroutine)
-    }
-}
-
-#[cfg(feature = "unsafe-cothread")]
-impl<C> Drop for Cothread<C> {
-    fn drop(&mut self) {
-        // A coroutine suspended inside a call is unwound by dropping it,
-        // which runs the frames of the call: they need their own state. If
-        // that cannot be installed, the coroutine is forgotten: `install`
-        // would panic, in a destructor.
-        if self.state.is_empty() {
-            return unsafe { std::mem::ManuallyDrop::drop(&mut self.coroutine) };
-        }
-        if !self.state.can_install() {
-            // Forgotten, and so are the registrations its calls hold.
-            return self.state.activation.abandon();
-        }
-        // Safety: dropping the coroutine is what runs while the state is
-        // installed, and the coroutine is not used again.
-        let _installed = unsafe { self.state.install() };
-        unsafe { std::mem::ManuallyDrop::drop(&mut self.coroutine) };
-    }
 }
 
 impl StorePtrWrapper {
@@ -800,12 +446,8 @@ fn with_active_while_unwinding(f: impl FnOnce(&mut StoreContext)) {
 impl Drop for StorePtrWrapper {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            // The borrow is given back while unwinding too, if its entry is
-            // still the active one, because a paused borrow is restored then
-            // (see `StorePtrPauseGuard`): a host frame further up that catches
-            // the panic must find the count of its own borrow. An entry that
-            // is no longer active is removed by its install guard, whatever
-            // its count.
+            // A host frame that catches a panic must find its own borrow
+            // count restored. Entries already unwound need no adjustment.
             with_active_while_unwinding(|top| {
                 if unsafe { top.entry.get().as_ref().unwrap() }.as_ptr() == self.store_ptr {
                     top.borrow_count = top.borrow_count.saturating_sub(1);
@@ -825,57 +467,9 @@ impl Drop for StorePtrWrapper {
     }
 }
 
-#[cfg(feature = "experimental-async")]
-impl Drop for StoreAsyncGuardWrapper {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            // As for `StorePtrWrapper`: the borrow is given back if its entry
-            // is still the active one. Only the address of the guard is
-            // compared; the entry it points to may be gone.
-            with_active_while_unwinding(|top| {
-                if let StoreContextEntry::Async { guard, .. } = unsafe { &*top.entry.get() }
-                    && std::ptr::eq(guard, self.guard)
-                {
-                    top.borrow_count = top.borrow_count.saturating_sub(1);
-                }
-            });
-            return;
-        }
-        let id = self.id;
-        STORE_CONTEXT_STACK.with(|cell| {
-            let mut stack = cell.borrow_mut();
-            let top = stack
-                .last_mut()
-                .expect("No store context installed on this thread");
-            assert_eq!(top.id, id, "Mismatched store context reinstall");
-            top.borrow_count -= 1;
-        })
-    }
-}
-
 impl Drop for StoreInstallGuard {
     fn drop(&mut self) {
-        let store_id = match *self {
-            Self::Pushed(store_id) => store_id,
-            #[cfg(feature = "experimental-async")]
-            Self::Lent { serial, previous } => {
-                // The entry the call was lent to gets its own pointer back, if
-                // it is still there: one made when the call resumed keeps its
-                // own. Never panics, also while unwinding.
-                let _ = STORE_CONTEXT_STACK.try_with(|cell| {
-                    let Ok(mut stack) = cell.try_borrow_mut() else {
-                        return;
-                    };
-                    if let Some(top) = stack.last_mut()
-                        && let StoreContextEntry::Async { ptr, serial: s, .. } = top.entry.get_mut()
-                        && *s == serial
-                    {
-                        *ptr = previous;
-                    }
-                });
-                return;
-            }
-        };
+        let Self::Pushed(store_id) = *self;
         STORE_CONTEXT_STACK.with(|cell| {
             let mut stack = cell.borrow_mut();
             match (stack.pop(), std::thread::panicking()) {
@@ -934,43 +528,6 @@ impl Drop for ForcedStoreInstallGuard {
     }
 }
 
-impl Drop for StorePtrPauseGuard {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            // The paused borrow is restored if its entry is still the active
-            // one: the host function that holds it may catch the panic and go
-            // on using the store, and its `StorePtrWrapper` gives the borrow
-            // back when it is dropped.
-            with_active_while_unwinding(|top| {
-                if self.ref_count_decremented
-                    && top.id == self.store_id
-                    && unsafe { top.entry.get().as_ref().unwrap() }.as_ptr() == self.ptr
-                {
-                    top.borrow_count = top.borrow_count.saturating_add(1);
-                    top.paused = top.paused.saturating_sub(1);
-                }
-            });
-            return;
-        }
-        STORE_CONTEXT_STACK.with(|cell| {
-            let mut stack = cell.borrow_mut();
-            let top = stack
-                .last_mut()
-                .expect("No store context installed on this thread");
-            assert_eq!(top.id, self.store_id, "Mismatched store context access");
-            assert_eq!(
-                unsafe { top.entry.get().as_ref().unwrap() }.as_ptr(),
-                self.ptr,
-                "Mismatched store context access"
-            );
-            if self.ref_count_decremented {
-                top.borrow_count += 1;
-                top.paused -= 1;
-            }
-        })
-    }
-}
-
 #[cfg(test)]
 mod borrow_provenance {
     use super::*;
@@ -1022,7 +579,6 @@ mod borrow_provenance {
             // --- the shim calls back into the guest
             let inner_install =
                 unsafe { StoreContext::install(shim.as_store_mut().inner as *mut _) };
-            let pause = unsafe { StoreContext::pause(id) };
 
             // --- the inner import trampoline
             let mut inner_wrapper = unsafe { StoreContext::get_current(id) };
@@ -1030,7 +586,6 @@ mod borrow_provenance {
             let _ = inner_shim.objects_mut().id();
             drop(inner_wrapper);
 
-            drop(pause);
             drop(inner_install);
         }
 
@@ -1072,8 +627,8 @@ mod borrow_provenance {
     }
 
     /// A host function that catches a panic from the guest it called goes on
-    /// with the borrow it held throughout, after the nested entry, the pause
-    /// and the borrow of the host function that panicked were dropped while
+    /// with the borrow it held throughout, after the nested entry and the
+    /// borrow of the host function that panicked were dropped while
     /// unwinding. Miri checks the last use.
     #[test]
     fn a_caught_panic_keeps_the_outer_borrow_usable() {
@@ -1090,7 +645,7 @@ mod borrow_provenance {
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _inner_install =
                 unsafe { StoreContext::install(shim.as_store_mut().inner as *mut _) };
-            let _pause = unsafe { StoreContext::pause(id) };
+
             let mut inner_wrapper = unsafe { StoreContext::get_current(id) };
             let _ = inner_wrapper.as_mut().objects_mut().id();
             panic!("host function panicked");
@@ -1115,18 +670,15 @@ mod unwinding {
         STORE_CONTEXT_STACK.with(|cell| cell.borrow().last().unwrap().borrow_count)
     }
 
-    /// An async context has one entry for all the host functions of a call:
-    /// a guest call pauses the borrow of the host function that makes it,
-    /// rather than installing an entry of its own. When a host function the
-    /// guest reaches panics, and the one that made the guest call catches the
-    /// panic, the paused borrow is restored and the borrow of the one that
-    /// panicked given back while unwinding, so that the count is that of the
-    /// borrow still held.
+    /// A nested synchronous guest call has its own context entry. Unwinding
+    /// that entry restores the outer async entry with its host borrow intact,
+    /// so a host function that catches the panic can keep using its loan.
     #[test]
     fn a_caught_panic_leaves_the_borrow_of_the_host_function_that_caught_it() {
-        let store = Store::default().into_async();
-        let id = store.id;
-        let install = StoreContext::install_async(store.inner.try_write().unwrap());
+        let mut store = Store::default();
+        let id = store.id();
+        let install =
+            unsafe { StoreContext::install_async_raw(store.as_store_mut().inner as *mut _) };
 
         // --- the host function that catches the panic
         let mut wrapper = unsafe { StoreContext::get_current(id) };
@@ -1134,7 +686,7 @@ mod unwinding {
         let caught = catch_unwind(AssertUnwindSafe(|| {
             // --- its guest call
             let _install = unsafe { StoreContext::install(wrapper.as_mut().inner as *mut _) };
-            let _pause = unsafe { StoreContext::pause(id) };
+
             assert_eq!(active_borrows(), 0);
             // --- a host function the guest reaches, which panics
             let _inner_wrapper = unsafe { StoreContext::get_current(id) };
@@ -1148,7 +700,6 @@ mod unwinding {
         drop(wrapper);
         drop(install);
         assert!(StoreContext::is_empty());
-        assert!(store.into_store().is_ok());
     }
 
     /// A synchronous host function of a call in an async context calls its
@@ -1165,9 +716,10 @@ mod unwinding {
             unsafe { std::ptr::write(objects, std::ptr::read(objects)) };
         }
 
-        let store = Store::default().into_async();
-        let id = store.id;
-        let install = StoreContext::install_async(store.inner.try_write().unwrap());
+        let mut store = Store::default();
+        let id = store.id();
+        let install =
+            unsafe { StoreContext::install_async_raw(store.as_store_mut().inner as *mut _) };
 
         // --- the host function, handed its store
         let mut wrapper = unsafe { StoreContext::get_current(id) };
@@ -1176,7 +728,7 @@ mod unwinding {
         {
             // --- its guest call
             let _install = unsafe { StoreContext::install(outer.as_store_mut().inner as *mut _) };
-            let _pause = unsafe { StoreContext::pause(id) };
+
             // --- a host function that guest call reaches
             let mut inner = unsafe { StoreContext::get_current(id) };
             write(&mut inner.as_mut());
@@ -1186,30 +738,30 @@ mod unwinding {
 
         drop(wrapper);
         drop(install);
-        assert!(store.into_store().is_ok());
+        assert!(StoreContext::is_empty());
     }
 
     /// A guest call can suspend, and give its store up, only where no host
     /// function holds a borrow of the store across it: the coroutine's own
     /// call can, which nothing holds a borrow across, and the guest call of a
     /// host function cannot, until it has returned. A panic caught by that
-    /// host function gives its paused borrow back as well.
+    /// host function restores its original context entry as well.
     #[test]
     fn only_a_call_no_host_function_holds_can_suspend() {
-        let store = Store::default().into_async();
-        let id = store.id;
-        let install = StoreContext::install_async(store.inner.try_write().unwrap());
+        let mut store = Store::default();
+        let id = store.id();
+        let install =
+            unsafe { StoreContext::install_async_raw(store.as_store_mut().inner as *mut _) };
 
-        // --- the coroutine's own guest call
-        let call = unsafe { StoreContext::install(StoreContext::get_current_transient(id)) };
-        let pause = unsafe { StoreContext::pause(id) };
+        // The root coroutine uses its poller's context directly.
         assert!(StoreContext::top_can_suspend());
 
         // --- a host function the guest reaches, and its guest call
         let mut host = unsafe { StoreContext::get_current(id) };
+        assert!(!StoreContext::top_can_suspend());
         {
             let _call = unsafe { StoreContext::install(host.as_mut().inner as *mut _) };
-            let _pause = unsafe { StoreContext::pause(id) };
+            assert!(!StoreContext::top_is_async());
             assert!(
                 !StoreContext::top_can_suspend(),
                 "the host function holds its borrow across the call"
@@ -1217,26 +769,27 @@ mod unwinding {
         }
         let caught = catch_unwind(AssertUnwindSafe(|| {
             let _call = unsafe { StoreContext::install(host.as_mut().inner as *mut _) };
-            let _pause = unsafe { StoreContext::pause(id) };
+
             panic!("a host function of the inner call panicked");
         }));
         assert!(caught.is_err());
+        assert_eq!(active_borrows(), 1);
+        assert!(!StoreContext::top_can_suspend());
         drop(host);
         assert!(StoreContext::top_can_suspend());
 
-        drop(pause);
-        drop(call);
         drop(install);
-        assert!(store.into_store().is_ok());
+        assert!(StoreContext::is_empty());
     }
 
-    /// A panic whose host function did not make the guest call, so that
-    /// nothing was paused, leaves the count where it was.
+    /// A panic inside the same entry gives back only the borrow acquired
+    /// by the panicking host function.
     #[test]
     fn a_caught_panic_without_a_guest_call_leaves_the_count_alone() {
-        let store = Store::default().into_async();
-        let id = store.id;
-        let install = StoreContext::install_async(store.inner.try_write().unwrap());
+        let mut store = Store::default();
+        let id = store.id();
+        let install =
+            unsafe { StoreContext::install_async_raw(store.as_store_mut().inner as *mut _) };
 
         let wrapper = unsafe { StoreContext::get_current(id) };
         let caught = catch_unwind(AssertUnwindSafe(|| {
@@ -1249,21 +802,21 @@ mod unwinding {
 
         drop(wrapper);
         drop(install);
-        assert!(store.into_store().is_ok());
+        assert!(StoreContext::is_empty());
     }
 
     /// The same for the borrow an async host function takes while it reads
     /// its arguments.
     #[test]
     fn a_caught_panic_gives_back_the_borrow_of_an_async_host_function() {
-        let store = Store::default().into_async();
-        let id = store.id;
-        let install = StoreContext::install_async(store.inner.try_write().unwrap());
+        let mut store = Store::default();
+        let id = store.id();
+        let install =
+            unsafe { StoreContext::install_async_raw(store.as_store_mut().inner as *mut _) };
 
         let wrapper = unsafe { StoreContext::get_current(id) };
         let caught = catch_unwind(AssertUnwindSafe(|| {
-            let inner = unsafe { StoreContext::try_get_current_async(id) };
-            assert!(matches!(inner, GetStoreAsyncGuardResult::Ok(_)));
+            let _inner = unsafe { StoreContext::get_current(id) };
             assert_eq!(active_borrows(), 2);
             panic!("async host function panicked");
         }));
@@ -1272,134 +825,6 @@ mod unwinding {
 
         drop(wrapper);
         drop(install);
-        assert!(store.into_store().is_ok());
-    }
-}
-
-/// What [`Cothread`] does with the store context entries of a coroutine,
-/// replayed without Wasm, so that Miri checks it: a "suspended call" is an
-/// install guard kept across the end of a resume, as the frames of a call
-/// are kept on the stack of a suspended coroutine.
-#[cfg(all(test, feature = "unsafe-cothread"))]
-mod cothread {
-    use std::{cell::RefCell, rc::Rc};
-
-    use super::*;
-    use crate::{AsStoreMut, Store};
-
-    type Call = Rc<RefCell<Option<(StoreInstallGuard, Option<StorePtrWrapper>)>>>;
-
-    /// The one pointer to the store that every borrow below derives from, as
-    /// the frames of a call derive theirs from the borrow the call was given.
-    /// The store must stay where it is while the pointer is used.
-    fn pointer(store: &mut Store) -> (StoreId, *mut StoreInner) {
-        (store.id(), store.as_store_mut().inner)
-    }
-
-    /// The coroutine enters the store, and its host function, holding a
-    /// borrow of the store, suspends it.
-    fn enter_and_suspend(ptr: *mut StoreInner, call: &Call) {
-        let id = unsafe { (*ptr).objects.id() };
-        let install = unsafe { StoreContext::install(ptr) };
-        let mut wrapper = unsafe { StoreContext::get_current(id) };
-        let _ = wrapper.as_mut().objects_mut().id();
-        *RefCell::borrow_mut(call) = Some((install, Some(wrapper)));
-    }
-
-    /// The host function is resumed, uses its borrow, and the call returns.
-    fn resume_and_return(id: StoreId, call: &Call) {
-        assert!(StoreContext::is_active(id), "the call finds its entry");
-        let (install, wrapper) = RefCell::borrow_mut(call).take().unwrap();
-        let mut wrapper = wrapper.unwrap();
-        let _ = wrapper.as_mut().objects_mut().id();
-        drop(wrapper);
-        drop(install);
-    }
-
-    #[test]
-    fn a_suspended_call_takes_its_entry_with_it() {
-        let mut store = Store::default();
-        let (id, ptr) = pointer(&mut store);
-        let call = Call::default();
-        // Safety: no coroutine; the tests replay its state by hand.
-        let mut cothread = unsafe { Cothread::new(()) };
-
-        unsafe { cothread.resume(|_| enter_and_suspend(ptr, &call)) };
-        assert!(StoreContext::is_empty(), "the entry is off the thread");
-        assert!(!cothread.state.is_empty());
-
-        unsafe { cothread.resume(|_| resume_and_return(id, &call)) };
         assert!(StoreContext::is_empty());
-        assert!(
-            cothread.state.is_empty(),
-            "nothing is kept once the call returned"
-        );
-    }
-
-    #[test]
-    fn a_cothread_is_resumed_above_the_calls_of_the_thread() {
-        let (mut a, mut b) = (Store::default(), Store::default());
-        let ((a_id, a_ptr), (b_id, b_ptr)) = (pointer(&mut a), pointer(&mut b));
-        let call = Call::default();
-        // Safety: no coroutine; the tests replay its state by hand.
-        let mut cothread = unsafe { Cothread::new(()) };
-        unsafe { cothread.resume(|_| enter_and_suspend(a_ptr, &call)) };
-
-        // Resumed from a host function of a call on another store.
-        let outer = unsafe { StoreContext::install(b_ptr) };
-        unsafe { cothread.resume(|_| resume_and_return(a_id, &call)) };
-        assert!(
-            StoreContext::is_active(b_id),
-            "the outer call's entry is untouched"
-        );
-        drop(outer);
-        assert!(StoreContext::is_empty());
-    }
-
-    /// Unwinds the call when dropped, as dropping a suspended coroutine
-    /// unwinds the frames on its stack.
-    struct Unwinds(StoreId, Call);
-    impl Drop for Unwinds {
-        fn drop(&mut self) {
-            resume_and_return(self.0, &self.1);
-        }
-    }
-
-    #[test]
-    fn dropping_a_cothread_unwinds_it_with_its_entries() {
-        let mut store = Store::default();
-        let (id, ptr) = pointer(&mut store);
-        let call = Call::default();
-        // Safety: `Unwinds` stands for an owned coroutine: dropping it is
-        // what unwinding one does.
-        let mut cothread = unsafe { Cothread::new(Unwinds(id, call.clone())) };
-        unsafe { cothread.resume(|_| enter_and_suspend(ptr, &call)) };
-        assert!(StoreContext::is_empty());
-        drop(cothread);
-        assert!(call.borrow().is_none(), "the call was unwound");
-        assert!(StoreContext::is_empty());
-    }
-
-    #[test]
-    fn a_cothread_is_not_resumed_while_its_store_is_used_on_the_thread() {
-        let mut store = Store::default();
-        let (id, ptr) = pointer(&mut store);
-        let call = Call::default();
-        // Safety: no coroutine; the tests replay its state by hand.
-        let mut cothread = unsafe { Cothread::new(()) };
-        unsafe { cothread.resume(|_| enter_and_suspend(ptr, &call)) };
-
-        // Another call on the store, made on the thread meanwhile.
-        let other_call = unsafe { StoreContext::install(ptr) };
-        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            cothread.resume(|_| ());
-        }));
-        assert!(refused.is_err(), "the store is already on the thread");
-        drop(other_call);
-        assert!(StoreContext::is_empty());
-
-        // The suspended call is untouched, and can be resumed now.
-        unsafe { cothread.resume(|_| resume_and_return(id, &call)) };
-        assert!(cothread.state.is_empty());
     }
 }

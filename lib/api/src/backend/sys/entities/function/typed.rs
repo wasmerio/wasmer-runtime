@@ -10,9 +10,6 @@ use crate::{
     entities::function::call_wrapper::call_wrapped,
     store::{AsStoreMut, AsStoreRef},
 };
-#[cfg(feature = "experimental-async")]
-use crate::{StoreAsync, store::AsStoreAsync};
-use std::future::Future;
 use wasmer_types::{FunctionType, RawValue, Type};
 
 macro_rules! impl_native_traits {
@@ -64,6 +61,7 @@ macro_rules! impl_native_traits {
                     rets_list.as_mut()
                 };
 
+                #[cfg(feature = "experimental-host-interrupt")]
                 let store_id = store.objects_mut().id();
 
                 #[cfg(feature = "experimental-host-interrupt")]
@@ -90,9 +88,6 @@ macro_rules! impl_native_traits {
                     let storeref = store.as_store_ref();
                     let config = storeref.engine().tunables().vmconfig();
                     unsafe {
-                        // Safety: This is the intended use-case for StoreContext::pause, as
-                        // documented in the function's doc comments.
-                        let _pause_guard = StoreContext::pause(store_id);
                         wasmer_vm::wasmer_call_trampoline(
                             storeref.signal_handler(),
                             config,
@@ -136,38 +131,6 @@ macro_rules! impl_native_traits {
                 // Ok(Rets::from_c_struct(results))
             }
 
-            /// Call the typed func asynchronously.
-            #[allow(unused_mut)]
-            #[allow(clippy::too_many_arguments)]
-            #[cfg(feature = "experimental-async")]
-            pub(crate) fn call_async_sys(
-                func: Function,
-                store: StoreAsync,
-                $( $x: $x, )*
-            ) -> impl Future<Output = Result<Rets, RuntimeError>> + 'static
-            where
-                $( $x: FromToNativeWasmType + 'static, )*
-            {
-                async move {
-                    let mut write = store.write_lock().await;
-                    let func_ty = func.ty(&mut write);
-                    let mut params_raw = [ $( $x.to_native().into_raw(&mut write) ),* ];
-                    let mut params_values = Vec::with_capacity(params_raw.len());
-                    {
-                        for (raw, ty) in params_raw.iter().zip(func_ty.params()) {
-                            unsafe {
-                                params_values.push(Value::from_raw(&mut write, *ty, *raw));
-                            }
-                        }
-                    }
-                    drop(write);
-
-                    let results = func.call_async(&store, params_values).await?;
-                    let mut write = store.write_lock().await;
-                    convert_results::<Rets>(&mut write, func_ty, &results)
-                }
-            }
-
             #[doc(hidden)]
             #[allow(missing_docs)]
             #[allow(unused_mut)]
@@ -197,6 +160,7 @@ macro_rules! impl_native_traits {
                     rets_list.as_mut()
                 };
 
+                #[cfg(feature = "experimental-host-interrupt")]
                 let store_id = store.objects_mut().id();
 
                 #[cfg(feature = "experimental-host-interrupt")]
@@ -216,9 +180,6 @@ macro_rules! impl_native_traits {
                     let storeref = store.as_store_ref();
                     let config = storeref.engine().tunables().vmconfig();
                     unsafe {
-                        // Safety: This is the intended use-case for StoreContext::pause, as
-                        // documented in the function's doc comments.
-                        let _pause_guard = StoreContext::pause(store_id);
                         wasmer_vm::wasmer_call_trampoline(
                             storeref.signal_handler(),
                             config,
@@ -329,7 +290,6 @@ where
     }
     unsafe { Ok(Rets::from_array(store, raw_array)) }
 }
-
 
 /// The results of a typed call are read as the raw values of their types:
 /// values of another type are refused, not read as such.

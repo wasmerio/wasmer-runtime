@@ -17,11 +17,7 @@ use crate::{
         utils::convert::{AsJs, js_value_to_wasmer},
     },
 };
-#[cfg(feature = "experimental-async")]
-use crate::{AsStoreAsync, StoreAsync};
 use js_sys::Array;
-#[cfg(feature = "experimental-async")]
-use std::future::Future;
 use std::iter::FromIterator;
 use wasm_bindgen::JsValue;
 use wasmer_types::{RawValue, Type};
@@ -72,35 +68,6 @@ macro_rules! impl_native_traits {
             $( $x: FromToNativeWasmType, )*
             Rets: WasmTypeList,
         {
-            /// Call the typed func asynchronously through JSPI.
-            #[allow(clippy::too_many_arguments)]
-            #[cfg(feature = "experimental-async")]
-            pub(crate) fn call_async_js(
-                func: crate::Function,
-                store: StoreAsync,
-                $( $x: $x, )*
-            ) -> impl Future<Output = Result<Rets, RuntimeError>> + 'static
-            where
-                $( $x: FromToNativeWasmType + 'static, )*
-            {
-                async move {
-                    let mut write = store.write_lock().await;
-                    let func_ty = func.ty(&mut write);
-                    let mut params_raw = [ $( $x.to_native().into_raw(&mut write) ),* ];
-                    let mut params_values = Vec::with_capacity(params_raw.len());
-                    for (raw, ty) in params_raw.iter().zip(func_ty.params()) {
-                        unsafe {
-                            params_values.push(Value::from_raw(&mut write, *ty, *raw));
-                        }
-                    }
-                    drop(write);
-
-                    let results = func.call_async(&store, params_values).await?;
-                    let mut write = store.write_lock().await;
-                    convert_results::<Rets>(&mut write, func_ty, &results)
-                }
-            }
-
             /// Call the typed func and return results.
             #[allow(clippy::too_many_arguments)]
             pub fn call_js(&self, store: &mut impl AsStoreMut, $( $x: $x, )* ) -> Result<Rets, RuntimeError> where
@@ -257,7 +224,6 @@ fn convert_results<Rets: WasmTypeList>(
 
     Ok(unsafe { Rets::from_array(store, rets_list_array) })
 }
-
 
 /// The results of a typed call are read as the raw values of their types:
 /// values of another type are refused, not read as such.

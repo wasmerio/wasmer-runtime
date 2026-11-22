@@ -64,7 +64,7 @@ impl crate::BackendStore {
 impl crate::Store {
     /// Consume [`self`] into [`crate::backend::js::store::Store`].
     pub(crate) fn into_js(self) -> crate::backend::js::store::Store {
-        self.inner.store.into_js()
+        self.inner.into_inner().store.into_js()
     }
 
     /// Convert a reference to [`self`] into a reference [`crate::backend::js::store::Store`].

@@ -83,12 +83,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         *env.data().counter.lock().unwrap()
     }
     fn add_to_counter(mut env: FunctionEnvMut<Env>, add: i32) -> i32 {
-        let (data, mut storemut) = env.data_and_store_mut();
+        let data = env.data().clone();
         let mut counter_ref = data.counter.lock().unwrap();
 
-        let global_count = data.g_counter.get(&mut storemut).unwrap_i32();
+        let global_count = data.g_counter.get(&mut env).unwrap_i32();
         data.g_counter
-            .set(&mut storemut, Value::I32(global_count + add))
+            .set(&mut env, Value::I32(global_count + add))
             .unwrap();
 
         *counter_ref += add;

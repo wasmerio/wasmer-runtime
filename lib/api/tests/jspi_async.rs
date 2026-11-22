@@ -1,12 +1,18 @@
-#![cfg(all(feature = "experimental-async", not(target_arch = "wasm32")))]
+#![cfg(all(
+    feature = "experimental-async",
+    feature = "sys",
+    not(feature = "v8-default"),
+    not(target_arch = "wasm32")
+))]
 
 use std::{cell::RefCell, sync::OnceLock};
 
 use anyhow::Result;
 use futures::future;
+use wasmer::AsyncEnv;
 use wasmer::{
-    AsyncFunctionEnvMut, Function, FunctionEnv, FunctionEnvMut, FunctionType, Instance, Module,
-    Store, StoreAsync, Type, TypedFunction, Value, imports,
+    Function, FunctionEnv, FunctionEnvMut, FunctionType, Instance, Module, Store, Type,
+    TypedFunction, Value, imports,
 };
 use wasmer_vm::TrapCode;
 
@@ -33,7 +39,7 @@ fn jspi_module() -> &'static [u8] {
 #[test]
 #[cfg_attr(
     feature = "v8-default",
-    ignore = "async functions are not supported by the default v8 backend"
+    ignore = "V8 cannot interleave independent guest stacks"
 )]
 fn async_state_updates_follow_jspi_example() -> Result<()> {
     let wasm = jspi_module();
@@ -66,14 +72,8 @@ fn async_state_updates_follow_jspi_example() -> Result<()> {
         &mut store,
         &delta_env,
         FunctionType::new(vec![], vec![Type::F64]),
-        |env: AsyncFunctionEnvMut<DeltaState>, _values| async move {
-            // Note: holding a lock across an await point prevents
-            // other coroutines from progressing, so it's a good
-            // idea to drop the lock before awaiting.
-            let delta = {
-                let mut env_write = env.write().await;
-                env_write.data_mut().next()
-            };
+        async |env: &mut AsyncEnv<DeltaState>, _values: Vec<Value>| {
+            let delta = env.with(|mut env| env.data_mut().next());
             // We can, however, actually suspend whenever
             // `Function::call_async` is used to call WASM functions.
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -101,20 +101,18 @@ fn async_state_updates_follow_jspi_example() -> Result<()> {
 
     assert_eq!(as_f64(&get_state.call(&mut store, &[])?), 1.0);
 
-    let step = |store: &StoreAsync, func: &wasmer::Function| -> Result<f64> {
+    let step = |store: &mut Store, func: &wasmer::Function| -> Result<f64> {
         let result = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(func.call_async(store, vec![]))?;
+            .block_on(func.call_async(store, &[]))?;
         Ok(as_f64(&result))
     };
 
-    let store_async = store.into_async();
-
-    assert_eq!(step(&store_async, update_state)?, 1.5);
-    assert_eq!(step(&store_async, update_state)?, 0.5);
-    assert_eq!(step(&store_async, update_state)?, 3.0);
+    assert_eq!(step(&mut store, update_state)?, 1.5);
+    assert_eq!(step(&mut store, update_state)?, 0.5);
+    assert_eq!(step(&mut store, update_state)?, 3.0);
 
     Ok(())
 }
@@ -122,7 +120,7 @@ fn async_state_updates_follow_jspi_example() -> Result<()> {
 #[test]
 #[cfg_attr(
     feature = "v8-default",
-    ignore = "async functions are not supported by the default v8 backend"
+    ignore = "V8 cannot interleave independent guest stacks"
 )]
 fn typed_async_host_and_calls_work() -> Result<()> {
     let wasm = wat::parse_str(
@@ -149,20 +147,24 @@ fn typed_async_host_and_calls_work() -> Result<()> {
     let module = Module::new(&store, wasm)?;
 
     let add_env = FunctionEnv::new(&mut store, AddBias { bias: 5 });
-    let async_add = Function::new_typed_with_env_async(
+    let async_add = Function::new_typed_async(
         &mut store,
         &add_env,
-        async move |env: AsyncFunctionEnvMut<AddBias>, a: i32, b: i32| {
-            let env_read = env.read().await;
-            let bias = env_read.data().bias;
+        async move |env: &mut AsyncEnv<AddBias>, a: i32, b: i32| {
+            let bias = env.with(|env| env.data().bias);
             tokio::task::yield_now().await;
             a + b + bias
         },
     );
-    let async_double = Function::new_typed_async(&mut store, async move |value: i32| {
-        tokio::task::yield_now().await;
-        value * 2
-    });
+    let unit = FunctionEnv::new(&mut store, ());
+    let async_double = Function::new_typed_async(
+        &mut store,
+        &unit,
+        async move |_: &mut AsyncEnv<()>, value: i32| {
+            tokio::task::yield_now().await;
+            value * 2
+        },
+    );
 
     let import_object = imports! {
         "host" => {
@@ -175,13 +177,11 @@ fn typed_async_host_and_calls_work() -> Result<()> {
     let compute: TypedFunction<i32, i32> =
         instance.exports.get_typed_function(&store, "compute")?;
 
-    let store_async = store.into_async();
-
     let result = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(compute.call_async(&store_async, 4))?;
+        .block_on(compute.call_async(&mut store, 4))?;
     assert_eq!(result, 27);
 
     Ok(())
@@ -190,7 +190,7 @@ fn typed_async_host_and_calls_work() -> Result<()> {
 #[test]
 #[cfg_attr(
     feature = "v8-default",
-    ignore = "async functions are not supported by the default v8 backend"
+    ignore = "V8 cannot interleave independent guest stacks"
 )]
 fn cannot_yield_when_not_in_async_context() -> Result<()> {
     const WAT: &str = r#"
@@ -249,7 +249,7 @@ fn cannot_yield_when_not_in_async_context() -> Result<()> {
 #[test]
 #[cfg_attr(
     feature = "v8-default",
-    ignore = "async functions are not supported by the default v8 backend"
+    ignore = "V8 cannot interleave independent guest stacks"
 )]
 fn nested_async_in_sync() -> Result<()> {
     const WAT: &str = r#"
@@ -299,15 +299,14 @@ fn nested_async_in_sync() -> Result<()> {
         },
     );
 
-    // A typed async host function takes the store's lock to convert its
-    // results, which it cannot get where its guest cannot be suspended, as in
-    // a synchronous call: this one gives its results as they are.
+    // Ready imports work even when entered through a synchronous host frame.
     let ready = Function::new_async(
         &mut store,
         FunctionType::new(vec![], vec![Type::I32]),
         |_| async { Ok(vec![Value::I32(7)]) },
     );
-    let async_ = Function::new_typed_async(&mut store, async || {
+    let unit = FunctionEnv::new(&mut store, ());
+    let async_ = Function::new_typed_async(&mut store, &unit, async |_: &mut AsyncEnv<()>| {
         tokio::task::yield_now().await;
         42
     });
@@ -333,14 +332,13 @@ fn nested_async_in_sync() -> Result<()> {
     let entry = instance
         .exports
         .get_typed_function::<i32, i32>(&store, "entry")?;
-    let store = store.into_async();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
 
-    assert_eq!(runtime.block_on(entry.call_async(&store, 0))?, 7);
-    assert_eq!(runtime.block_on(entry.call_async(&store, 1))?, -2);
+    assert_eq!(runtime.block_on(entry.call_async(&mut store, 0))?, 7);
+    assert_eq!(runtime.block_on(entry.call_async(&mut store, 1))?, -2);
 
     Ok(())
 }

@@ -1,7 +1,7 @@
 # Type-Safe Async API for Wasmer
 
-**Status:** proposal, 2026-11-21. The trials and design notes are in
-[`sound-async/`](./sound-async/README.md).
+**Status:** design proposal, 2026-11-21. Implementation progress, validation,
+and the original design notes are in [`sound-async/`](./sound-async/README.md).
 
 ## Summary
 
@@ -31,9 +31,9 @@ Nothing suspends while holding the store, so a native store never has a waiter.
 | Store handle outliving an import | Allowed | Compile error |
 | Async store lock | 956-line `LocalRwLock` | None |
 
-A stub-bodied type model of this API, built on Rust 1.99, accepts all 20
-intended uses and rejects all 23 misuses. It proves the signatures, not an
-implementation, and no runtime code has changed.
+At the proposal revision, a stub-bodied type model of this API, built on Rust
+1.99, accepted all 20 intended uses and rejected all 23 misuses. Those trials
+proved the signatures before the runtime implementation began.
 
 JavaScript also needs one private runtime guard, because its engine can resume a
 guest with no `poll` on the stack. The Backends section defines it.

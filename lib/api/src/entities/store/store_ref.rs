@@ -2,8 +2,6 @@ use std::ops::{Deref, DerefMut};
 
 use super::{StoreObjects, inner::StoreInner};
 use crate::entities::engine::{AsEngineRef, Engine, EngineRef};
-#[cfg(feature = "experimental-async")]
-use crate::{AsStoreAsync, StoreAsync};
 use wasmer_types::ExternType;
 //use wasmer_vm::{StoreObjects, TrapHandlerFn};
 
@@ -108,17 +106,31 @@ impl StoreMut<'_> {
     /// }
     /// ```
     pub fn parked<R>(&mut self, f: impl FnOnce() -> R) -> R {
-        // This is the same thing `Function::call` does before entering Wasm:
-        // install this borrow as the store executing on the thread, so that
-        // code which reaches the store through the context — rather than
-        // through a reference it was handed — picks up a borrow derived from
-        // *this* one. The new entry starts unborrowed, which is what makes the
-        // store lendable for as long as it is on top.
+        // Derive one pointer and use it for both callback paths. Deriving a
+        // sibling after publishing it would invalidate the shared callback loan.
         let ptr: *mut StoreInner = &mut *self.inner;
-        // SAFETY: `ptr` comes from `&mut *self.inner`, which `&mut self` keeps
-        // alive and unreachable for every frame on this thread until `f`
-        // returns and the guard is dropped.
-        let _guard = unsafe { super::StoreContext::install(ptr) };
+        let allocation = unsafe { &*(*ptr).allocation.as_ptr() };
+        #[cfg(feature = "js")]
+        let _released_guest = allocation.guest.release();
+        struct Restore<'a> {
+            allocation: &'a super::AllocationInner,
+            busy: bool,
+            lent: *mut StoreInner,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.allocation.lent.set(self.lent);
+                self.allocation.busy.set(self.busy);
+            }
+        }
+        let _restore = Restore {
+            busy: allocation.busy.replace(false),
+            lent: allocation.lent.replace(ptr),
+            allocation,
+        };
+        // SAFETY: &mut self keeps this exact loan alive and unreachable until
+        // f returns. A separate sync entry hides any outer borrowed context.
+        let _context = unsafe { super::StoreContext::install_lent(ptr) };
         f()
     }
 }
@@ -127,17 +139,6 @@ impl StoreMut<'_> {
 pub trait AsStoreRef {
     /// Returns a `StoreRef` pointing to the underlying context.
     fn as_store_ref(&self) -> StoreRef<'_>;
-
-    /// Returns a [`StoreAsync`] if the current
-    /// context is asynchronous. The store will be locked since
-    /// it's already active in the current context, but can be used
-    /// to spawn new coroutines via
-    /// [`Function::call_async`](crate::Function::call_async).
-    #[cfg(feature = "experimental-async")]
-    fn as_store_async(&self) -> Option<impl AsStoreAsync + 'static> {
-        let id = self.as_store_ref().inner.objects.id();
-        StoreAsync::from_context(id)
-    }
 }
 
 /// Helper trait for a value that is convertible to a [`StoreMut`].

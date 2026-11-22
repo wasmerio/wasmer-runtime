@@ -198,6 +198,7 @@ impl Module {
                 objects.as_sys_mut(),
             )?;
 
+            #[cfg(feature = "experimental-host-interrupt")]
             let store_id = objects.id();
             // Before the store takes the instance: one refused here has put
             // nothing anywhere, and is dropped.
@@ -228,14 +229,11 @@ impl Module {
             // the data, call the start function and so. If any of these steps
             // traps, the instance stays with the store.
             //
-            // The store is paused while the start function runs, as for any
-            // other entry into Wasm: an async import it calls can then
-            // suspend the call of a host function that instantiates.
-            let finished = {
-                let _pause_guard = StoreContext::pause(store_id);
+            // Instantiation is synchronous even beneath an async guest. An
+            // async start import may complete immediately, but cannot suspend.
+            let finished =
                 self.artifact
-                    .finish_instantiation(config, signal_handler, &mut instance)
-            };
+                    .finish_instantiation(config, signal_handler, &mut instance);
             finished?;
 
             drop(store_install_guard);

@@ -7,18 +7,66 @@ why, what was tried, what failed, and how to rerun every trial.
 
 ## Current state
 
-- The proposal is in
-  [wasmerio/wasmer-runtime#18](https://github.com/wasmerio/wasmer-runtime/pull/18),
-  stacked on
-  [wasmerio/wasmer-runtime#16](https://github.com/wasmerio/wasmer-runtime/pull/16).
-- **None of the proposed API is implemented.** The type contract is
-  compile-checked with stub bodies.
-- All design decisions are settled. See the [decision
-  log](./08-decision-log.md).
-- The JavaScript guest guard and the NAPI port are the least proven parts.
-  Prototype them early.
-- A trial `StoreRef` port type-checks WASIX and the C API imports on `next`. Its
-  tests were not run.
+The `sound-async-codex` branch implements the proposal on PR 18's head
+`4fab3dcb52dfc9c9e52e6744e0b2051fda30195c`.
+
+- The public API now uses borrowing `Function::call_async` and
+  `TypedFunction::call_async`, `AsyncEnv::with`, and explicit `SharedStore`
+  handles. The implementation lives in `lib/api/src/async_runtime.rs`;
+  `async_v2` was only a migration stage.
+- `FunctionEnvMut::data_and_store` returns a `StoreRef`, and accessing host
+  state through `FunctionEnv` requires mutable store access. Compile-fail
+  doctests cover the former aliasing hole and async borrow restrictions.
+- Native calls retain PR 16's activation switching and executor-stack host
+  polling. JavaScript calls own their live engine allocation and guard public
+  store access after a forgotten call. V8 polls host futures synchronously and
+  supports lexical nesting, without interleaving independent guest stacks.
+- The old async API, `LocalRwLock`, and `unsafe-cothread` feature are removed,
+  together with the obsolete pause counts, entry serials, and async lent-entry
+  shortcut in `StoreContext`. Nested synchronous calls install their own
+  context; only an unborrowed root async entry can suspend.
+- WASIX, asyncify, and NAPI are ported on a companion
+  `sound-async-codex-consumers` branch based on the pinned `next` revision below.
+  NAPI's nested repository has a branch with the same name. The consumer port
+  and runtime baseline synchronization are exported separately for review.
+  WASIX context-switching and dynamic-call fixtures, asyncify unwind handlers,
+  and NAPI JavaScript callbacks pass against the new API.
+
+The numbered documents and source appendices below are the original design
+record. Their descriptions of the old API and trial results refer to the pinned
+revisions, not to the implementation branch.
+
+## Implementation validation
+
+Run the native API (including compile-fail doctests), compiler fixtures, and lint
+checks from the repository root:
+
+```bash
+cargo test --locked -p wasmer --features experimental-async,experimental-host-interrupt
+cargo test --locked -p wasmer-workspace --features cranelift --test compilers
+cargo clippy --locked -p wasmer --features experimental-async,experimental-host-interrupt --all-targets -- -D clippy::all
+cargo fmt --all -- --check
+```
+
+Miri covers capability lifetimes, shared-store release/re-entry, store-pointer
+provenance, and overlapping dynamic host-import contexts without executing JIT
+code. `-Zmiri-ignore-leaks` permits tests that intentionally forget a call:
+
+```bash
+MIRIFLAGS='-Zmiri-disable-isolation -Zmiri-ignore-leaks' cargo +nightly miri test --locked -p wasmer --no-default-features --features sys,headless,experimental-async --lib async_runtime:: -- --skip backend::
+MIRIFLAGS='-Zmiri-disable-isolation -Zmiri-ignore-leaks' cargo +nightly miri test --locked -p wasmer --no-default-features --features sys,headless,experimental-async --test shared_store
+```
+
+JavaScript tests require Node 24 or 26 and `wasm-bindgen-test-runner` matching
+`Cargo.lock`. Run with `WASM_BINDGEN_TEST_ONLY_NODE=1` and the runner configured
+for `wasm32-unknown-unknown`, selecting `js-default,experimental-async` with
+`--no-default-features`. `sound_async_js` tests the proposal's cancellation,
+leak, nesting, ready-import, shared-release, and JavaScript exception recovery. The existing
+`jspi_async_js` and `jspi_calls_js` suites use the new public API too.
+
+V8's full API suite uses `--no-default-features --features
+v8-default,experimental-async`. `sound_async_v8` exercises ready and waiting
+imports, nested calls, start functions, and panic handling.
 
 ## Reading order
 

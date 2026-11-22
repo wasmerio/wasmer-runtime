@@ -91,7 +91,7 @@ impl crate::BackendStore {
 impl crate::Store {
     /// Consume [`self`] into [`crate::backend::v8::store::Store`].
     pub(crate) fn into_v8(self) -> crate::backend::v8::store::Store {
-        self.inner.store.into_v8()
+        self.inner.into_inner().store.into_v8()
     }
 
     /// Convert a reference to [`self`] into a reference [`crate::backend::v8::store::Store`].

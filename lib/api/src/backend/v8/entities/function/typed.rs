@@ -61,7 +61,10 @@ macro_rules! impl_native_traits {
 
                  let func = unsafe { wasm_extern_as_func(self.func.to_vm_extern().unwrap_v_8()) };
 
-                 call_wrapped(store, wrapper, |_| {
+                 call_wrapped(store, wrapper, |store| {
+                    #[cfg(feature = "experimental-async")]
+                    let mut store = store.as_store_mut();
+                    let mut call = || {
                     // `wasm_func_call` takes the arguments, so every entry gets its own.
                     let mut params = unsafe { std::mem::zeroed() };
                     let trap = unsafe {
@@ -73,6 +76,11 @@ macro_rules! impl_native_traits {
                     } else {
                         Err(RuntimeError::from(Trap::from(trap)))
                     }
+                    };
+                    #[cfg(feature = "experimental-async")]
+                    { crate::backend::v8::async_runtime::enter(&mut store, call) }
+                    #[cfg(not(feature = "experimental-async"))]
+                    { call() }
                  })?;
 
                 unsafe {

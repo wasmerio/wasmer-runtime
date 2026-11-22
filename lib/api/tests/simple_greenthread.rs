@@ -16,9 +16,11 @@ use futures::task::LocalSpawnExt;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_test::wasm_bindgen_test;
 use wasmer::{
-    AsStoreAsync, AsyncFunctionEnvMut, Function, FunctionEnv, FunctionEnvMut, FunctionType,
-    Instance, Memory, Module, RuntimeError, Store, Type, Value, imports,
+    Function, FunctionEnv, FunctionEnvMut, FunctionType, Instance, Memory, Module, RuntimeError,
+    Store, Type, Value, imports,
 };
+
+use wasmer::AsyncEnv;
 
 const SWITCHING_WAT: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -115,57 +117,57 @@ impl Clone for Greenthread {
 }
 
 async fn greenthread_new(
-    env: AsyncFunctionEnvMut<GreenEnv>,
+    env: &mut AsyncEnv<GreenEnv>,
     entrypoint_data: u32,
 ) -> core::result::Result<u32, RuntimeError> {
-    let async_store = env.as_store_async();
-    let mut env_write = env.write().await;
-    let data = env_write.data_mut();
-    let new_greenthread_id = data
-        .next_free_id
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    env.with(|mut env| {
+        let mut shared = env.shared().expect("green threads use a shared store");
+        let data = env.data_mut();
+        let new_greenthread_id = data
+            .next_free_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-    let function = data.entrypoint.clone().expect("entrypoint set");
-    let (sender, receiver) = oneshot::channel::<()>();
+        let function = data.entrypoint.clone().expect("entrypoint set");
+        let (sender, receiver) = oneshot::channel::<()>();
 
-    let new_greenthread = Greenthread {
-        entrypoint: Some(entrypoint_data),
-        resumer: Some(sender),
-    };
+        let new_greenthread = Greenthread {
+            entrypoint: Some(entrypoint_data),
+            resumer: Some(sender),
+        };
 
-    data.greenthreads
-        .write()
-        .unwrap()
-        .insert(new_greenthread_id, new_greenthread);
+        data.greenthreads
+            .write()
+            .unwrap()
+            .insert(new_greenthread_id, new_greenthread);
 
-    let spawner = data.spawner.as_ref().expect("spawner set").clone();
-    let (abort, registration) = AbortHandle::new_pair();
-    let (done_tx, done) = oneshot::channel();
-    data.spawned_tasks.push(SpawnedTask { abort, done });
-    spawner.spawn(async move {
-        let result = Abortable::new(
-            async move {
-                receiver.await.unwrap();
-                function
-                    .call_async(&async_store, vec![Value::I32(entrypoint_data as i32)])
-                    .await
-            },
-            registration,
-        )
-        .await;
-        if let Ok(result) = result {
-            panic!("Greenthread function returned {result:?}");
-        }
-        let _ = done_tx.send(());
-    });
+        let spawner = data.spawner.as_ref().expect("spawner set").clone();
+        let (abort, registration) = AbortHandle::new_pair();
+        let (done_tx, done) = oneshot::channel();
+        data.spawned_tasks.push(SpawnedTask { abort, done });
+        spawner.spawn(async move {
+            let result = Abortable::new(
+                async move {
+                    receiver.await.unwrap();
+                    function
+                        .call_async(&mut shared, &[Value::I32(entrypoint_data as i32)])
+                        .await
+                },
+                registration,
+            )
+            .await;
+            if let Ok(result) = result {
+                panic!("Greenthread function returned {result:?}");
+            }
+            let _ = done_tx.send(());
+        });
 
-    Ok(new_greenthread_id)
+        Ok(new_greenthread_id)
+    })
 }
 
-async fn greenthread_switch(env: AsyncFunctionEnvMut<GreenEnv>, next_greenthread_id: u32) {
-    let (receiver, current_id_arc, current_greenthread_id) = {
-        let mut write_lock = env.write().await;
-        let data = write_lock.data_mut();
+async fn greenthread_switch(env: &mut AsyncEnv<GreenEnv>, next_greenthread_id: u32) {
+    let (receiver, current_id_arc, current_greenthread_id) = env.with(|mut env| {
+        let data = env.data_mut();
 
         let current_greenthread_id = {
             let mut current = data.current_greenthread_id.write().unwrap();
@@ -200,7 +202,7 @@ async fn greenthread_switch(env: AsyncFunctionEnvMut<GreenEnv>, next_greenthread
         let current_id_arc = data.current_greenthread_id.clone();
 
         (receiver, current_id_arc, current_greenthread_id)
-    };
+    });
 
     let _ = receiver.await;
 
@@ -222,7 +224,7 @@ async fn run_greenthread_test(wat: &[u8], spawner: TestSpawner) -> Result<Vec<St
         |mut env: FunctionEnvMut<GreenEnv>, params: &[Value]| {
             let ptr = params[0].unwrap_i32() as u32;
             let len = params[1].unwrap_i32() as u32;
-            let (data, storemut) = env.data_and_store_mut();
+            let (data, storemut) = env.data_and_store();
             let memory = data.memory.as_ref().expect("memory set");
             let view = memory.view(&storemut);
             let mut bytes = Vec::with_capacity(len as usize);
@@ -235,10 +237,9 @@ async fn run_greenthread_test(wat: &[u8], spawner: TestSpawner) -> Result<Vec<St
         },
     );
 
-    let greenthread_new = Function::new_typed_with_env_async(&mut store, &env, greenthread_new);
+    let greenthread_new = Function::new_typed_async(&mut store, &env, greenthread_new);
 
-    let greenthread_switch =
-        Function::new_typed_with_env_async(&mut store, &env, greenthread_switch);
+    let greenthread_switch = Function::new_typed_async(&mut store, &env, greenthread_switch);
 
     let import_object = imports! {
         "test" => {
@@ -271,14 +272,12 @@ async fn run_greenthread_test(wat: &[u8], spawner: TestSpawner) -> Result<Vec<St
 
     env.as_mut(&mut store).spawner = Some(spawner);
 
-    let store_async = store.into_async();
+    let mut shared = store.into_shared();
 
-    main_fn.call_async(&store_async, vec![]).await?;
+    main_fn.call_async(&mut shared, &[]).await?;
 
-    let spawned_tasks = {
-        let mut store = store_async.write_lock().await;
-        std::mem::take(&mut env.as_mut(&mut store).spawned_tasks)
-    };
+    let spawned_tasks =
+        shared.try_with(|mut store| std::mem::take(&mut env.as_mut(&mut store).spawned_tasks))?;
     for task in &spawned_tasks {
         task.abort.abort();
     }
@@ -286,8 +285,7 @@ async fn run_greenthread_test(wat: &[u8], spawner: TestSpawner) -> Result<Vec<St
         let _ = task.done.await;
     }
 
-    let store = store_async.read_lock().await;
-    Ok(env.as_ref(&store).logs.clone())
+    Ok(shared.try_with(|store| env.as_ref(&store).logs.clone())?)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -313,7 +311,7 @@ fn assert_logs(logs: &[String], expected: &[&str]) {
 #[test]
 #[cfg_attr(
     feature = "v8-default",
-    ignore = "async functions are not supported by the default v8 backend"
+    ignore = "V8 cannot interleave independent guest stacks"
 )]
 fn green_threads_switch_and_log_in_expected_order() -> Result<()> {
     let logs = run_greenthread_test_native(SWITCHING_WAT)?;
@@ -335,7 +333,7 @@ async fn green_threads_switch_and_log_in_expected_order() {
 #[test]
 #[cfg_attr(
     feature = "v8-default",
-    ignore = "async functions are not supported by the default v8 backend"
+    ignore = "V8 cannot interleave independent guest stacks"
 )]
 fn green_threads_switch_main_crashed() -> Result<()> {
     let logs = run_greenthread_test_native(REGRESSION_WAT)?;

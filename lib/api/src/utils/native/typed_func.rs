@@ -8,7 +8,7 @@
 //! let add_one_native: TypedFunction<i32, i32> = add_one.native().unwrap();
 //! ```
 #[cfg(feature = "experimental-async")]
-use crate::AsStoreAsync;
+use crate::AsyncCallStore;
 use crate::{
     AsStoreMut, BackendStore, CallWrapper, FromToNativeWasmType, Function, NativeWasmTypeInto,
     RuntimeError, WasmTypeList, store::AsStoreRef,
@@ -93,40 +93,20 @@ macro_rules! impl_native_traits {
                 }
             }
 
-            /// Call the typed func asynchronously.
+            /// Calls the function with an exclusive store borrow, or an
+            /// explicitly shared store for interleaving guest tasks.
             #[cfg(feature = "experimental-async")]
-            #[allow(unused_mut)]
             #[allow(clippy::too_many_arguments)]
-            pub fn call_async(
-                &self,
-                store: &impl AsStoreAsync,
+            pub fn call_async<'a, S: AsyncCallStore>(
+                &'a self,
+                store: &'a mut S,
                 $( $x: $x, )*
-            ) -> impl Future<Output = Result<Rets, RuntimeError>> + Sized + 'static
+            ) -> S::Call<'a, Result<Rets, RuntimeError>>
             where
                 $( $x: FromToNativeWasmType + 'static, )*
+                Rets: 'static,
             {
-                $(
-                    let [<p_ $x>] = $x;
-                )*
-                let store = store.store();
-                let func = self.func.clone();
-                async move {
-                    let read_lock = store.read_lock().await;
-                    match read_lock.as_store_ref().inner.store {
-                        #[cfg(feature = "sys")]
-                        BackendStore::Sys(_) => {
-                            drop(read_lock);
-                            Self::call_async_sys(func, store, $([<p_ $x>]),*).await
-                        }
-                        #[cfg(feature = "v8")]
-                        BackendStore::V8(_) => async_backend_error(),
-                        #[cfg(feature = "js")]
-                        BackendStore::Js(_) => {
-                            drop(read_lock);
-                            Self::call_async_js(func, store, $([<p_ $x>]),*).await
-                        }
-                    }
-                }
+                crate::async_runtime::call_typed_async(self, store, ($( $x ),*))
             }
 
             #[doc(hidden)]

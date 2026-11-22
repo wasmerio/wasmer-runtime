@@ -31,7 +31,7 @@ impl<T> FunctionEnv<T> {
     }
 
     /// Get the data as reference
-    pub fn as_ref<'a>(&self, store: &'a impl AsStoreRef) -> &'a T
+    pub fn as_ref<'a>(&self, store: &'a impl AsStoreMut) -> &'a T
     where
         T: Any + Send + 'static + Sized,
     {
@@ -136,15 +136,14 @@ impl<T: Send + 'static> FunctionEnvMut<'_, T> {
         }
     }
 
-    /// Borrows a new mutable reference of both the attached Store and host state
-    pub fn data_and_store_mut<'a>(&'a mut self) -> (&'a mut T, StoreMut<'a>) {
+    /// Borrows the host state mutably and the store immutably.
+    pub fn data_and_store(&mut self) -> (&mut T, StoreRef<'_>) {
         let data = self.func_env.as_mut(&mut self.store_mut) as *mut T;
-        // telling the borrow check to close his eyes here
-        // this is still relatively safe to do as func_env are
-        // stored in a specific vec of Store, separate from the other objects
-        // and not really directly accessible with the StoreMut
-        let data = unsafe { &mut *data };
-        (data, self.store_mut.as_store_mut())
+        let store = self.store_mut.as_store_ref();
+        // SAFETY: the environment's boxed data is disjoint from the store's
+        // other objects. StoreRef cannot access function environment data or
+        // enter a guest, and both references are bounded by this borrow.
+        (unsafe { &mut *data }, store)
     }
 }
 

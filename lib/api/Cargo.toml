@@ -138,10 +138,6 @@ headless = []
 # Experimental concurrent execution support
 experimental-async = ["dep:futures", "dep:corosensei"]
 
-# Enables `Cothread`, for coroutines that an embedder switches itself and that
-# suspend while they run Wasm.
-unsafe-cothread = ["sys"]
-
 # Experimental host-triggered interruption support
 experimental-host-interrupt = ["wasmer-vm/experimental-host-interrupt"]
 

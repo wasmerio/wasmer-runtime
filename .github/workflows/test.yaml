@@ -426,7 +426,7 @@ jobs:
           # Linux, so the test-capi stage runs them with its own feature sets.
           args=(--workspace --release --locked --exclude wasmer-c-api --exclude wasmer-c-api-imports
             --exclude wasmer-c-api-test-runner --exclude wasmer-capi-examples-runner)
-          features="$ARTIFACT_FEATURES,experimental-async,wasmer/experimental-host-interrupt,wasmer/unsafe-cothread"
+          features="$ARTIFACT_FEATURES,experimental-async,wasmer/experimental-host-interrupt"
           if [[ "$TEST_PLATFORM" == windows-x64 ]]; then
             # Use V8 as the default backend on Windows, as the Makefile did.
             features+=,v8-default

@@ -1,11 +1,8 @@
 //! Defines the [`Store`] data type and various useful traits and data types to interact with a
 //! store.
 
-/// Defines the [`AsStoreAsync`] trait and its supporting types.
-#[cfg(feature = "experimental-async")]
-mod async_;
-#[cfg(feature = "experimental-async")]
-pub use async_::*;
+mod allocation;
+pub(crate) use allocation::{AllocationInner, StoreAllocation};
 
 /// Defines the [`StoreContext`] type.
 mod context;
@@ -15,12 +12,6 @@ mod inner;
 
 /// Create temporary handles to engines.
 mod store_ref;
-
-/// Single-threaded async-aware RwLock.
-#[cfg(feature = "experimental-async")]
-mod local_rwlock;
-#[cfg(feature = "experimental-async")]
-pub(crate) use local_rwlock::*;
 
 use std::{
     boxed::Box,
@@ -33,8 +24,6 @@ mod obj;
 pub use obj::*;
 
 use crate::{AsEngineRef, BackendEngine, Engine, EngineRef};
-#[cfg(feature = "unsafe-cothread")]
-pub use context::Cothread;
 pub(crate) use context::*;
 pub(crate) use inner::*;
 use wasmer_types::StoreId;
@@ -53,7 +42,7 @@ use wasmer_vm::TrapHandlerFn;
 /// For more information, check out the [related WebAssembly specification]
 /// [related WebAssembly specification]: <https://webassembly.github.io/spec/core/exec/runtime.html#store>
 pub struct Store {
-    pub(crate) inner: Box<StoreInner>,
+    pub(crate) inner: StoreAllocation,
 }
 
 impl Store {
@@ -77,10 +66,7 @@ impl Store {
         };
 
         Self {
-            inner: Box::new(StoreInner {
-                objects: StoreObjects::from_store_ref(&store),
-                store,
-            }),
+            inner: StoreAllocation::new(store),
         }
     }
 
@@ -176,16 +162,6 @@ impl Store {
     #[cfg(all(unix, feature = "experimental-host-interrupt"))]
     pub fn interrupter(&self) -> Interrupter {
         self.inner.objects.interrupter()
-    }
-
-    #[cfg(feature = "experimental-async")]
-    /// Transforms this store into a [`StoreAsync`] which can be used
-    /// to invoke [`Function::call_async`](crate::Function::call_async).
-    pub fn into_async(self) -> StoreAsync {
-        StoreAsync {
-            id: self.id(),
-            inner: LocalRwLock::new(self.inner),
-        }
     }
 }
 
