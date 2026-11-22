@@ -62,19 +62,36 @@ async fn settle() {
     }
 }
 
-struct Gate(Rc<Cell<bool>>);
+/// What a test opens to let the host futures that wait for it go on.
+#[derive(Default)]
+struct GateState {
+    open: Cell<bool>,
+    waiting: RefCell<Vec<Waker>>,
+}
+
+impl GateState {
+    fn set(&self, open: bool) {
+        self.open.set(open);
+        for waker in self.waiting.take() {
+            waker.wake();
+        }
+    }
+}
+
+struct Gate(Rc<GateState>);
 impl Future for Gate {
     type Output = ();
-    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
-        if self.0.get() {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0.open.get() {
             Poll::Ready(())
         } else {
+            self.0.waiting.borrow_mut().push(cx.waker().clone());
             Poll::Pending
         }
     }
 }
 
-fn waiter(store: &mut Store, gate: Rc<Cell<bool>>) -> Function {
+fn waiter(store: &mut Store, gate: Rc<GateState>) -> Function {
     async_host(
         store,
         FunctionType::new(vec![], vec![]),
@@ -116,7 +133,7 @@ fn wait_bump_guest(store: &mut Store, wait: Function, bump: Function) -> Functio
 async fn a_store_handle_under_a_forgotten_call_is_refused() {
     let mut store: &'static mut Store = Box::leak(Box::new(Store::default()));
     let env = FunctionEnv::new(&mut store, 0u64);
-    let gate = Rc::new(Cell::new(false));
+    let gate = Rc::new(GateState::default());
     let wait = waiter(store, gate.clone());
     let bump = Function::new_typed_with_env(&mut store, &env, bump);
     let run = wait_bump_guest(store, wait, bump);
@@ -144,7 +161,7 @@ async fn a_store_handle_under_a_forgotten_call_is_refused() {
 #[wasm_bindgen_test]
 async fn two_guests_woken_together_keep_their_imports() {
     let mut store = Store::default();
-    let gate = Rc::new(Cell::new(false));
+    let gate = Rc::new(GateState::default());
     let seen = Rc::new(RefCell::new(Vec::new()));
     let wait = async_host(&mut store, FunctionType::new(vec![Type::I32], vec![]), {
         let (gate, seen) = (gate.clone(), seen.clone());
@@ -219,7 +236,7 @@ async fn two_guests_woken_together_keep_their_imports() {
 async fn a_cancelled_guests_host_function_is_refused() {
     let mut store = Store::default();
     let env = FunctionEnv::new(&mut store, 0u64);
-    let gate = Rc::new(Cell::new(false));
+    let gate = Rc::new(GateState::default());
     let wait = waiter(&mut store, gate.clone());
     let bump = Function::new_typed_with_env(&mut store, &env, bump);
     let run = wait_bump_guest(&mut store, wait, bump);
@@ -262,7 +279,7 @@ fn replace_vec(mut env: FunctionEnvMut<Vec<u8>>) {
 async fn a_forgotten_call_cannot_free_host_state() {
     let mut store: &'static mut Store = Box::leak(Box::new(Store::default()));
     let env = FunctionEnv::new(&mut store, vec![7u8; 64]);
-    let gate = Rc::new(Cell::new(false));
+    let gate = Rc::new(GateState::default());
     let wait = waiter(store, gate.clone());
     let replace = Function::new_typed_with_env(&mut store, &env, replace_vec);
     let run = wait_bump_guest(store, wait, replace);
@@ -288,7 +305,7 @@ async fn a_forgotten_call_cannot_free_host_state() {
 #[wasm_bindgen_test]
 async fn guests_woken_together_leave_the_store_usable() {
     let mut store = Store::default();
-    let gate = Rc::new(Cell::new(false));
+    let gate = Rc::new(GateState::default());
     let wait = async_host(&mut store, FunctionType::new(vec![Type::I32], vec![]), {
         let gate = gate.clone();
         move |_: &[Value]| {
@@ -364,16 +381,23 @@ fn guest_of(store: &mut Store, wait: Function) -> Function {
     instance.exports.get_function("run").unwrap().clone()
 }
 
+/// The engine suspends a guest for every async import, also a ready one, and
+/// refuses to where the guest was entered synchronously.
 #[wasm_bindgen_test]
-fn a_ready_import_works_on_a_sync_call() {
+fn an_async_import_fails_on_a_sync_call() {
     let mut store = Store::default();
     let wait = ready_import(&mut store);
     let run = guest_of(&mut store, wait);
-    assert_eq!(run.call(&mut store, &[]).unwrap()[0].unwrap_i32(), 7);
+    let error = run.call(&mut store, &[]).unwrap_err();
+    assert_eq!(
+        error.clone().to_trap(),
+        Some(wasmer_types::TrapCode::YieldOutsideAsyncContext),
+        "{error}"
+    );
 }
 
 #[wasm_bindgen_test]
-fn a_ready_import_works_in_a_start_function() {
+fn an_async_import_fails_in_a_start_function() {
     let mut store = Store::default();
     let wait = ready_import(&mut store);
     let module = Module::new(
@@ -386,9 +410,7 @@ fn a_ready_import_works_in_a_start_function() {
     )
     .unwrap();
     let imports = imports! { "h" => { "wait" => wait } };
-    let instance = Instance::new(&mut store, &module, &imports).unwrap();
-    let started = instance.exports.get_global("started").unwrap();
-    assert_eq!(started.get(&mut store).unwrap_i32(), 7);
+    assert!(Instance::new(&mut store, &module, &imports).is_err());
 }
 
 /// A JavaScript exception crosses a host slice without running its Rust
@@ -423,7 +445,7 @@ async fn an_exception_does_not_disable_the_guard() {
     let throwing = guest_of(&mut store, throws);
     assert!(throwing.call_async(&mut store, &[]).await.is_err());
 
-    let gate = Rc::new(Cell::new(false));
+    let gate = Rc::new(GateState::default());
     let wait = waiter(&mut store, gate);
     let bump_env = FunctionEnv::new(&mut store, 0u64);
     let bump = Function::new_typed_with_env(&mut store, &bump_env, bump);
@@ -506,10 +528,6 @@ async fn a_call_dropped_by_its_host_function_keeps_the_store_held() {
     let mut shared = store.into_shared();
     let mut call: Call = Box::pin(run.call_async(&mut shared, &[]));
     assert!(poll(call.as_mut()).is_pending());
-    for _ in 0..3 {
-        tick().await;
-    }
-    assert!(poll(call.as_mut()).is_pending());
     SLOT.with(|slot| *slot.borrow_mut() = Some(call));
     settle().await;
     assert_eq!(OBSERVED.get(), Some((false, 1)));
@@ -543,10 +561,6 @@ async fn the_owner_is_refused_inside_a_forgotten_calls_slice() {
 
     let mut call = Box::pin(run.call_async(&mut store, &[]));
     assert!(poll(call.as_mut()).is_pending());
-    for _ in 0..3 {
-        tick().await;
-    }
-    assert!(poll(call.as_mut()).is_pending());
     std::mem::forget(call);
     OWNER.with(|owner| *owner.borrow_mut() = Some(store));
     OBSERVED.set(None);
@@ -561,7 +575,7 @@ async fn the_owner_is_refused_inside_a_forgotten_calls_slice() {
 /// A forgotten exclusive call made from a slice keeps the shared store held.
 #[wasm_bindgen_test]
 fn a_forgotten_call_from_a_slice_keeps_the_shared_store_busy() {
-    let gate = Rc::new(Cell::new(false));
+    let gate = Rc::new(GateState::default());
     let mut store = Store::default();
     let wait = waiter(&mut store, gate);
     let env = FunctionEnv::new(&mut store, 0u64);

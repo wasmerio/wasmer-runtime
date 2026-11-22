@@ -170,7 +170,8 @@ impl Function {
     ///
     /// The function reaches the store with [`AsyncEnv::with`]. Called through
     /// [`Function::call_async`], it may wait. Called synchronously, it must be
-    /// ready at once, or the guest traps with `YieldOutsideAsyncContext`.
+    /// ready at once, or the guest traps with `YieldOutsideAsyncContext`; on
+    /// `js` it traps there either way.
     #[cfg(feature = "experimental-async")]
     pub fn new_async<T, FT, F>(
         store: &mut impl AsStoreMut,
@@ -379,8 +380,8 @@ impl Function {
     /// A guest suspends only where no host function holds its store. A guest
     /// called by a synchronous host function cannot suspend, and an async
     /// import it calls traps with `YieldOutsideAsyncContext` unless it is
-    /// ready at once. A host function that needs to wait must be async and
-    /// pass its `AsyncEnv` here.
+    /// ready at once (on `js`, also then). A host function that needs to wait
+    /// must be async and pass its `AsyncEnv` here.
     ///
     /// Dropping the call discards the guest's stack without running guest or
     /// host code, and leaves the instance usable with partial guest state, as
@@ -389,9 +390,13 @@ impl Function {
     /// On `sys`, the coroutine has a fixed stack of 1 MiB, on which the host
     /// functions the guest calls run. Host futures are polled on the
     /// executor's stack. On `js`, the engine suspends the guest's stack
-    /// (JSPI), host futures run only while the call is polled, and JavaScript
-    /// that Wasmer never saw must not call a guest's export while a guest of
-    /// the same store runs. On `v8`, the guest stays on the calling stack, so
+    /// (JSPI) and runs the call: after its first poll it makes progress
+    /// whether or not it is polled again, host futures run on the microtask
+    /// queue, an async import never works for a guest that was entered
+    /// synchronously, and a dropped call whose guest the engine has already
+    /// resumed runs guest code until its next import. JavaScript that Wasmer
+    /// never saw must not call a guest's export while a guest of the same
+    /// store runs. On `v8`, the guest stays on the calling stack, so
     /// `poll` blocks while an import's future is driven, and a
     /// [`SharedStore`](crate::SharedStore) task whose import must wait fails
     /// with a trap.

@@ -36,9 +36,9 @@ thread_local! {
 /// nothing to mark.
 ///
 /// Synchronous calls of this crate mark the guest they enter, and the host
-/// functions it makes, and the JavaScript functions it is given, mark
-/// whatever they run: a guest entered from inside one, also by JavaScript
-/// that calls an export directly, is beneath a JavaScript frame.
+/// functions it makes mark whatever they run: a guest entered from inside
+/// one, also by JavaScript that calls an export directly, is beneath a
+/// JavaScript frame.
 #[inline]
 pub(crate) fn enter_sync() -> EnteredGuest {
     EnteredGuest::new(true)
@@ -58,8 +58,8 @@ pub(crate) fn entered_synchronously() -> bool {
 }
 
 /// Marks what runs from now on as entered synchronously, or not, and returns
-/// how it was marked before: for the JavaScript functions an embedder gives,
-/// which JavaScript calls (see `jspi`).
+/// how it was marked before: for a guest the engine resumes, and for what an
+/// exception boundary puts back (see `jspi` and `boundary`).
 #[cfg(feature = "experimental-async")]
 pub(crate) fn mark_entered(synchronously: bool) -> bool {
     ENTERED_SYNCHRONOUSLY.replace(synchronously)
@@ -735,8 +735,8 @@ where
 {
     /// The body of the `WebAssembly.Suspending` import a guest calls, given
     /// the arguments in an array: it returns the promise the guest waits on.
-    /// Nothing of the host function runs here: the future is polled by the
-    /// call, once the guest waits and the store is free.
+    /// Nothing of the host function runs here: its future runs on the
+    /// microtask queue, once the guest waits.
     ///
     /// Parameters that are all numbers arrive as they are, with no array in
     /// between; the body is then the function itself. Returns the body, and

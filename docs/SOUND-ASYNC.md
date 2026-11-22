@@ -373,27 +373,28 @@ view, and V8's C API cannot switch stacks.
 |  | `sys` | JavaScript (JSPI) | V8 |
 | --- | --- | --- | --- |
 | Guest stack | `corosensei` coroutine owned by the call future | Engine-owned JSPI stack | The calling OS stack, never suspended |
-| Level 1 | Full | Full, with the guest guard below. Host futures run only inside `poll` | Yes: `poll` blocks while a pending import's future is driven |
+| Level 1 | Full | Full, with the guest guard below. The engine drives the call: host futures run on the microtask queue | Yes: `poll` blocks while a pending import's future is driven |
 | Level 2 overlap | Full | Full, with the guest guard below | Lexical nesting only; stacks cannot resume out of order, so a task whose import must wait fails with a trap |
-| Cancellation | Drop the host future, then discard the stack | Unwind with an uncatchable trap. A guest already woken runs until it leaves the stack, with its host functions refused | Not possible during an import, because `poll` has not returned |
+| Cancellation | Drop the host future, then discard the stack | Drop the host future and unwind with an uncatchable trap. A guest already resumed runs until its next import, which is refused | Not possible during an import, because `poll` has not returned |
 | Runtime check that remains | Wrong-store handles | Guest guard, and a lend or live call for each host function | Thread and store ownership checks |
 
 **JavaScript needs a private guest guard, because the engine resumes a guest
 from a microtask with no `poll` on the stack.** The borrow cannot protect that
 slice. A forgotten call ends the borrow while its guest can still run and reach
-the store. The guard has three rules:
+the store. JavaScript runs one thing at a time, and a microtask only on an
+empty stack, so a resumed guest never overlaps other code that uses the store:
+a guest holds nothing, and only host code takes the store, one synchronous
+slice at a time. What is left for the guard is how long the borrow lasts:
 
-1. A started guest co-owns the store's allocation until it leaves the engine's
-   stack, so dropping the `Store` cannot free memory under it.
-2. A call that is neither finished nor dropped marks the store as held. If its
-   borrow ended anyway because the call was forgotten, every public store entry
-   panics until the guest leaves.
-3. Dropping a call marks its guest cancelled. If the engine can no longer be
-   stopped from resuming it, its host functions fail without touching the store,
-   and the store is usable at once. A new guest call waits for that guest to
-   leave the stack, or fails if it is synchronous.
+1. A call that is neither finished nor dropped co-owns the store's allocation,
+   so dropping the `Store` cannot free memory under it.
+2. It also marks the store as held. If its borrow ended anyway because the call
+   was forgotten, every public store entry panics until its guest is done.
 
-This is one flag and one owner per call, not a lock. Any JavaScript can also
+Dropping a call gives the store up at once: the host functions of its guest
+fail without touching the store.
+
+This is one counter per store, not a lock. Any JavaScript can also
 call a host function, so each host function still checks for a current lend or
 live call. The existing limit stays documented: JavaScript that Wasmer never saw
 must not call a guest's export while a guest of that store runs.

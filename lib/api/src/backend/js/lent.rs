@@ -10,8 +10,8 @@
 //! `Instance::new` for the start function, and `Function::call_async` for the
 //! slice of its guest that it runs. A host function runs with the store the
 //! innermost call lends, if that is its own. Otherwise it fails, and touches
-//! nothing. In a slice of a guest of `call_async` that JavaScript resumed,
-//! which no call lends anything, it runs with the store the guest holds.
+//! nothing. In a guest of `call_async` that the engine resumed, which no call
+//! lends anything, it runs with the store of that guest's call (see `jspi`).
 //!
 //! A host function holds the store it runs with until it returns, and no
 //! other host function can run with it meanwhile. The calls it makes lend the
@@ -88,9 +88,6 @@ pub(crate) struct Lend {
 /// reaches, until the returned guard is dropped. Fails if calls nest too
 /// deeply already.
 pub(crate) fn lend(store: &mut StoreMut<'_>) -> Result<Lend, RuntimeError> {
-    // A synchronous guest call cannot wait for a cancelled guest to leave.
-    #[cfg(feature = "experimental-async")]
-    store.inner.guard.refuse_sync_entry()?;
     let id = store.objects_mut().id();
     lend_raw(id, &mut *store.inner)
 }
@@ -143,7 +140,7 @@ pub(crate) fn restore((depth, held): (usize, bool)) {
 pub(crate) enum Hold {
     /// The flag of the lend held, in the thread's lends.
     Lend(*const Cell<bool>),
-    /// The store a guest of `call_async` that JavaScript resumed holds.
+    /// The store of the call of a guest that the engine resumed.
     #[cfg(feature = "experimental-async")]
     Running(crate::js::jspi::Held),
 }
@@ -467,7 +464,7 @@ mod tests {
 
     /// A slice of a guest of `call_async` that JavaScript resumes, once
     /// what the guest waited for is ready, runs with no call that lends a
-    /// store: its host functions run with the store the guest holds.
+    /// store: its host functions run with the store of its call.
     #[cfg(feature = "experimental-async")]
     #[wasm_bindgen_test]
     async fn a_resumed_guest_runs_its_host_functions_with_its_store() {
@@ -651,7 +648,7 @@ mod tests {
     }
 
     /// A host function of a slice of a guest of `call_async` that JavaScript
-    /// resumed holds the store the guest holds, the same way.
+    /// resumed holds the store of its call, the same way.
     #[cfg(feature = "experimental-async")]
     #[wasm_bindgen_test]
     async fn a_host_function_of_a_resumed_guest_holds_its_store() {

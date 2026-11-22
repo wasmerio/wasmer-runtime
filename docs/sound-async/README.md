@@ -29,7 +29,7 @@ the API was replaced directly.
 | Area | State |
 | --- | --- |
 | `sys` Level 1 and Level 2 | Done |
-| JavaScript and the guest guard | Done, in `lib/api/src/backend/js/guard.rs`. Host futures run only inside `Call::poll` |
+| JavaScript and the guest guard | Done, in `lib/api/src/backend/js/guard.rs`. The engine drives the call: host futures run on the microtask queue, and a guest holds nothing while it runs or waits |
 | V8 | Done. `poll` blocks during an exclusive call's import, so another thread must wake it. A synchronous entry or a `SharedStore` task fails if its import must wait |
 | WASIX and NAPI ports | **Not done.** They live on `next` |
 
@@ -38,8 +38,10 @@ Differences from the proposal's signatures:
 - `new_async` and `new_typed_async` require `T: Send + 'static`, which every
   `FunctionEnv<T>` already needs to exist.
 - A guest whose call was dropped now fails at its next host function, even if
-  it holds no wait. That follows guard rule 3, and one PR 16 test was changed
-  to expect it.
+  it holds no wait, and one PR 16 test was changed to expect it.
+- On JavaScript, an async import fails for a guest that was entered
+  synchronously even if it is ready at once: the engine suspends a guest for
+  every `WebAssembly.Suspending` import, and refuses to there.
 
 Rules added after reviewing this branch against an alternative implementation:
 
