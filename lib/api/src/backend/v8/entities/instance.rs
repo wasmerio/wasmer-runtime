@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 use crate::{
-    AsStoreMut, AsStoreRef, Exports, Extern, Imports, InstantiationError, Module,
+    AsStoreMut, AsStoreRef, Exports, Extern, Imports, InstantiationError, Module, RuntimeError,
     backend::v8::bindings::*, v8::error::Trap, vm::VMExtern,
 };
 
@@ -20,7 +20,7 @@ impl InstanceHandle {
         store: *mut wasm_store_t,
         module: *mut wasm_shared_module_t,
         mut externs: Vec<VMExtern>,
-    ) -> Result<Self, InstantiationError> {
+    ) -> Result<Self, RuntimeError> {
         let mut trap: *mut wasm_trap_t = std::ptr::null_mut() as _;
 
         let externs: Vec<_> = externs.into_iter().map(|v| v.unwrap_v_8()).collect();
@@ -44,7 +44,7 @@ impl InstanceHandle {
 
         if instance.is_null() {
             let trap = Trap::from(trap);
-            return Err(InstantiationError::Start(trap.into()));
+            return Err(trap.into());
         }
 
         Ok(Self(instance))
@@ -121,11 +121,20 @@ impl Instance {
             .iter()
             .map(|extern_| extern_.to_vm_extern())
             .collect::<Vec<_>>();
-        let instance = InstanceHandle::new(
-            store_ref.inner.store.as_v8().inner,
-            module.as_v8().handle.v8_shared_module_handle,
-            externs,
-        )?;
+        let raw_store = store_ref.inner.store.as_v8().inner;
+        let instantiate = || {
+            InstanceHandle::new(
+                raw_store,
+                module.as_v8().handle.v8_shared_module_handle,
+                externs,
+            )
+        };
+        #[cfg(feature = "experimental-async")]
+        let instance =
+            crate::backend::v8::async_call::enter(&mut store.as_store_mut(), instantiate)
+                .map_err(InstantiationError::Start)?;
+        #[cfg(not(feature = "experimental-async"))]
+        let instance = instantiate().map_err(InstantiationError::Start)?;
         let exports = instance.get_exports(store, module);
 
         Ok((

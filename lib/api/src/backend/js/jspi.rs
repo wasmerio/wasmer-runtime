@@ -6,8 +6,9 @@
 //! its store while it runs, and what it is waiting for.
 //!
 //! * An async host function is a JavaScript function, [`host_function`],
-//!   which a guest imports as a `WebAssembly.Suspending` function. Its body,
-//!   [`start`], runs on the guest's stack: it keeps the host future, and
+//!   which a guest imports through a Wasm adapter. The adapter selects a
+//!   plain entry for synchronous calls and `WebAssembly.Suspending` for async
+//!   calls. On the async path its body, [`start`], keeps the host future and
 //!   returns the promise the guest waits on. Called directly by `call_async`,
 //!   the function itself stands for the guest's promising function, and the
 //!   call returns what the host future returned, as it is.
@@ -24,13 +25,12 @@
 //! * The host future of an async import belongs to the activation and is
 //!   polled with the caller's waker: first in the microtask that sees the
 //!   guest wait, then by the future of the call whenever that is woken.
-//! * The engine refuses to suspend a guest that was entered by a synchronous
-//!   call, or that has another JavaScript frame on the stack since it was
-//!   entered, and some engines run the body of the import before they
-//!   refuse. So the body does nothing that cannot be undone: the store is
-//!   given up, and the host future polled, only once a microtask after the
-//!   guest's slice has seen it waiting ([`check`]). The engine's error for a
-//!   refusal is taken for the one other backends give ([`refusal`]).
+//! * Synchronous entries poll an async import once using the caller's loan:
+//!   ready results return directly and `Pending` traps. On an async entry,
+//!   some engines run the import before refusing to suspend a guest beneath
+//!   a JavaScript frame. That path gives up the store and polls the host only
+//!   after a microtask confirms the wait ([`check`]); the engine's refusal is
+//!   translated to the same trap as other backends ([`refusal`]).
 //! * The store changes hands only where this module sees the guest move: it
 //!   is given up when the guest waits in an async host function, or unwinds,
 //!   and when its promise settles. A guest suspended anywhere else, in a
@@ -55,7 +55,8 @@ use std::{
 
 use js_sys::{Array, Function, Reflect};
 use wasm_bindgen::{
-    JsValue,
+    JsCast, JsValue,
+    closure::ScopedClosure,
     prelude::{Closure, wasm_bindgen},
 };
 use wasmer_types::{FunctionType, StoreId, TrapCode, Type};
@@ -63,9 +64,10 @@ use wasmer_types::{FunctionType, StoreId, TrapCode, Type};
 use crate::{
     AsStoreRef, AsyncCallRequest, BackendTrap, CallStore, PollScope, PollStore, RuntimeError,
     SharedStore, StoreInner, StoreMut, StoreSlice, Value,
+    entities::function::call_wrapper::call_wrapped,
     js::{
         error::Trap,
-        function::{enter_async, entered_synchronously},
+        function::{enter_async, enter_sync, entered_synchronously},
         guard::GuestGuard,
         utils::convert::{AsJs as _, js_value_to_wasmer},
     },
@@ -133,7 +135,7 @@ struct Activation {
     /// How the guest's promise settled.
     result: RefCell<Option<Result<JsValue, JsValue>>>,
     /// Whoever awaits the call: the waker of its last poll.
-    caller: RefCell<Option<Waker>>,
+    caller: Rc<RefCell<Option<Waker>>>,
     /// The call is being polled and is entering the guest. It looks at the
     /// activation again when the guest leaves the stack, and need not be woken.
     entering: Cell<bool>,
@@ -163,6 +165,8 @@ struct Activations {
 const FIRST_TOKEN: i32 = 1;
 
 thread_local! {
+    /// Cleanup metadata owned outside the JavaScript host frames it protects.
+    static HOSTS: RefCell<Vec<HostCheckpoint>> = const { RefCell::new(Vec::new()) };
     /// Every activation that is not done, by token.
     static ACTIVATIONS: RefCell<Activations> = const {
         RefCell::new(Activations {
@@ -174,9 +178,12 @@ thread_local! {
     /// There is at most one per store, and a guest that waits is not in here,
     /// so there are few.
     static RUNNING: RefCell<Vec<Rc<Activation>>> = const { RefCell::new(Vec::new()) };
-    /// The activation of a direct call of an async host function, while
-    /// [`Call::enter`] calls it: the body runs for that call, and no other.
-    static DIRECT: RefCell<Option<Rc<Activation>>> = const { RefCell::new(None) };
+    /// A direct call of an async host function, consumed by its body before
+    /// polling so that nested calls cannot take its activation or results.
+    static DIRECT: RefCell<Option<Direct>> = const { RefCell::new(None) };
+    /// A host import being driven by a synchronous entry. Nested calls through
+    /// its AsyncEnv must also finish synchronously rather than start JSPI.
+    static SYNC_IMPORT: Cell<bool> = const { Cell::new(false) };
     /// The last wait any guest of the thread started: see `Activation::waits`.
     static LAST_WAIT: Cell<u32> = const { Cell::new(0) };
     /// The error of a trap was made: see [`prepare_trap`].
@@ -188,6 +195,9 @@ thread_local! {
         &Closure::wrap(Box::new(crate::js::function::mark_entered) as Box<dyn Fn(bool) -> bool>)
             .into_js_value(),
         &Closure::wrap(Box::new(woken) as Box<dyn Fn(i32)>).into_js_value(),
+        &Closure::wrap(Box::new(entered_synchronously) as Box<dyn Fn() -> bool>).into_js_value(),
+        &Closure::wrap(Box::new(enter_host) as Box<dyn Fn(usize) -> u32>).into_js_value(),
+        &Closure::wrap(Box::new(leave_host) as Box<dyn Fn(u32)>).into_js_value(),
     );
 }
 
@@ -211,10 +221,27 @@ thread_local! {
 // the import's body runs once the guest's slice is over.
 #[wasm_bindgen(inline_js = r#"
 const resolvers = [], rejecters = [];
-let done, check, mark, woken, trapError, wakes = 0;
+let done, check, mark, woken, entered, enterHost, leaveHost, trapError, wakes = 0;
 const pendingWakes = [], pendingValues = [];
-export function jspiInit(d, c, m, w) {
+export function jspiInit(d, c, m, w, e, h, l) {
   done = d; check = c; mark = m; woken = w;
+  entered = e; enterHost = h; leaveHost = l;
+}
+function hostBoundary(value, store, synchronous) {
+  const host = function (...args) {
+    const checkpoint = enterHost(store), previous = entered();
+    if (synchronous) mark(true);
+    try { return apply(value, this, args); }
+    finally { leaveHost(checkpoint); mark(previous); }
+  };
+  storeOf.set(host, store);
+  return host;
+}
+export function jspiSyncHost(value, store) { return hostBoundary(value, store, true); }
+export function jspiHostCallback(store, callback) {
+  const checkpoint = enterHost(store), previous = mark(true);
+  try { callback(); }
+  finally { leaveHost(checkpoint); mark(previous); }
 }
 export function jspiPrepareTrap() {
   if (trapError !== undefined) return;
@@ -230,8 +257,14 @@ export function jspiForgetTrap() {
   trapError = undefined;
 }
 const suspendingOf = new WeakMap(), hostOf = new WeakMap(), storeOf = new WeakMap();
+const adapterOf = new WeakMap();
+export function jspiAdapter(host, adapter) {
+  adapterOf.set(host, adapter);
+  hostOf.set(adapter, host);
+  storeOf.set(adapter, storeOf.get(host));
+}
 export function jspiHost(start, array, store) {
-  const host = array ? (...args) => start(args) : start;
+  const host = hostBoundary(array ? (...args) => start(args) : start, store, false);
   const suspending = new WebAssembly.Suspending(host);
   suspendingOf.set(host, suspending);
   hostOf.set(suspending, host);
@@ -251,7 +284,7 @@ export function jspiIsHost(value) {
   return suspendingOf.has(value);
 }
 export function jspiImport(value, kinds) {
-  return suspendingOf.get(value) ?? embedderFunction(value, kinds);
+  return adapterOf.get(value) ?? suspendingOf.get(value) ?? embedderFunction(value, kinds);
 }
 const apply = Reflect.apply, markedOf = new WeakMap(), embedderOf = new WeakMap();
 const wasmFunctions = new WeakSet();
@@ -317,7 +350,7 @@ export function jspiIsWasmFunction(value) {
   return isWasmFunction(value);
 }
 export function jspiPublic(value) {
-  return suspendingOf.get(value) ?? value;
+  return adapterOf.get(value) ?? suspendingOf.get(value) ?? value;
 }
 export function jspiWait(token) {
   return new Promise((resolve, reject) => { resolvers[token] = resolve; rejecters[token] = reject; });
@@ -386,7 +419,19 @@ export function jspiSettle(promise, token) {
 "#)]
 extern "C" {
     #[wasm_bindgen(js_name = jspiInit)]
-    fn shim_init(done: &JsValue, check: &JsValue, mark: &JsValue, woken: &JsValue);
+    fn shim_init(
+        done: &JsValue,
+        check: &JsValue,
+        mark: &JsValue,
+        woken: &JsValue,
+        entered: &JsValue,
+        enter_host: &JsValue,
+        leave_host: &JsValue,
+    );
+    #[wasm_bindgen(js_name = jspiSyncHost)]
+    fn shim_sync_host(value: &JsValue, store: usize) -> Function;
+    #[wasm_bindgen(js_name = jspiHostCallback, catch)]
+    fn shim_host_callback(store: usize, callback: &JsValue) -> Result<(), JsValue>;
     #[wasm_bindgen(js_name = jspiPrepareTrap, catch)]
     fn shim_prepare_trap() -> Result<(), JsValue>;
     #[wasm_bindgen(js_name = jspiTrapError)]
@@ -397,6 +442,8 @@ extern "C" {
     fn shim_forget_trap();
     #[wasm_bindgen(js_name = jspiHost)]
     fn shim_host(start: &JsValue, array: bool, store: f64) -> Function;
+    #[wasm_bindgen(js_name = jspiAdapter)]
+    fn shim_adapter(host: &JsValue, adapter: &JsValue);
     #[wasm_bindgen(js_name = jspiOwn)]
     fn shim_own(value: &JsValue, store: f64);
     #[wasm_bindgen(js_name = jspiOwner)]
@@ -495,8 +542,8 @@ fn deliverable(values: &[Value]) -> Result<(), RuntimeError> {
 
 /// The function of an async host function of the store `store`: `start`,
 /// which returns the promise the guest waits on, or, if it takes an `array`,
-/// a function that calls it with its arguments in one. A guest imports it as
-/// a `WebAssembly.Suspending` function, which it keeps (see [`import`]).
+/// a function that calls it with its arguments in one. A guest imports the
+/// Wasm adapter that selects the synchronous or suspending form (see [`import`]).
 ///
 /// # Panics
 /// Panics if the signature has a type JavaScript has no value of, or takes a
@@ -522,13 +569,48 @@ pub(crate) fn host_function(
         );
     }
     SHIM.with(|_| ());
-    shim_host(start, array, store.as_raw().get() as f64)
+    let host = shim_host(start, array, store.as_raw().get() as f64);
+    dispatch_import(ty, &host);
+    host
+}
+
+fn check_params(params: &[Value], signature: &FunctionType) -> Result<(), RuntimeError> {
+    if params.len() != signature.params().len()
+        || params
+            .iter()
+            .zip(signature.params())
+            .any(|(param, ty)| param.ty() != *ty)
+    {
+        let types: Vec<String> = params.iter().map(|param| param.ty().to_string()).collect();
+        return Err(RuntimeError::new(format!(
+            "Parameters of type [{}] did not match signature {signature}",
+            types.join(", "),
+        )));
+    }
+    Ok(())
+}
+
+fn check_results(values: &[Value], signature: &FunctionType) -> Result<(), RuntimeError> {
+    if !crate::js::function::values_match(values, signature.results()) {
+        let types: Vec<String> = values.iter().map(|value| value.ty().to_string()).collect();
+        return Err(RuntimeError::new(format!(
+            "an async host function returned values of type [{}], which do not \
+             match the signature it is called with, {signature}",
+            types.join(", "),
+        )));
+    }
+    Ok(())
 }
 
 /// Records that `function`, a host function this crate made for the store
 /// `id`, belongs to it: what it runs reaches that store through a pointer.
 pub(crate) fn own(function: &JsValue, id: StoreId) {
     shim_own(function, id.as_raw().get() as f64);
+}
+
+pub(crate) fn sync_host(function: &JsValue, id: StoreId) -> Function {
+    SHIM.with(|_| ());
+    shim_sync_host(function, id.as_raw().get())
 }
 
 /// Whether `function` can be used with the store `id`: a host function this
@@ -545,7 +627,7 @@ pub(crate) fn foreign_store_error() -> RuntimeError {
 }
 
 /// What a guest imports for `value`, a function of the type `ty`: the
-/// `WebAssembly.Suspending` form of an async host function; for a JavaScript
+/// Wasm adapter of an async host function; for a JavaScript
 /// function an embedder gave, a function that marks what it runs as entered
 /// synchronously (see [`suspendable`]), calls `value` with its receiver and
 /// arguments, and makes of what it returns the primitives the engine takes
@@ -574,8 +656,8 @@ pub(crate) fn import(value: &JsValue, ty: &FunctionType) -> JsValue {
 }
 
 /// The function `value` stands for, given to this crate: the async host
-/// function whose `WebAssembly.Suspending` form it is, as [`public`] gives
-/// it, or the embedder's own function for one [`import`] made; anything else
+/// function whose Wasm adapter or `WebAssembly.Suspending` form it is, or the
+/// embedder's own function for one [`import`] made; anything else
 /// as it is.
 pub(crate) fn host_of(value: &JsValue) -> JsValue {
     shim_host_of(value)
@@ -588,17 +670,156 @@ pub(crate) fn enters_a_guest(function: &JsValue) -> bool {
     shim_is_host(function) || shim_is_wasm_function(function)
 }
 
-/// What a function is given to JavaScript as: the `WebAssembly.Suspending`
-/// form of an async host function, which is what works outside a guest
-/// Wasmer instantiated, and anything else as it is.
+/// What a function is given to JavaScript as: the Wasm import adapter of an
+/// async host function, and anything else as it is.
 pub(crate) fn public(value: &JsValue) -> JsValue {
     shim_public(value)
 }
 
+/// Engines may reject a Suspending import before calling its body on a sync
+/// entry, even if the host future is ready. A Wasm frame selects the plain
+/// import on sync entry and the suspending import on async entry. A JavaScript
+/// dispatcher cannot do this: its frame would itself prevent suspension.
+fn dispatch_import(ty: &FunctionType, host: &js_sys::Function) -> js_sys::Function {
+    fn u32(out: &mut Vec<u8>, mut value: usize) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            out.push(byte | if value == 0 { 0 } else { 0x80 });
+            if value == 0 {
+                break;
+            }
+        }
+    }
+    fn section(wasm: &mut Vec<u8>, id: u8, contents: &[u8]) {
+        wasm.push(id);
+        u32(wasm, contents.len());
+        wasm.extend_from_slice(contents);
+    }
+    fn types(out: &mut Vec<u8>, types: &[wasmer_types::Type]) {
+        u32(out, types.len());
+        for ty in types {
+            out.push(match ty {
+                wasmer_types::Type::I32 => 0x7f,
+                wasmer_types::Type::I64 => 0x7e,
+                wasmer_types::Type::F32 => 0x7d,
+                wasmer_types::Type::F64 => 0x7c,
+                wasmer_types::Type::FuncRef => 0x70,
+                wasmer_types::Type::ExternRef => 0x6f,
+                _ => unreachable!("host_function checked JS-supported types"),
+            });
+        }
+    }
+    let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+    let mut signatures = vec![2, 0x60];
+    types(&mut signatures, ty.params());
+    types(&mut signatures, ty.results());
+    signatures.extend_from_slice(&[0x60, 0, 1, 0x7f]);
+    section(&mut wasm, 1, &signatures);
+    // (import "h" "mode" (func (type 1)))
+    // (import "h" "sync" (func (type 0)))
+    // (import "h" "wait" (func (type 0)))
+    let mut imports = vec![3];
+    for (name, ty) in [(b"mode", 1), (b"sync", 0), (b"wait", 0)] {
+        imports.extend_from_slice(&[1, b'h', 4]);
+        imports.extend_from_slice(name);
+        imports.extend_from_slice(&[0, ty]);
+    }
+    section(&mut wasm, 2, &imports);
+    section(&mut wasm, 3, &[1, 0]);
+    section(&mut wasm, 7, &[1, 3, b'r', b'u', b'n', 0, 3]);
+    let mut body = vec![0, 0x10, 0, 0x04, 0x40];
+    for index in 0..ty.params().len() {
+        body.push(0x20);
+        u32(&mut body, index);
+    }
+    body.extend_from_slice(&[0x10, 1, 0x0f, 0x0b]);
+    for index in 0..ty.params().len() {
+        body.push(0x20);
+        u32(&mut body, index);
+    }
+    body.extend_from_slice(&[0x10, 2, 0x0b]);
+    let mut code = vec![1];
+    u32(&mut code, body.len());
+    code.extend(body);
+    section(&mut wasm, 10, &code);
+    let module =
+        js_sys::WebAssembly::Module::new(&js_sys::Uint8Array::from(wasm.as_slice()).into())
+            .expect("valid async import adapter");
+    let imports = js_sys::Object::new();
+    let namespace = js_sys::Object::new();
+    let mode = Closure::wrap(
+        Box::new(|| i32::from(crate::js::function::entered_synchronously()))
+            as Box<dyn Fn() -> i32>,
+    )
+    .into_js_value();
+    Reflect::set(&namespace, &"mode".into(), &mode).unwrap();
+    Reflect::set(&namespace, &"sync".into(), host).unwrap();
+    Reflect::set(&namespace, &"wait".into(), &shim_public(host)).unwrap();
+    Reflect::set(&imports, &"h".into(), &namespace).unwrap();
+    let instance = js_sys::WebAssembly::Instance::new(&module, &imports)
+        .expect("valid async import adapter imports");
+    let adapter = Reflect::get(&instance.exports(), &"run".into()).unwrap();
+    shim_adapter(host, &adapter);
+    adapter.unchecked_into()
+}
+
+/// Whether the current host future borrows a synchronous entry or belongs to
+/// an async activation. An independent task polled inside a synchronous import
+/// must use its own mode, then restore the enclosing import's mode on return.
+struct ImportMode(bool);
+
+impl ImportMode {
+    fn enter(synchronous: bool) -> Self {
+        Self(SYNC_IMPORT.replace(synchronous))
+    }
+}
+
+impl Drop for ImportMode {
+    fn drop(&mut self) {
+        SYNC_IMPORT.set(self.0);
+    }
+}
+
+/// Keep the borrowed callback and its result outside the caught JS boundary.
+fn invoke_host<R>(id: StoreId, mut f: impl FnMut() -> R) -> Result<R, JsValue> {
+    let mut result = None;
+    let mut invoke = || result = Some(f());
+    let callback = ScopedClosure::borrow_mut_assert_unwind_safe(&mut invoke);
+    shim_host_callback(id.as_raw().get(), callback.as_ref())?;
+    drop(callback);
+    Ok(result.expect("host callback was invoked synchronously"))
+}
+
 impl Activation {
+    fn invoke_host<R>(&self, f: impl FnMut() -> R) -> Result<R, JsValue> {
+        let _mode = ImportMode::enter(false);
+        // A microtask-driven host can cancel its own call, releasing the
+        // activation's owner while a synchronous slice is still live. Keep
+        // the shared metadata alive above the caught boundary until every
+        // slice and its exception checkpoint have finished.
+        let _shared = self
+            .store
+            .borrow()
+            .as_ref()
+            .and_then(|store| store._shared.clone());
+        let _scope = PollScope::enter(self.poll_store());
+        let _mark = self.guard.mark();
+        invoke_host(self.store_id, f)
+    }
+
+    fn dispose_import(&self, import: ImportFuture) -> Result<(), JsValue> {
+        let mut import = Some(import);
+        // A throwing destructor must not be retried.
+        self.invoke_host(|| drop(import.take()))
+    }
+
     /// The guest goes on, with the store.
     fn switch_in(self: &Rc<Self>, slice: StoreSlice) {
-        debug_assert!(running(self.store_id).is_none(), "two guests run in one store");
+        debug_assert!(
+            running(self.store_id).is_none(),
+            "two guests run in one store"
+        );
         self.guard.acquire();
         *self.slice.borrow_mut() = Some(slice);
         RUNNING.with(|running| running.borrow_mut().push(self.clone()));
@@ -705,7 +926,7 @@ impl Activation {
     /// still holds the store.
     fn forget_refused_wait(&self) {
         if self.state.get() == State::Waiting && !self.accepted.get() {
-            drop(self.import.take());
+            self.drop_import();
             self.state.set(State::Running);
         }
     }
@@ -737,33 +958,39 @@ impl Activation {
         if self.state.get() != State::Waiting || !self.accepted.get() {
             return;
         }
-        let Some(store) = self.poll_store() else {
+        if self.poll_store().is_none() {
             return;
-        };
+        }
         if let Some(mut import) = self.import.take() {
             // A host future reaches the store in synchronous slices, so it
             // can only run while no guest holds the store.
             if !self.guard.is_free() {
                 *self.import.borrow_mut() = Some(import);
-                self.guard.wait(cx.waker());
+                self.guard.wait(&self.caller);
                 return;
             }
-            let outcome = {
-                let _scope = PollScope::enter(Some(store));
-                let _mark = self.guard.mark();
-                import.as_mut().poll(cx)
+            let outcome = match self.invoke_host(|| import.as_mut().poll(cx)) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // A foreign throw can leave the generator partially moved.
+                    // Its runtime capability owns no store. Revoke that
+                    // publication and leak the poisoned generator rather than
+                    // dropping it; arbitrary user captures may also leak.
+                    std::mem::forget(import);
+                    *self.error.borrow_mut() = Some(error.into());
+                    return self.unwind();
+                }
             };
             if self.state.get() != State::Waiting {
                 // The poll dropped the call.
-                let _scope = PollScope::enter(Some(store));
-                drop(import);
+                let _ = self.dispose_import(import);
                 return;
             }
             match outcome {
                 Poll::Ready(Ok(results)) => {
-                    {
-                        let _scope = PollScope::enter(Some(store));
-                        drop(import);
+                    if let Err(error) = self.dispose_import(import) {
+                        *self.error.borrow_mut() = Some(error.into());
+                        return self.unwind();
                     }
                     // A direct call returns them as they are, to no guest.
                     if !self.direct {
@@ -780,10 +1007,7 @@ impl Activation {
                     *self.results.borrow_mut() = Some(results);
                 }
                 Poll::Ready(Err(error)) => {
-                    {
-                        let _scope = PollScope::enter(Some(store));
-                        drop(import);
-                    }
+                    let _ = self.dispose_import(import);
                     *self.error.borrow_mut() = Some(error);
                     return self.unwind();
                 }
@@ -796,7 +1020,7 @@ impl Activation {
         match self.try_slice() {
             Some(slice) => self.resume(slice, now),
             // Another guest has the store: this one goes on when it leaves.
-            None => self.guard.wait(cx.waker()),
+            None => self.guard.wait(&self.caller),
         }
     }
 
@@ -847,9 +1071,7 @@ impl Activation {
     /// Drops the host future, with the store in reach of its destructor.
     fn drop_import(&self) {
         if let Some(import) = self.import.take() {
-            let _scope = PollScope::enter(self.poll_store());
-            let _mark = self.guard.mark();
-            drop(import);
+            let _ = self.dispose_import(import);
         }
     }
 }
@@ -868,21 +1090,79 @@ fn activation(token: i32) -> Option<Rc<Activation>> {
 fn running(id: StoreId) -> Option<Rc<Activation>> {
     RUNNING.with(|running| {
         let running = running.borrow();
-        running.iter().find(|activation| activation.store_id == id).cloned()
+        running
+            .iter()
+            .find(|activation| activation.store_id == id)
+            .cloned()
     })
 }
 
 /// A host function's hold on the store a guest of `call_async` holds: see
 /// [`hold_running`].
 pub(crate) struct Held {
-    activation: Rc<Activation>,
-    _mark: crate::js::guard::SliceMark,
+    // The registry owns this activation through the synchronous host entry.
+    // A JavaScript throw can skip Drop, so this guard must own no Rc.
+    token: i32,
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
-        self.activation.held.set(false);
+        release_host_hold(self.token);
     }
+}
+
+fn release_host_hold(token: i32) {
+    if token != 0
+        && let Some(activation) = activation(token)
+        && activation.held.replace(false)
+    {
+        activation.guard.leave_slice();
+    }
+}
+
+struct HostCheckpoint {
+    lends: u32,
+    context: (usize, u32),
+    poll: (Option<PollStore>, usize),
+    hold: i32,
+}
+
+fn enter_host(id: usize) -> u32 {
+    let hold = RUNNING.with(|running| {
+        running
+            .borrow()
+            .iter()
+            .find(|a| a.store_id.as_raw().get() == id && !a.held.get())
+            .map_or(0, |a| a.token)
+    });
+    let snapshot = HostCheckpoint {
+        lends: crate::js::lent::checkpoint(),
+        context: crate::StoreContext::checkpoint(),
+        poll: PollScope::checkpoint(),
+        hold,
+    };
+    HOSTS.with(|hosts| {
+        let mut hosts = hosts.borrow_mut();
+        let depth = hosts.len() as u32;
+        hosts.push(snapshot);
+        depth
+    })
+}
+
+fn leave_host(depth: u32) {
+    let snapshot = HOSTS.with(|hosts| {
+        let mut hosts = hosts.borrow_mut();
+        assert_eq!(hosts.len(), depth as usize + 1, "host boundaries must nest");
+        hosts.pop().unwrap()
+    });
+    // SAFETY: JavaScript finally runs after every interior frame has returned
+    // or been unwound. Only enclosing, still-live loans are restored.
+    crate::js::lent::restore(snapshot.lends);
+    unsafe {
+        crate::StoreContext::restore_checkpoint(snapshot.context.0, snapshot.context.1);
+        PollScope::restore_checkpoint(snapshot.poll);
+    }
+    release_host_hold(snapshot.hold);
 }
 
 /// The store whose raw id is `id`, if a guest entered by `call_async` runs
@@ -896,13 +1176,13 @@ impl Drop for Held {
 /// the store with the activation (see `Call::drop`). A woken guest is off the
 /// stack until its microtask, and dropping its call gives the store up, which
 /// a host function holding it would go on using.
-pub(crate) fn hold_running(
-    id: usize,
-) -> Option<Result<(*mut StoreInner, Held), RuntimeError>> {
+pub(crate) fn hold_running(id: usize) -> Option<Result<(*mut StoreInner, Held), RuntimeError>> {
     let activation = RUNNING.with(|running| {
         let running = running.borrow();
         let mut running = running.iter();
-        running.find(|activation| activation.store_id.as_raw().get() == id).cloned()
+        running
+            .find(|activation| activation.store_id.as_raw().get() == id)
+            .cloned()
     })?;
     let on_stack = match activation.state.get() {
         State::Running => true,
@@ -925,8 +1205,13 @@ pub(crate) fn hold_running(
     }
     let store = activation.store_ptr()?;
     activation.held.set(true);
-    let _mark = activation.guard.mark();
-    Some(Ok((store, Held { activation, _mark })))
+    activation.guard.enter_slice();
+    Some(Ok((
+        store,
+        Held {
+            token: activation.token,
+        },
+    )))
 }
 
 /// The error of an async host function whose guest cannot be suspended: it
@@ -982,19 +1267,112 @@ fn suspendable(id: StoreId) -> Result<Rc<Activation>, JsValue> {
     Ok(activation)
 }
 
-/// The body of an async host function of the store `id`. Returns the promise
-/// the guest waits on; nothing of the host function runs here.
+type ImmediateResults = Rc<RefCell<Option<Vec<Value>>>>;
+
+enum Direct {
+    Async(Rc<Activation>),
+    Immediate(StoreId, ImmediateResults),
+}
+
+/// The caller owns this guard above the caught JavaScript entry. `start`
+/// consumes its ticket, but an entry that throws before reaching it cannot
+/// leave that ticket for an unrelated call.
+struct DirectScope(Option<Direct>);
+
+impl DirectScope {
+    fn enter(direct: Direct) -> Self {
+        Self(DIRECT.with(|slot| slot.replace(Some(direct))))
+    }
+}
+
+impl Drop for DirectScope {
+    fn drop(&mut self) {
+        DIRECT.with(|slot| slot.replace(self.0.take()));
+    }
+}
+
+/// A nested synchronous `call_async` of a host preserves its Rust results,
+/// including reference values that JavaScript cannot decode or would await.
+fn call_immediate_host(
+    function: &Function,
+    id: StoreId,
+    store: &mut StoreMut<'_>,
+    params: &[Value],
+) -> Result<Vec<Value>, RuntimeError> {
+    let arguments = Array::new_with_length(params.len() as u32);
+    for (index, param) in params.iter().enumerate() {
+        arguments.set(index as u32, param.as_jsvalue(store));
+    }
+    let returned = Rc::new(RefCell::new(None));
+    call_wrapped(store, None, |store| {
+        let _lent = crate::js::lent::lend(store)?;
+        let _entered = enter_sync();
+        let _direct = DirectScope::enter(Direct::Immediate(id, returned.clone()));
+        Reflect::apply(function, &JsValue::NULL, &arguments)?;
+        Ok(())
+    })?;
+    Ok(returned
+        .take()
+        .expect("the direct host returned its results"))
+}
+
+/// The body of an async host function of the store `id`. An async entry keeps
+/// its future and returns a promise; a synchronous entry polls it once.
 pub(crate) fn start(
     id: StoreId,
     import: impl FnOnce() -> ImportFuture,
 ) -> Result<JsValue, JsValue> {
     let activation = match DIRECT.with(|direct| direct.borrow_mut().take()) {
-        Some(activation) if activation.store_id == id => activation,
+        Some(Direct::Async(activation)) if activation.store_id == id => activation,
+        Some(Direct::Immediate(store, returned)) if store == id => {
+            return immediate(id, import, Some(returned));
+        }
         Some(_) => return Err(Trap::user(Box::new(foreign_store_error())).into()),
+        None if entered_synchronously() || running(id).is_none() => {
+            return immediate(id, import, None);
+        }
         None => suspendable(id)?,
     };
     *activation.import.borrow_mut() = Some(import());
     Ok(activation.wait())
+}
+
+/// A synchronous import gets one poll on its caller's existing store loan.
+/// Pending is a trap; neither the future nor a nested guest may outlive it.
+fn immediate(
+    id: StoreId,
+    import: impl FnOnce() -> ImportFuture,
+    returned: Option<ImmediateResults>,
+) -> Result<JsValue, JsValue> {
+    let (ptr, _hold) = crate::js::lent::hold(id.as_raw().get()).map_err(|_| cannot_suspend())?;
+    let _scope = PollScope::enter(Some(PollStore::exclusive(id, ptr)));
+    let _mode = ImportMode::enter(true);
+    let mut future = import();
+    let mut cx = Context::from_waker(Waker::noop());
+    let outcome = match invoke_host(id, || future.as_mut().poll(&mut cx)) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            // A foreign exception can leave a generator partially moved.
+            // Its runtime capability is borrowed; user captures may leak.
+            std::mem::forget(future);
+            return Err(error);
+        }
+    };
+    let mut future = Some(future);
+    invoke_host(id, || drop(future.take()))?;
+    match outcome {
+        Poll::Ready(Ok(values)) => {
+            if let Some(returned) = returned {
+                *returned.borrow_mut() = Some(values);
+                return Ok(JsValue::UNDEFINED);
+            }
+            // SAFETY: the synchronous host hold keeps this loan exclusive.
+            let store = unsafe { StoreMut::from_raw(ptr) };
+            Ok(results(&values, &store))
+        }
+        Poll::Ready(Err(error)) => Err(Trap::user(Box::new(error)).into()),
+        Poll::Pending => Err(cannot_suspend()),
+    }
 }
 
 /// The microtask after the slice in which a guest started its `wait`th wait:
@@ -1106,7 +1484,7 @@ impl Call {
                 returned: RefCell::new(None),
                 error: RefCell::new(None),
                 result: RefCell::new(None),
-                caller: RefCell::new(None),
+                caller: Rc::default(),
                 entering: Cell::new(true),
                 waits: Cell::new(0),
                 accepted: Cell::new(false),
@@ -1125,7 +1503,9 @@ impl Call {
         // A promising function returns a promise, or throws before it enters
         // the guest. The reaction is attached here, before anything else can
         // run: a rejection nobody handles ends the process on some hosts.
-        let store_ptr = activation.store_ptr().expect("the activation holds its store");
+        let store_ptr = activation
+            .store_ptr()
+            .expect("the activation holds its store");
         let lent = prepare_trap()
             .map_err(|error| {
                 RuntimeError::new(format!(
@@ -1140,12 +1520,8 @@ impl Call {
             Ok(_lent) => {
                 let _mark = guard.mark();
                 let _entered = enter_async();
-                if direct {
-                    DIRECT.with(|slot| *slot.borrow_mut() = Some(activation.clone()));
-                }
-                let entered = enter();
-                DIRECT.with(|slot| slot.borrow_mut().take());
-                entered
+                let _direct = direct.then(|| DirectScope::enter(Direct::Async(activation.clone())));
+                enter()
             }
             Err(error) => {
                 *activation.error.borrow_mut() = Some(error);
@@ -1176,7 +1552,10 @@ impl Future for Call {
         let activation = &self.0;
         {
             let mut caller = activation.caller.borrow_mut();
-            if !caller.as_ref().is_some_and(|caller| caller.will_wake(cx.waker())) {
+            if !caller
+                .as_ref()
+                .is_some_and(|caller| caller.will_wake(cx.waker()))
+            {
                 *caller = Some(cx.waker().clone());
             }
         }
@@ -1235,11 +1614,16 @@ impl Drop for Call {
 
 /// Waits until no guest is on the stack of this store.
 async fn guest_left(guard: &GuestGuard) {
+    if guard.is_free() {
+        return;
+    }
+    let waiter = Rc::new(RefCell::new(None));
     std::future::poll_fn(|cx| {
         if guard.is_free() {
             Poll::Ready(())
         } else {
-            guard.wait(cx.waker());
+            *waiter.borrow_mut() = Some(cx.waker().clone());
+            guard.wait(&waiter);
             Poll::Pending
         }
     })
@@ -1263,6 +1647,20 @@ pub(crate) async fn call<'a, X: 'static>(
     if !belongs_to(&handle.function, id) {
         return Err(foreign_store_error());
     }
+    if SYNC_IMPORT.get() && matches!(&store, CallStore::Env { .. }) {
+        let slice = store.resolve().enter_slice();
+        // SAFETY: the synchronous import lends this store for the entire poll.
+        let mut store = unsafe { StoreMut::from_raw(slice.ptr()) };
+        let params = params(&mut store)?;
+        check_params(&params, &handle.ty)?;
+        if shim_is_host(&handle.function) {
+            let results = call_immediate_host(&handle.function, id, &mut store, &params)?;
+            check_results(&results, &handle.ty)?;
+            return finish(&mut store, &results);
+        }
+        let results = function.call(&mut store, &params)?;
+        return finish(&mut store, &results);
+    }
     let poll = store.try_resolve().unwrap_or_else(|| store.resolve());
     let guard = poll.guard();
     guest_left(&guard).await;
@@ -1276,19 +1674,7 @@ pub(crate) async fn call<'a, X: 'static>(
     let params = params(&mut store_mut)?;
     // As on other backends: an async host function, which this calls
     // directly, could not take them, and nothing converts them.
-    let signature = &handle.ty;
-    if params.len() != signature.params().len()
-        || params
-            .iter()
-            .zip(signature.params())
-            .any(|(param, ty)| param.ty() != *ty)
-    {
-        let types: Vec<String> = params.iter().map(|param| param.ty().to_string()).collect();
-        return Err(RuntimeError::new(format!(
-            "Parameters of type [{}] did not match signature {signature}",
-            types.join(", "),
-        )));
-    }
+    check_params(&params, &handle.ty)?;
     if !enters_a_guest(&handle.function) {
         // JavaScript that runs to the end: a host function, or one an
         // embedder gave. It is called as `call` calls it.
@@ -1300,7 +1686,8 @@ pub(crate) async fn call<'a, X: 'static>(
         arguments.set(index as u32, param.as_jsvalue(&store_mut));
     }
     let promising = handle.promising().map_err(RuntimeError::from)?;
-    let direct = AsRef::<JsValue>::as_ref(&promising) == AsRef::<JsValue>::as_ref(&*handle.function);
+    let direct =
+        AsRef::<JsValue>::as_ref(&promising) == AsRef::<JsValue>::as_ref(&*handle.function);
     drop(mark);
 
     // The guest runs with the store, in this span and in every later one.
@@ -1325,17 +1712,7 @@ pub(crate) async fn call<'a, X: 'static>(
         // function was made with; this handle may give it another
         // (`Function::from_jsvalue`), by which its caller reads them.
         Returned::Host(values) => {
-            let expected = handle.ty.results();
-            if !crate::js::function::values_match(&values, expected) {
-                let types: Vec<String> =
-                    values.iter().map(|value| value.ty().to_string()).collect();
-                return Err(RuntimeError::new(format!(
-                    "an async host function returned values of type [{}], which do not \
-                     match the signature it is called with, {}",
-                    types.join(", "),
-                    handle.ty,
-                )));
-            }
+            check_results(&values, &handle.ty)?;
             values
         }
         Returned::Guest(result) => {
@@ -1421,24 +1798,24 @@ mod tests {
                 Ok(vec![])
             },
         );
-        let ready = Function::new_typed_async(
-            &mut store,
-            &env,
-            async |_: &mut crate::AsyncEnv<()>| 7,
-        );
+        let ready =
+            Function::new_typed_async(&mut store, &env, async |_: &mut crate::AsyncEnv<()>| 7);
         let store = store.into_shared();
         assert_eq!(live(), (0, 0));
 
         for round in 0..2 {
-            let call = |fail: i32| {
-                Box::pin(host.call_async(&mut store.clone(), &[Value::I32(fail)]))
-            };
+            let call =
+                |fail: i32| Box::pin(host.call_async(&mut store.clone(), &[Value::I32(fail)]));
 
             // Returns.
             let mut returning = call(0);
             let mut cx = Context::from_waker(Waker::noop());
             assert!(returning.as_mut().poll(&mut cx).is_pending());
-            assert_eq!(live(), (1, 0), "round {round}: suspended, the store is free");
+            assert_eq!(
+                live(),
+                (1, 0),
+                "round {round}: suspended, the store is free"
+            );
             returning.await.unwrap();
             assert_eq!(live(), (0, 0), "round {round}: returned");
 
@@ -1563,7 +1940,10 @@ mod tests {
 
         host.call_async(&mut store, &[Value::I32(1)]).await.unwrap();
         let first = form(&host);
-        again.call_async(&mut store, &[Value::I32(2)]).await.unwrap();
+        again
+            .call_async(&mut store, &[Value::I32(2)])
+            .await
+            .unwrap();
         assert!(js_sys::Object::is(&first, &form(&host)));
         assert!(js_sys::Object::is(&first, &form(&again)));
     }

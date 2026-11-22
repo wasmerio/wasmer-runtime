@@ -39,6 +39,12 @@ thread_local! {
     /// The store of the call being polled on this thread. Empty inside a
     /// slice, so that a slice cannot be taken twice.
     static POLL_STORE: Cell<Option<PollStore>> = const { Cell::new(None) };
+    // Only synchronous slices participate: engine-owned guest slices can
+    // legitimately outlive a JavaScript host boundary.
+    #[cfg(feature = "js")]
+    static SYNC_SLICES: std::cell::RefCell<Vec<*const SharedState>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
 }
 
 impl PollStore {
@@ -102,7 +108,12 @@ impl PollStore {
     /// Panics if a shared store is already in a slice.
     pub(crate) fn enter_slice(self) -> StoreSlice {
         match self.access {
-            StoreAccess::Exclusive(ptr) => StoreSlice { ptr, shared: None },
+            StoreAccess::Exclusive(ptr) => StoreSlice {
+                ptr,
+                shared: None,
+                #[cfg(feature = "js")]
+                cleanup: None,
+            },
             StoreAccess::Shared(state) => {
                 // Safety: whoever published this access holds a handle to the
                 // state for at least as long as the poll.
@@ -114,9 +125,29 @@ impl PollStore {
                 StoreSlice {
                     ptr: state_ref.ptr,
                     shared: Some(state),
+                    #[cfg(feature = "js")]
+                    cleanup: None,
                 }
             }
         }
+    }
+}
+
+impl PollStore {
+    /// A slice whose Rust guard may be skipped by a JavaScript exception.
+    fn enter_sync_slice(self) -> StoreSlice {
+        #[allow(unused_mut)]
+        let mut slice = self.enter_slice();
+        #[cfg(feature = "js")]
+        if let Some(state) = slice.shared {
+            slice.cleanup = Some(SYNC_SLICES.with(|slices| {
+                let mut slices = slices.borrow_mut();
+                let depth = slices.len();
+                slices.push(state);
+                depth
+            }));
+        }
+        slice
     }
 }
 
@@ -124,6 +155,8 @@ impl PollStore {
 pub(crate) struct StoreSlice {
     ptr: *mut StoreInner,
     shared: Option<*const SharedState>,
+    #[cfg(feature = "js")]
+    cleanup: Option<usize>,
 }
 
 impl StoreSlice {
@@ -134,6 +167,14 @@ impl StoreSlice {
 
 impl Drop for StoreSlice {
     fn drop(&mut self) {
+        #[cfg(feature = "js")]
+        if let Some(depth) = self.cleanup {
+            SYNC_SLICES.with(|slices| {
+                let mut slices = slices.borrow_mut();
+                assert_eq!(slices.len(), depth + 1, "synchronous slices must nest");
+                slices.pop();
+            });
+        }
         if let Some(state) = self.shared {
             // Safety: see `PollStore::enter_slice`.
             unsafe { &*state }.busy.set(false);
@@ -148,6 +189,30 @@ pub(crate) struct PollScope {
 }
 
 impl PollScope {
+    #[cfg(feature = "js")]
+    pub(crate) fn checkpoint() -> (Option<PollStore>, usize) {
+        (
+            POLL_STORE.get(),
+            SYNC_SLICES.with(|slices| slices.borrow().len()),
+        )
+    }
+
+    /// # Safety
+    /// Every frame entered since the checkpoint has returned or been unwound.
+    /// Each slice's enclosing store loan keeps its metadata alive until then.
+    #[cfg(feature = "js")]
+    pub(crate) unsafe fn restore_checkpoint(checkpoint: (Option<PollStore>, usize)) {
+        POLL_STORE.set(checkpoint.0);
+        SYNC_SLICES.with(|slices| {
+            let mut slices = slices.borrow_mut();
+            assert!(slices.len() >= checkpoint.1, "mismatched slice checkpoint");
+            for state in slices.drain(checkpoint.1..).rev() {
+                // SAFETY: each synchronous slice borrowed a live shared owner.
+                unsafe { &*state }.busy.set(false);
+            }
+        });
+    }
+
     pub(crate) fn enter(store: Option<PollStore>) -> Self {
         Self {
             previous: POLL_STORE.replace(store),
@@ -190,7 +255,7 @@ impl WithSlice {
             }
         }
         let restore = Restore(poll);
-        let slice = poll.enter_slice();
+        let slice = poll.enter_sync_slice();
         std::mem::forget(restore);
         Self {
             slice: ManuallyDrop::new(slice),
@@ -350,7 +415,7 @@ impl SharedStore {
             let mut lent = StoreContext::try_get_lent(self.0.id).ok_or(StoreBusy)?;
             return Ok(f(lent.as_mut()));
         }
-        let slice = self.poll_store().enter_slice();
+        let slice = self.poll_store().enter_sync_slice();
         // Safety: the slice is the only holder of the store until it drops,
         // after `f` and every borrow `f` was given are gone.
         Ok(f(unsafe { StoreMut::from_raw(slice.ptr()) }))

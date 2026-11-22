@@ -30,10 +30,9 @@ thread_local! {
 }
 
 /// Marks the guest about to be entered as entered synchronously, until the
-/// guard is dropped: one that cannot be suspended. Some engines run the body
-/// of an async import before they refuse to suspend such a guest; the body
-/// refuses itself instead (see `jspi`). Without `experimental-async` there is
-/// nothing to mark.
+/// guard is dropped: one that cannot be suspended. Async imports reached on
+/// this path get one synchronous poll: ready results return and `Pending`
+/// traps (see `jspi`). Without `experimental-async` there is nothing to mark.
 ///
 /// Synchronous calls of this crate mark the guest they enter, and the host
 /// functions it makes, and the JavaScript functions it is given, mark
@@ -69,7 +68,7 @@ pub(crate) fn mark_entered(synchronously: bool) -> bool {
 /// store's (see `Function::is_from_store`).
 fn owned(function: JsFunction, id: wasmer_types::StoreId) -> JsFunction {
     #[cfg(feature = "experimental-async")]
-    jspi::own(&function, id);
+    let function = jspi::sync_host(&function, id);
     #[cfg(not(feature = "experimental-async"))]
     let _ = id;
     function
@@ -106,17 +105,17 @@ impl Drop for EnteredGuest {
     }
 }
 
-use js_sys::{Array, Function as JsFunction};
 #[cfg(feature = "experimental-async")]
 use js_sys::Reflect;
+use js_sys::{Array, Function as JsFunction};
 use wasm_bindgen::{JsCast, prelude::*};
 use wasmer_types::{FunctionType, RawValue, Type};
 
 use crate::{
     AsStoreMut, AsStoreRef, BackendFunction, BackendFunctionEnv, BackendFunctionEnvMut,
-    CallWrapper, FromToNativeWasmType, FunctionEnv, FunctionEnvMut, HostFunction,
-    HostFunctionKind, IntoResult, NativeWasmType, NativeWasmTypeInto, RuntimeError, StoreMut,
-    Value, WasmTypeList, WithEnv, WithoutEnv,
+    CallWrapper, FromToNativeWasmType, FunctionEnv, FunctionEnvMut, HostFunction, HostFunctionKind,
+    IntoResult, NativeWasmType, NativeWasmTypeInto, RuntimeError, StoreMut, Value, WasmTypeList,
+    WithEnv, WithoutEnv,
     entities::function::call_wrapper::call_wrapped,
     js::{
         error::trap_value,
@@ -168,7 +167,11 @@ fn result_to_js(value: &Value, ty: Option<&Type>) -> JsValue {
 /// Whether `values` are of the types `types`, as many as there are.
 #[cfg(feature = "experimental-async")]
 pub(crate) fn values_match(values: &[Value], types: &[Type]) -> bool {
-    values.len() == types.len() && values.iter().zip(types).all(|(value, ty)| value.ty() == *ty)
+    values.len() == types.len()
+        && values
+            .iter()
+            .zip(types)
+            .all(|(value, ty)| value.ty() == *ty)
 }
 
 /// [`result_to_js`] for each of several results of the types `types`.
@@ -228,10 +231,7 @@ impl Function {
         let (start, takes_array) = host.start();
         let function = jspi::host_function(&func_ty, store_id, &start, takes_array);
         let vm_function = VMFunction::new(function, func_ty);
-        Self::from_vm_extern(
-            &mut store.as_store_mut(),
-            VMExternFunction::Js(vm_function),
-        )
+        Self::from_vm_extern(&mut store.as_store_mut(), VMExternFunction::Js(vm_function))
     }
 
     #[allow(clippy::cast_ptr_alignment)]
@@ -285,15 +285,12 @@ impl Function {
                     .params()
                     .iter()
                     .enumerate()
-                    .map(|(i, param)| {
-                        js_value_to_wasmer(&mut store, param, &args.get(i as u32))
-                    })
+                    .map(|(i, param)| js_value_to_wasmer(&mut store, param, &args.get(i as u32)))
                     .collect::<Vec<_>>();
                 let env: FunctionEnvMut<T> = raw_env.clone().into_mut(&mut store);
                 let _results = func(env, &wasm_arguments).map_err(trap_value)?;
                 Ok(())
-            })
-                as Box<dyn Fn(&Array) -> Result<(), JsValue>>)
+            }) as Box<dyn Fn(&Array) -> Result<(), JsValue>>)
             .into_js_value(),
             1 => Closure::wrap(Box::new(move |args: &Array| {
                 let (store, _hold) = lent::hold(store_id).map_err(trap_value)?;
@@ -303,9 +300,7 @@ impl Function {
                     .params()
                     .iter()
                     .enumerate()
-                    .map(|(i, param)| {
-                        js_value_to_wasmer(&mut store, param, &args.get(i as u32))
-                    })
+                    .map(|(i, param)| js_value_to_wasmer(&mut store, param, &args.get(i as u32)))
                     .collect::<Vec<_>>();
                 let env: FunctionEnvMut<T> = raw_env.clone().into_mut(&mut store);
                 let results = func(env, &wasm_arguments).map_err(trap_value)?;
@@ -321,9 +316,7 @@ impl Function {
                     .params()
                     .iter()
                     .enumerate()
-                    .map(|(i, param)| {
-                        js_value_to_wasmer(&mut store, param, &args.get(i as u32))
-                    })
+                    .map(|(i, param)| js_value_to_wasmer(&mut store, param, &args.get(i as u32)))
                     .collect::<Vec<_>>();
                 let env: FunctionEnvMut<T> = raw_env.clone().into_mut(&mut store);
                 let results = func(env, &wasm_arguments).map_err(trap_value)?;
@@ -482,9 +475,7 @@ impl Function {
                 Ok(result_array
                     .iter()
                     .enumerate()
-                    .map(|(i, js_val)| {
-                        js_value_to_wasmer(store, &result_types[i], &js_val)
-                    })
+                    .map(|(i, js_val)| js_value_to_wasmer(store, &result_types[i], &js_val))
                     .collect::<Vec<_>>()
                     .into_boxed_slice())
             }
@@ -518,10 +509,7 @@ impl Function {
     /// Checks whether this `Function` can be used with the given context.
     pub fn is_from_store(&self, _store: &impl AsStoreRef) -> bool {
         #[cfg(feature = "experimental-async")]
-        return jspi::belongs_to(
-            &self.handle.function,
-            _store.as_store_ref().objects().id(),
-        );
+        return jspi::belongs_to(&self.handle.function, _store.as_store_ref().objects().id());
         #[cfg(not(feature = "experimental-async"))]
         true
     }
@@ -705,7 +693,10 @@ mod tests {
         }
         let made = js_sys::Reflect::get(&counter, &"count".into()).unwrap();
         let restore = js_sys::Reflect::get(&counter, &"restore".into()).unwrap();
-        restore.unchecked_into::<JsFunction>().call0(&counter).unwrap();
+        restore
+            .unchecked_into::<JsFunction>()
+            .call0(&counter)
+            .unwrap();
         assert_eq!(made.as_f64(), Some(0.0), "functions were made from text");
     }
 }
@@ -735,8 +726,8 @@ where
 {
     /// The body of the `WebAssembly.Suspending` import a guest calls, given
     /// the arguments in an array: it returns the promise the guest waits on.
-    /// Nothing of the host function runs here: the future is polled by the
-    /// call, once the guest waits and the store is free.
+    /// An async entry defers polling until the guest waits and the store is
+    /// free. A synchronous entry polls once using its existing store loan.
     ///
     /// Parameters that are all numbers arrive as they are, with no array in
     /// between; the body is then the function itself. Returns the body, and
@@ -790,7 +781,6 @@ where
             }
         }
     }
-
 }
 
 impl std::fmt::Debug for Function {
@@ -823,7 +813,9 @@ where
         T: Sized,
     {
         Self {
-            address: function.function_callback(crate::BackendKind::Js).unwrap_js(),
+            address: function
+                .function_callback(crate::BackendKind::Js)
+                .unwrap_js(),
             _phantom: PhantomData,
         }
     }

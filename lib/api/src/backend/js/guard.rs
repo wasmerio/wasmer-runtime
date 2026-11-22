@@ -20,7 +20,7 @@ use std::{
     cell::{Cell, RefCell},
     mem::ManuallyDrop,
     ops::{Deref, DerefMut},
-    rc::Rc,
+    rc::{Rc, Weak},
     task::Waker,
 };
 
@@ -40,7 +40,7 @@ pub(crate) struct GuestGuard {
     /// That guest's call was dropped.
     holder_cancelled: Cell<bool>,
     /// Calls waiting for that guest to leave.
-    waiters: RefCell<Vec<Waker>>,
+    waiters: RefCell<Vec<Weak<RefCell<Option<Waker>>>>>,
     /// The store, if its owner dropped it while a guest was still running.
     orphan: RefCell<Option<Box<StoreInner>>>,
 }
@@ -77,6 +77,14 @@ impl GuestGuard {
         self.calls.set(self.calls.get() - 1);
     }
 
+    pub(crate) fn enter_slice(&self) {
+        self.slices.set(self.slices.get() + 1);
+    }
+
+    pub(crate) fn leave_slice(&self) {
+        self.slices.set(self.slices.get() - 1);
+    }
+
     /// Lets the code of a live call use the store until the mark is dropped.
     pub(crate) fn mark(self: &Rc<Self>) -> SliceMark {
         self.slices.set(self.slices.get() + 1);
@@ -101,7 +109,12 @@ impl GuestGuard {
         // Not woken under the borrow: a waker may do anything.
         let waiters = std::mem::take(&mut *self.waiters.borrow_mut());
         for waiter in waiters {
-            waiter.wake();
+            if let Some(waiter) = waiter.upgrade() {
+                let waker = waiter.borrow().clone();
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            }
         }
     }
 
@@ -109,11 +122,14 @@ impl GuestGuard {
         self.holder_cancelled.set(true);
     }
 
-    /// Wakes `waker` when the guest on the stack leaves.
-    pub(crate) fn wait(&self, waker: &Waker) {
+    /// The waiting call owns its waker, so cancellation releases it even if
+    /// the older guest never leaves the engine's stack.
+    pub(crate) fn wait(&self, waiter: &Rc<RefCell<Option<Waker>>>) {
         let mut waiters = self.waiters.borrow_mut();
-        if !waiters.iter().any(|waiter| waiter.will_wake(waker)) {
-            waiters.push(waker.clone());
+        waiters.retain(|waiter| waiter.strong_count() != 0);
+        let weak = Rc::downgrade(waiter);
+        if !waiters.iter().any(|waiter| Weak::ptr_eq(waiter, &weak)) {
+            waiters.push(weak);
         }
     }
 

@@ -15,8 +15,9 @@ why, what was tried, what failed, and how to rerun every trial.
   [implementation status](#implementation-status).
 - All design decisions are settled. See the [decision
   log](./08-decision-log.md).
-- The JavaScript guest guard and the NAPI port are the least proven parts.
-  Prototype them early.
+- JavaScript exception cleanup, ready synchronous imports, shared resumption,
+  and cancellation have regression coverage in `lib/api/tests/sound_async_js.rs`
+  and `lib/api/tests/jspi_calls_js.rs`. The NAPI port remains separate work.
 - A trial `StoreRef` port type-checks WASIX and the C API imports on `next`. Its
   tests were not run.
 
@@ -29,8 +30,8 @@ the API was replaced directly.
 | Area | State |
 | --- | --- |
 | `sys` Level 1 and Level 2 | Done |
-| JavaScript and the guest guard | Done, in `lib/api/src/backend/js/guard.rs` |
-| V8 | Done. `poll` blocks during an import, so another thread must wake it |
+| JavaScript and the guest guard | Ready imports work on synchronous entry; pending imports trap. Host boundaries restore runtime state after JavaScript exceptions, and cancelled entry waits release their wakers. |
+| V8 | Async `poll` blocks during an import; awaited work must not depend on the blocked executor. Synchronous pending imports trap, nested drivers keep independent wake notifications, and host errors and panics return through the Rust entry. |
 | WASIX and NAPI ports | **Not done.** They live on `next` |
 
 Differences from the proposal's signatures:
@@ -45,6 +46,13 @@ Tests that depended on the removed lock were deleted or rewritten. Coroutine
 switches cannot run under Miri, so Miri covers the store context and slice
 provenance, not the switch itself. The probes in `A2` target the PR 16 API and
 no longer build against this branch.
+
+JavaScript cleanup preserves enclosing borrows and rolls back only synchronous
+slices entered inside a host boundary. Guest activation state is not rolled
+back: cancellation and nested calls can legitimately change it. A shared owner
+stays alive through host polling and destruction, including self-cancellation.
+Raw JavaScript throws can still skip arbitrary user destructors; an interrupted
+host future is abandoned rather than polled or destroyed again.
 
 ## Reading order
 

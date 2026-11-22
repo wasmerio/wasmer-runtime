@@ -79,6 +79,27 @@ thread_local! {
     };
 }
 
+/// Metadata restored by the JavaScript host boundary even after a raw throw.
+#[cfg(feature = "experimental-async")]
+pub(crate) fn checkpoint() -> u32 {
+    LENDS.with(|lends| {
+        let depth = lends.depth.get();
+        let held = depth.checked_sub(1).is_some_and(|at| lends.held[at].get());
+        depth as u32 * 2 + u32::from(held)
+    })
+}
+
+#[cfg(feature = "experimental-async")]
+pub(crate) fn restore(checkpoint: u32) {
+    LENDS.with(|lends| {
+        let depth = (checkpoint / 2) as usize;
+        lends.depth.set(depth);
+        if let Some(at) = depth.checked_sub(1) {
+            lends.held[at].set(checkpoint & 1 != 0);
+        }
+    });
+}
+
 /// A lend of a store, taken back when dropped.
 pub(crate) struct Lend {
     depth: usize,
@@ -536,7 +557,9 @@ mod tests {
             };
             let ran = RAN.get();
             let result = export.call1(&JsValue::UNDEFINED, &argument);
-            let error = result.err().map(|error| RuntimeError::from(error).message());
+            let error = result
+                .err()
+                .map(|error| RuntimeError::from(error).message());
             (error, RAN.get() - ran)
         };
         let first = through_javascript();

@@ -75,8 +75,8 @@ impl Function {
 
     #[allow(clippy::cast_ptr_alignment)]
     /// Creates an async host function from its body. The guest cannot
-    /// suspend on this backend, so the import blocks its stack until the
-    /// future is ready (see `v8::async_call`).
+    /// suspend on this backend, so async entries drive it on the calling
+    /// thread. Synchronous entries accept only an immediately ready future.
     #[cfg(feature = "experimental-async")]
     pub(crate) fn new_async<FT, F, T>(
         store: &mut impl AsStoreMut,
@@ -90,31 +90,53 @@ impl Function {
             + 'static,
         T: Send + 'static,
     {
-        /// The body and environment handle of an import. V8 requires a host
-        /// function to be `Send + Sync`, but this one only runs on the thread
-        /// of the store's isolate, which `check_isolate` enforces.
-        struct OnStoreThread<B>(B);
-        unsafe impl<B> Send for OnStoreThread<B> {}
-        unsafe impl<B> Sync for OnStoreThread<B> {}
-        impl<B> OnStoreThread<B> {
-            fn get(&self) -> &B {
-                &self.0
-            }
+        check_isolate(store);
+        let mut store = store.as_store_mut();
+        let ty: FunctionType = ty.into();
+        let id = store.inner.objects.id();
+        let env = env.clone();
+        let factory = Box::new(move |args| func(crate::AsyncEnv::new(env.clone(), id), args));
+        let params: Vec<_> = ty
+            .params()
+            .iter()
+            .map(|ty| unsafe { wasm_valtype_new((*ty).into_ct()) })
+            .collect();
+        let results: Vec<_> = ty
+            .results()
+            .iter()
+            .map(|ty| unsafe { wasm_valtype_new((*ty).into_ct()) })
+            .collect();
+        let (mut param_vec, mut result_vec) = (Default::default(), Default::default());
+        unsafe {
+            wasm_valtype_vec_new(&mut param_vec, params.len(), params.as_ptr());
+            wasm_valtype_vec_new(&mut result_vec, results.len(), results.as_ptr());
         }
-
-        let store_id = store.objects_mut().id();
-        let state = OnStoreThread((func, env.clone()));
-        Self::new_with_env(
-            store,
-            env,
+        let function_type = unsafe { wasm_functype_new(&mut param_vec, &mut result_vec) };
+        let callback = Box::new(AsyncCallback {
+            id: store.inner.objects.id(),
+            owner: std::thread::current().id(),
+            store: store.inner.store.as_v8().inner,
             ty,
-            move |mut env: FunctionEnvMut<'_, T>, args: &[Value]| {
-                let (func, handle) = state.get();
-                let future = func(crate::AsyncEnv::new(handle.clone(), store_id), args.to_vec());
-                let mut store = env.as_store_mut();
-                crate::backend::v8::async_call::block_on_host(&mut store, future)
-            },
-        )
+            factory,
+        });
+        let callback = Box::into_raw(callback);
+        let function = unsafe {
+            wasm_func_new_with_env(
+                (*callback).store,
+                function_type,
+                Some(async_callback),
+                callback.cast(),
+                Some(drop_async_callback),
+            )
+        };
+        unsafe {
+            wasm_functype_delete(function_type);
+        }
+        assert!(
+            !function.is_null(),
+            "failed to create V8 async host function"
+        );
+        Self { handle: function }
     }
 
     pub fn new_with_env<FT, F, T: Send + 'static>(
@@ -443,17 +465,29 @@ impl Function {
             }
         };
 
-        call_wrapped(store, wrapper, |_| {
-            // `wasm_func_call` takes the arguments, so every entry gets its own.
-            let mut args = Default::default();
-            let trap = unsafe {
-                wasm_val_vec_new(&mut args, wasm_params.len(), wasm_params.as_ptr());
-                wasm_func_call(self.handle, &mut args as _, &mut results as *mut _)
+        call_wrapped(store, wrapper, |store| {
+            #[cfg(feature = "experimental-async")]
+            let mut store = store.as_store_mut();
+            let mut call = || {
+                // `wasm_func_call` takes the arguments, so every entry gets its own.
+                let mut args = Default::default();
+                let trap = unsafe {
+                    wasm_val_vec_new(&mut args, wasm_params.len(), wasm_params.as_ptr());
+                    wasm_func_call(self.handle, &mut args as _, &mut results as *mut _)
+                };
+                if trap.is_null() {
+                    Ok(())
+                } else {
+                    Err(Into::<Trap>::into(trap).into())
+                }
             };
-            if trap.is_null() {
-                Ok(())
-            } else {
-                Err(Into::<Trap>::into(trap).into())
+            #[cfg(feature = "experimental-async")]
+            {
+                crate::backend::v8::async_call::enter(&mut store, call)
+            }
+            #[cfg(not(feature = "experimental-async"))]
+            {
+                call()
             }
         })?;
 
@@ -488,6 +522,106 @@ impl Function {
     /// Checks whether this `Function` can be used with the given context.
     pub fn is_from_store(&self, _store: &impl AsStoreRef) -> bool {
         true
+    }
+}
+
+#[cfg(feature = "experimental-async")]
+struct AsyncCallback {
+    id: wasmer_types::StoreId,
+    owner: std::thread::ThreadId,
+    store: *mut wasm_store_t,
+    ty: FunctionType,
+    factory: Box<dyn Fn(Vec<Value>) -> crate::entities::function::async_host::HostFuture>,
+}
+
+#[cfg(feature = "experimental-async")]
+unsafe extern "C" fn drop_async_callback(env: *mut c_void) {
+    // V8 destroys the callback on its owning isolate thread.
+    unsafe {
+        drop(Box::from_raw(env.cast::<AsyncCallback>()));
+    }
+}
+
+#[cfg(feature = "experimental-async")]
+unsafe extern "C" fn async_callback(
+    env: *mut c_void,
+    args: *const wasm_val_vec_t,
+    rets: *mut wasm_val_vec_t,
+) -> *mut wasm_trap_t {
+    let callback = unsafe { &*env.cast::<AsyncCallback>() };
+    let result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<(), RuntimeError> {
+        if callback.owner != std::thread::current().id() {
+            return Err(RuntimeError::new(
+                "V8 async host function called on a different thread",
+            ));
+        }
+        let args = unsafe {
+            if (*args).size == 0 {
+                &[]
+            } else {
+                std::slice::from_raw_parts((*args).data, (*args).size)
+            }
+        };
+        let args = args.iter().map(|arg| (*arg).into_wv()).collect();
+        let values =
+            crate::backend::v8::async_call::run_host(callback.id, callback.factory.as_ref(), args)?;
+        if values.len() != callback.ty.results().len()
+            || values
+                .iter()
+                .zip(callback.ty.results())
+                .any(|(value, ty)| value.ty() != *ty)
+        {
+            return Err(RuntimeError::new("V8 async host result signature mismatch"));
+        }
+        if values.len() != unsafe { (*rets).size } {
+            return Err(RuntimeError::new("V8 async host result count mismatch"));
+        }
+        for (index, value) in values.into_iter().enumerate() {
+            unsafe {
+                (*rets).data.add(index).write(value.into_cv());
+            }
+        }
+        Ok(())
+    }));
+    let error = match result {
+        Ok(Ok(())) => return std::ptr::null_mut(),
+        Ok(Err(error)) => {
+            crate::backend::v8::async_call::save_error(error);
+            "V8 async host returned an error"
+        }
+        Err(panic) => {
+            crate::backend::v8::async_call::save_panic(callback.id, panic);
+            "V8 async host future panicked"
+        }
+    };
+    // A C callback cannot unwind. Panics are resumed by `enter` after V8's
+    // frames return. Original runtime errors also stay in the entry, so their
+    // source and trap code survive without formatting user errors in C frames.
+    let mut message = Default::default();
+    unsafe {
+        wasm_byte_vec_new(&mut message, error.len(), error.as_ptr().cast());
+        let trap = wasm_trap_new(callback.store, &message);
+        wasm_byte_vec_delete(&mut message);
+        trap
+    }
+}
+
+/// A synchronous host may be the Rust caller of a nested async import. Relay
+/// its panic through each enclosing C frame until the outer Rust call resumes.
+#[cfg(feature = "experimental-async")]
+fn panic_trap(
+    store: &mut impl AsStoreMut,
+    panic: Box<dyn std::any::Any + Send>,
+) -> *mut wasm_trap_t {
+    let store = store.as_store_mut();
+    crate::backend::v8::async_call::save_panic(store.inner.objects.id(), panic);
+    let mut message = Default::default();
+    let text = "V8 host function panicked";
+    unsafe {
+        wasm_byte_vec_new(&mut message, text.len(), text.as_ptr().cast());
+        let trap = wasm_trap_new(store.inner.store.as_v8().inner, &message);
+        wasm_byte_vec_delete(&mut message);
+        trap
     }
 }
 
@@ -562,7 +696,14 @@ where
             }
 
             Err(e) => {
-                unimplemented!("host function panicked");
+                #[cfg(feature = "experimental-async")]
+                {
+                    panic_trap(&mut store, e)
+                }
+                #[cfg(not(feature = "experimental-async"))]
+                {
+                    unimplemented!("host function panicked");
+                }
             }
         }
     }
@@ -670,7 +811,10 @@ macro_rules! impl_host_function {
                     },
 
                     Err(e) => {
-                        unimplemented!("host function panicked");
+                        #[cfg(feature = "experimental-async")]
+                        { panic_trap(store, e) }
+                        #[cfg(not(feature = "experimental-async"))]
+                        { unimplemented!("host function panicked"); }
                     }
                 }
             }}
@@ -742,7 +886,12 @@ macro_rules! impl_host_function {
                     let trap = crate::backend::v8::error::Trap::user(Box::new(e)); unsafe { trap.into_wasm_trap(store) }
                 },
 
-                Err(e) => { unimplemented!("host function panicked"); }
+                Err(e) => {
+                    #[cfg(feature = "experimental-async")]
+                    { panic_trap(store, e) }
+                    #[cfg(not(feature = "experimental-async"))]
+                    { unimplemented!("host function panicked"); }
+                }
               }
             }}
 

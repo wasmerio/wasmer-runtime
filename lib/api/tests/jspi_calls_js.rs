@@ -977,8 +977,9 @@ async fn results_that_do_not_match_the_signature_trap() {
 
 /// An async import reached through a synchronous call from a host function,
 /// or through a JavaScript frame, cannot suspend its guest. The call fails
-/// with the error other backends give, the host function does not run, and
-/// the call beneath is left as it was: it has its store and can still wait.
+/// with the error other backends give after one poll. Raw re-entry without
+/// lending the store is refused before polling. The call beneath keeps its
+/// store and can still wait.
 #[wasm_bindgen_test]
 async fn a_refused_suspension_leaves_the_call_usable() {
     for raw in [0, 1] {
@@ -990,10 +991,12 @@ async fn a_refused_suspension_leaves_the_call_usable() {
 
             let waits = format!("wait{AUTO}");
             let mut expected = vec!["1: async, locked", &waits, "2: async, locked"];
+            if raw == 0 {
+                expected.insert(0, "wait99");
+            }
             if resumed == 1 {
                 expected.insert(0, &waits);
             }
-            // The host function did not run for the refused import, `wait99`.
             assert_eq!(guest.log(), expected, "{case}");
             let errors = guest.errors().await;
             assert_eq!(errors.len(), 1, "{case}");
@@ -1003,15 +1006,15 @@ async fn a_refused_suspension_leaves_the_call_usable() {
                 "{case}: {}",
                 errors[0]
             );
-            assert_eq!(guest.gate.dropped(), 0, "{case}");
+            assert_eq!(guest.gate.dropped(), u32::from(raw == 0), "{case}");
             drop(call);
             guest.into_store();
         }
     }
 }
 
-/// A guest that was not entered by `call_async` at all gets the same error,
-/// from `Function::call` and from a start function.
+/// A pending import reached synchronously is polled once and dropped, both
+/// through `Function::call` and through a start function.
 #[wasm_bindgen_test]
 fn an_async_import_outside_call_async_is_refused() {
     let Guest {
@@ -1040,11 +1043,8 @@ fn an_async_import_outside_call_async_is_refused() {
     let gate = Gate::new(&log);
     let imports = imports! { "host" => { "wait" => gate.import(&mut store) } };
     assert!(Instance::new(&mut store, &module, &imports).is_err());
-    assert!(
-        log.borrow().is_empty(),
-        "a host function ran: {:?}",
-        log.borrow()
-    );
+    assert_eq!(&*log.borrow(), &["wait7", "wait7"]);
+    assert_eq!(gate.dropped(), 1, "the pending start import was dropped");
 }
 
 /// An async host function can be called with `call_async` itself.
@@ -1422,10 +1422,7 @@ async fn an_embedder_reentry_then_a_foreign_suspension_keeps_the_store() {
             locked(&store),
             "{way}: the store was given up while the guest waits"
         );
-        assert!(
-            log.borrow().is_empty(),
-            "{way}: the refused host function ran"
-        );
+        assert_eq!(&*log.borrow(), &["wait99"], "{way}: one synchronous poll");
         resolve
             .call1(&JsValue::UNDEFINED, &JsValue::from(5))
             .unwrap();
@@ -1438,7 +1435,7 @@ async fn an_embedder_reentry_then_a_foreign_suspension_keeps_the_store() {
             Some(TrapCode::YieldOutsideAsyncContext),
             "{way}: {error}"
         );
-        assert_eq!(gate.dropped(), 0, "{way}");
+        assert_eq!(gate.dropped(), 1, "{way}: the pending import was dropped");
         assert!(store.into_store().is_ok(), "{way}");
     }
 }
@@ -1861,7 +1858,8 @@ async fn a_host_function_belongs_to_its_store() {
     struct Env;
     let unary = FunctionType::new([Type::I32], [Type::I32]);
     let wide = FunctionType::new([Type::I32], [Type::I64]);
-    let make: [(&str, FunctionType, fn(&mut Store) -> Function); 5] = [
+    type HostFactory = fn(&mut Store) -> Function;
+    let make: [(&str, FunctionType, HostFactory); 5] = [
         ("async", unary.clone(), |store| {
             typed_host(store, async |_: &mut AsyncEnv<()>, value: i32| value + 1)
         }),
@@ -2947,4 +2945,34 @@ async fn a_cancelled_guest_on_the_stack_blocks_only_new_guests() {
         .try_with(|mut lock| env.as_mut(&mut lock).inner = None)
         .expect("the store is free");
     assert!(store.into_store().is_ok());
+}
+
+/// Both guests make another import after waking in the same executor turn.
+/// Resumption must reserve the store until the engine accepts the next wait.
+#[wasm_bindgen_test]
+async fn simultaneous_wakes_preserve_subsequent_imports() {
+    for reverse in [false, true] {
+        let guest = guest();
+        let mut a = guest.call("twice", &[10]);
+        let mut b = guest.call("twice", &[20]);
+        guest.until_waiting(&mut a, 10).await;
+        guest.until_waiting(&mut b, 20).await;
+        guest.gate.release(10);
+        guest.gate.release(20);
+        if reverse {
+            assert!(poll_once(&mut b).is_pending());
+            assert!(poll_once(&mut a).is_pending());
+        } else {
+            assert!(poll_once(&mut a).is_pending());
+            assert!(poll_once(&mut b).is_pending());
+        }
+        settle().await;
+        guest.until_waiting(&mut b, 21).await;
+        guest.until_waiting(&mut a, 11).await;
+        guest.gate.release(21);
+        guest.gate.release(11);
+        let (a, b) = futures::join!(a, b);
+        assert_eq!((i32_of(a), i32_of(b)), (21, 41));
+        guest.into_store();
+    }
 }

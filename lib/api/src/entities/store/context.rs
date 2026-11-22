@@ -49,6 +49,36 @@ thread_local! {
 }
 
 impl StoreContext {
+    /// Metadata saved outside a JavaScript host boundary.
+    #[cfg(all(feature = "js", feature = "experimental-async"))]
+    pub(crate) fn checkpoint() -> (usize, u32) {
+        STORE_CONTEXT_STACK.with(|cell| {
+            let stack = cell.borrow();
+            (
+                stack.len(),
+                stack.last().map_or(0, |entry| entry.borrow_count),
+            )
+        })
+    }
+
+    /// # Safety
+    /// All interior Rust frames have returned or been unwound by JavaScript.
+    /// The checkpoint's enclosing context and its live borrows remain intact.
+    #[cfg(all(feature = "js", feature = "experimental-async"))]
+    pub(crate) unsafe fn restore_checkpoint(depth: usize, borrows: u32) {
+        STORE_CONTEXT_STACK.with(|cell| {
+            let mut stack = cell.borrow_mut();
+            assert!(
+                stack.len() >= depth,
+                "mismatched JavaScript store checkpoint"
+            );
+            stack.truncate(depth);
+            if let Some(entry) = stack.last_mut() {
+                entry.borrow_count = borrows;
+            }
+        });
+    }
+
     /// Whether the thread still has what unwinding a call suspended in Wasm
     /// needs of it: false once its thread locals are being destroyed, as it
     /// exits, and always with `baremetal`. A call suspended then is forgotten

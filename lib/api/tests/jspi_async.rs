@@ -8,7 +8,7 @@ use wasmer::{
     AsyncEnv, Function, FunctionEnv, FunctionEnvMut, FunctionType, Instance, Module, Store, Type,
     TypedFunction, Value, imports,
 };
-use wasmer_vm::TrapCode;
+use wasmer_types::TrapCode;
 
 #[derive(Default)]
 struct DeltaState {
