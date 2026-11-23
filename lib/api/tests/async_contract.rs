@@ -204,6 +204,49 @@ fn a_typed_import_converts_its_arguments_and_results() {
     check(&mut store, &results.unwrap());
 }
 
+/// A typed async host function is a static function, as a typed sync one
+/// is: a guest can call it through a table, and wait in it.
+#[test]
+fn a_guest_waits_in_a_typed_import_it_calls_through_a_table() {
+    const GUEST: &str = r#"(module
+      (type $wait (func (param i32) (result i32)))
+      (table (export "table") 1 funcref)
+      (func (export "run") (param i32) (result i32)
+        (call_indirect (type $wait) (local.get 0) (i32.const 0))))"#;
+    let mut store = Store::default();
+    let module = Module::new(&store, GUEST).unwrap();
+    let gate = Rc::new(Cell::new(false));
+    let counter = Counter {
+        value: 0,
+        gate: Some(OnOneThread(gate.clone())),
+    };
+    let env = FunctionEnv::new(&mut store, counter);
+    let wait = Function::new_typed_async(
+        &mut store,
+        &env,
+        async |cx: &mut AsyncEnv<Counter>, x: i32| -> i32 {
+            let gate = cx.with(|env| env.data().gate.as_ref().unwrap().get().clone());
+            Gate(gate).await;
+            x * 2
+        },
+    );
+    let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+    let table = instance.exports.get_table("table").unwrap();
+    table
+        .set(&mut store, 0, Value::FuncRef(Some(wait)))
+        .unwrap();
+    let run = instance.exports.get_function("run").unwrap().clone();
+
+    let params = [Value::I32(4)];
+    let mut call = Box::pin(run.call_async(&mut store, &params));
+    assert!(poll(&mut call).is_pending());
+    gate.set(true);
+    let Poll::Ready(results) = poll(&mut call) else {
+        panic!("the call did not finish");
+    };
+    assert_eq!(results.unwrap()[0].unwrap_i32(), 8);
+}
+
 /// An async host function waits for a guest through its own `AsyncEnv`. The
 /// inner guest suspends, and both calls resume.
 #[test]

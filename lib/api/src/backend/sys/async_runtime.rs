@@ -421,9 +421,9 @@ impl Drop for Resuming {
 
 /// What an async import does with its host future: see
 /// [`wait_for_host_future`].
-pub(crate) enum HostWait {
+pub(crate) enum HostWait<R> {
     /// The future was ready.
-    Ready(Result<RawResults, RuntimeError>),
+    Ready(R),
     /// The guest is to be suspended: its call has the future.
     Suspend,
     /// The future was not ready, and the guest cannot be suspended.
@@ -437,14 +437,15 @@ pub(crate) enum HostWait {
 /// it meanwhile.
 ///
 /// With `suspendable`, the guest runs on the stack of a `call_async`, which
-/// takes a future that is not ready. Otherwise the guest was entered
-/// synchronously, by a host function that holds a borrow of its store across
-/// the call: it cannot wait.
-pub(crate) fn wait_for_host_future(
+/// takes a future that is not ready, as `into_pending` makes it: with raw
+/// results. Otherwise the guest was entered synchronously, by a host function
+/// that holds a borrow of its store across the call: it cannot wait.
+pub(crate) fn wait_for_host_future<Fut: Future + ?Sized>(
     store: StorePtrWrapper,
-    future: RawHostFuture,
+    future: Pin<Box<Fut>>,
     suspendable: bool,
-) -> HostWait {
+    into_pending: impl FnOnce(Pin<Box<Fut>>) -> RawHostFuture,
+) -> HostWait<Fut::Output> {
     // The entry's pointer is used only for the duration of this poll, in the
     // slices the future takes, while the borrow in `store` stands.
     let _scope = PollScope::enter(Some(PollStore::exclusive(store.id(), store.as_ptr())));
@@ -460,7 +461,7 @@ pub(crate) fn wait_for_host_future(
         return match future.as_mut().poll(cx) {
             Poll::Ready(result) => HostWait::Ready(result),
             Poll::Pending => {
-                waiting.pending = Some(future);
+                waiting.pending = Some(into_pending(future));
                 HostWait::Suspend
             }
         };
