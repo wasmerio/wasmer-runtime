@@ -75,6 +75,16 @@ impl<T> AsyncEnv<T> {
 }
 
 mod sealed {
+    /// On `sys`, a typed async host function is a static function, and the
+    /// backend has the trampolines of every one.
+    #[cfg(feature = "sys")]
+    #[allow(private_bounds)]
+    pub trait Sealed<T, Args, Rets>:
+        crate::backend::sys::function::AsyncHostTrampolines<T, Args, Rets>
+    {
+    }
+
+    #[cfg(not(feature = "sys"))]
     pub trait Sealed<T, Args, Rets> {}
 }
 
@@ -93,26 +103,17 @@ where
         env: &mut AsyncEnv<T>,
         args: Args,
     ) -> impl Future<Output = Result<Rets, RuntimeError>>;
-
-    /// The trampoline a guest calls this function through on `sys`.
-    #[doc(hidden)]
-    #[cfg(feature = "sys")]
-    fn function_callback_sys(&self) -> crate::vm::VMFunctionCallback;
-
-    /// The trampoline that calls the one above with an array of values.
-    #[doc(hidden)]
-    #[cfg(feature = "sys")]
-    fn call_trampoline_address_sys() -> crate::vm::VMTrampoline;
 }
 
 macro_rules! impl_async_host_function {
-    ( $c_struct_name:ident, $( $x:ident ),* ) => {
+    ( $( $x:ident ),* ) => {
         impl<$( $x, )* Rets, RetsAsResult, T, F> sealed::Sealed<T, ( $( $x ),* ), Rets> for F
         where
+            T: 'static,
             F: for<'e> AsyncFn(&'e mut AsyncEnv<T>, $( $x ),*) -> RetsAsResult + 'static,
-            RetsAsResult: IntoResult<Rets>,
-            Rets: WasmTypeList,
-            ( $( $x ),* ): WasmTypeList,
+            RetsAsResult: IntoResult<Rets> + 'static,
+            Rets: WasmTypeList + 'static,
+            ( $( $x ),* ): WasmTypeList + 'static,
             $( $x: FromToNativeWasmType + 'static, )*
         {
         }
@@ -140,64 +141,65 @@ macro_rules! impl_async_host_function {
                         .map_err(|err| RuntimeError::from_dyn(Box::new(err)))
                 }
             }
-
-            #[cfg(feature = "sys")]
-            fn function_callback_sys(&self) -> crate::vm::VMFunctionCallback {
-                paste::paste! {
-                    crate::vm::VMFunctionCallback::Sys(
-                        crate::backend::sys::function::[<gen_fn_callback_ $c_struct_name:lower _async>]
-                            ::<T, $( $x, )* Rets, Self>(self)
-                    )
-                }
-            }
-
-            #[cfg(feature = "sys")]
-            fn call_trampoline_address_sys() -> crate::vm::VMTrampoline {
-                paste::paste! {
-                    crate::vm::VMTrampoline::Sys(
-                        crate::backend::sys::function::[<gen_call_trampoline_address_ $c_struct_name:lower>]
-                            ::<$( $x, )* Rets>()
-                    )
-                }
-            }
         }
     };
 }
 
-impl_async_host_function!(S0,);
-impl_async_host_function!(S1, A1);
-impl_async_host_function!(S2, A1, A2);
-impl_async_host_function!(S3, A1, A2, A3);
-impl_async_host_function!(S4, A1, A2, A3, A4);
-impl_async_host_function!(S5, A1, A2, A3, A4, A5);
-impl_async_host_function!(S6, A1, A2, A3, A4, A5, A6);
-impl_async_host_function!(S7, A1, A2, A3, A4, A5, A6, A7);
-impl_async_host_function!(S8, A1, A2, A3, A4, A5, A6, A7, A8);
-impl_async_host_function!(S9, A1, A2, A3, A4, A5, A6, A7, A8, A9);
-impl_async_host_function!(S10, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10);
-impl_async_host_function!(S11, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11);
-impl_async_host_function!(S12, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12);
-impl_async_host_function!(S13, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13);
+impl_async_host_function!();
+impl_async_host_function!(A1);
+impl_async_host_function!(A1, A2);
+impl_async_host_function!(A1, A2, A3);
+impl_async_host_function!(A1, A2, A3, A4);
+impl_async_host_function!(A1, A2, A3, A4, A5);
+impl_async_host_function!(A1, A2, A3, A4, A5, A6);
+impl_async_host_function!(A1, A2, A3, A4, A5, A6, A7);
+impl_async_host_function!(A1, A2, A3, A4, A5, A6, A7, A8);
+impl_async_host_function!(A1, A2, A3, A4, A5, A6, A7, A8, A9);
+impl_async_host_function!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10);
+impl_async_host_function!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11);
+impl_async_host_function!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12);
+impl_async_host_function!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13);
+impl_async_host_function!(A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14);
 impl_async_host_function!(
-    S14, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14
+    A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15
 );
 impl_async_host_function!(
-    S15, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15
+    A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16
 );
 impl_async_host_function!(
-    S16, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16
+    A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17
 );
 impl_async_host_function!(
-    S17, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17
+    A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18
 );
 impl_async_host_function!(
-    S18, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18
+    A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18, A19
 );
 impl_async_host_function!(
-    S19, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18, A19
+    A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18, A19, A20
 );
 impl_async_host_function!(
-    S20, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18, A19, A20
+    A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18, A19, A20, A21
+);
+impl_async_host_function!(
+    A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18, A19, A20, A21,
+    A22
+);
+impl_async_host_function!(
+    A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18, A19, A20, A21,
+    A22, A23
+);
+impl_async_host_function!(
+    A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18, A19, A20, A21,
+    A22, A23, A24
+);
+impl_async_host_function!(
+    A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18, A19, A20, A21,
+    A22, A23, A24, A25
+);
+impl_async_host_function!(
+    A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18, A19, A20, A21,
+    A22, A23, A24, A25, A26
 );
 
 /// Boxes the futures of the body of an async host function, for a backend

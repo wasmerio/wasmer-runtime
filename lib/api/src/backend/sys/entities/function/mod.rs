@@ -327,7 +327,7 @@ impl Function {
         Args: WasmTypeList + 'static,
         Rets: WasmTypeList + 'static,
     {
-        let func_ptr = func.function_callback_sys().unwrap_sys();
+        let func_ptr = <F as AsyncHostTrampolines<T, Args, Rets>>::function_callback(&func);
         let host_data = Box::new(StaticFunction {
             store_id: store.objects_mut().id(),
             env: env.clone(),
@@ -343,7 +343,8 @@ impl Function {
         let vmctx = VMFunctionContext {
             host_env: host_data.as_ref() as *const _ as *mut c_void,
         };
-        let call_trampoline = F::call_trampoline_address_sys().unwrap_sys();
+        let call_trampoline =
+            <F as AsyncHostTrampolines<T, Args, Rets>>::call_trampoline_address();
         let anyfunc = VMCallerCheckedAnyfunc {
             include_m0_param: false,
             func_ptr,
@@ -983,6 +984,17 @@ pub(crate) struct StaticFunction<F, T> {
     pub(crate) func: F,
 }
 
+/// The trampolines of a typed async host function, which make it a static
+/// function of this backend. Every [`AsyncHostFunction`] has them.
+#[cfg(feature = "experimental-async")]
+pub(crate) trait AsyncHostTrampolines<T, Args, Rets> {
+    /// The trampoline a guest calls the function through.
+    fn function_callback(&self) -> VMFunctionCallback;
+
+    /// The trampoline that calls the one above with an array of values.
+    fn call_trampoline_address() -> VMTrampoline;
+}
+
 impl crate::Function {
     /// Consume [`self`] into [`crate::backend::sys::function::Function`].
     pub fn into_sys(self) -> crate::backend::sys::function::Function {
@@ -1213,37 +1225,41 @@ macro_rules! impl_host_function {
             call_trampoline::<$( $x, )* Rets> as _
         }
 
-        /// The trampoline of a typed async host function. The guest calls
-        /// it as it calls the one of a function with an environment, so the
-        /// two share their call trampoline.
         #[cfg(feature = "experimental-async")]
         #[allow(non_snake_case, unused_parens)]
-        pub(crate) fn [<gen_fn_callback_ $c_struct_name:lower _async>]
-            <T, $( $x, )* Rets, Func>
-            (_this: &Func) -> crate::backend::sys::vm::VMFunctionCallback
+        impl<T, $( $x, )* Rets, RetsAsResult, Func> AsyncHostTrampolines<T, ( $( $x ),* ), Rets> for Func
         where
             T: 'static,
-            $( $x: FromToNativeWasmType + 'static, )*
+            Func: for<'e> AsyncFn(&'e mut AsyncEnv<T>, $( $x ),*) -> RetsAsResult + 'static,
+            RetsAsResult: IntoResult<Rets> + 'static,
             Rets: WasmTypeList + 'static,
             ( $( $x ),* ): WasmTypeList + 'static,
-            Func: AsyncHostFunction<T, ( $( $x ),* ), Rets>,
+            $( $x: FromToNativeWasmType + 'static, )*
         {
-            #[allow(unused_variables, clippy::unused_unit)]
-            unsafe extern "C-unwind" fn func_wrapper<T, $( $x, )* Rets, Func>( env: &StaticFunction<Rc<Func>, T>, $( $x: <$x::Native as NativeWasmType>::Abi, )* ) -> Rets::CStruct
-            where
-                T: 'static,
-                $( $x: FromToNativeWasmType + 'static, )*
-                Rets: WasmTypeList + 'static,
-                ( $( $x ),* ): WasmTypeList + 'static,
-                Func: AsyncHostFunction<T, ( $( $x ),* ), Rets>,
-            {
-                unsafe {
-                    call_typed_async(env, |store: &mut StoreMut<'_>| {
-                        ( $( FromToNativeWasmType::from_native(NativeWasmTypeInto::from_abi(&mut *store, $x)) ),* )
-                    })
+            fn function_callback(&self) -> VMFunctionCallback {
+                #[allow(unused_variables, clippy::unused_unit)]
+                unsafe extern "C-unwind" fn func_wrapper<T, $( $x, )* Rets, Func>( env: &StaticFunction<Rc<Func>, T>, $( $x: <$x::Native as NativeWasmType>::Abi, )* ) -> Rets::CStruct
+                where
+                    T: 'static,
+                    $( $x: FromToNativeWasmType + 'static, )*
+                    Rets: WasmTypeList + 'static,
+                    ( $( $x ),* ): WasmTypeList + 'static,
+                    Func: AsyncHostFunction<T, ( $( $x ),* ), Rets>,
+                {
+                    unsafe {
+                        call_typed_async(env, |store: &mut StoreMut<'_>| {
+                            ( $( FromToNativeWasmType::from_native(NativeWasmTypeInto::from_abi(&mut *store, $x)) ),* )
+                        })
+                    }
                 }
+                func_wrapper::< T, $( $x, )* Rets, Self > as _
             }
-            func_wrapper::< T, $( $x, )* Rets, Func > as _
+
+            /// The guest calls the trampoline as it calls the one of a
+            /// function with an environment, so the two share this one.
+            fn call_trampoline_address() -> VMTrampoline {
+                [<gen_call_trampoline_address_ $c_struct_name:lower>]::<$( $x, )* Rets>()
+            }
         }
     }};
 }
