@@ -442,6 +442,14 @@ compile_error!(
     "the `sys` feature requires enabling at least one compiler backend: `singlepass`, `cranelift`, `llvm`, or `headless`."
 );
 
+// A `baremetal` trap leaves through the embedder's unwinder, which cannot
+// stop at the coroutine of a `call_async`, and a call dropped while suspended
+// cannot be unwound either: it would be forgotten, stack and all.
+#[cfg(all(feature = "sys", feature = "experimental-async", feature = "baremetal"))]
+compile_error!(
+    "the `experimental-async` feature is not supported with `baremetal`: traps and cancelled calls cannot unwind a `call_async` coroutine there."
+);
+
 cfg_compiler! {
     mod utils;
     pub use utils::*;

@@ -75,15 +75,10 @@ impl StoreContext {
 
     /// Whether the thread still has what unwinding a call suspended in Wasm
     /// needs of it: false once its thread locals are being destroyed, as it
-    /// exits, and always with `baremetal`. A call suspended then is forgotten
-    /// rather than unwound.
+    /// exits. A call suspended then is forgotten rather than unwound.
     #[cfg(all(feature = "sys", feature = "experimental-async"))]
     pub(crate) fn thread_can_unwind() -> bool {
-        // With `baremetal`, what a guest frame raises leaves through the
-        // embedder's unwinder, which would take the unwind of a suspended
-        // coroutine off its stack: such a coroutine is forgotten instead.
-        !cfg!(feature = "baremetal")
-            && STORE_CONTEXT_STACK.try_with(|_| ()).is_ok()
+        STORE_CONTEXT_STACK.try_with(|_| ()).is_ok()
             && wasmer_vm::ActivationState::thread_is_usable()
     }
 
