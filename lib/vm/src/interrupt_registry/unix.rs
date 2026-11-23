@@ -382,3 +382,46 @@ pub fn is_interrupted(store_id: StoreId) -> bool {
             .is_some_and(|(_, interrupted)| interrupted.load(Ordering::Acquire))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A sync call enters a store, and one of its host functions runs
+    /// `block_on(f.call_async(&mut env, ..))`. The interrupt lands after the
+    /// nested call's poll checked for one, and before the nested call enters
+    /// the store from its coroutine. The nested entry must be refused, as it
+    /// is without the coroutine in between.
+    // TODO: fails today, so it is ignored. `install` gives an entry a fresh
+    // flag when the store is interrupted but not in the thread's list, so
+    // that a forgotten suspended call cannot keep its store interrupted. The
+    // coroutine switch swaps the caller's entry out of that list, so the
+    // nested entry is taken for a new call, gets a fresh flag, and its guest
+    // runs on as if never interrupted. Either drop the reset, or keep the
+    // callers of a coroutine on the thread's list. Reported in
+    // https://github.com/wasmerio/wasmer-runtime/pull/18#discussion_r4664630939.
+    #[test]
+    #[ignore = "TODO: an interrupted store lets a nested entry in behind a coroutine switch"]
+    fn an_entry_behind_a_coroutine_switch_is_refused_once_interrupted() {
+        let store_id = StoreId::default();
+        let outer = install(store_id).unwrap();
+        // The coroutine of the nested call starts with no stores of its own.
+        let mut coroutine = ActiveStores::new();
+        coroutine.swap();
+        // What `interrupt` does to the flag, without the signal.
+        STORE_INTERRUPT_STATE
+            .get(&store_id)
+            .unwrap()
+            .interrupted
+            .store(true, Ordering::Release);
+
+        let nested = install(store_id);
+        let refused = matches!(nested, Err(InstallError::AlreadyInterrupted));
+        // Leave the thread as it was before asserting: guards are popped in
+        // order, and the coroutine's list is not left on the thread.
+        drop(nested);
+        coroutine.swap();
+        drop(outer);
+        assert!(refused, "the nested entry was let in with a fresh flag");
+    }
+}

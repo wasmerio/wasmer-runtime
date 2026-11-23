@@ -9,6 +9,7 @@ see the [`wasmer` crate README](../lib/api/README.md), the
 ## Develop the runtime
 
 - [Architecture](./ARCHITECTURE.md)
+- [Async calls](./ASYNC.md)
 - [Building from source](./BUILD.md)
 - [Testing](./TEST.md)
 - [Contributing](./CONTRIBUTING.md)

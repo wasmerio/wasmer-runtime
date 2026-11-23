@@ -80,9 +80,9 @@ cc = "1.2.47"
 cmake = "0.1.50"
 compiletest_rs = "0.11.2"
 corosensei = "0.3.0"
-cranelift-codegen = { version = "=0.136.5", default-features = false }
-cranelift-entity = { version = "=0.136.5", default-features = false }
-cranelift-frontend = { version = "=0.136.5", default-features = false }
+cranelift-codegen = { version = "=0.138.0", default-features = false }
+cranelift-entity = { version = "=0.138.0", default-features = false }
+cranelift-frontend = { version = "=0.138.0", default-features = false }
 crc32fast = "1.5.0"
 criterion = { version = "0.8.1", default-features = false }
 crossbeam-channel = "0.5.15"
@@ -318,6 +318,11 @@ required-features = ["singlepass"]
 name = "call_paths"
 harness = false
 required-features = ["cranelift"]
+
+[[bench]]
+name = "async_import"
+harness = false
+required-features = ["wat", "experimental-async"]
 
 [[example]]
 name = "early-exit"
