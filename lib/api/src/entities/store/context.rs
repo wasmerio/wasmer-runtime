@@ -297,6 +297,9 @@ impl Drop for StorePtrWrapper {
 }
 
 impl Drop for StoreInstallGuard<'_> {
+    // Inlined into the call that installed the entry, which then looks the
+    // thread-local up once for both.
+    #[inline]
     fn drop(&mut self) {
         let entry = self.entry;
         // Taken off before anything is checked, so that the thread never keeps
