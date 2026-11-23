@@ -125,6 +125,32 @@ pub fn on_host_stack<F: FnOnce() -> T, T>(f: F) -> T {
     f()
 }
 
+/// See the `std` variant: there is no Wasm stack to switch from here, so `f`
+/// is always given back.
+pub fn try_on_host_stack<F: FnOnce() -> T, T>(f: F) -> Result<T, F> {
+    Err(f)
+}
+
+/// Runs `f` in-place (there is only one stack).
+pub fn on_host_stack_from_host<F: FnOnce() -> T, T>(f: F) -> T {
+    f()
+}
+
+/// See the `std` variant. Host code always runs where it is called here, so
+/// the reserve is never measured.
+pub const HOST_CALL_RESERVE: usize = 256 * 1024;
+
+/// See the `std` variant. Host code always runs where it is called here.
+#[must_use = "the host call ends when this is dropped"]
+pub struct HostCallInPlace(());
+
+/// See the `std` variant. Host code always runs where it is called here: the
+/// guard does nothing.
+#[inline(always)]
+pub fn host_call_in_place() -> Option<HostCallInPlace> {
+    Some(HostCallInPlace(()))
+}
+
 /// Just run the `closure` and return its result wrapped in `Ok()`. Nothing is
 /// caught in `baremetal` mode.
 ///

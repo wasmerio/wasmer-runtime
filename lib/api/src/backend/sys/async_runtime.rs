@@ -370,7 +370,8 @@ impl<E: Entry> Future for AsyncCallFuture<'_, E> {
             // published as well.
             let _hidden = PollScope::enter(None);
             // Safety: the entry is taken off before the slice ends.
-            let _entered = unsafe { StoreContext::install(slice.ptr()) };
+            let entry = unsafe { StoreContext::new(slice.ptr()) };
+            let _entered = unsafe { entry.install() };
             let _waiting = Resuming::enter(&mut this.waiting);
             guest.resume(this.store.id(), trap_handler)
         };

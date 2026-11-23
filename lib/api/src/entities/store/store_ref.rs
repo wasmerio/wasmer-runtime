@@ -188,7 +188,8 @@ impl StoreMut<'_> {
         // SAFETY: `ptr` comes from `&mut *self.inner`, which `&mut self` keeps
         // alive and unreachable for every frame on this thread until `f`
         // returns and the guard is dropped.
-        let guard = unsafe { super::StoreContext::install(ptr) };
+        let entry = unsafe { super::StoreContext::new(ptr) };
+        let guard = unsafe { entry.install() };
         keeper.holding(guard, |_| f())
     }
 }

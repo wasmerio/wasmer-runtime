@@ -15,15 +15,13 @@ use bytesize::ByteSize;
 use core::ptr::{read, read_unaligned};
 use corosensei::stack::{DefaultStack, Stack};
 use corosensei::trap::{CoroutineTrapHandler, TrapHandlerRegs};
-use corosensei::{Coroutine, CoroutineResult, ScopedCoroutine, Yielder};
+use corosensei::{Coroutine, CoroutineResult, Yielder};
 use scopeguard::defer;
 use std::any::Any;
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
 use std::error::Error;
 use std::io;
-use std::mem;
-#[cfg(unix)]
-use std::mem::MaybeUninit;
+use std::mem::{self, ManuallyDrop, MaybeUninit};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering, compiler_fence};
 use std::sync::{LazyLock, Once};
@@ -87,32 +85,28 @@ pub fn get_stack_size() -> usize {
     DEFAULT_STACK_SIZE.load(Ordering::Relaxed)
 }
 
+/// How much of the Wasm stack must be left for a synchronous host function
+/// called from Wasm to run on it, in bytes: 256 KiB.
+///
+/// A host function set to run in place (see [`host_call_in_place`];
+/// `Function::set_calls_on_native_stack(.., false)` in the API) runs on the
+/// Wasm stack it was called from when at least this much of that stack is
+/// left, which saves switching to the native stack and back again. With less
+/// left it runs on the native stack. The reserve is all the stack such a host
+/// function is sure to have there: one that may need more must stay on the
+/// native stack, where host functions run by default. A host function that
+/// overflows the Wasm stack aborts the process, as overflowing the native
+/// stack does.
+///
+/// The space is measured from the lowest address of the Wasm stack, above its
+/// guard page.
+pub const HOST_CALL_RESERVE: usize = ByteSize::kib(256).as_u64() as usize;
+
 /// Pool of pre-allocated coroutine stacks to avoid repeated mmap syscalls.
 /// Acts as the cross-thread overflow store; per-thread reuse is served by
-/// `TLS_STACK` to keep the hot path atomic-free.
+/// [`VmThread::stack_cache`] to keep the hot path atomic-free.
 static STACK_POOL: LazyLock<crossbeam_queue::SegQueue<DefaultStack>> =
     LazyLock::new(crossbeam_queue::SegQueue::new);
-
-/// Per-thread cache holding a single ready-to-use coroutine stack. The hot
-/// path of `on_wasm_stack` pops from here without touching the global
-/// `STACK_POOL`'s atomics; only the first call on a thread or re-entrant
-/// nested calls fall back to the pool.
-///
-/// On thread exit the held stack (if any) is pushed to `STACK_POOL` so memory
-/// cycles correctly across thread lifetimes (no mmap leaks).
-struct StackCache(Cell<Option<DefaultStack>>);
-
-impl Drop for StackCache {
-    fn drop(&mut self) {
-        if let Some(stack) = self.0.take() {
-            STACK_POOL.push(stack);
-        }
-    }
-}
-
-thread_local! {
-    static TLS_STACK: StackCache = const { StackCache(Cell::new(None)) };
-}
 
 /// Acquire a coroutine stack large enough for `min_size`. Prefers the
 /// thread-local cache (no atomics), falls back to the global `STACK_POOL`,
@@ -120,7 +114,7 @@ thread_local! {
 fn acquire_stack(min_size: usize) -> DefaultStack {
     // Fast path: thread-local cache. Steady-state per-thread reuse never
     // touches the SegQueue.
-    if let Some(stack) = TLS_STACK.with(|cache| cache.0.take()) {
+    if let Some(stack) = VmThread::get().stack_cache.take() {
         if stack.size() >= min_size {
             return stack;
         }
@@ -138,20 +132,15 @@ fn acquire_stack(min_size: usize) -> DefaultStack {
 
 /// Release a coroutine stack. Prefers the thread-local slot if empty (no
 /// atomics); otherwise pushes to the global `STACK_POOL` so the stack is
-/// still reusable by other threads.
+/// still reusable by other threads, as it does once the thread exits.
 fn release_stack(stack: DefaultStack) {
-    let displaced = TLS_STACK.with(|cache| cache.0.replace(Some(stack)));
+    let thread = VmThread::get();
+    let displaced = if thread.keeps() {
+        thread.stack_cache.replace(Some(stack))
+    } else {
+        Some(stack)
+    };
     if let Some(displaced) = displaced {
-        STACK_POOL.push(displaced);
-    }
-}
-
-/// [`release_stack`], for a stack that can be released while the thread's
-/// locals are destroyed, as it exits: it then goes to the shared pool.
-fn release_stack_of_dropped_call(stack: DefaultStack) {
-    let mut stack = Some(stack);
-    let displaced = TLS_STACK.try_with(|cache| cache.0.replace(stack.take()));
-    if let Some(displaced) = displaced.ok().flatten().or(stack) {
         STACK_POOL.push(displaced);
     }
 }
@@ -169,14 +158,15 @@ fn release_stack_of_dropped_call(stack: DefaultStack) {
 /// only a best-effort drain: there is no guarantee that no undersized stacks
 /// exist immediately after it returns unless the caller ensures, via external
 /// synchronization, that no other Wasm executions can return stacks to the
-/// pool while this function runs. The current thread's TLS-cached stack is
-/// drained as part of this call.
+/// pool while this function runs. The current thread's TLS-cached stack, and
+/// those of its entry coroutines that no running call uses, are drained as
+/// part of this call.
 pub fn drain_stack_pool() {
-    // Drain the calling thread's TLS slot first (best-effort across threads
+    // Drain the calling thread's TLS slots first (best-effort across threads
     // still applies — other threads' caches aren't touched).
-    if let Some(stack) = TLS_STACK.with(|cache| cache.0.take()) {
-        drop(stack);
-    }
+    let thread = VmThread::get();
+    thread.entries.take_idle().for_each(drop);
+    drop(thread.stack_cache.take());
     while STACK_POOL.pop().is_some() {}
 }
 
@@ -888,43 +878,221 @@ pub unsafe fn catch_traps<F, R: 'static>(
 where
     F: FnOnce() -> R + 'static,
 {
-    // Ensure that per-thread initialization is done.
-    lazy_per_thread_init()?;
     let stack_size = config
         .wasm_stack_size
         .unwrap_or_else(|| DEFAULT_STACK_SIZE.load(Ordering::Relaxed));
     on_wasm_stack(stack_size, trap_handler, closure).map_err(UnwindReason::into_trap)
 }
 
-// We need two separate thread-local variables here:
-// - YIELDER is set within the new stack and is used to unwind back to the root
-//   of the stack from inside it.
-// - TRAP_HANDLER is set from outside the new stack and is solely used from
-//   signal handlers. It must be atomic since it is used by signal handlers.
-//
-// We also do per-thread signal stack initialization on the first time
-// TRAP_HANDLER is accessed.
 thread_local! {
-    static YIELDER: Cell<Option<NonNull<WasmYielder>>> = const { Cell::new(None) };
-    static TRAP_HANDLER: AtomicPtr<TrapHandlerContext> = const { AtomicPtr::new(ptr::null_mut()) };
-    /// The yielder of the [`SuspendableCall`] that is being resumed on this
-    /// thread, if one is. The Wasm stack that is running may be suspended
-    /// only if it is that call's own: a call made from a host function it
-    /// reached runs on another stack, with that host function beneath it.
-    static SUSPENDABLE: Cell<Option<NonNull<WasmYielder>>> = const { Cell::new(None) };
+    /// What the VM keeps for this thread, in one thread-local so that a call
+    /// looks it up once. It is `const` and has no destructor: looking it up
+    /// is only computing its address, and the signal handler can read it.
+    static THREAD: VmThread = const { VmThread::new() };
+    /// Registered when the thread is set up for Wasm (see
+    /// [`VmThread::prepare`]): its destructor releases what [`THREAD`]
+    /// caches when the thread exits.
+    static THREAD_EXIT: ThreadExit = const { ThreadExit };
 }
 
-/// Why a Wasm stack gives control back to the host stack that resumed it,
-/// short of returning.
-enum WasmYield {
-    /// To unwind: the stack is reset, and none of it runs again.
-    Unwind(UnwindReason),
-    /// To wait, in a [`SuspendableCall`]: the stack is resumed later, as the
-    /// one that may suspend, which its yielder says.
-    Suspend(NonNull<WasmYielder>),
+/// What the VM keeps for each thread (see [`THREAD`]).
+struct VmThread {
+    /// How far the thread is set up for Wasm.
+    setup: Cell<Setup>,
+    /// The Wasm stacks code runs on.
+    stacks: Stacks,
+    /// What the signal handler needs to turn a fault in Wasm into a trap,
+    /// while a call runs: set from outside the Wasm stack. Atomic, since the
+    /// signal handler reads it.
+    trap_handler: AtomicPtr<TrapHandlerContext>,
+    /// The Wasm stack of the [`SuspendableCall`] that is being resumed on
+    /// this thread, if one is. The Wasm stack that is running may be
+    /// suspended only if it is that call's own: a call made from a host
+    /// function it reached runs on another stack, with that host function
+    /// beneath it.
+    suspendable: Cell<Option<NonNull<WasmStack>>>,
+    /// The entry coroutines this thread keeps between calls (see
+    /// [`EntrySlots`]).
+    entries: ManuallyDrop<EntrySlots>,
+    /// A coroutine stack ready to use: making a coroutine takes it before
+    /// the global `STACK_POOL`, whose atomics it saves, and a coroutine that
+    /// is done puts its stack back here.
+    stack_cache: ManuallyDrop<Cell<Option<DefaultStack>>>,
 }
 
-type WasmYielder = Yielder<(), WasmYield>;
+const _: () = assert!(!mem::needs_drop::<VmThread>());
+
+/// How far a thread is set up for Wasm (see [`VmThread::prepare`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Setup {
+    /// Not yet: its first call sets it up.
+    Pending,
+    /// Set up, with [`THREAD_EXIT`] registered: it keeps coroutines and
+    /// stacks between calls.
+    Ready,
+    /// It exits, and [`THREAD_EXIT`] released what it kept: a call from a
+    /// later destructor keeps nothing.
+    Exited,
+}
+
+impl VmThread {
+    const fn new() -> Self {
+        Self {
+            setup: Cell::new(Setup::Pending),
+            stacks: Stacks::new(),
+            trap_handler: AtomicPtr::new(ptr::null_mut()),
+            suspendable: Cell::new(None),
+            entries: ManuallyDrop::new(EntrySlots::new()),
+            stack_cache: ManuallyDrop::new(Cell::new(None)),
+        }
+    }
+
+    /// The calling thread's.
+    ///
+    /// Same as `THREAD.with(|thread| ..)`, without the closure: when the
+    /// closure is large, `with` itself is not inlined, and then the lookup
+    /// becomes an indirect call through the `LocalKey`.
+    #[inline(always)]
+    fn get() -> &'static Self {
+        // Safety: `THREAD` has no destructor, so it lives as long as the
+        // thread, and it is not `Sync`: references to it stay on the thread.
+        unsafe { &*THREAD.with(ptr::from_ref) }
+    }
+
+    /// Sets the thread up for Wasm, the first time: its signal stack (see
+    /// [`lazy_per_thread_init`]), and [`THREAD_EXIT`]. Returns whether the
+    /// thread keeps coroutines and stacks: not once it exits.
+    #[inline(always)]
+    fn prepare(&self) -> Result<bool, Trap> {
+        if self.keeps() {
+            return Ok(true);
+        }
+        self.prepare_slow()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn prepare_slow(&self) -> Result<bool, Trap> {
+        lazy_per_thread_init()?;
+        if self.setup.get() == Setup::Pending && THREAD_EXIT.try_with(|_| ()).is_ok() {
+            self.setup.set(Setup::Ready);
+        }
+        Ok(self.keeps())
+    }
+
+    /// Whether the thread keeps what it caches: whether it is set up, and
+    /// not exiting, so that [`THREAD_EXIT`] will release it.
+    #[inline(always)]
+    fn keeps(&self) -> bool {
+        self.setup.get() == Setup::Ready
+    }
+}
+
+/// Releases what a thread caches when it exits (see [`THREAD_EXIT`]): the
+/// stacks go to the global pool, so that memory cycles across thread
+/// lifetimes.
+struct ThreadExit;
+
+impl Drop for ThreadExit {
+    fn drop(&mut self) {
+        let thread = VmThread::get();
+        thread.setup.set(Setup::Exited);
+        for stack in thread.entries.take_idle() {
+            STACK_POOL.push(stack);
+        }
+        if let Some(stack) = thread.stack_cache.take() {
+            STACK_POOL.push(stack);
+        }
+    }
+}
+
+/// The Wasm stacks code runs on, on a thread (see [`VmThread`]).
+struct Stacks {
+    /// The Wasm stack that Wasm runs on: set on that stack at the start of
+    /// each call, and taken while host code runs, on whichever stack. `None`
+    /// means that no Wasm runs at this point.
+    wasm: Cell<Option<NonNull<WasmStack>>>,
+    /// The Wasm stack that host code runs on in place, if it does (see
+    /// [`host_call_in_place`]): set while such a host call runs, and cleared
+    /// for whatever it runs on another stack. A call into Wasm from host code
+    /// in place resumes its coroutine from the stack that this Wasm stack's
+    /// coroutine was resumed from, and `on_host_stack` runs there too, so that
+    /// the stack a coroutine switches back to is never another Wasm stack.
+    ///
+    /// The signal handler relies on it to tell a fault of host code on a Wasm
+    /// stack from one of the guest: host code elsewhere runs on the native
+    /// stack, outside the bounds of every Wasm stack.
+    in_place: Cell<Option<NonNull<WasmStack>>>,
+}
+
+impl Stacks {
+    const fn new() -> Self {
+        Self {
+            wasm: Cell::new(None),
+            in_place: Cell::new(None),
+        }
+    }
+}
+
+/// Runs `f` with the calling thread's [`Stacks`].
+#[inline(always)]
+fn with_stacks<R>(f: impl FnOnce(&Stacks) -> R) -> R {
+    f(&VmThread::get().stacks)
+}
+
+/// A Wasm stack, which [`Stacks::wasm`] points to while Wasm runs on it: what
+/// it takes to leave the stack (its yielder) and to measure what is left of
+/// it. It lives on that very stack, in the frame of the coroutine's body, for
+/// as long as the coroutine does, so taking and restoring the pointer keeps
+/// the two together.
+struct WasmStack {
+    yielder: NonNull<WasmYielder>,
+    /// The lowest address code may use on the stack, above its guard page.
+    limit: usize,
+}
+
+impl WasmStack {
+    /// The lowest address code may use on `stack`.
+    fn limit_of(stack: &DefaultStack) -> usize {
+        // `Stack::limit` includes the guard page.
+        stack.limit().get() + region::page::size()
+    }
+}
+
+/// The yielder of a Wasm stack: that of an entry coroutine (see
+/// [`EntrySlots`]) or of a [`SuspendableCall`].
+///
+/// Only word-sized values cross its switches, which corosensei passes in a
+/// register; larger ones go through memory, where they are read right after
+/// being written. An entry coroutine is resumed with the call it is to run
+/// (a [`SuspendableCall`] with null), and a Wasm stack gives control back
+/// with null when that call returned, with [`SUSPENDED`] when an import
+/// suspended a [`SuspendableCall`], or with a pointer to the reason given to
+/// [`unwind_with`], on the stack itself. A trap handler makes the coroutine
+/// return instead (see [`FromUnwind`]).
+type WasmYielder = Yielder<*const EntryJob, *mut UnwindReason>;
+
+/// What a [`SuspendableCall`] gives control back with when an import
+/// suspends it: an address no reason is ever at.
+const SUSPENDED: *mut UnwindReason = ptr::dangling_mut();
+
+/// What a coroutine that a trap handler makes return returns, made of the
+/// reason of the trap.
+trait FromUnwind {
+    fn from_unwind(reason: UnwindReason) -> Self;
+}
+
+impl FromUnwind for UnwindReason {
+    fn from_unwind(reason: UnwindReason) -> Self {
+        reason
+    }
+}
+
+impl<T> FromUnwind for Result<T, UnwindReason> {
+    fn from_unwind(reason: UnwindReason) -> Self {
+        Err(reason)
+    }
+}
 
 /// What a suspended [`SuspendableCall`] keeps registered beyond its thread:
 /// with `experimental-host-interrupt`, the stores it entered, which an
@@ -969,7 +1137,7 @@ impl ActivationState {
     /// in on another thread.
     pub unsafe fn swap(&mut self) {
         debug_assert!(
-            YIELDER.with(|cell| cell.get()).is_none(),
+            with_stacks(|stacks| stacks.wasm.get()).is_none(),
             "registrations switched while running on the Wasm stack"
         );
         #[cfg(feature = "experimental-host-interrupt")]
@@ -985,12 +1153,13 @@ impl ActivationState {
 
     /// Whether the calling thread still has what swapping a state in needs of
     /// it: false once its thread locals are being destroyed, as it exits. A
-    /// state is then abandoned (see [`Self::abandon`]).
+    /// state is then abandoned (see [`Self::abandon`]). The VM's own state
+    /// for the thread has no destructor; only the interrupt registry's does.
     pub fn thread_is_usable() -> bool {
-        let usable = TLS_STACK.try_with(|_| ()).is_ok();
         #[cfg(feature = "experimental-host-interrupt")]
-        let usable = usable && interrupt_registry::thread_is_usable();
-        usable
+        return interrupt_registry::thread_is_usable();
+        #[cfg(not(feature = "experimental-host-interrupt"))]
+        true
     }
 
     /// Whether nothing is registered: true before a call first runs and after
@@ -1029,22 +1198,24 @@ struct TrapHandlerContext {
     ) -> bool,
     custom_trap: Option<*const TrapHandlerFn<'static>>,
 }
-struct TrapHandlerContextInner<T> {
+struct TrapHandlerContextInner<R> {
     /// Information about the currently running coroutine. This is used to
     /// reset execution to the root of the coroutine when a trap is handled.
-    coro_trap_handler: CoroutineTrapHandler<Result<T, UnwindReason>>,
+    coro_trap_handler: CoroutineTrapHandler<R>,
 }
 
 impl TrapHandlerContext {
-    /// Runs the given function with a trap handler context. The previous
-    /// trap handler context is preserved and restored afterwards.
-    fn install<T, R>(
+    /// Runs the given function with a trap handler context, installed in
+    /// `thread`, the calling thread's. The previous trap handler context is
+    /// preserved and restored afterwards.
+    fn install<R: FromUnwind, X>(
+        thread: &VmThread,
         custom_trap: Option<*const TrapHandlerFn<'static>>,
-        coro_trap_handler: CoroutineTrapHandler<Result<T, UnwindReason>>,
-        f: impl FnOnce() -> R,
-    ) -> R {
+        coro_trap_handler: CoroutineTrapHandler<R>,
+        f: impl FnOnce() -> X,
+    ) -> X {
         // Type-erase the trap handler function so that it can be placed in TLS.
-        fn func<T>(
+        fn func<R: FromUnwind>(
             ptr: *const u8,
             pc: usize,
             sp: usize,
@@ -1053,7 +1224,7 @@ impl TrapHandlerContext {
             update_regs: &mut dyn FnMut(TrapHandlerRegs),
         ) -> bool {
             unsafe {
-                (*(ptr as *const TrapHandlerContextInner<T>)).handle_trap(
+                (*(ptr as *const TrapHandlerContextInner<R>)).handle_trap(
                     pc,
                     sp,
                     maybe_fault_address,
@@ -1065,19 +1236,18 @@ impl TrapHandlerContext {
         let inner = TrapHandlerContextInner { coro_trap_handler };
         let ctx = Self {
             inner: &inner as *const _ as *const u8,
-            handle_trap: func::<T>,
+            handle_trap: func::<R>,
             custom_trap,
         };
 
         compiler_fence(Ordering::Release);
-        let prev = TRAP_HANDLER.with(|ptr| {
-            let prev = ptr.load(Ordering::Relaxed);
-            ptr.store(&ctx as *const Self as *mut Self, Ordering::Relaxed);
-            prev
-        });
+        let prev = thread.trap_handler.load(Ordering::Relaxed);
+        thread
+            .trap_handler
+            .store(&ctx as *const Self as *mut Self, Ordering::Relaxed);
 
         defer! {
-            TRAP_HANDLER.with(|ptr| ptr.store(prev, Ordering::Relaxed));
+            thread.trap_handler.store(prev, Ordering::Relaxed);
             compiler_fence(Ordering::Acquire);
         }
 
@@ -1094,7 +1264,8 @@ impl TrapHandlerContext {
         call_handler: impl Fn(&TrapHandlerFn<'static>) -> bool,
     ) -> bool {
         unsafe {
-            let ptr = TRAP_HANDLER.with(|ptr| ptr.load(Ordering::Relaxed));
+            let thread = VmThread::get();
+            let ptr = thread.trap_handler.load(Ordering::Relaxed);
             if ptr.is_null() {
                 return false;
             }
@@ -1106,6 +1277,15 @@ impl TrapHandlerContext {
                 && call_handler(&*trap_handler)
             {
                 return true;
+            }
+
+            // Host code may run in place on a Wasm stack (see
+            // `host_call_in_place`): a fault in it is the host's, and
+            // resetting the coroutine would skip its destructors. Host code
+            // anywhere else runs on the native stack, which the context of
+            // the coroutine tells from its own below.
+            if thread.stacks.in_place.get().is_some() {
+                return false;
             }
 
             (ctx.handle_trap)(
@@ -1120,7 +1300,7 @@ impl TrapHandlerContext {
     }
 }
 
-impl<T> TrapHandlerContextInner<T> {
+impl<R: FromUnwind> TrapHandlerContextInner<R> {
     unsafe fn handle_trap(
         &self,
         pc: usize,
@@ -1167,7 +1347,7 @@ impl<T> TrapHandlerContextInner<T> {
             };
             let regs = self
                 .coro_trap_handler
-                .setup_trap_handler(move || Err(unwind));
+                .setup_trap_handler(move || R::from_unwind(unwind));
             update_regs(regs);
             true
         }
@@ -1176,13 +1356,15 @@ impl<T> TrapHandlerContextInner<T> {
 
 unsafe fn unwind_with(reason: UnwindReason) -> ! {
     unsafe {
-        let yielder = YIELDER
-            .with(|cell| cell.replace(None))
-            .expect("not running on Wasm stack");
+        let wasm_stack =
+            with_stacks(|stacks| stacks.wasm.replace(None)).expect("not running on Wasm stack");
 
-        yielder.as_ref().suspend(WasmYield::Unwind(reason));
+        // Whoever resumed the stack moves the reason off this frame, then
+        // forcibly resets the stack.
+        let mut reason = ManuallyDrop::new(reason);
+        let yielder = wasm_stack.as_ref().yielder;
+        yielder.as_ref().suspend(&mut *reason as *mut UnwindReason);
 
-        // on_wasm_stack will forcibly reset the coroutine stack after yielding.
         unreachable!();
     }
 }
@@ -1190,53 +1372,337 @@ unsafe fn unwind_with(reason: UnwindReason) -> ! {
 /// Runs the given function on a separate stack so that its stack usage can be
 /// bounded. Stack overflows and other traps can be caught and execution
 /// returned to the root of the stack.
+///
+/// The function runs as one resume of an entry coroutine of the thread (see
+/// [`EntrySlots`]).
+//
+// Always inlined, so that the closure is read where its caller wrote it (see
+// `EntryJob`).
+#[inline(always)]
 fn on_wasm_stack<F: FnOnce() -> T + 'static, T: 'static>(
     stack_size: usize,
     trap_handler: Option<*const TrapHandlerFn<'static>>,
     f: F,
 ) -> Result<T, UnwindReason> {
-    // Reuse a cached stack — TLS first (atomic-free hot path), then the
-    // cross-thread overflow pool, then allocate fresh. Size mismatches
-    // (e.g. after `drain_stack_pool()` + a stack-size change) are filtered
-    // inside `acquire_stack`. `base() - limit()` is the full mmap region
-    // (including guard page), which is always >= the requested size for
-    // stacks allocated with that size.
-    let stack = acquire_stack(stack_size);
-    let mut stack = scopeguard::guard(stack, release_stack);
+    unsafe fn run<F: FnOnce() -> T, T>(f: *const u8, result: *mut u8) {
+        unsafe { result.cast::<T>().write(ptr::read(f.cast::<F>())()) }
+    }
+    // `run` moves the closure out. It is never dropped here: if the call
+    // traps, it is abandoned with the rest of the Wasm stack.
+    let f = ManuallyDrop::new(f);
+    let mut result = MaybeUninit::<T>::uninit();
+    let job = EntryJob {
+        run: run::<F, T>,
+        f: ptr::from_ref(&*f).cast(),
+        result: result.as_mut_ptr().cast(),
+    };
+    let thread = VmThread::get();
+    // Once the thread exits, its slots keep nothing: a call from a later
+    // destructor runs on a coroutine of its own.
+    let keeps = thread.prepare().map_err(UnwindReason::LibTrap)?;
+    // The first coroutine of the thread that no running call uses, or one
+    // made for this call if they are all in use.
+    let slots = &thread.entries;
+    let busy = slots.busy.get();
+    let index = busy.trailing_ones() as usize;
+    let outcome = if keeps && index < ENTRY_SLOTS {
+        slots.busy.set(busy | (1 << index));
+        let _release = SlotRelease { slots, index };
+        // SAFETY: the slot is this call's until `_release` releases it.
+        let entry = unsafe { slots.entry(index, stack_size) };
+        unsafe { resume_entry(thread, entry, &job, trap_handler) }
+    } else {
+        unsafe { run_on_new_entry(thread, stack_size, &job, trap_handler) }
+    };
+    // SAFETY: `run` wrote the result if the call returned.
+    outcome.map(|()| unsafe { result.assume_init() })
+}
 
-    // Create a coroutine with a new stack to run the function on.
-    let coro = ScopedCoroutine::with_stack(&mut *stack, move |yielder, ()| {
-        // Save the yielder to TLS so that it can be used later.
-        YIELDER.with(|cell| cell.set(Some(yielder.into())));
+/// How many entry coroutines a thread keeps: one for calls from the host and
+/// one for calls back into Wasm from a host function. Deeper nesting makes a
+/// coroutine per call.
+const ENTRY_SLOTS: usize = 2;
 
-        Ok(f())
-    });
+/// The entry coroutines a thread keeps between synchronous calls into Wasm,
+/// suspended: a call is one resume of one of them, instead of setting up a
+/// coroutine of its own on a cached stack.
+///
+/// Most of what setting up a coroutine per call cost was not instructions
+/// but loads waiting on stores: the cached stack was moved out of its
+/// thread-local and back, the call's closure was copied onto the coroutine's
+/// stack right after its caller had written it, and the result came back as
+/// a large enum through memory. Each of these reads, in one load, bytes that
+/// the stores just before it wrote in other widths or pieces, which the CPU
+/// cannot forward from its store buffer. Now the closure and its result stay
+/// on the frame of [`on_wasm_stack`], and only words cross the switch (see
+/// [`WasmYielder`]).
+///
+/// A call takes the first slot no running call uses. Slots are not tied to a
+/// nesting depth, though calls only ever nest here: a [`SuspendableCall`],
+/// which may wait with Wasm frames on its stack, runs on a coroutine of its
+/// own. A coroutine that finished, after a trap or a panic, is not kept: its
+/// stack goes back to the stack cache. [`ThreadExit`] returns their stacks to
+/// the pool when the thread exits.
+struct EntrySlots {
+    entries: [UnsafeCell<Option<EntryCoroutine>>; ENTRY_SLOTS],
+    /// Bit `i` set: a running call uses `entries[i]`.
+    busy: Cell<u8>,
+}
 
-    // Ensure that YIELDER is reset on exit even if the coroutine panics,
-    defer! {
-        YIELDER.with(|cell| cell.set(None));
+impl EntrySlots {
+    const fn new() -> Self {
+        Self {
+            entries: [const { UnsafeCell::new(None) }; ENTRY_SLOTS],
+            busy: Cell::new(0),
+        }
     }
 
-    coro.scope(|mut coro_ref| {
-        // Set up metadata for the trap handler for the duration of the coroutine
-        // execution. This is restored to its previous value afterwards.
-        TrapHandlerContext::install(trap_handler, coro_ref.trap_handler(), || {
-            match coro_ref.resume(()) {
-                CoroutineResult::Yield(WasmYield::Unwind(trap)) => {
-                    // This came from unwind_with which requires that there be only
-                    // Wasm code on the stack.
-                    unsafe {
-                        coro_ref.force_reset();
-                    }
-                    Err(trap)
-                }
-                CoroutineResult::Yield(WasmYield::Suspend(_)) => {
-                    unreachable!("a Wasm call that cannot be suspended was")
-                }
-                CoroutineResult::Return(result) => result,
+    /// The coroutine of slot `index`, made first if the slot has none, or
+    /// one whose stack is smaller than `stack_size` (which is discarded, as
+    /// `acquire_stack` does with stacks).
+    ///
+    /// # Safety
+    ///
+    /// The slot must be the caller's: marked busy by it, and by no other
+    /// running call.
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn entry(&self, index: usize, stack_size: usize) -> &mut EntryCoroutine {
+        // SAFETY: the slot is the caller's, so nothing else refers into it.
+        let slot = unsafe { &mut *self.entries[index].get() };
+        if !matches!(slot, Some(entry) if entry.stack_size >= stack_size) {
+            fill_slot(slot, stack_size);
+        }
+        // SAFETY: filled above if it was empty.
+        unsafe { slot.as_mut().unwrap_unchecked() }
+    }
+
+    /// Takes the coroutines that no running call uses, as their stacks.
+    fn take_idle(&self) -> impl Iterator<Item = DefaultStack> + '_ {
+        (0..ENTRY_SLOTS).filter_map(move |i| {
+            if self.busy.get() & (1 << i) != 0 {
+                return None;
             }
+            // SAFETY: not busy, so no call holds a reference into the slot.
+            unsafe { (*self.entries[i].get()).take() }.map(retire_entry)
         })
-    })
+    }
+}
+
+/// Releases the entry slot of a call when the call ends, and retires the
+/// slot's coroutine if it finished (after a trap or a panic).
+struct SlotRelease<'a> {
+    slots: &'a EntrySlots,
+    index: usize,
+}
+
+impl Drop for SlotRelease<'_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        let slots = self.slots;
+        slots.busy.set(slots.busy.get() & !(1 << self.index));
+        // SAFETY: the slot was the call's, which no longer runs.
+        let slot = unsafe { &mut *slots.entries[self.index].get() };
+        if slot.as_ref().is_some_and(|entry| entry.coro.done()) {
+            retire_slot(slot);
+        }
+    }
+}
+
+/// One call for an entry coroutine: `run(f, result)` on its stack, which calls
+/// the closure at `f` and writes what it returns to `result`.
+///
+/// The closure and the place for its result stay on the frame of
+/// [`on_wasm_stack`], reached through type-erased pointers. The closure is not
+/// copied: its caller has just written it field by field, and a bulk copy
+/// would read bytes from several of those stores at once, which waits for the
+/// stores to reach the cache instead of taking their values.
+struct EntryJob {
+    run: unsafe fn(*const u8, *mut u8),
+    f: *const u8,
+    result: *mut u8,
+}
+
+/// A coroutine that runs calls on a Wasm stack, one per resume (see
+/// [`entry_body`]). A trap handler makes it return.
+type EntryCoro = Coroutine<*const EntryJob, *mut UnwindReason, UnwindReason, DefaultStack>;
+
+struct EntryCoroutine {
+    coro: EntryCoro,
+    /// The size of its stack, compared with the size a call asks for.
+    stack_size: usize,
+}
+
+/// The body of every entry coroutine: runs the call it was resumed with, then
+/// suspends until the next one. Between two calls nothing on its stack needs
+/// dropping, so it can be reset at any suspension. `limit` is that of its
+/// [`WasmStack`]; `thread` is the thread the coroutine is made and runs on.
+fn entry_body(
+    yielder: &WasmYielder,
+    mut job: *const EntryJob,
+    limit: usize,
+    thread: &VmThread,
+) -> UnwindReason {
+    let wasm_stack = WasmStack {
+        yielder: NonNull::from(yielder),
+        limit,
+    };
+    loop {
+        thread.stacks.wasm.set(Some(NonNull::from(&wasm_stack)));
+        // SAFETY: `on_wasm_stack` resumed the coroutine with its call, which
+        // stays on its frame until the coroutine gives control back.
+        unsafe {
+            let job = &*job;
+            (job.run)(job.f, job.result);
+        }
+        job = yielder.suspend(ptr::null_mut());
+    }
+}
+
+/// Runs `job` as one resume of `entry`, with the trap handler context of the
+/// coroutine installed.
+///
+/// # Safety
+///
+/// Nothing else may use `entry` until this returns.
+#[inline(always)]
+unsafe fn resume_entry(
+    thread: &VmThread,
+    entry: &mut EntryCoroutine,
+    job: &EntryJob,
+    trap_handler: Option<*const TrapHandlerFn<'static>>,
+) -> Result<(), UnwindReason> {
+    let stacks = &thread.stacks;
+    if let Some(in_place) = stacks.in_place.get() {
+        return unsafe { resume_entry_from_in_place(thread, in_place, entry, job, trap_handler) };
+    }
+    // However the call ends, even if the coroutine panics, the thread is back
+    // in the host code that called. Host code runs with the Wasm stack
+    // taken, wherever it runs; a host function that called back into Wasm
+    // from a Wasm stack restores that stack itself.
+    defer! {
+        stacks.wasm.set(None);
+    }
+    let coro = &mut entry.coro;
+    let resumed = TrapHandlerContext::install(thread, trap_handler, coro.trap_handler(), || {
+        coro.resume(ptr::from_ref(job))
+    });
+    unsafe { entry_outcome(coro, resumed) }
+}
+
+/// [`resume_entry`] from host code in place on `in_place`: the coroutine is
+/// resumed from the stack beneath it (see [`Stacks::in_place`]). Out of line,
+/// so that the common case does not carry it.
+///
+/// # Safety
+///
+/// As for [`resume_entry`].
+#[cold]
+#[inline(never)]
+unsafe fn resume_entry_from_in_place(
+    thread: &VmThread,
+    in_place: NonNull<WasmStack>,
+    entry: &mut EntryCoroutine,
+    job: &EntryJob,
+    trap_handler: Option<*const TrapHandlerFn<'static>>,
+) -> Result<(), UnwindReason> {
+    let stacks = &thread.stacks;
+    defer! {
+        stacks.wasm.set(None);
+    }
+    let coro = &mut entry.coro;
+    let resumed = TrapHandlerContext::install(thread, trap_handler, coro.trap_handler(), || {
+        on_parent_of_in_place(stacks, in_place, || coro.resume(ptr::from_ref(job)))
+    });
+    unsafe { entry_outcome(coro, resumed) }
+}
+
+/// What a resume of an entry coroutine ended with.
+///
+/// # Safety
+///
+/// `resumed` is what `coro` gave control back with.
+#[inline(always)]
+unsafe fn entry_outcome(
+    coro: &mut EntryCoro,
+    resumed: CoroutineResult<*mut UnwindReason, UnwindReason>,
+) -> Result<(), UnwindReason> {
+    match resumed {
+        // The call returned, and the coroutine waits for the next one.
+        CoroutineResult::Yield(reason) if reason.is_null() => Ok(()),
+        // This came from unwind_with, which requires that there be only Wasm
+        // code on the stack: take the reason off it, then discard the stack.
+        CoroutineResult::Yield(reason) => unsafe {
+            debug_assert_ne!(reason, SUSPENDED, "an entry coroutine was suspended");
+            let reason = ptr::read(reason);
+            coro.force_reset();
+            Err(reason)
+        },
+        // A trap handler made the coroutine return.
+        CoroutineResult::Return(reason) => Err(reason),
+    }
+}
+
+/// Fills an entry slot, retiring the coroutine it held.
+#[cold]
+#[inline(never)]
+fn fill_slot(slot: &mut Option<EntryCoroutine>, stack_size: usize) {
+    if let Some(undersized) = slot.take() {
+        drop(retire_entry(undersized));
+    }
+    *slot = Some(new_entry(stack_size));
+}
+
+/// Gives the stack of a slot's coroutine that finished back to the stack
+/// cache, emptying the slot.
+#[cold]
+#[inline(never)]
+fn retire_slot(slot: &mut Option<EntryCoroutine>) {
+    if let Some(entry) = slot.take() {
+        release_stack(retire_entry(entry));
+    }
+}
+
+/// Runs `job` on a coroutine of its own, when every entry slot is in use or
+/// the thread is exiting. Its stack goes back to the stack cache afterwards.
+#[cold]
+#[inline(never)]
+unsafe fn run_on_new_entry(
+    thread: &VmThread,
+    stack_size: usize,
+    job: &EntryJob,
+    trap_handler: Option<*const TrapHandlerFn<'static>>,
+) -> Result<(), UnwindReason> {
+    let mut entry = scopeguard::guard(new_entry(stack_size), |entry| {
+        release_stack(retire_entry(entry))
+    });
+    unsafe { resume_entry(thread, &mut entry, job, trap_handler) }
+}
+
+/// Makes an entry coroutine on a stack from `acquire_stack`, for the calling
+/// thread: it never leaves it.
+#[cold]
+#[inline(never)]
+fn new_entry(stack_size: usize) -> EntryCoroutine {
+    let stack = acquire_stack(stack_size);
+    let stack_size = stack.size();
+    let limit = WasmStack::limit_of(&stack);
+    let thread = VmThread::get();
+    EntryCoroutine {
+        coro: Coroutine::with_stack(stack, move |yielder, job| {
+            entry_body(yielder, job, limit, thread)
+        }),
+        stack_size,
+    }
+}
+
+/// Turns an entry coroutine that is not running back into its stack.
+fn retire_entry(mut entry: EntryCoroutine) -> DefaultStack {
+    // SAFETY: a coroutine that is not running has finished, has not started,
+    // or is suspended in `entry_body` between two calls; nothing on its stack
+    // needs dropping in any of these cases.
+    unsafe { entry.coro.force_reset() };
+    entry.coro.into_stack()
 }
 
 /// How many values a [`SuspendableCall`] keeps on its own stack.
@@ -1264,6 +1730,12 @@ pub enum CallStep {
     Finished(Result<CallValues, Trap>),
 }
 
+/// The coroutine of a [`SuspendableCall`]: it is resumed with no call (see
+/// [`WasmYielder`]), and returns the call's values or, if a trap handler made
+/// it return, the reason of the trap.
+type SuspendableCoro =
+    Coroutine<*const EntryJob, *mut UnwindReason, Result<CallValues, UnwindReason>, DefaultStack>;
+
 /// A Wasm call on a stack of its own that an import can suspend, and its
 /// caller resume later, as `Function::call_async` in the API crate does.
 ///
@@ -1276,9 +1748,9 @@ pub enum CallStep {
 /// suspended it, which keeps nothing a destructor would have to release.
 /// Dropping the call resets the stack: none of it runs again.
 pub struct SuspendableCall {
-    coroutine: Option<Coroutine<(), WasmYield, Result<CallValues, UnwindReason>, DefaultStack>>,
-    /// The coroutine's yielder, once it has suspended.
-    yielder: Option<NonNull<WasmYielder>>,
+    coroutine: Option<SuspendableCoro>,
+    /// The coroutine's Wasm stack, once it has suspended.
+    wasm_stack: Option<NonNull<WasmStack>>,
 }
 
 impl SuspendableCall {
@@ -1295,17 +1767,22 @@ impl SuspendableCall {
         callee: *const crate::VMFunctionBody,
         values: CallValues,
     ) -> Result<Self, Trap> {
-        // Ensure that per-thread initialization is done.
-        lazy_per_thread_init()?;
+        VmThread::get().prepare()?;
         let stack_size = config
             .wasm_stack_size
             .unwrap_or_else(|| DEFAULT_STACK_SIZE.load(Ordering::Relaxed));
-        let coroutine = Coroutine::with_stack(
-            acquire_stack(stack_size),
-            move |yielder: &WasmYielder, ()| {
-                let yielder = NonNull::from(yielder);
-                SUSPENDABLE.with(|cell| cell.set(Some(yielder)));
-                YIELDER.with(|cell| cell.set(Some(yielder)));
+        let stack = acquire_stack(stack_size);
+        let limit = WasmStack::limit_of(&stack);
+        let coroutine =
+            Coroutine::with_stack(stack, move |yielder: &WasmYielder, _: *const EntryJob| {
+                let wasm_stack = WasmStack {
+                    yielder: NonNull::from(yielder),
+                    limit,
+                };
+                let wasm_stack = NonNull::from(&wasm_stack);
+                let thread = VmThread::get();
+                thread.suspendable.set(Some(wasm_stack));
+                thread.stacks.wasm.set(Some(wasm_stack));
                 // In this frame, on the call's own stack, from here on.
                 let mut values = values;
                 let values_vec = match &mut values {
@@ -1328,11 +1805,10 @@ impl SuspendableCall {
                     >(trampoline)(vmctx, callee, values_vec.cast());
                 }
                 Ok(values)
-            },
-        );
+            });
         Ok(Self {
             coroutine: Some(coroutine),
-            yielder: None,
+            wasm_stack: None,
         })
     }
 
@@ -1347,27 +1823,41 @@ impl SuspendableCall {
         trap_handler: Option<*const TrapHandlerFn<'static>>,
     ) -> CallStep {
         let coroutine = self.coroutine.as_mut().expect("the call is not over");
+        let thread = VmThread::get();
+        let stacks = &thread.stacks;
         // Which Wasm stack may suspend, for as long as this one runs.
-        let outer = SUSPENDABLE.with(|cell| cell.replace(self.yielder));
+        let outer = thread.suspendable.replace(self.wasm_stack);
         defer! {
-            SUSPENDABLE.with(|cell| cell.set(outer));
+            thread.suspendable.set(outer);
             // A stack that suspended cleared it; one that is over did not.
-            YIELDER.with(|cell| cell.set(None));
+            stacks.wasm.set(None);
         }
-        let resumed = TrapHandlerContext::install(trap_handler, coroutine.trap_handler(), || {
-            coroutine.resume(())
-        });
+        let resumed =
+            TrapHandlerContext::install(thread, trap_handler, coroutine.trap_handler(), || {
+                // From host code in place, from the stack beneath it, as a call
+                // into Wasm does (see `Stacks::in_place`).
+                match stacks.in_place.get() {
+                    None => coroutine.resume(ptr::null()),
+                    Some(in_place) => {
+                        on_parent_of_in_place(stacks, in_place, || coroutine.resume(ptr::null()))
+                    }
+                }
+            });
         let result = match resumed {
-            CoroutineResult::Yield(WasmYield::Suspend(yielder)) => {
-                self.yielder = Some(yielder);
+            CoroutineResult::Yield(reason) if reason == SUSPENDED => {
+                // The coroutine made itself the one that may suspend when it
+                // started, and it still is.
+                self.wasm_stack = thread.suspendable.get();
                 return CallStep::Suspended;
             }
-            CoroutineResult::Yield(WasmYield::Unwind(reason)) => {
-                // This came from unwind_with which requires that there be only
-                // Wasm code on the stack.
-                unsafe { coroutine.force_reset() };
+            // This came from unwind_with which requires that there be only
+            // Wasm code on the stack: take the reason off it, then discard
+            // the stack.
+            CoroutineResult::Yield(reason) => unsafe {
+                let reason = ptr::read(reason);
+                coroutine.force_reset();
                 Err(reason)
-            }
+            },
             CoroutineResult::Return(result) => result,
         };
         CallStep::Finished(result.map_err(UnwindReason::into_trap))
@@ -1387,15 +1877,16 @@ impl Drop for SuspendableCall {
             // type), and is never resumed.
             unsafe { coroutine.force_reset() };
         }
-        release_stack_of_dropped_call(coroutine.into_stack());
+        release_stack(coroutine.into_stack());
     }
 }
 
 /// Whether the Wasm stack that is running is that of the [`SuspendableCall`]
 /// being resumed: whether an import called from it may suspend it.
 pub fn wasm_call_is_suspendable() -> bool {
-    let yielder = YIELDER.with(|cell| cell.get());
-    yielder.is_some() && yielder == SUSPENDABLE.with(|cell| cell.get())
+    let thread = VmThread::get();
+    let wasm_stack = thread.stacks.wasm.get();
+    wasm_stack.is_some() && wasm_stack == thread.suspendable.get()
 }
 
 /// Suspends the Wasm call that is running, from an import it called, until
@@ -1407,11 +1898,10 @@ pub fn wasm_call_is_suspendable() -> bool {
 /// be dropped while it waits.
 pub unsafe fn suspend_wasm_call() {
     unsafe {
-        let yielder = YIELDER
-            .with(|cell| cell.replace(None))
-            .expect("not running on Wasm stack");
-        yielder.as_ref().suspend(WasmYield::Suspend(yielder));
-        YIELDER.with(|cell| cell.set(Some(yielder)));
+        let wasm_stack =
+            with_stacks(|stacks| stacks.wasm.replace(None)).expect("not running on Wasm stack");
+        wasm_stack.as_ref().yielder.as_ref().suspend(SUSPENDED);
+        with_stacks(|stacks| stacks.wasm.set(Some(wasm_stack)));
     }
 }
 
@@ -1423,33 +1913,205 @@ pub unsafe fn suspend_wasm_call() {
 /// the control of untrusted code. Malicious code could artificially induce a
 /// stack overflow in the middle of a sensitive host operations (e.g. growing
 /// a memory) which would be hard to recover from.
+//
+// `#[inline]`, so that every host function trampoline gets it inlined, in
+// whichever codegen unit its instance lands in.
+#[inline]
 pub fn on_host_stack<F: FnOnce() -> T, T>(f: F) -> T {
-    // Reset YIEDER to None for the duration of this call to indicate that we
-    // are no longer on the Wasm stack.
-    let yielder_ptr = YIELDER.with(|cell| cell.replace(None));
-
-    // If we are already on the host stack, execute the function directly. This
-    // happens if a host function is called directly from the API.
-    let yielder = match yielder_ptr {
-        Some(ptr) => unsafe { ptr.as_ref() },
-        None => return f(),
-    };
-
-    // Restore YIELDER upon exiting normally or unwinding.
-    defer! {
-        YIELDER.with(|cell| cell.set(yielder_ptr));
+    match try_on_host_stack(f) {
+        Ok(result) => result,
+        Err(f) => on_host_stack_from_host(f),
     }
+}
 
-    // on_parent_stack requires the closure to be Send so that the Yielder
-    // cannot be called from the parent stack. This is not a problem for us
-    // since we don't expose the Yielder.
-    struct SendWrapper<T>(T);
-    unsafe impl<T> Send for SendWrapper<T> {}
+/// [`on_host_stack`] from Wasm: runs `f` on the native stack and returns what
+/// it returns if this runs on a Wasm stack, and gives `f` back otherwise, for
+/// [`on_host_stack_from_host`] to run.
+///
+/// For a caller that handles the result of each path apart: one result that
+/// may come from either is kept in memory by the caller, where the one that
+/// comes through the switch is copied with loads wider than the stores that
+/// wrote it, which wait for the stores to reach the cache.
+#[inline]
+pub fn try_on_host_stack<F: FnOnce() -> T, T>(f: F) -> Result<T, F> {
+    let stacks = &VmThread::get().stacks;
+    let Some(wasm_stack) = stacks.wasm.get() else {
+        return Err(f);
+    };
+    // Safety: it lives on the stack of the coroutine that is running.
+    let yielder = unsafe { wasm_stack.as_ref().yielder.as_ref() };
+    // Take the Wasm stack for as long as `f` runs, and give it back once
+    // control is back here, whether `f` returns or unwinds. This is done on
+    // the Wasm stack, around the switch, where the thread's stacks are in hand
+    // already: on the native side it cost every host call more than the
+    // switch's own bookkeeping. The switch itself, on either side, runs on the
+    // Wasm stack as the guest's, which the signal handler tells from host code
+    // by `Stacks::in_place`: overflowing the stack there is the guest's stack
+    // overflow, which it turns into a trap, as it does in the guest's frames.
+    stacks.wasm.set(None);
+    defer! {
+        stacks.wasm.set(Some(wasm_stack));
+    }
+    // Only the closure crosses the switch: it is read on the other side
+    // right after it was written here.
     let wrapped = SendWrapper(f);
-    yielder.on_parent_stack(move || {
+    Ok(yielder.on_parent_stack(move || {
         let wrapped = wrapped;
         (wrapped.0)()
+    }))
+}
+
+/// [`on_host_stack`] where host code runs already, which is when
+/// [`try_on_host_stack`] gives `f` back: on the host stack, as when a host
+/// function is called directly from the API, where `f` runs as it is, or in
+/// place on a Wasm stack, which it leaves as a call into Wasm from there does.
+///
+/// Out of line, and calling `f` from one place, so that `f` is called from two
+/// places in all: LLVM then inlines it into the switch from Wasm, the path of
+/// every host function called from Wasm, where with a third caller it did
+/// not.
+#[inline(never)]
+pub fn on_host_stack_from_host<F: FnOnce() -> T, T>(f: F) -> T {
+    let stacks = &VmThread::get().stacks;
+    let mut f = Some(f);
+    let mut result = None;
+    let mut run = || result = f.take().map(|f| f());
+    match stacks.in_place.get() {
+        None => run(),
+        Some(in_place) => on_parent_of_in_place(stacks, in_place, &mut run),
+    }
+    // Safety: `run` ran, and `f` returned if this is reached.
+    unsafe { result.unwrap_unchecked() }
+}
+
+/// Runs `f` on the stack that the coroutine of `wasm_stack`, where host code
+/// runs in place, was resumed from, with no host code in place while it runs.
+#[cold]
+#[inline(never)]
+fn on_parent_of_in_place<F: FnOnce() -> T, T>(
+    stacks: &Stacks,
+    wasm_stack: NonNull<WasmStack>,
+    f: F,
+) -> T {
+    // Safety: it lives on the stack of the coroutine that is running, under
+    // the host code that runs in place on it.
+    let yielder = unsafe { wasm_stack.as_ref().yielder.as_ref() };
+    let wrapped = SendWrapper((f, ptr::from_ref(stacks), wasm_stack));
+    yielder.on_parent_stack(move || {
+        let wrapped = wrapped;
+        let (f, stacks, wasm_stack) = wrapped.0;
+        // Safety: this thread's, and the closure runs on this thread.
+        let stacks = unsafe { &*stacks };
+        stacks.in_place.set(None);
+        defer! {
+            stacks.in_place.set(Some(wasm_stack));
+        }
+        f()
     })
+}
+
+/// `Yielder::on_parent_stack` requires its closure to be `Send`, so that the
+/// yielder cannot be called from the parent stack. That is not a problem
+/// here, since the yielder is not exposed, and the closure runs on the same
+/// thread.
+struct SendWrapper<T>(T);
+unsafe impl<T> Send for SendWrapper<T> {}
+
+/// A host function called from Wasm that runs where it was called, without
+/// switching stacks (see [`host_call_in_place`]). Gives the thread its Wasm
+/// stack back when dropped, which must happen on the thread and before the
+/// host function returns to Wasm.
+#[must_use = "the host call ends when this is dropped"]
+pub struct HostCallInPlace {
+    stacks: NonNull<Stacks>,
+    /// The Wasm stack the host function was called on, if any.
+    wasm_stack: Option<NonNull<WasmStack>>,
+    /// What `Stacks::in_place` was before the call: none if it came from
+    /// Wasm.
+    in_place: Option<NonNull<WasmStack>>,
+}
+
+impl Drop for HostCallInPlace {
+    #[inline(always)]
+    fn drop(&mut self) {
+        // Safety: this thread's (the guard is not `Send`), which outlives
+        // the host call.
+        let stacks = unsafe { self.stacks.as_ref() };
+        stacks.in_place.set(self.in_place);
+        stacks.wasm.set(self.wasm_stack);
+    }
+}
+
+/// Starts a call of a synchronous host function from Wasm where it stands, on
+/// the Wasm stack, if at least [`HOST_CALL_RESERVE`] is left on that stack;
+/// returns `None` otherwise, and the host function must then run through
+/// [`on_host_stack`].
+///
+/// Like `on_host_stack`, it takes the Wasm stack for as long as the returned
+/// guard lives: the host code runs as host code, which unwinding from inside
+/// it (`raise_user_trap` and the like) and the signal handler rely on. A call
+/// into Wasm that the host code makes meanwhile starts from the stack the Wasm
+/// stack's coroutine was resumed from (see `Stacks::in_place`). Called outside
+/// of Wasm, it returns a guard that does nothing, as `on_host_stack` then runs
+/// its function in place.
+///
+/// A host function that may suspend the coroutine it was called from, as an
+/// asynchronous one does, must not use this.
+#[inline(always)]
+pub fn host_call_in_place() -> Option<HostCallInPlace> {
+    with_stacks(|stacks| {
+        let wasm_stack = stacks.wasm.get();
+        let in_place = match wasm_stack {
+            Some(stack) => {
+                // Safety: it lives on the stack of the coroutine that is
+                // running.
+                let limit = unsafe { stack.as_ref() }.limit;
+                // Below the limit is none: a frame can reach below it, into
+                // the guard page, before it touches the page. Then the host
+                // function must not run as host code there, where the signal
+                // handler leaves its fault alone and the process dies;
+                // switching stacks faults as the guest.
+                if stack_pointer().saturating_sub(limit) < HOST_CALL_RESERVE {
+                    return None;
+                }
+                stacks.wasm.set(None);
+                // Host code was not in place while Wasm ran.
+                stacks.in_place.replace(Some(stack))
+            }
+            None => stacks.in_place.get(),
+        };
+        Some(HostCallInPlace {
+            stacks: NonNull::from(stacks),
+            wasm_stack,
+            in_place,
+        })
+    })
+}
+
+/// The current stack pointer, or an address in the current frame where it
+/// cannot be read directly.
+#[inline(always)]
+fn stack_pointer() -> usize {
+    let sp: usize;
+    cfg_select! {
+        target_arch = "aarch64" => {
+            unsafe { std::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
+        }
+        target_arch = "x86_64" => {
+            unsafe { std::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
+        }
+        target_arch = "riscv64" => {
+            unsafe { std::arch::asm!("mv {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
+        }
+        target_arch = "loongarch64" => {
+            unsafe { std::arch::asm!("move {}, $sp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
+        }
+        _ => {
+            let probe = 0u8;
+            sp = std::hint::black_box(ptr::from_ref(&probe)) as usize;
+        }
+    }
+    sp
 }
 
 #[cfg(windows)]
@@ -1703,29 +2365,26 @@ mod tests {
         let result = on_wasm_stack(big_size, None, || 42);
 
         assert_eq!(result.expect("on_wasm_stack should succeed"), 42);
-        // The undersized stack was discarded; the correctly-sized stack
-        // allocated for the call now lives in the TLS cache (the hot path).
-        // It will end up in the global pool only on thread exit or eviction.
-        let returned = TLS_STACK
-            .with(|cache| cache.0.take())
-            .or_else(|| STACK_POOL.pop())
-            .expect("stack should have been returned to TLS cache or pool");
+        // The undersized stack was discarded; the call ran on a coroutine on
+        // a correctly-sized stack, which the thread keeps for the next call.
+        // It ends up in the global pool only on thread exit or eviction.
+        assert!(STACK_POOL.is_empty(), "the undersized stack is discarded");
+        let kept = cached_entries()[0].expect("the call's coroutine stays cached");
         assert!(
-            returned.size() >= big_size,
-            "returned stack must be at least as large as the requested size"
+            kept >= big_size,
+            "the kept stack must be at least as large as the requested size"
         );
 
         // Ensure no residual TLS state leaks into other tests sharing the
-        // runner thread. `take()` above already cleared the slot, but be
-        // explicit so future edits cannot drop this guarantee silently.
+        // runner thread.
         clear_tls_stack();
     }
 
-    /// After a wasm call, the freshly-used stack stays in the thread-local
-    /// cache so subsequent calls on the same thread reuse it without touching
-    /// the global SegQueue.
+    /// After a wasm call, the thread keeps the entry coroutine it ran on,
+    /// suspended, and the next call on the same thread runs on the same one
+    /// without touching the global SegQueue.
     #[test]
-    fn tls_stack_caches_after_first_call() {
+    fn the_next_call_reuses_the_entry_coroutine() {
         let _lock = GLOBAL_STATE.lock().unwrap();
         let _restore = RestoreStackSize(get_stack_size());
         drain_stack_pool();
@@ -1733,48 +2392,213 @@ mod tests {
 
         let size = get_stack_size();
 
-        // First call: TLS + pool both empty → allocate fresh; stack ends in TLS.
-        assert!(on_wasm_stack(size, None, || ()).is_ok());
+        // First call: nothing cached → a coroutine on a fresh stack, kept in
+        // the first slot with its stack.
+        let first = on_wasm_stack(size, None, running_entry).unwrap();
         assert!(
             STACK_POOL.is_empty(),
-            "pool should still be empty after a TLS-served call"
+            "pool should still be empty after the first call"
         );
+        assert!(cached_entries()[0].is_some(), "the coroutine is kept");
+        assert!(!has_cached_stack(), "its stack is in the coroutine");
 
-        // Verify TLS holds a stack, then put it back.
-        let cached_present = TLS_STACK.with(|cache| {
-            let taken = cache.0.take();
-            let present = taken.is_some();
-            cache.0.set(taken);
-            present
-        });
-        assert!(cached_present, "TLS slot should hold the post-call stack");
-
-        // Second call should consume from TLS; pool stays empty.
-        assert!(on_wasm_stack(size, None, || ()).is_ok());
+        // Second call: same coroutine; pool stays empty.
+        let second = on_wasm_stack(size, None, running_entry).unwrap();
+        assert_eq!(first, second, "the second call runs on the same coroutine");
         assert!(
             STACK_POOL.is_empty(),
             "second call must not push to the global pool"
         );
-        let still_cached = TLS_STACK.with(|cache| {
-            let taken = cache.0.take();
-            let present = taken.is_some();
-            cache.0.set(taken);
-            present
-        });
-        assert!(
-            still_cached,
-            "TLS slot should still hold a stack after the second call"
-        );
 
-        // Cleanup: clear TLS so we don't leak into other tests. The cached
-        // stack here is dropped rather than returned to the pool; the next
-        // test starts with `drain_stack_pool()` anyway, so there is no
-        // observable difference.
         clear_tls_stack();
     }
 
-    /// On thread exit, the TLS cache's `Drop` impl returns the held stack to
-    /// the global pool so memory cycles correctly across thread lifetimes.
+    /// A host function calling back into Wasm runs on the second entry
+    /// coroutine. Both are kept, so repeated calls reuse both.
+    #[test]
+    fn a_call_back_into_wasm_reuses_the_second_entry_coroutine() {
+        let _lock = GLOBAL_STATE.lock().unwrap();
+        let _restore = RestoreStackSize(get_stack_size());
+        drain_stack_pool();
+        clear_tls_stack();
+
+        let size = get_stack_size();
+        let call = move || {
+            on_wasm_stack(size, None, move || {
+                let outer = running_entry();
+                let inner = on_host_stack(|| on_wasm_stack(size, None, running_entry).unwrap());
+                (outer, inner)
+            })
+            .unwrap()
+        };
+        let (outer, inner) = call();
+        assert_ne!(outer, inner, "the call back runs on another coroutine");
+        assert_eq!(call(), (outer, inner), "both coroutines are reused");
+        let [first, second] = cached_entries();
+        assert!(first.is_some() && second.is_some(), "both are kept");
+        assert!(STACK_POOL.is_empty());
+
+        clear_tls_stack();
+    }
+
+    /// Calls nested deeper than there are slots each make a coroutine of their
+    /// own, whose stack goes back to the stack cache when they return.
+    #[test]
+    fn calls_nested_beyond_the_slots_make_their_own_coroutine() {
+        let _lock = GLOBAL_STATE.lock().unwrap();
+        let _restore = RestoreStackSize(get_stack_size());
+        drain_stack_pool();
+        clear_tls_stack();
+
+        let size = get_stack_size();
+        let busy_in_third = on_wasm_stack(size, None, move || {
+            on_host_stack(|| {
+                on_wasm_stack(size, None, move || {
+                    on_host_stack(|| {
+                        on_wasm_stack(size, None, || with_entries(|slots| slots.busy.get()))
+                            .unwrap()
+                    })
+                })
+                .unwrap()
+            })
+        })
+        .unwrap();
+        assert_eq!(busy_in_third, 0b11, "both slots were in use");
+        let [first, second] = cached_entries();
+        assert!(first.is_some() && second.is_some());
+        assert!(has_cached_stack(), "the third call's stack is cached");
+
+        clear_tls_stack();
+        drain_stack_pool();
+    }
+
+    /// A slot held by a call that has not returned (marked busy by hand here)
+    /// is skipped, whatever its index: calls take the first free one.
+    #[test]
+    fn calls_skip_a_slot_in_use() {
+        let _lock = GLOBAL_STATE.lock().unwrap();
+        let _restore = RestoreStackSize(get_stack_size());
+        drain_stack_pool();
+        clear_tls_stack();
+
+        let size = get_stack_size();
+        with_entries(|slots| slots.busy.set(0b01));
+        let in_second = on_wasm_stack(size, None, running_entry).unwrap();
+        with_entries(|slots| {
+            assert_eq!(slots.busy.get(), 0b01, "the held slot stays held");
+            slots.busy.set(0);
+        });
+        let [first, second] = cached_entries();
+        assert!(first.is_none() && second.is_some(), "the call used slot 1");
+
+        let in_first = on_wasm_stack(size, None, running_entry).unwrap();
+        assert_ne!(in_first, in_second, "slot 0 is free again and gets its own");
+
+        clear_tls_stack();
+        drain_stack_pool();
+    }
+
+    /// A trap discards the entry coroutine it ran on. Its stack goes back to
+    /// the stack cache, and the next call makes a new coroutine on it.
+    #[test]
+    fn a_trap_retires_the_entry_coroutine() {
+        let _lock = GLOBAL_STATE.lock().unwrap();
+        let _restore = RestoreStackSize(get_stack_size());
+        drain_stack_pool();
+        clear_tls_stack();
+
+        let size = get_stack_size();
+        let r = on_wasm_stack(size, None, || -> () {
+            unsafe { raise_lib_trap(Trap::lib(TrapCode::UnreachableCodeReached)) }
+        });
+        assert!(matches!(r, Err(UnwindReason::LibTrap(_))));
+        assert_eq!(cached_entries(), [None, None]);
+        assert!(has_cached_stack(), "the stack is back in the stack cache");
+
+        assert_eq!(on_wasm_stack(size, None, || 5).unwrap(), 5);
+        assert!(cached_entries()[0].is_some());
+        assert!(!has_cached_stack(), "the new coroutine took the stack");
+
+        clear_tls_stack();
+        drain_stack_pool();
+    }
+
+    /// A panic in the call reaches the caller, and the coroutine it ended is
+    /// not kept; the thread's state is as before the call.
+    #[test]
+    fn a_panic_in_the_call_retires_the_entry_coroutine() {
+        let _lock = GLOBAL_STATE.lock().unwrap();
+        let _restore = RestoreStackSize(get_stack_size());
+        drain_stack_pool();
+        clear_tls_stack();
+
+        let size = get_stack_size();
+        let r = std::panic::catch_unwind(|| {
+            on_wasm_stack(size, None, || -> () { panic!("panic in the call") })
+        });
+        assert!(r.is_err());
+        assert_eq!(with_entries(|slots| slots.busy.get()), 0);
+        assert!(current_wasm_stack().is_none());
+        assert!(
+            VmThread::get()
+                .trap_handler
+                .load(Ordering::Relaxed)
+                .is_null()
+        );
+        assert_eq!(cached_entries(), [None, None]);
+        assert_eq!(on_wasm_stack(size, None, || 6).unwrap(), 6);
+
+        clear_tls_stack();
+        drain_stack_pool();
+    }
+
+    /// Many threads entering, trapping, re-entering through the host stack
+    /// and exiting: every stack comes back, and the pool stays bounded by the
+    /// number of threads alive at once.
+    #[test]
+    fn stacks_of_exiting_threads_stay_bounded() {
+        let _lock = GLOBAL_STATE.lock().unwrap();
+        let _restore = RestoreStackSize(get_stack_size());
+        drain_stack_pool();
+        clear_tls_stack();
+        let size = get_stack_size();
+        const THREADS: usize = 16;
+        for _wave in 0..30 {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|i| {
+                    std::thread::spawn(move || {
+                        for j in 0..50 {
+                            let traps = (i + j) % 2 == 0;
+                            let result: Result<(), UnwindReason> =
+                                on_wasm_stack(size, None, move || unsafe {
+                                    if traps {
+                                        raise_lib_trap(Trap::lib(TrapCode::UnreachableCodeReached));
+                                    }
+                                    on_host_stack(|| {
+                                        assert_eq!(on_wasm_stack(size, None, || 3).unwrap(), 3);
+                                    });
+                                });
+                            assert_eq!(result.is_err(), traps);
+                        }
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        }
+        let mut pooled = 0;
+        while STACK_POOL.pop().is_some() {
+            pooled += 1;
+        }
+        // At most three stacks per thread alive at once: those of its two
+        // entry coroutines and the one it caches.
+        assert!(pooled <= 3 * THREADS, "pool grew to {pooled} stacks");
+    }
+
+    /// On thread exit, `ThreadExit` returns the stack of the coroutine the
+    /// thread keeps to the global pool so memory cycles correctly across
+    /// thread lifetimes.
     #[test]
     fn tls_stack_returns_to_pool_on_thread_exit() {
         // Keep other tests from draining the pool or changing the stack size
@@ -1791,8 +2615,8 @@ mod tests {
         });
         handle.join().unwrap();
 
-        // The spawned thread's TLS cache was dropped on join; the stack must
-        // have made it back to the global pool.
+        // The spawned thread released what it kept as it exited; the stack
+        // must have made it back to the global pool.
         let returned = STACK_POOL
             .pop()
             .expect("thread exit should return TLS-cached stack to the global pool");
@@ -1803,11 +2627,62 @@ mod tests {
     // Test helpers
     // -----------------------------------------------------------------
 
-    /// Clears the current thread's TLS slot so tests don't see state from
-    /// previous tests (they share the same thread under cargo test's
-    /// per-test serialization via `GLOBAL_STATE`).
+    /// Clears the current thread's cached stack and entry coroutines so tests
+    /// don't see state from previous tests (they share the same thread under
+    /// cargo test's per-test serialization via `GLOBAL_STATE`).
+    ///
+    /// Also sets the thread up for Wasm, as its first call would, so that it
+    /// keeps what it caches.
     fn clear_tls_stack() {
-        TLS_STACK.with(|cache| cache.0.set(None));
+        let thread = VmThread::get();
+        assert!(thread.prepare().unwrap());
+        thread.entries.take_idle().for_each(drop);
+        thread.stack_cache.set(None);
+    }
+
+    /// Runs `f` with the current thread's entry slots.
+    fn with_entries<R>(f: impl FnOnce(&EntrySlots) -> R) -> R {
+        f(&VmThread::get().entries)
+    }
+
+    /// Whether the current thread caches a stack (outside its entry
+    /// coroutines).
+    fn has_cached_stack() -> bool {
+        let cache = &VmThread::get().stack_cache;
+        let stack = cache.take();
+        let cached = stack.is_some();
+        cache.set(stack);
+        cached
+    }
+
+    /// The stack sizes of the current thread's cached entry coroutines, by
+    /// slot. Only between calls.
+    fn cached_entries() -> [Option<usize>; ENTRY_SLOTS] {
+        with_entries(|slots| {
+            assert_eq!(slots.busy.get(), 0, "no call is running");
+            // SAFETY: no call is running, so nothing refers into the slots.
+            std::array::from_fn(|i| unsafe {
+                (*slots.entries[i].get())
+                    .as_ref()
+                    .map(|entry| entry.stack_size)
+            })
+        })
+    }
+
+    /// Identifies the coroutine running the current call: the address of its
+    /// `WasmStack`, which lives on its stack.
+    fn running_entry() -> usize {
+        current_wasm_stack()
+            .expect("running on a Wasm stack")
+            .as_ptr() as usize
+    }
+
+    fn current_wasm_stack() -> Option<NonNull<WasmStack>> {
+        with_stacks(|stacks| stacks.wasm.get())
+    }
+
+    fn current_in_place() -> Option<NonNull<WasmStack>> {
+        with_stacks(|stacks| stacks.in_place.get())
     }
 
     /// `base().get() - limit().get()` (i.e. `Stack::size`) is constant per
@@ -1851,7 +2726,7 @@ mod tests {
         let size = get_stack_size();
         let tls_stack = DefaultStack::new(size).unwrap();
         let tls_id = stack_id(&tls_stack);
-        TLS_STACK.with(|cache| cache.0.set(Some(tls_stack)));
+        VmThread::get().stack_cache.set(Some(tls_stack));
 
         let pool_stack = DefaultStack::new(size).unwrap();
         let pool_id = stack_id(&pool_stack);
@@ -1903,7 +2778,7 @@ mod tests {
 
         let small_size = ByteSize::kib(512).as_u64() as usize;
         let undersized = DefaultStack::new(small_size).unwrap();
-        TLS_STACK.with(|cache| cache.0.set(Some(undersized)));
+        VmThread::get().stack_cache.set(Some(undersized));
 
         let big_size = ByteSize::mib(2).as_u64() as usize;
         let got = acquire_stack(big_size);
@@ -1919,12 +2794,7 @@ mod tests {
             got.size() >= big_size,
             "acquired stack must satisfy big_size"
         );
-        let tls_empty = TLS_STACK.with(|cache| {
-            let s = cache.0.take();
-            let empty = s.is_none();
-            cache.0.set(s);
-            empty
-        });
+        let tls_empty = !has_cached_stack();
         assert!(
             tls_empty,
             "undersized TLS stack must have been taken and discarded"
@@ -1986,8 +2856,9 @@ mod tests {
         let id = stack_id(&stack);
         release_stack(stack);
 
-        let in_tls = TLS_STACK
-            .with(|cache| cache.0.take())
+        let in_tls = VmThread::get()
+            .stack_cache
+            .take()
             .expect("release into empty TLS should leave the stack in TLS");
         assert_eq!(stack_id(&in_tls), id);
         assert!(
@@ -2007,14 +2878,15 @@ mod tests {
         let size = get_stack_size();
         let older = DefaultStack::new(size).unwrap();
         let older_id = stack_id(&older);
-        TLS_STACK.with(|cache| cache.0.set(Some(older)));
+        VmThread::get().stack_cache.set(Some(older));
 
         let newer = DefaultStack::new(size).unwrap();
         let newer_id = stack_id(&newer);
         release_stack(newer);
 
-        let in_tls = TLS_STACK
-            .with(|cache| cache.0.take())
+        let in_tls = VmThread::get()
+            .stack_cache
+            .take()
             .expect("TLS should hold the newly-released stack");
         assert_eq!(
             stack_id(&in_tls),
@@ -2045,11 +2917,11 @@ mod tests {
         clear_tls_stack();
 
         let stack = DefaultStack::new(get_stack_size()).unwrap();
-        TLS_STACK.with(|cache| cache.0.set(Some(stack)));
+        VmThread::get().stack_cache.set(Some(stack));
 
         drain_stack_pool();
 
-        let tls_empty = TLS_STACK.with(|cache| cache.0.take().is_none());
+        let tls_empty = VmThread::get().stack_cache.take().is_none();
         assert!(
             tls_empty,
             "drain_stack_pool must also clear current thread's TLS slot"
@@ -2174,7 +3046,7 @@ mod tests {
 
     #[test]
     fn trap_does_not_corrupt_subsequent_calls() {
-        // After a trap, the per-call coroutine is force-reset and dropped.
+        // After a trap, the entry coroutine is force-reset and retired.
         // The TLS stack cache and global pool must remain in a usable state
         // so that subsequent calls succeed.
         let _lock = GLOBAL_STATE.lock().unwrap();
@@ -2217,6 +3089,190 @@ mod tests {
 
         let r = on_wasm_stack(get_stack_size(), None, || on_host_stack(|| 88i32));
         assert_eq!(r.ok(), Some(88));
+
+        clear_tls_stack();
+        drain_stack_pool();
+    }
+
+    // -----------------------------------------------------------------
+    // Host calls in place
+    // -----------------------------------------------------------------
+
+    /// Whether `sp` is on the Wasm stack `stack` describes: above its guard
+    /// page and below its `WasmStack`, which the coroutine's body keeps near
+    /// its top.
+    fn on_stack(sp: usize, stack: NonNull<WasmStack>) -> bool {
+        let limit = unsafe { stack.as_ref() }.limit;
+        sp > limit - region::page::size() && sp < stack.as_ptr() as usize
+    }
+
+    #[test]
+    fn a_host_call_outside_wasm_runs_in_place() {
+        let _lock = GLOBAL_STATE.lock().unwrap();
+        let in_place = host_call_in_place().expect("there is no stack to switch from");
+        assert!(current_wasm_stack().is_none());
+        drop(in_place);
+        assert!(current_wasm_stack().is_none());
+    }
+
+    /// With the reserve left, a host call stays on the Wasm stack, runs as host
+    /// code there, and gives the stack back when it ends.
+    #[test]
+    fn a_host_call_with_room_runs_on_the_wasm_stack() {
+        let _lock = GLOBAL_STATE.lock().unwrap();
+        let _restore = RestoreStackSize(get_stack_size());
+        drain_stack_pool();
+        clear_tls_stack();
+
+        let r = on_wasm_stack(get_stack_size(), None, || {
+            let outer = current_wasm_stack().expect("running on a Wasm stack");
+            assert!(current_in_place().is_none());
+            let in_place = host_call_in_place().expect("a fresh Wasm stack has room");
+            assert!(
+                current_wasm_stack().is_none(),
+                "the host call runs as host code"
+            );
+            assert_eq!(current_in_place(), Some(outer));
+            // Still on the Wasm stack.
+            assert!(on_stack(stack_pointer(), outer));
+            drop(in_place);
+            assert_eq!(current_wasm_stack(), Some(outer));
+            assert!(current_in_place().is_none());
+        });
+        assert!(r.is_ok());
+
+        clear_tls_stack();
+        drain_stack_pool();
+    }
+
+    /// Without the reserve left, the host call has to switch stacks.
+    #[test]
+    fn a_host_call_without_room_switches_stacks() {
+        let _lock = GLOBAL_STATE.lock().unwrap();
+        let _restore = RestoreStackSize(get_stack_size());
+        drain_stack_pool();
+        clear_tls_stack();
+
+        let r = on_wasm_stack(get_stack_size(), None, || {
+            let outer = current_wasm_stack().expect("running on a Wasm stack");
+            // The stack as a frame with less than the reserve left sees it.
+            let short = WasmStack {
+                yielder: unsafe { outer.as_ref() }.yielder,
+                limit: stack_pointer() - HOST_CALL_RESERVE / 2,
+            };
+            let short = NonNull::from(&short);
+            with_stacks(|stacks| stacks.wasm.set(Some(short)));
+            assert!(host_call_in_place().is_none());
+            // Nothing was taken.
+            assert_eq!(current_wasm_stack(), Some(short));
+            let switched = on_host_stack(|| {
+                current_wasm_stack().is_none() && !on_stack(stack_pointer(), outer)
+            });
+            with_stacks(|stacks| stacks.wasm.set(Some(outer)));
+            switched
+        });
+        assert_eq!(r.ok(), Some(true));
+
+        clear_tls_stack();
+        drain_stack_pool();
+    }
+
+    /// Outer Wasm -> host call in place -> inner Wasm: the inner call starts
+    /// from the native stack, leaves the host code as it found it, the host
+    /// call gives the outer stack back, and the outer call can still unwind
+    /// from it.
+    #[test]
+    fn a_call_back_into_wasm_from_a_host_call_in_place() {
+        let _lock = GLOBAL_STATE.lock().unwrap();
+        let _restore = RestoreStackSize(get_stack_size());
+        drain_stack_pool();
+        clear_tls_stack();
+
+        let size = get_stack_size();
+        let r: Result<(), UnwindReason> = on_wasm_stack(size, None, move || {
+            let outer = current_wasm_stack().expect("running on a Wasm stack");
+            let in_place = host_call_in_place().expect("a fresh Wasm stack has room");
+            let inner = on_wasm_stack(size, None, move || {
+                let inner = current_wasm_stack().expect("running on a Wasm stack");
+                assert_ne!(inner, outer);
+                assert!(current_in_place().is_none(), "Wasm runs");
+                // The inner call's coroutine was resumed from the native
+                // stack, which is where its host calls switch to.
+                on_host_stack(|| !on_stack(stack_pointer(), outer))
+            });
+            assert_eq!(inner.ok(), Some(true));
+            assert!(current_wasm_stack().is_none(), "still in host code");
+            assert_eq!(current_in_place(), Some(outer));
+            // Host code in place that wants the native stack goes there too.
+            assert!(on_host_stack(|| !on_stack(stack_pointer(), outer)));
+            assert_eq!(current_in_place(), Some(outer));
+            drop(in_place);
+            assert_eq!(current_wasm_stack(), Some(outer));
+            unsafe { raise_lib_trap(Trap::lib(TrapCode::IntegerDivisionByZero)) }
+        });
+        assert!(r.is_err(), "the outer call unwinds from its own stack");
+
+        clear_tls_stack();
+        drain_stack_pool();
+    }
+
+    /// A host call from a frame that reaches below the limit, into the guard
+    /// page, without having touched it yet, has no room left: it switches
+    /// stacks. Run in place, as host code, it would fault there, and the
+    /// signal handler would leave the fault alone.
+    #[test]
+    fn a_host_call_from_below_the_limit_switches_stacks() {
+        let _lock = GLOBAL_STATE.lock().unwrap();
+        let _restore = RestoreStackSize(get_stack_size());
+        drain_stack_pool();
+        clear_tls_stack();
+
+        let r = on_wasm_stack(get_stack_size(), None, || {
+            let outer = current_wasm_stack().expect("running on a Wasm stack");
+            // The stack as such a frame sees it: its limit above the frame.
+            let below = WasmStack {
+                yielder: unsafe { outer.as_ref() }.yielder,
+                limit: stack_pointer() + region::page::size(),
+            };
+            with_stacks(|stacks| stacks.wasm.set(Some(NonNull::from(&below))));
+            let in_place = host_call_in_place();
+            let switches = in_place.is_none();
+            drop(in_place);
+            with_stacks(|stacks| stacks.wasm.set(Some(outer)));
+            switches
+        });
+        assert_eq!(r.ok(), Some(true));
+
+        clear_tls_stack();
+        drain_stack_pool();
+    }
+
+    /// A fault on the Wasm stack while host code runs there is the host's: the
+    /// signal handler must not reset the coroutine under it.
+    #[test]
+    fn the_signal_handler_leaves_host_code_on_the_wasm_stack_alone() {
+        let _lock = GLOBAL_STATE.lock().unwrap();
+        let _restore = RestoreStackSize(get_stack_size());
+        drain_stack_pool();
+        clear_tls_stack();
+
+        let r = on_wasm_stack(get_stack_size(), None, || {
+            let in_place = host_call_in_place().expect("a fresh Wasm stack has room");
+            let sp = stack_pointer();
+            let handled = unsafe {
+                TrapHandlerContext::handle_trap(
+                    0,
+                    sp,
+                    Some(sp),
+                    Some(TrapCode::StackOverflow),
+                    |_| panic!("the host code's registers were rewritten"),
+                    |_| false,
+                )
+            };
+            drop(in_place);
+            handled
+        });
+        assert_eq!(r.ok(), Some(false));
 
         clear_tls_stack();
         drain_stack_pool();
@@ -2313,7 +3369,7 @@ mod tests {
     #[test]
     fn reentrant_with_on_host_stack_in_between() {
         // Outer wasm → on_host_stack → inner wasm. This exercises the
-        // YIELDER save/restore in `unwind_with` / `on_host_stack` against
+        // Wasm stack save/restore in `unwind_with` / `on_host_stack` against
         // a re-entrant boundary.
         let _lock = GLOBAL_STATE.lock().unwrap();
         let _restore = RestoreStackSize(get_stack_size());
@@ -2387,44 +3443,31 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn growing_request_discards_smaller_tls_stack() {
+    fn growing_request_discards_a_smaller_entry_coroutine() {
         let _lock = GLOBAL_STATE.lock().unwrap();
         let _restore = RestoreStackSize(get_stack_size());
         drain_stack_pool();
         clear_tls_stack();
 
-        // First call at a small size populates TLS with a small stack.
+        // First call at a small size keeps a coroutine on a small stack.
         let small = ByteSize::mib(1).as_u64() as usize;
         set_stack_size(small);
         assert!(on_wasm_stack(small, None, || ()).is_ok());
-
-        let cached_size = TLS_STACK.with(|cache| {
-            let s = cache.0.take();
-            let sz = s.as_ref().map_or(0, |s| s.size());
-            cache.0.set(s);
-            sz
-        });
+        let cached_size = cached_entries()[0].unwrap_or(0);
         assert!(
             cached_size >= small,
-            "TLS should hold the small-sized stack"
+            "the first slot should hold the small-sized coroutine"
         );
 
-        // Now request a larger stack. acquire_stack should discard the TLS
-        // entry and either pop a big-enough one from pool or allocate.
+        // Now request a larger stack. The slot's coroutine is discarded and
+        // replaced by one on a stack that is big enough.
         let big = ByteSize::mib(4).as_u64() as usize;
         set_stack_size(big);
         assert!(on_wasm_stack(big, None, || ()).is_ok());
-
-        // The TLS slot should now hold a stack that's big enough.
-        let cached_size = TLS_STACK.with(|cache| {
-            let s = cache.0.take();
-            let sz = s.as_ref().map_or(0, |s| s.size());
-            cache.0.set(s);
-            sz
-        });
+        let cached_size = cached_entries()[0].unwrap_or(0);
         assert!(
             cached_size >= big,
-            "TLS should hold the bigger stack after size bump"
+            "the first slot should hold a bigger coroutine after size bump"
         );
 
         clear_tls_stack();

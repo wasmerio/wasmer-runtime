@@ -526,6 +526,48 @@ impl Function {
         self.0.is_from_store(store)
     }
 
+    /// With `false`, lets calls from Wasm to this host function run on the
+    /// Wasm stack they come from; with `true`, makes every call run on the
+    /// native stack again, as it does by default.
+    ///
+    /// On the `sys` backend a call from Wasm switches from the Wasm stack to
+    /// the native stack to run its host function, and back. A typed
+    /// synchronous host function (made with [`Self::new_typed`] or
+    /// [`Self::new_typed_with_env`]) set to `false` here instead runs on the
+    /// Wasm stack when enough of that stack is left
+    /// (`wasmer::sys::vm::HOST_CALL_RESERVE`, 256 KiB), which saves switching
+    /// stacks, and switches otherwise. The reserve is all the stack it is sure
+    /// to have there: a host function that may need more must stay on the
+    /// native stack, since one that overflows the Wasm stack aborts the
+    /// process. The setting applies from the next call on, including calls
+    /// through instances that already import the function.
+    ///
+    /// Dynamic and asynchronous host functions always run on the native
+    /// stack, and other backends always run host functions on their own
+    /// stack: there, and for a function defined in Wasm, this does nothing.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use wasmer::{Function, Store};
+    /// # let mut store = Store::default();
+    /// #
+    /// let light = Function::new_typed(&mut store, |x: i32| x + 1);
+    /// light.set_calls_on_native_stack(&mut store, false);
+    /// ```
+    pub fn set_calls_on_native_stack(&self, store: &mut impl AsStoreMut, always: bool) {
+        self.0.set_calls_on_native_stack(store, always)
+    }
+
+    /// Whether every call from Wasm to this host function runs on the native
+    /// stack: unless it is a typed synchronous host function that was set not
+    /// to with [`Self::set_calls_on_native_stack`]. Always `false` on backends
+    /// that have no Wasm stacks of their own, and for a function defined in
+    /// Wasm.
+    pub fn calls_on_native_stack(&self, store: &impl AsStoreRef) -> bool {
+        self.0.calls_on_native_stack(store)
+    }
+
     pub(crate) fn to_vm_extern(&self) -> VMExtern {
         self.0.to_vm_extern()
     }
