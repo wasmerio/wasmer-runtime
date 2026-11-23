@@ -1,5 +1,5 @@
 //! Data types, functions and traits for `v8` runtime's `Tag` implementation.
-use wasmer_types::{TagType, Type};
+use wasmer_types::{TagType, Type, StoreId};
 
 use crate::{
     AsStoreMut, AsStoreRef,
@@ -11,12 +11,14 @@ use crate::{
     vm::{VMExtern, VMExternTag},
 };
 
-use super::check_isolate;
+use super::{check_isolate, check_owner};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A WebAssembly `tag` in the `v8` runtime.
 pub(crate) struct Tag {
     pub(crate) handle: VMTag,
+    /// The store it belongs to: V8 does not know.
+    pub(crate) store_id: StoreId,
 }
 
 unsafe impl Send for Tag {}
@@ -53,11 +55,14 @@ impl Tag {
             panic!("failed to create new tag: returned tag is null");
         }
 
-        Self { handle }
+        Self {
+            handle,
+            store_id: store_mut.inner.objects.id(),
+        }
     }
 
     pub fn ty(&self, store: &impl AsStoreRef) -> TagType {
-        check_isolate(store);
+        check_owner(store, self.store_id);
         let type_ = unsafe { wasm_tag_type(self.handle) };
         let params: *const wasm_valtype_vec_t = unsafe { wasm_tagtype_params(type_) };
 
@@ -76,12 +81,13 @@ impl Tag {
         check_isolate(store);
         Self {
             handle: vm_tag.unwrap_v_8(),
+            store_id: store.objects_mut().id(),
         }
     }
 
     pub fn is_from_store(&self, store: &impl AsStoreRef) -> bool {
         check_isolate(store);
-        true
+        self.store_id == store.as_store_ref().objects().id()
     }
 
     pub(crate) fn to_vm_extern(&self) -> VMExtern {

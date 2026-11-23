@@ -1,12 +1,16 @@
-#![cfg(all(feature = "experimental-async", not(target_arch = "wasm32")))]
+#![cfg(all(
+    feature = "experimental-async",
+    feature = "sys",
+    not(target_arch = "wasm32")
+))]
 
 use std::{cell::RefCell, sync::OnceLock};
 
 use anyhow::Result;
 use futures::future;
 use wasmer::{
-    AsyncFunctionEnvMut, Function, FunctionEnv, FunctionEnvMut, FunctionType, Instance, Module,
-    Store, StoreAsync, Type, TypedFunction, Value, imports,
+    AsyncEnv, Function, FunctionEnv, FunctionEnvMut, FunctionType, Instance, Module, Store, Type,
+    TypedFunction, Value, imports,
 };
 use wasmer_vm::TrapCode;
 
@@ -33,17 +37,19 @@ fn jspi_module() -> &'static [u8] {
 #[test]
 #[cfg_attr(
     feature = "v8-default",
-    ignore = "async functions are not supported by the default v8 backend"
+    ignore = "these guests suspend, which the default v8 backend cannot"
 )]
 fn async_state_updates_follow_jspi_example() -> Result<()> {
     let wasm = jspi_module();
     let mut store = Store::default();
     let module = Module::new(&store, wasm)?;
 
+    let unit_env = FunctionEnv::new(&mut store, ());
     let init_state = Function::new_async(
         &mut store,
+        &unit_env,
         FunctionType::new(vec![], vec![Type::F64]),
-        |_values| async move {
+        async |_: &mut AsyncEnv<()>, _: &[Value]| {
             // Note: future::ready doesn't actually suspend. It's important
             // to note that, while we're in an async import here, it's
             // impossible to suspend during module instantiation, which is
@@ -62,18 +68,14 @@ fn async_state_updates_follow_jspi_example() -> Result<()> {
             index: 0,
         },
     );
-    let compute_delta = Function::new_with_env_async(
+    let compute_delta = Function::new_async(
         &mut store,
         &delta_env,
         FunctionType::new(vec![], vec![Type::F64]),
-        |env: AsyncFunctionEnvMut<DeltaState>, _values| async move {
-            // Note: holding a lock across an await point prevents
-            // other coroutines from progressing, so it's a good
-            // idea to drop the lock before awaiting.
-            let delta = {
-                let mut env_write = env.write().await;
-                env_write.data_mut().next()
-            };
+        async |cx: &mut AsyncEnv<DeltaState>, _: &[Value]| {
+            // The store is reachable only in this synchronous slice, so no
+            // borrow of it can be held across the await below.
+            let delta = cx.with(|mut env| env.data_mut().next());
             // We can, however, actually suspend whenever
             // `Function::call_async` is used to call WASM functions.
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -101,20 +103,18 @@ fn async_state_updates_follow_jspi_example() -> Result<()> {
 
     assert_eq!(as_f64(&get_state.call(&mut store, &[])?), 1.0);
 
-    let step = |store: &StoreAsync, func: &wasmer::Function| -> Result<f64> {
+    let step = |store: &mut Store, func: &wasmer::Function| -> Result<f64> {
         let result = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(func.call_async(store, vec![]))?;
+            .block_on(func.call_async(store, &[]))?;
         Ok(as_f64(&result))
     };
 
-    let store_async = store.into_async();
-
-    assert_eq!(step(&store_async, update_state)?, 1.5);
-    assert_eq!(step(&store_async, update_state)?, 0.5);
-    assert_eq!(step(&store_async, update_state)?, 3.0);
+    assert_eq!(step(&mut store, update_state)?, 1.5);
+    assert_eq!(step(&mut store, update_state)?, 0.5);
+    assert_eq!(step(&mut store, update_state)?, 3.0);
 
     Ok(())
 }
@@ -122,7 +122,7 @@ fn async_state_updates_follow_jspi_example() -> Result<()> {
 #[test]
 #[cfg_attr(
     feature = "v8-default",
-    ignore = "async functions are not supported by the default v8 backend"
+    ignore = "these guests suspend, which the default v8 backend cannot"
 )]
 fn typed_async_host_and_calls_work() -> Result<()> {
     let wasm = wat::parse_str(
@@ -149,20 +149,24 @@ fn typed_async_host_and_calls_work() -> Result<()> {
     let module = Module::new(&store, wasm)?;
 
     let add_env = FunctionEnv::new(&mut store, AddBias { bias: 5 });
-    let async_add = Function::new_typed_with_env_async(
+    let async_add = Function::new_typed_async(
         &mut store,
         &add_env,
-        async move |env: AsyncFunctionEnvMut<AddBias>, a: i32, b: i32| {
-            let env_read = env.read().await;
-            let bias = env_read.data().bias;
+        async move |cx: &mut AsyncEnv<AddBias>, a: i32, b: i32| {
+            let bias = cx.with(|env| env.data().bias);
             tokio::task::yield_now().await;
             a + b + bias
         },
     );
-    let async_double = Function::new_typed_async(&mut store, async move |value: i32| {
-        tokio::task::yield_now().await;
-        value * 2
-    });
+    let unit_env = FunctionEnv::new(&mut store, ());
+    let async_double = Function::new_typed_async(
+        &mut store,
+        &unit_env,
+        async move |_: &mut AsyncEnv<()>, value: i32| {
+            tokio::task::yield_now().await;
+            value * 2
+        },
+    );
 
     let import_object = imports! {
         "host" => {
@@ -175,13 +179,11 @@ fn typed_async_host_and_calls_work() -> Result<()> {
     let compute: TypedFunction<i32, i32> =
         instance.exports.get_typed_function(&store, "compute")?;
 
-    let store_async = store.into_async();
-
     let result = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap()
-        .block_on(compute.call_async(&store_async, 4))?;
+        .block_on(compute.call_async(&mut store, 4))?;
     assert_eq!(result, 27);
 
     Ok(())
@@ -190,7 +192,7 @@ fn typed_async_host_and_calls_work() -> Result<()> {
 #[test]
 #[cfg_attr(
     feature = "v8-default",
-    ignore = "async functions are not supported by the default v8 backend"
+    ignore = "these guests suspend, which the default v8 backend cannot"
 )]
 fn cannot_yield_when_not_in_async_context() -> Result<()> {
     const WAT: &str = r#"
@@ -206,10 +208,12 @@ fn cannot_yield_when_not_in_async_context() -> Result<()> {
     let mut store = Store::default();
     let module = Module::new(&store, wasm)?;
 
+    let env = FunctionEnv::new(&mut store, ());
     let yield_now = Function::new_async(
         &mut store,
+        &env,
         FunctionType::new(vec![], vec![]),
-        |_values| async move {
+        async |_: &mut AsyncEnv<()>, _: &[Value]| {
             // Attempting to yield when not in an async context should trap.
             tokio::task::yield_now().await;
             Ok(vec![])
@@ -240,18 +244,28 @@ fn cannot_yield_when_not_in_async_context() -> Result<()> {
     Ok(())
 }
 
+/// A synchronous host function of a `call_async` calls back into its guest,
+/// holding its borrow of the store across that call, so the guest it calls
+/// cannot be suspended: whoever used the store while it waited would alias
+/// that borrow. An async import that is ready at once goes through; one that
+/// has to wait fails with `YieldOutsideAsyncContext`, as on the JavaScript
+/// backend, and the host function goes on with its store.
 #[test]
 #[cfg_attr(
     feature = "v8-default",
-    ignore = "async functions are not supported by the default v8 backend"
+    ignore = "these guests suspend, which the default v8 backend cannot"
 )]
 fn nested_async_in_sync() -> Result<()> {
     const WAT: &str = r#"
     (module
-        (import "env" "sync" (func $sync (result i32)))
+        (import "env" "sync" (func $sync (param i32) (result i32)))
+        (import "env" "ready" (func $ready (result i32)))
         (import "env" "async" (func $async (result i32)))
-        (func (export "entry") (result i32)
-            call $sync
+        (func (export "entry") (param i32) (result i32)
+            (call $sync (local.get 0))
+        )
+        (func (export "inner_ready") (result i32)
+            call $ready
         )
         (func (export "inner_async") (result i32)
             call $async
@@ -264,26 +278,34 @@ fn nested_async_in_sync() -> Result<()> {
     let module = Module::new(&store, wasm)?;
 
     struct Env {
-        inner_async: RefCell<Option<wasmer::TypedFunction<(), i32>>>,
+        inner: RefCell<Vec<wasmer::TypedFunction<(), i32>>>,
     }
     let env = FunctionEnv::new(
         &mut store,
         Env {
-            inner_async: RefCell::new(None),
+            inner: RefCell::new(Vec::new()),
         },
     );
 
-    let sync = Function::new_typed_with_env(&mut store, &env, |mut env: FunctionEnvMut<Env>| {
-        let (env, mut store) = env.data_and_store_mut();
-        env.inner_async
-            .borrow()
-            .as_ref()
-            .expect("inner_async function to be set")
-            .call(&mut store)
-            .expect("inner async call to succeed")
-    });
+    let sync = Function::new_typed_with_env(
+        &mut store,
+        &env,
+        |mut env: FunctionEnvMut<Env>, which: i32| -> i32 {
+            let inner = env.data().inner.borrow()[which as usize].clone();
+            match inner.call(&mut env) {
+                Ok(value) => value,
+                Err(error) => {
+                    assert_eq!(error.to_trap(), Some(TrapCode::YieldOutsideAsyncContext));
+                    // The host function goes on with its store.
+                    -(env.data().inner.borrow().len() as i32)
+                }
+            }
+        },
+    );
 
-    let async_ = Function::new_typed_async(&mut store, async || {
+    let unit_env = FunctionEnv::new(&mut store, ());
+    let ready = Function::new_typed_async(&mut store, &unit_env, async |_: &mut AsyncEnv<()>| 7);
+    let async_ = Function::new_typed_async(&mut store, &unit_env, async |_: &mut AsyncEnv<()>| {
         tokio::task::yield_now().await;
         42
     });
@@ -291,31 +313,31 @@ fn nested_async_in_sync() -> Result<()> {
     let imports = imports! {
         "env" => {
             "sync" => sync,
+            "ready" => ready,
             "async" => async_,
         }
     };
 
     let instance = Instance::new(&mut store, &module, &imports)?;
 
-    let inner_async = instance
-        .exports
-        .get_typed_function::<(), i32>(&store, "inner_async")
-        .unwrap();
-    env.as_mut(&mut store)
-        .inner_async
-        .borrow_mut()
-        .replace(inner_async);
+    for name in ["inner_ready", "inner_async"] {
+        let inner = instance
+            .exports
+            .get_typed_function::<(), i32>(&store, name)
+            .unwrap();
+        env.as_mut(&mut store).inner.borrow_mut().push(inner);
+    }
 
     let entry = instance
         .exports
-        .get_typed_function::<(), i32>(&store, "entry")?;
-    let result = tokio::runtime::Builder::new_current_thread()
+        .get_typed_function::<i32, i32>(&store, "entry")?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap()
-        .block_on(entry.call_async(&store.into_async()))?;
+        .unwrap();
 
-    assert_eq!(result, 42);
+    assert_eq!(runtime.block_on(entry.call_async(&mut store, 0))?, 7);
+    assert_eq!(runtime.block_on(entry.call_async(&mut store, 1))?, -2);
 
     Ok(())
 }

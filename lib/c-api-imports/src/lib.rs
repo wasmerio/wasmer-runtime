@@ -565,7 +565,7 @@ fn write_guest_bytes(env: &mut FunctionEnvMut<WasmCapiEnv>, guest_ptr: i32, data
     let Ok(len) = u32::try_from(data.len()) else {
         return false;
     };
-    let (state, store) = env.data_and_store_mut();
+    let (state, store) = env.data_and_store();
     let Some(memory) = state.memory.clone() else {
         return false;
     };
@@ -624,7 +624,7 @@ fn read_guest_bytes(
         return Some(Vec::new());
     }
 
-    let (state, store) = env.data_and_store_mut();
+    let (state, store) = env.data_and_store();
     let memory = state.memory.clone()?;
     let view = memory.view(&store);
 
@@ -637,7 +637,7 @@ fn read_guest_array<const N: usize>(
 ) -> Option<[u8; N]> {
     let ptr = guest_byte_ptr(guest_ptr)?;
     let len = u32::try_from(N).ok()?;
-    let (state, store) = env.data_and_store_mut();
+    let (state, store) = env.data_and_store();
     let memory = state.memory.clone()?;
     let mut bytes = [0u8; N];
     let view = memory.view(&store);
@@ -656,7 +656,7 @@ fn read_guest_i32_vec(
     }
     let byte_len = len.checked_mul(size_of::<i32>())?;
 
-    let (state, store) = env.data_and_store_mut();
+    let (state, store) = env.data_and_store();
     let memory = state.memory.clone()?;
     let view = memory.view(&store);
 
@@ -710,10 +710,7 @@ fn allocate_guest_memory(env: &mut FunctionEnvMut<WasmCapiEnv>, len: usize) -> O
 
     let malloc_fn = env.data().malloc_fn.clone()?;
     let len = i32::try_from(len).ok()?;
-    let guest_ptr: i32 = {
-        let (_, mut store_ref) = env.data_and_store_mut();
-        malloc_fn.call(&mut store_ref, len).ok()?
-    };
+    let guest_ptr: i32 = { malloc_fn.call(env, len).ok()? };
     if guest_ptr <= INVALID_HANDLE {
         return None;
     }
@@ -728,8 +725,7 @@ fn free_guest_memory(env: &mut FunctionEnvMut<WasmCapiEnv>, guest_ptr: i32) {
     let Some(free_fn) = env.data().free_fn.clone() else {
         return;
     };
-    let (_, mut store_ref) = env.data_and_store_mut();
-    let _ = free_fn.call(&mut store_ref, guest_ptr);
+    let _ = free_fn.call(env, guest_ptr);
 }
 
 struct GuestAllocation<'env, 'store> {
@@ -1110,7 +1106,7 @@ fn wasm_module_new(mut env: FunctionEnvMut<WasmCapiEnv>, _store: i32, bytes_ptr:
     };
 
     let resolver = env.data().resolve_module_sync.clone();
-    let (_, store) = env.data_and_store_mut();
+    let (_, store) = env.data_and_store();
     let module = if let Some(resolve) = resolver {
         resolve(store.engine(), bytes)
     } else {
@@ -1127,7 +1123,7 @@ fn wasm_module_validate(mut env: FunctionEnvMut<WasmCapiEnv>, _store: i32, bytes
     let Some(bytes) = read_byte_vec(&mut env, bytes_ptr) else {
         return BOOL_FALSE;
     };
-    let (_, store) = env.data_and_store_mut();
+    let (_, store) = env.data_and_store();
     Module::validate(&store, &bytes).is_ok() as i32
 }
 
@@ -2186,9 +2182,8 @@ unsafe impl Sync for GuestForeign {}
 
 fn wasm_foreign_new(mut env: FunctionEnvMut<WasmCapiEnv>, _store: i32) -> i32 {
     let extern_ref = {
-        let (_, mut store) = env.data_and_store_mut();
         ExternRef::new(
-            &mut store,
+            &mut env,
             GuestForeign {
                 host_info: std::cell::Cell::new(0),
                 finalizer: std::cell::Cell::new(0),

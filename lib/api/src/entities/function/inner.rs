@@ -1,9 +1,5 @@
-use std::pin::Pin;
-
 use wasmer_types::{FunctionType, RawValue};
 
-#[cfg(feature = "experimental-async")]
-use crate::{AsStoreAsync, AsyncFunctionEnvMut, entities::function::async_host::AsyncHostFunction};
 use crate::{
     AsStoreMut, AsStoreRef, CallWrapper, ExportError, Exportable, Extern, FunctionEnv,
     FunctionEnvMut, HostFunction, StoreMut, StoreRef, TypedFunction, Value, WasmTypeList, WithEnv,
@@ -12,6 +8,8 @@ use crate::{
     macros::backend::{gen_rt_ty, match_rt},
     vm::{VMExtern, VMExternFunction, VMFuncRef},
 };
+#[cfg(feature = "experimental-async")]
+use crate::{AsyncEnv, entities::function::async_host::HostFuture};
 
 /// A WebAssembly `function` instance.
 ///
@@ -202,132 +200,32 @@ impl BackendFunction {
         }
     }
 
-    /// Creates a new async host `Function` (dynamic) with the provided
-    /// signature.
-    ///
-    /// If you know the signature of the host function at compile time,
-    /// consider using [`Self::new_typed_async`] for less runtime overhead.
-    ///
-    /// The provided closure returns a future that resolves to the function results.
-    /// When invoked synchronously
-    /// (via [`Function::call`](crate::Function::call)) the future will run to
-    /// completion immediately, provided it doesn't suspend. When invoked through
-    /// [`Function::call_async`](crate::Function::call_async), the future may suspend
-    /// and resume as needed.
+    /// Creates an async host `Function` from its boxed body.
     #[inline]
     #[cfg(feature = "experimental-async")]
-    pub fn new_async<FT, F, Fut>(store: &mut impl AsStoreMut, ty: FT, func: F) -> Self
-    where
-        FT: Into<FunctionType>,
-        F: Fn(&[Value]) -> Fut + 'static,
-        Fut: Future<Output = Result<Vec<Value>, RuntimeError>> + 'static,
-    {
-        match &store.as_store_mut().inner.store {
-            #[cfg(feature = "sys")]
-            crate::BackendStore::Sys(_) => Self::Sys(
-                crate::backend::sys::entities::function::Function::new_async(store, ty, func),
-            ),
-            #[cfg(feature = "v8")]
-            crate::BackendStore::V8(_) => unsupported_async_backend("v8"),
-            #[cfg(feature = "js")]
-            crate::BackendStore::Js(_) => Self::Js(
-                crate::backend::js::entities::function::Function::new_async(store, ty, func),
-            ),
-        }
-    }
-
-    /// Creates a new async host `Function` (dynamic) with the provided
-    /// signature and environment.
-    ///
-    /// If you know the signature of the host function at compile time,
-    /// consider using [`Self::new_typed_with_env_async`] for less runtime overhead.
-    ///
-    /// Takes an [`AsyncFunctionEnvMut`] that is passed into func. If
-    /// that is not required, [`Self::new_async`] might be an option as well.
-    #[inline]
-    #[cfg(feature = "experimental-async")]
-    pub fn new_with_env_async<FT, F, Fut, T: 'static>(
+    pub(crate) fn new_async<T, FT, F>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
         ty: FT,
         func: F,
     ) -> Self
     where
+        T: Send + 'static,
         FT: Into<FunctionType>,
-        F: Fn(AsyncFunctionEnvMut<T>, &[Value]) -> Fut + 'static,
-        Fut: Future<Output = Result<Vec<Value>, RuntimeError>> + 'static,
+        F: Fn(AsyncEnv<T>, Vec<Value>) -> HostFuture + 'static,
     {
         match &store.as_store_mut().inner.store {
             #[cfg(feature = "sys")]
             crate::BackendStore::Sys(_) => Self::Sys(
-                crate::backend::sys::entities::function::Function::new_with_env_async(
-                    store, env, ty, func,
-                ),
+                crate::backend::sys::entities::function::Function::new_async(store, env, ty, func),
             ),
             #[cfg(feature = "v8")]
-            crate::BackendStore::V8(_) => unsupported_async_backend("v8"),
+            crate::BackendStore::V8(_) => Self::V8(
+                crate::backend::v8::entities::function::Function::new_async(store, env, ty, func),
+            ),
             #[cfg(feature = "js")]
             crate::BackendStore::Js(_) => Self::Js(
-                crate::backend::js::entities::function::Function::new_with_env_async(
-                    store, env, ty, func,
-                ),
-            ),
-        }
-    }
-
-    /// Creates a new async host `Function` from a native typed function.
-    ///
-    /// The future can return either the raw result tuple or any type that implements
-    /// [`IntoResult`](crate::IntoResult) for the result tuple (e.g. `Result<Rets, E>`).
-    #[inline]
-    #[cfg(feature = "experimental-async")]
-    pub fn new_typed_async<F, Args, Rets>(store: &mut impl AsStoreMut, func: F) -> Self
-    where
-        F: AsyncHostFunction<(), Args, Rets, WithoutEnv> + 'static,
-        Args: WasmTypeList + 'static,
-        Rets: WasmTypeList + 'static,
-    {
-        match &store.as_store_mut().inner.store {
-            #[cfg(feature = "sys")]
-            crate::BackendStore::Sys(_) => Self::Sys(
-                crate::backend::sys::entities::function::Function::new_typed_async(store, func),
-            ),
-            #[cfg(feature = "v8")]
-            crate::BackendStore::V8(_) => unsupported_async_backend("v8"),
-            #[cfg(feature = "js")]
-            crate::BackendStore::Js(_) => Self::Js(
-                crate::backend::js::entities::function::Function::new_typed_async(store, func),
-            ),
-        }
-    }
-
-    /// Creates a new async host `Function` with an environment from a typed function.
-    #[inline]
-    #[cfg(feature = "experimental-async")]
-    pub fn new_typed_with_env_async<T: 'static, F, Args, Rets>(
-        store: &mut impl AsStoreMut,
-        env: &FunctionEnv<T>,
-        func: F,
-    ) -> Self
-    where
-        F: AsyncHostFunction<T, Args, Rets, WithEnv> + 'static,
-        Args: WasmTypeList + 'static,
-        Rets: WasmTypeList + 'static,
-    {
-        match &store.as_store_mut().inner.store {
-            #[cfg(feature = "sys")]
-            crate::BackendStore::Sys(_) => Self::Sys(
-                crate::backend::sys::entities::function::Function::new_typed_with_env_async(
-                    store, env, func,
-                ),
-            ),
-            #[cfg(feature = "v8")]
-            crate::BackendStore::V8(_) => unsupported_async_backend("v8"),
-            #[cfg(feature = "js")]
-            crate::BackendStore::Js(_) => Self::Js(
-                crate::backend::js::entities::function::Function::new_typed_with_env_async(
-                    store, env, func,
-                ),
+                crate::backend::js::entities::function::Function::new_async(store, env, ty, func),
             ),
         }
     }
@@ -467,23 +365,6 @@ impl BackendFunction {
         match_rt!(on self => f {
             f.call_raw(store, params)
         })
-    }
-
-    #[cfg(feature = "experimental-async")]
-    #[allow(clippy::type_complexity)]
-    pub fn call_async(
-        &self,
-        store: &impl AsStoreAsync,
-        params: Vec<Value>,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<[Value]>, RuntimeError>> + 'static>> {
-        match self {
-            #[cfg(feature = "sys")]
-            Self::Sys(f) => f.call_async(store, params),
-            #[cfg(feature = "v8")]
-            Self::V8(_) => unsupported_async_future(),
-            #[cfg(feature = "js")]
-            Self::Js(f) => f.call_async(store, params),
-        }
     }
 
     #[inline]
@@ -675,23 +556,6 @@ impl BackendFunction {
             f.to_vm_extern()
         })
     }
-}
-
-#[cold]
-fn unsupported_async_backend(backend: &str) -> ! {
-    panic!(
-        "async host functions are only supported with the `sys` backend (attempted on {backend})"
-    )
-}
-
-#[allow(clippy::type_complexity)]
-pub(super) fn unsupported_async_future<'a>()
--> Pin<Box<dyn Future<Output = Result<Box<[Value]>, RuntimeError>> + 'a>> {
-    Box::pin(async {
-        Err(RuntimeError::new(
-            "async calls are only supported with the `sys` backend",
-        ))
-    })
 }
 
 impl<'a> Exportable<'a> for BackendFunction {

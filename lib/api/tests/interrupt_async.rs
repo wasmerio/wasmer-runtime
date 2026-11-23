@@ -7,16 +7,22 @@
 // TODO: tests for recursive function calls across different stores
 
 use std::{
+    cell::RefCell,
+    future::Future,
+    pin::Pin,
     sync::{Arc, Barrier, Mutex, atomic::AtomicU32},
-    task::{Context, Poll},
+    task::{Context, Poll, Wake, Waker},
     thread,
     time::Duration,
 };
 
 use anyhow::Result;
 use futures::task::noop_waker;
-use wasmer::{Function, Instance, Module, Store, imports};
-use wasmer_vm::TrapCode;
+use wasmer::{
+    AsyncEnv, Function, FunctionEnv, FunctionEnvMut, Instance, Interrupter, Module, RuntimeError,
+    Store, Value, imports,
+};
+use wasmer_vm::{TrapCode, interrupt_registry};
 
 const WAT: &str = r#"
     (module
@@ -24,7 +30,27 @@ const WAT: &str = r#"
       (func (export "async")
         call $f
       )
+      (func (export "plain") (result i32)
+        i32.const 1
+      )
     )"#;
+
+/// A store whose export `async` waits for good, and its export `plain`.
+/// Untyped: the future of a typed call drops the untyped call it awaits as
+/// soon as that returns, and a caller keeps an untyped one as long as it likes.
+fn waiting_guest() -> Result<(Store, Function, Function)> {
+    let wasm = wat::parse_str(WAT)?;
+    let mut store = Store::default();
+    let module = Module::new(&store, &wasm)?;
+    let env = FunctionEnv::new(&mut store, ());
+    let f = Function::new_typed_async(&mut store, &env, async |_: &mut AsyncEnv<()>| {
+        std::future::pending::<()>().await;
+    });
+    let instance = Instance::new(&mut store, &module, &imports! { "env" => { "f" => f } })?;
+    let waits = instance.exports.get_function("async")?.clone();
+    let plain = instance.exports.get_function("plain")?.clone();
+    Ok((store, waits, plain))
+}
 
 #[test]
 fn async_function_can_be_interrupted() -> Result<()> {
@@ -42,7 +68,8 @@ fn async_function_can_be_interrupted() -> Result<()> {
             interrupter_slot.lock().unwrap().replace(interrupter);
             let module = Module::new(&store, &wasm)?;
 
-            let f = Function::new_typed_async(&mut store, async || {
+            let env = FunctionEnv::new(&mut store, ());
+            let f = Function::new_typed_async(&mut store, &env, async |_: &mut AsyncEnv<()>| {
                 std::future::pending::<()>().await;
             });
             let imports = imports! {
@@ -56,14 +83,12 @@ fn async_function_can_be_interrupted() -> Result<()> {
                 .exports
                 .get_typed_function::<(), ()>(&store, "async")?;
 
-            let store_async = store.into_async();
-
             barrier.wait();
             let res = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(f.call_async(&store_async));
+                .block_on(f.call_async(&mut store));
             anyhow::Ok(res)
         }
     });
@@ -94,14 +119,12 @@ fn all_futures_from_store_are_interrupted() -> Result<()> {
 
     let pending_count = Arc::new(AtomicU32::new(0));
 
-    let f = Function::new_typed_async(&mut store, {
+    let env = FunctionEnv::new(&mut store, ());
+    let f = Function::new_typed_async(&mut store, &env, {
         let pending_count = pending_count.clone();
-        move || {
-            let pending_count = pending_count.clone();
-            async move {
-                pending_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                std::future::pending::<()>().await;
-            }
+        async move |_: &mut AsyncEnv<()>| {
+            pending_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<()>().await;
         }
     });
     let imports = imports! {
@@ -115,12 +138,12 @@ fn all_futures_from_store_are_interrupted() -> Result<()> {
         .exports
         .get_typed_function::<(), ()>(&store, "async")?;
 
-    let store_async = store.into_async();
+    let mut shared = store.into_shared();
     let mut futures = [
-        Box::pin(f.call_async(&store_async)),
-        Box::pin(f.call_async(&store_async)),
-        Box::pin(f.call_async(&store_async)),
-        Box::pin(f.call_async(&store_async)),
+        Box::pin(f.call_async(&mut shared)),
+        Box::pin(f.call_async(&mut shared)),
+        Box::pin(f.call_async(&mut shared)),
+        Box::pin(f.call_async(&mut shared)),
     ];
 
     let waker = noop_waker();
@@ -146,5 +169,199 @@ fn all_futures_from_store_are_interrupted() -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+/// An interrupted call ends at once, with its coroutine: the store is not
+/// left interrupted by calls that returned their error but were not dropped,
+/// and a new call on it runs.
+#[test]
+fn an_interrupted_call_does_not_keep_its_store_interrupted() -> Result<()> {
+    let (store, waits, plain) = waiting_guest()?;
+    let interrupter = store.interrupter();
+    let mut store = store.into_shared();
+    let waker = noop_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    let mut call = Box::pin(waits.call_async(&mut store, &[]));
+    assert!(call.as_mut().poll(&mut cx).is_pending());
+    interrupter.interrupt();
+    let Poll::Ready(Err(error)) = call.as_mut().poll(&mut cx) else {
+        panic!("the call was not interrupted");
+    };
+    assert_eq!(error.to_trap(), Some(TrapCode::HostInterrupt));
+
+    // `call` is kept: it finished, and holds nothing.
+    let mut next = Box::pin(plain.call_async(&mut store, &[]));
+    let Poll::Ready(result) = next.as_mut().poll(&mut cx) else {
+        panic!("the next call did not finish");
+    };
+    assert_eq!(result?.to_vec(), vec![Value::I32(1)]);
+    drop(call);
+    Ok(())
+}
+
+type CallFuture = Pin<Box<dyn Future<Output = Result<Box<[Value]>, RuntimeError>>>>;
+
+thread_local! {
+    /// The call `PollsAtOnce` polls.
+    static POLLED_AT_ONCE: RefCell<Option<CallFuture>> = const { RefCell::new(None) };
+}
+
+/// A waker that polls its call as soon as it is woken.
+struct PollsAtOnce;
+
+impl Wake for PollsAtOnce {
+    fn wake(self: Arc<Self>) {
+        let waker = Waker::from(self);
+        POLLED_AT_ONCE.with_borrow_mut(|call| {
+            if let Some(call) = call {
+                let _ = call.as_mut().poll(&mut Context::from_waker(&waker));
+            }
+        });
+    }
+}
+
+/// The interrupt wakes a call whose waker polls it at once: the poll can
+/// take the interrupt's bookkeeping again.
+#[test]
+fn an_interrupt_wakes_a_waker_that_polls_at_once() -> Result<()> {
+    let (store, waits, _) = waiting_guest()?;
+    let interrupter = store.interrupter();
+    let mut store = store.into_shared();
+    let waker = Waker::from(Arc::new(PollsAtOnce));
+    let mut call: CallFuture = Box::pin(waits.call_async(&mut store, &[]));
+    assert!(
+        call.as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    POLLED_AT_ONCE.set(Some(call));
+    interrupter.interrupt();
+    drop(POLLED_AT_ONCE.take());
+    Ok(())
+}
+
+/// A call forgotten while it is suspended keeps its store's interrupt state,
+/// aimed at its thread. Once the thread is gone, an interrupt does not signal
+/// it: the store is not running anywhere.
+#[test]
+fn a_forgotten_call_on_an_exited_thread_is_not_signalled() -> Result<()> {
+    let id = thread::spawn(|| -> Result<_> {
+        let (store, waits, _) = waiting_guest()?;
+        let id = store.id();
+        let mut store = store.into_shared();
+        let mut call = Box::pin(waits.call_async(&mut store, &[]));
+        assert!(
+            call.as_mut()
+                .poll(&mut Context::from_waker(&noop_waker()))
+                .is_pending()
+        );
+        std::mem::forget(call);
+        Ok(id)
+    })
+    .join()
+    .unwrap()?;
+    assert!(matches!(
+        interrupt_registry::interrupt(id),
+        Err(interrupt_registry::InterruptError::StoreNotRunning)
+    ));
+    Ok(())
+}
+
+/// The state of the import of `relaying_guest`.
+struct Relay {
+    interrupter: Interrupter,
+    /// The guest's export `plain`.
+    plain: Option<Function>,
+    /// What the import's call of `plain` returned.
+    nested: Option<Result<(), Option<TrapCode>>>,
+}
+
+/// A store whose export `async` calls the import that `make_relay` builds.
+/// Returns the export, and the environment of the import.
+fn relaying_guest(
+    make_relay: impl FnOnce(&mut Store, &FunctionEnv<Relay>) -> Function,
+) -> Result<(Store, FunctionEnv<Relay>, Function)> {
+    let wasm = wat::parse_str(WAT)?;
+    let mut store = Store::default();
+    let module = Module::new(&store, &wasm)?;
+    let relay = Relay {
+        interrupter: store.interrupter(),
+        plain: None,
+        nested: None,
+    };
+    let env = FunctionEnv::new(&mut store, relay);
+    let f = make_relay(&mut store, &env);
+    let instance = Instance::new(&mut store, &module, &imports! { "env" => { "f" => f } })?;
+    env.as_mut(&mut store).plain = Some(instance.exports.get_function("plain")?.clone());
+    let run = instance.exports.get_function("async")?.clone();
+    Ok((store, env, run))
+}
+
+/// A sync import interrupts its store, then calls into it again. The nested
+/// call is refused: the store was interrupted before it entered.
+#[test]
+fn a_sync_call_nested_after_an_interrupt_is_interrupted() -> Result<()> {
+    let (mut store, env, run) = relaying_guest(|store, env| {
+        Function::new_typed_with_env(
+            store,
+            env,
+            |mut env: FunctionEnvMut<Relay>| -> Result<(), RuntimeError> {
+                env.data().interrupter.interrupt();
+                let plain = env.data().plain.clone().unwrap();
+                let nested = plain.call(&mut env, &[]);
+                env.data_mut().nested = Some(nested.map(drop).map_err(|e| e.to_trap()));
+                Ok(())
+            },
+        )
+    })?;
+
+    let result = run.call(&mut store, &[]);
+    assert_eq!(result.unwrap_err().to_trap(), Some(TrapCode::HostInterrupt));
+    assert_eq!(
+        env.as_ref(&store).nested,
+        Some(Err(Some(TrapCode::HostInterrupt)))
+    );
+    Ok(())
+}
+
+/// The same through an async import, whose nested call is a `call_async`.
+// TODO: fails today, so it is ignored. The import runs while its call is
+// suspended, so that call's entry of the store is not on the thread when the
+// nested call enters it. `interrupt_registry::install` then gives the nested
+// entry a fresh flag, which it does so that a forgotten suspended call cannot
+// keep its store interrupted, and the nested guest runs as if the store was
+// never interrupted. A guest that loops there misses the interrupt until it
+// is sent again. Either drop that reset, or keep the stores of a suspended
+// call on the thread while it polls its host future. Found in the review of
+// https://github.com/wasmerio/wasmer-runtime/pull/18.
+#[test]
+#[ignore = "TODO: a call nested in an async import runs after its store was interrupted"]
+fn an_async_call_nested_after_an_interrupt_is_interrupted() -> Result<()> {
+    let (mut store, env, run) = relaying_guest(|store, env| {
+        Function::new_typed_async(
+            store,
+            env,
+            async |cx: &mut AsyncEnv<Relay>| -> Result<(), RuntimeError> {
+                let (interrupter, plain) = cx.with(|env| {
+                    let relay = env.data();
+                    (relay.interrupter.clone(), relay.plain.clone().unwrap())
+                });
+                interrupter.interrupt();
+                let nested = plain.call_async(cx, &[]).await;
+                let nested = nested.map(drop).map_err(|e| e.to_trap());
+                cx.with(|mut env| env.data_mut().nested = Some(nested));
+                Ok(())
+            },
+        )
+    })?;
+
+    let result = futures::executor::block_on(run.call_async(&mut store, &[]));
+    assert_eq!(result.unwrap_err().to_trap(), Some(TrapCode::HostInterrupt));
+    assert_eq!(
+        env.as_ref(&store).nested,
+        Some(Err(Some(TrapCode::HostInterrupt)))
+    );
     Ok(())
 }

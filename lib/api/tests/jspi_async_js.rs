@@ -4,7 +4,7 @@ use js_sys::Promise;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_test::wasm_bindgen_test;
-use wasmer::{Function, Instance, Module, Store, TypedFunction, imports};
+use wasmer::{AsyncEnv, Function, FunctionEnv, Instance, Module, Store, TypedFunction, imports};
 
 mod common;
 use common::Exit;
@@ -23,12 +23,17 @@ async fn typed_async_host_and_guest_calls_use_jspi() {
         "#,
     )
     .unwrap();
-    let increment = Function::new_typed_async(&mut store, async move |value: i32| {
-        JsFuture::from(Promise::resolve(&JsValue::UNDEFINED))
-            .await
-            .unwrap();
-        value + 1
-    });
+    let env = FunctionEnv::new(&mut store, ());
+    let increment = Function::new_typed_async(
+        &mut store,
+        &env,
+        async move |_: &mut AsyncEnv<()>, value: i32| {
+            JsFuture::from(Promise::resolve(&JsValue::UNDEFINED))
+                .await
+                .unwrap();
+            value + 1
+        },
+    );
     let imports = imports! {
         "host" => {
             "increment" => increment,
@@ -40,7 +45,7 @@ async fn typed_async_host_and_guest_calls_use_jspi() {
         .get_typed_function(&store, "compute")
         .unwrap();
 
-    let result = compute.call_async(&store.into_async(), 41).await.unwrap();
+    let result = compute.call_async(&mut store, 41).await.unwrap();
     assert_eq!(result, 42);
 }
 
@@ -60,14 +65,19 @@ async fn exit_through_async_import(code: i32, await_js: bool) -> wasmer::Runtime
         "#,
     )
     .unwrap();
-    let exit = Function::new_typed_async(&mut store, move |code: i32| async move {
-        if await_js {
-            JsFuture::from(Promise::resolve(&JsValue::UNDEFINED))
-                .await
-                .unwrap();
-        }
-        Err::<(), _>(Exit(code))
-    });
+    let env = FunctionEnv::new(&mut store, ());
+    let exit = Function::new_typed_async(
+        &mut store,
+        &env,
+        async move |_: &mut AsyncEnv<()>, code: i32| {
+            if await_js {
+                JsFuture::from(Promise::resolve(&JsValue::UNDEFINED))
+                    .await
+                    .unwrap();
+            }
+            Err::<(), _>(Exit(code))
+        },
+    );
     let imports = imports! {
         "host" => {
             "exit" => exit,
@@ -75,7 +85,7 @@ async fn exit_through_async_import(code: i32, await_js: bool) -> wasmer::Runtime
     };
     let instance = Instance::new(&mut store, &module, &imports).unwrap();
     let run: TypedFunction<i32, ()> = instance.exports.get_typed_function(&store, "run").unwrap();
-    run.call_async(&store.into_async(), code).await.unwrap_err()
+    run.call_async(&mut store, code).await.unwrap_err()
 }
 
 #[wasm_bindgen_test]

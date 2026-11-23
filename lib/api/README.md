@@ -40,7 +40,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   disabled to select V8 instead of the native compiler stack.
 - **JavaScript host (`js`)**: build a Rust program for
   `wasm32-unknown-unknown` with `js-default` and default features disabled.
-  Execution uses the host's WebAssembly engine.
+  Execution uses the host's WebAssembly engine. Its small static JavaScript
+  helpers ship as `wasm-bindgen` snippets, so it works with every
+  `wasm-bindgen` target except `--target no-modules`.
 - **Ahead-of-time compilation**: compile a module for a target and serialize
   it for later use. A headless engine can load compatible compiled artifacts
   without a compiler. Only deserialize artifacts you trust.

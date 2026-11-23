@@ -1,0 +1,320 @@
+//! The future of an async call, and what can make one.
+
+use std::{
+    future::Future,
+    marker::PhantomData,
+    pin::Pin,
+    task::{Context, Poll},
+};
+
+use crate::{
+    AsStoreMut, AsyncEnv, BackendFunction, CallStore, Function, RuntimeError, SharedStore,
+    StoreInner, StoreMut, Value, WasmTypeList,
+};
+
+/// The future of every async call.
+///
+/// `'a` is the exclusive borrow of the store, or `'static` for a call on a
+/// [`SharedStore`]. Dropping the call cancels it. Its guest stack is discarded
+/// without running guest or host code.
+#[must_use = "an async call does nothing until it is polled"]
+pub struct AsyncCall<'a, R> {
+    inner: Pin<Box<dyn Future<Output = R> + 'a>>,
+}
+
+impl<'a, R> AsyncCall<'a, R> {
+    pub(crate) fn new(future: impl Future<Output = R> + 'a) -> Self {
+        Self {
+            inner: Box::pin(future),
+        }
+    }
+}
+
+impl<R> Future for AsyncCall<'_, R> {
+    type Output = R;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
+        self.inner.as_mut().poll(cx)
+    }
+}
+
+impl<R> std::fmt::Debug for AsyncCall<'_, R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AsyncCall")
+    }
+}
+
+type CallParams = Box<dyn FnOnce(&mut StoreMut<'_>) -> Result<Vec<Value>, RuntimeError>>;
+type CallFinish<X> = Box<dyn FnOnce(&mut StoreMut<'_>, &[Value]) -> Result<X, RuntimeError>>;
+
+/// What a typed or dynamic call needs its backend to run.
+///
+/// The arguments and results are converted in a slice of the call, because
+/// that is where the store can be reached.
+#[doc(hidden)]
+pub struct AsyncCallRequest<X> {
+    pub(crate) function: Function,
+    pub(crate) params: CallParams,
+    pub(crate) finish: CallFinish<X>,
+}
+
+impl AsyncCallRequest<Box<[Value]>> {
+    pub(crate) fn dynamic(function: Function, params: &[Value]) -> Self {
+        let params = params.to_vec();
+        Self {
+            function,
+            params: Box::new(move |_| Ok(params)),
+            finish: Box::new(|_, results| Ok(results.into())),
+        }
+    }
+}
+
+impl<X> AsyncCallRequest<X> {
+    pub(crate) fn typed(
+        function: Function,
+        params: impl FnOnce(&mut StoreMut<'_>) -> Vec<Value> + 'static,
+    ) -> Self
+    where
+        X: WasmTypeList,
+    {
+        let ty_source = function.clone();
+        Self {
+            function,
+            params: Box::new(move |store| Ok(params(store))),
+            finish: Box::new(move |store, results| {
+                let ty = ty_source.ty(store);
+                convert_results::<X>(store, ty.results(), results)
+            }),
+        }
+    }
+}
+
+/// Reads typed results from dynamic ones, refusing values of another type.
+pub(crate) fn convert_results<Rets: WasmTypeList>(
+    store: &mut impl AsStoreMut,
+    types: &[wasmer_types::Type],
+    results: &[Value],
+) -> Result<Rets, RuntimeError> {
+    if results.len() != types.len() {
+        return Err(RuntimeError::new("result arity mismatch"));
+    }
+    let mut raw_array = Rets::empty_array();
+    for ((slot, ty), value) in raw_array.as_mut().iter_mut().zip(types).zip(results) {
+        // `Rets::from_array` reads each raw value as the field of its type.
+        if value.ty() != *ty {
+            return Err(RuntimeError::new(format!(
+                "a result of type {} where the signature has {ty}",
+                value.ty()
+            )));
+        }
+        *slot = value.as_raw(store);
+    }
+    // Safety: the raw values were read from values of the result types.
+    Ok(unsafe { Rets::from_array(store, raw_array) })
+}
+
+mod sealed {
+    use super::*;
+
+    pub trait Sealed {}
+    impl<S: AsStoreMut> Sealed for S {}
+    impl<T> Sealed for AsyncEnv<T> {}
+    impl Sealed for SharedStore {}
+}
+
+/// What [`Function::call_async`] can run on: a store, the [`AsyncEnv`] of an
+/// async host function, or a [`SharedStore`].
+///
+/// The trait is sealed. `Call<'a, R>` is [`AsyncCall<'a, R>`], or
+/// `AsyncCall<'static, R>` for a `SharedStore`, whose calls keep their own
+/// handle.
+pub trait AsyncCallStore: sealed::Sealed {
+    /// The future of a call on this store.
+    type Call<'a, R: 'static>: Future<Output = R>
+    where
+        Self: 'a;
+
+    #[doc(hidden)]
+    fn start_call<'a, X: 'static>(
+        &'a mut self,
+        request: AsyncCallRequest<X>,
+    ) -> Self::Call<'a, Result<X, RuntimeError>>;
+}
+
+impl<S: AsStoreMut> AsyncCallStore for S {
+    type Call<'a, R: 'static>
+        = AsyncCall<'a, R>
+    where
+        Self: 'a;
+
+    fn start_call<'a, X: 'static>(
+        &'a mut self,
+        request: AsyncCallRequest<X>,
+    ) -> AsyncCall<'a, Result<X, RuntimeError>> {
+        // `AsStoreMut` is a public trait, and a later call could return
+        // another store: the pointer is derived here, once, and `'a` keeps
+        // the borrow it comes from alive and unreachable.
+        let store: StoreMut<'a> = self.as_store_mut();
+        let id = store.inner.objects.id();
+        let ptr: *mut StoreInner = store.inner;
+        start(
+            CallStore::Exclusive {
+                id,
+                ptr,
+                _borrow: PhantomData,
+            },
+            request,
+        )
+    }
+}
+
+impl<T> AsyncCallStore for AsyncEnv<T> {
+    type Call<'a, R: 'static>
+        = AsyncCall<'a, R>
+    where
+        Self: 'a;
+
+    fn start_call<'a, X: 'static>(
+        &'a mut self,
+        request: AsyncCallRequest<X>,
+    ) -> AsyncCall<'a, Result<X, RuntimeError>> {
+        start(
+            CallStore::Env {
+                id: self.store_id(),
+                _borrow: PhantomData,
+            },
+            request,
+        )
+    }
+}
+
+impl AsyncCallStore for SharedStore {
+    type Call<'a, R: 'static>
+        = AsyncCall<'static, R>
+    where
+        Self: 'a;
+
+    fn start_call<X: 'static>(
+        &mut self,
+        request: AsyncCallRequest<X>,
+    ) -> AsyncCall<'static, Result<X, RuntimeError>> {
+        start(CallStore::Shared(self.clone()), request)
+    }
+}
+
+fn start<'a, X: 'static>(
+    store: CallStore<'a>,
+    request: AsyncCallRequest<X>,
+) -> AsyncCall<'a, Result<X, RuntimeError>> {
+    match &request.function.0 {
+        #[cfg(feature = "sys")]
+        BackendFunction::Sys(_) => AsyncCall::new(
+            crate::backend::sys::async_runtime::AsyncCallFuture::new(store, request),
+        ),
+        #[cfg(feature = "v8")]
+        BackendFunction::V8(_) => {
+            AsyncCall::new(crate::backend::v8::async_call::call(store, request))
+        }
+        #[cfg(feature = "js")]
+        BackendFunction::Js(_) => AsyncCall::new(crate::backend::js::jspi::call(store, request)),
+    }
+}
+
+/// The misuses the type contract rejects at compile time.
+///
+/// A second call while one is live:
+///
+/// ```compile_fail,E0499
+/// # use wasmer::*;
+/// # fn f(mut store: Store, f: Function) {
+/// let first = f.call_async(&mut store, &[]);
+/// let second = f.call_async(&mut store, &[]);
+/// drop((first, second));
+/// # }
+/// ```
+///
+/// Using the store while a call is live:
+///
+/// ```compile_fail,E0499
+/// # use wasmer::*;
+/// # fn f(mut store: Store, f: Function) {
+/// let call = f.call_async(&mut store, &[]);
+/// let _ = f.call(&mut store, &[]);
+/// drop(call);
+/// # }
+/// ```
+///
+/// Dropping the store while a call is live:
+///
+/// ```compile_fail,E0505
+/// # use wasmer::*;
+/// # fn f(mut store: Store, f: Function) {
+/// let call = f.call_async(&mut store, &[]);
+/// drop(store);
+/// drop(call);
+/// # }
+/// ```
+///
+/// Sending a call to another thread:
+///
+/// ```compile_fail,E0277
+/// # use wasmer::*;
+/// # fn f(mut store: Store, f: Function) {
+/// fn send<T: Send>(_: T) {}
+/// send(f.call_async(&mut store, &[]));
+/// # }
+/// ```
+///
+/// Holding a store borrow across an `.await` in a host function:
+///
+/// ```compile_fail,E0728
+/// # use wasmer::*;
+/// async fn host(cx: &mut AsyncEnv<()>) {
+///     cx.with(|_env| { std::future::ready(()).await; });
+/// }
+/// ```
+///
+/// Keeping the store past a `with` slice:
+///
+/// ```compile_fail
+/// # use wasmer::*;
+/// async fn host(cx: &mut AsyncEnv<()>) {
+///     let env = cx.with(|env| env);
+///     std::future::ready(()).await;
+///     drop(env);
+/// }
+/// ```
+///
+/// Two overlapping nested calls through one `AsyncEnv`:
+///
+/// ```compile_fail,E0499
+/// # use wasmer::*;
+/// async fn host(cx: &mut AsyncEnv<()>, f: Function) {
+///     let first = f.call_async(cx, &[]);
+///     let second = f.call_async(cx, &[]);
+///     drop((first, second));
+/// }
+/// ```
+///
+/// Reaching the host state through the `StoreRef` of `data_and_store`:
+///
+/// ```compile_fail,E0277
+/// # use wasmer::*;
+/// fn host(mut env: FunctionEnvMut<'_, i32>, handle: FunctionEnv<i32>) {
+///     let (data, store) = env.data_and_store();
+///     let _alias = handle.as_ref(&store);
+///     *data += 1;
+/// }
+/// ```
+///
+/// A call on a shared store borrows nothing, so it can outlive the handle:
+///
+/// ```
+/// # use wasmer::*;
+/// fn task(mut shared: SharedStore, f: Function) -> impl std::future::Future + 'static {
+///     f.call_async(&mut shared, &[])
+/// }
+/// ```
+#[doc(hidden)]
+#[allow(dead_code)]
+pub(crate) const COMPILE_FAIL_CONTRACT: () = ();

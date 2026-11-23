@@ -3,7 +3,12 @@
 pub(crate) mod entities;
 pub(crate) mod error;
 #[cfg(feature = "experimental-async")]
+pub(crate) mod boundary;
+#[cfg(feature = "experimental-async")]
+pub(crate) mod guard;
+#[cfg(feature = "experimental-async")]
 pub(crate) mod jspi;
+pub(crate) mod lent;
 pub(crate) mod utils;
 pub(crate) mod vm;
 

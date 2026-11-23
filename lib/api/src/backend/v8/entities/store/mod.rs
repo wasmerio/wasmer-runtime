@@ -25,7 +25,19 @@ impl std::fmt::Debug for Store {
     }
 }
 
+/// What this backend keeps beside a store's allocation: nothing. A call
+/// cannot outlive the borrow of the store it was made with.
+#[derive(Clone, Debug)]
+pub(crate) struct StoreKeeper;
+
+impl crate::entities::store::KeepsStore for StoreKeeper {}
+
 impl Store {
+    #[inline]
+    pub(crate) fn keeper(&self) -> &StoreKeeper {
+        &StoreKeeper
+    }
+
     pub(crate) fn new(engine: crate::engine::Engine) -> Self {
         let inner: *mut wasm_store_t = unsafe { wasm_store_new(engine.as_v8().inner.engine) };
         let thread_id = std::thread::current().id();
@@ -91,7 +103,7 @@ impl crate::BackendStore {
 impl crate::Store {
     /// Consume [`self`] into [`crate::backend::v8::store::Store`].
     pub(crate) fn into_v8(self) -> crate::backend::v8::store::Store {
-        self.inner.store.into_v8()
+        self.inner.into_box().store.into_v8()
     }
 
     /// Convert a reference to [`self`] into a reference [`crate::backend::v8::store::Store`].

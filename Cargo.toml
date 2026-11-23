@@ -314,6 +314,11 @@ name = "typed_call"
 harness = false
 required-features = ["singlepass"]
 
+[[bench]]
+name = "async_import"
+harness = false
+required-features = ["wat", "experimental-async"]
+
 [[example]]
 name = "early-exit"
 path = "examples/early_exit.rs"

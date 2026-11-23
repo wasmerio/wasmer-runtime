@@ -92,18 +92,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // To "throw" an exception from native code, we create a new one and
         // return it wrapped in a `RuntimeError`. The Wasmer runtime will
         // recognize it and will start the unwinding process.
-        let (env, mut ctx) = env.data_and_store_mut();
-        let exn = wasmer::Exception::new(&mut ctx, &env.tag, &[Value::I32(69)]);
-        Err(RuntimeError::exception(&ctx, exn))
+        let tag = env.data().tag.clone();
+        let exn = wasmer::Exception::new(&mut env, &tag, &[Value::I32(69)]);
+        Err(RuntimeError::exception(&env, exn))
     }
     let throw1 =
         Function::new_with_env(&mut store, &env, FunctionType::new(vec![], vec![]), throw1);
 
     fn throw2(mut env: FunctionEnvMut<MyEnv>) -> Result<(), RuntimeError> {
         println!("Throwing exception 2");
-        let (env, mut ctx) = env.data_and_store_mut();
-        let exn = wasmer::Exception::new(&mut ctx, &env.tag, &[Value::I32(42)]);
-        Err(RuntimeError::exception(&ctx, exn))
+        let tag = env.data().tag.clone();
+        let exn = wasmer::Exception::new(&mut env, &tag, &[Value::I32(42)]);
+        Err(RuntimeError::exception(&env, exn))
     }
     let throw2 = Function::new_typed_with_env(&mut store, &env, throw2);
 
