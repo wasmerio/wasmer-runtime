@@ -185,38 +185,38 @@ pub(crate) trait Entry {
 }
 
 /// The future of one call. `'a` is its borrow of the store, if it has one.
+///
+/// It holds what every call needs: its store and what it calls. What only a
+/// call whose guest waits needs is made when the guest first waits.
 pub(crate) struct AsyncCallFuture<'a, E: Entry> {
-    /// The key of the call's waker among those of its store, once it waited.
-    #[cfg(feature = "experimental-host-interrupt")]
-    waker_id: Option<AsyncCallFutureId>,
     store: CallStore<'a>,
     entry: E,
+    suspended: Option<Box<Suspended>>,
+}
+
+/// What a call keeps from the moment its guest waits.
+struct Suspended {
+    /// The key of the call's waker among those of its store.
+    #[cfg(feature = "experimental-host-interrupt")]
+    waker_id: Option<AsyncCallFutureId>,
     /// The values of the call, where the entry keeps them on the heap: too
     /// many for the guest's own stack.
     spilled: Option<NonNull<[RawValue]>>,
-    guest: Option<Guest>,
+    guest: Guest,
     waiting: Waiting,
 }
 
 // Nothing here relies on being pinned: the guest's frames, and the values it
-// was called with, are on its own stack or the heap, and the host future is
-// boxed.
+// was called with, are on its own stack or the heap, as is what the call
+// keeps while the guest waits.
 impl<E: Entry> Unpin for AsyncCallFuture<'_, E> {}
 
 impl<'a, E: Entry> AsyncCallFuture<'a, E> {
     pub(crate) fn new(store: CallStore<'a>, entry: E) -> Self {
         Self {
-            #[cfg(feature = "experimental-host-interrupt")]
-            waker_id: None,
             store,
             entry,
-            spilled: None,
-            guest: None,
-            waiting: Waiting {
-                cx: ptr::null_mut(),
-                pending: None,
-                ready: None,
-            },
+            suspended: None,
         }
     }
 
@@ -224,7 +224,7 @@ impl<'a, E: Entry> AsyncCallFuture<'a, E> {
     /// rather than dropped: dropping a waker is user code.
     #[cfg(feature = "experimental-host-interrupt")]
     fn take_waker(&mut self) -> Option<Arc<Waker>> {
-        let id = self.waker_id.take()?;
+        let id = self.suspended.as_mut()?.waker_id.take()?;
         match ASYNC_CALL_FUTURE_WAKERS.entry(self.store.id()) {
             dashmap::Entry::Occupied(mut wakers) => {
                 let removed = wakers.get_mut().remove(&id);
@@ -248,7 +248,10 @@ impl<'a, E: Entry> AsyncCallFuture<'a, E> {
     #[cfg(feature = "experimental-host-interrupt")]
     fn register_waker(&mut self, waker: &Waker) {
         let store_id = self.store.id();
-        let id = match self.waker_id {
+        let Some(suspended) = self.suspended.as_mut() else {
+            return;
+        };
+        let id = match suspended.waker_id {
             Some(id) => {
                 let current = ASYNC_CALL_FUTURE_WAKERS
                     .get(&store_id)
@@ -261,7 +264,7 @@ impl<'a, E: Entry> AsyncCallFuture<'a, E> {
             None => {
                 let id =
                     NEXT_ASYNC_CALL_FUTURE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                self.waker_id = Some(id);
+                suspended.waker_id = Some(id);
                 id
             }
         };
@@ -281,9 +284,9 @@ impl<'a, E: Entry> AsyncCallFuture<'a, E> {
         let store_id = self.store.id();
         super::vm::interrupt_registry::is_interrupted(store_id)
             || self
-                .guest
+                .suspended
                 .as_ref()
-                .is_some_and(|guest| guest.interrupts.state.is_interrupted(store_id))
+                .is_some_and(|suspended| suspended.guest.interrupts.state.is_interrupted(store_id))
     }
 
     /// Ends the call as an interrupt of its store does.
@@ -316,11 +319,13 @@ impl<'a, E: Entry> AsyncCallFuture<'a, E> {
     /// stack is reset. What the caller owns is dropped last.
     fn cancel(&mut self) {
         let _waker = self.take_waker();
-        if let Some(future) = self.waiting.pending.take() {
+        let Some(mut suspended) = self.suspended.take() else {
+            return;
+        };
+        if let Some(future) = suspended.waiting.pending.take() {
             let _scope = PollScope::enter(self.store.try_resolve());
             drop(future);
         }
-        self.guest = None;
     }
 }
 
@@ -336,44 +341,50 @@ impl<E: Entry> Future for AsyncCallFuture<'_, E> {
 
         // The guest waits for a host future: it is polled here, on this
         // stack, with the store in reach.
-        if let Some(future) = this.waiting.pending.as_mut() {
+        if let Some(suspended) = this.suspended.as_mut()
+            && let Some(future) = suspended.waiting.pending.as_mut()
+        {
             let polled = {
                 let _scope = PollScope::enter(Some(this.store.resolve()));
                 let polled = future.as_mut().poll(cx);
                 if polled.is_ready() {
                     // Its destructors run with the store in reach too.
-                    this.waiting.pending = None;
+                    suspended.waiting.pending = None;
                 }
                 polled
             };
             match polled {
                 Poll::Pending => return this.wait(cx),
-                Poll::Ready(result) => this.waiting.ready = Some(result),
+                Poll::Ready(result) => suspended.waiting.ready = Some(result),
             }
         }
 
         // The store is taken for as long as the guest runs, and given up as
         // soon as it waits or returns.
         let slice = this.store.resolve().enter_slice();
-        // A call that starts in this poll makes no guest to keep unless the
-        // guest waits: most return at once.
-        let starting = if this.guest.is_none() {
+        // A call that starts in this poll keeps what it shares with an async
+        // import on this frame, and makes nothing to keep unless its guest
+        // waits: most return at once.
+        let mut first = Waiting {
+            cx: ptr::null_mut(),
+            pending: None,
+            ready: None,
+        };
+        let mut spilled = None;
+        let starting = if this.suspended.is_none() {
             // Safety: the slice is the only holder of the store.
             let mut store = unsafe { StoreMut::from_raw(slice.ptr()) };
             match this.entry.start(&mut store) {
                 Ok((function, values)) => {
                     let call_values = if values.spilled() {
-                        this.spilled = Some(NonNull::from(&mut values[..]));
+                        spilled = Some(NonNull::from(&mut values[..]));
                         CallValues::At(values.as_mut_ptr())
                     } else {
                         CallValues::Inline(values.as_ptr(), values.len())
                     };
                     Some(Starting::new(&store, function, call_values))
                 }
-                Err(error) => {
-                    let _waker = this.take_waker();
-                    return Poll::Ready(this.entry.finish(Err(error)));
-                }
+                Err(error) => return Poll::Ready(this.entry.finish(Err(error))),
             }
         } else {
             None
@@ -386,7 +397,14 @@ impl<E: Entry> Future for AsyncCallFuture<'_, E> {
         // Where the guest's values go when it returns, unless they are too
         // many: the results first.
         let mut results = [RawValue { i32: 0 }; INLINE_CALL_VALUES];
-        this.waiting.cx = ptr::from_mut(cx).cast();
+        let (guest, waiting) = match this.suspended.as_deref_mut() {
+            Some(suspended) => {
+                spilled = suspended.spilled;
+                (Some(&mut suspended.guest), &mut suspended.waiting)
+            }
+            None => (None, &mut first),
+        };
+        waiting.cx = ptr::from_mut(cx).cast();
         let step = {
             // The store is published for host futures only: a sync host
             // function of this guest holds it, and must not find it
@@ -395,25 +413,31 @@ impl<E: Entry> Future for AsyncCallFuture<'_, E> {
             // Safety: the entry is taken off before the slice ends.
             let entry = unsafe { StoreContext::new(slice.ptr()) };
             let _entered = unsafe { entry.install() };
-            let _waiting = Resuming::enter(&mut this.waiting);
-            match starting {
-                Some(starting) => starting.run(store_id, &mut results, trap_handler),
-                None => {
-                    let guest = this.guest.as_mut().expect("a guest that waits");
-                    guest
-                        .resume(store_id, &mut results, trap_handler)
-                        .map(|step| match step {
-                            CallStep::Suspended => Step::Suspended(None),
-                            CallStep::Finished(returned) => Step::Finished(returned),
-                        })
-                }
+            let _waiting = Resuming::enter(waiting);
+            match (starting, guest) {
+                (Some(starting), _) => starting.run(store_id, &mut results, trap_handler),
+                (None, Some(guest)) => guest
+                    .resume(store_id, &mut results, trap_handler)
+                    .map(|step| match step {
+                        CallStep::Suspended => Step::Suspended(None),
+                        CallStep::Finished(returned) => Step::Finished(returned),
+                    }),
+                (None, None) => unreachable!("a call that neither starts nor waits"),
             }
         };
-        this.waiting.cx = ptr::null_mut();
+        waiting.cx = ptr::null_mut();
         let returned = match step {
             Ok(Step::Suspended(guest)) => {
-                if guest.is_some() {
-                    this.guest = guest;
+                if let Some(guest) = guest {
+                    // The guest waits for the first time: from here on the
+                    // call keeps it, and what it waits for.
+                    this.suspended = Some(Box::new(Suspended {
+                        #[cfg(feature = "experimental-host-interrupt")]
+                        waker_id: None,
+                        spilled,
+                        guest,
+                        waiting: first,
+                    }));
                 }
                 drop(slice);
                 return this.wait(cx);
@@ -421,22 +445,19 @@ impl<E: Entry> Future for AsyncCallFuture<'_, E> {
             Ok(Step::Finished(returned)) => returned.map_err(RuntimeError::from),
             Err(error) => Err(error),
         };
-        // Only a guest that waited is there to drop.
-        if this.guest.is_some() {
-            this.guest = None;
+        if this.suspended.is_some() {
+            let _waker = this.take_waker();
+            this.suspended = None;
         }
-        let _waker = this.take_waker();
         // Safety: the slice is the only holder of the store.
         let mut store = unsafe { StoreMut::from_raw(slice.ptr()) };
-        let values = match this.spilled {
+        let values = match spilled {
             // Safety: the entry keeps them until `finish` is done with them.
             Some(spilled) => unsafe { spilled.as_ref() },
             None => &results[..],
         };
         let outcome = returned.map(|()| (&mut store, values));
-        let finished = this.entry.finish(outcome);
-        this.spilled = None;
-        Poll::Ready(finished)
+        Poll::Ready(this.entry.finish(outcome))
     }
 }
 
