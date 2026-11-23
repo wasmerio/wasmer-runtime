@@ -20,8 +20,8 @@ use std::{
 
 use futures::channel::oneshot;
 use wasmer::{
-    AsyncEnv, Function, FunctionEnv, Instance, Module, RuntimeError, Store, TypedFunction, Value,
-    imports,
+    AsyncEnv, Deferred, Function, FunctionEnv, FunctionEnvMut, Instance, Module, RuntimeError,
+    Store, TypedFunction, Value, imports,
 };
 use wasmer_types::TrapCode;
 
@@ -276,6 +276,39 @@ fn a_ready_async_host_function_runs_when_called_synchronously() {
     let typed = function.typed::<i32, i32>(&store).unwrap();
     assert_eq!(typed.call(&mut store, 4).unwrap(), 5);
     assert_eq!(*env.as_ref(&store), 6);
+}
+
+/// A function that returns `Deferred` is an async host function here: it
+/// runs if it is ready, with its environment, and fails if it would wait.
+#[test]
+fn a_deferred_function_runs_when_it_is_ready() {
+    let mut store = Store::default();
+    let env = FunctionEnv::new(&mut store, 0i32);
+    let function = Function::new_typed_deferred(
+        &mut store,
+        &env,
+        |mut env: FunctionEnvMut<i32>, value: i32| -> Deferred<i32> {
+            *env.data_mut() += value;
+            if value < 0 {
+                let mut cx = env.async_env();
+                return Deferred::pending(async move {
+                    cx.with(|mut env| *env.data_mut() += 100);
+                    YieldOnce(false).await;
+                    value
+                });
+            }
+            Deferred::ready(value + 1)
+        },
+    );
+    let results = function.call(&mut store, &[Value::I32(2)]).unwrap();
+    assert_eq!(results[0], Value::I32(3));
+    let typed = function.typed::<i32, i32>(&store).unwrap();
+    assert_eq!(typed.call(&mut store, 4).unwrap(), 5);
+    assert_eq!(*env.as_ref(&store), 6);
+
+    let error = function.call(&mut store, &[Value::I32(-1)]).unwrap_err();
+    assert_eq!(error.to_trap(), Some(TrapCode::YieldOutsideAsyncContext));
+    assert_eq!(*env.as_ref(&store), 105);
 }
 
 /// A synchronous entry made inside an async call does not inherit its right

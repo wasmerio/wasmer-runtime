@@ -236,6 +236,55 @@ async fn fetch(cx: &mut AsyncEnv<State>, key: i32) -> Result<i32, RuntimeError> 
 Taking `&mut self` is stricter than Wasmtime's `&Accessor`. Recursive `with` and
 overlapping nested guest calls become compile errors instead of runtime panics.
 
+A host function that usually has its results at once returns a `Deferred`
+instead of being `async`. It runs as a sync host function does, with its
+`FunctionEnvMut`. A call that returns `Deferred::ready` is over, and on the
+native backend costs what a call of a sync host function costs. Only a call that
+returns `Deferred::pending` has its guest wait, for a future that reaches the
+store as an async host function does:
+
+```rust
+impl Function {
+    pub fn new_typed_deferred<T, Args, Rets>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        func: impl DeferredHostFunction<T, Args, Rets> + Send + Sync,
+    ) -> Self;
+}
+
+/// Sealed. Implemented for `Fn(FunctionEnvMut<T>, Args..) -> Deferred<Rets>`.
+pub trait DeferredHostFunction<T, Args, Rets>: 'static { /* private */ }
+
+/// The results of a call, or a future for them.
+pub struct Deferred<R> { /* private */ }
+
+impl<R> Deferred<R> {
+    pub fn ready(results: R) -> Self;
+    pub fn pending(future: impl Future<Output = R> + 'static) -> Self;
+}
+
+impl<T> FunctionEnvMut<'_, T> {
+    /// A handle for a future to keep. It contains no borrow.
+    pub fn async_env(&self) -> AsyncEnv<T>;
+}
+
+fn read(mut env: FunctionEnvMut<State>, fd: i32) -> Deferred<i32> {
+    if let Some(byte) = env.data_mut().buffered(fd) {
+        return Deferred::ready(byte);
+    }
+    let mut cx = env.async_env();
+    Deferred::pending(async move {
+        let byte = receive(fd).await;
+        cx.with(|mut env| env.data_mut().count(fd));
+        byte
+    })
+}
+```
+
+The function has returned, and given its borrow of the store back, before the
+guest waits, so the future holds no more of the store than the one of an async
+host function does.
+
 ### Level 2: shared stores
 
 ```rust

@@ -240,7 +240,7 @@ where
 }
 
 #[cfg(any(feature = "js", feature = "v8"))]
-fn args_from_values<Args: WasmTypeList>(
+pub(crate) fn args_from_values<Args: WasmTypeList>(
     store: &mut impl AsStoreMut,
     ty: &FunctionType,
     values: &[Value],
@@ -264,7 +264,7 @@ fn args_from_values<Args: WasmTypeList>(
 }
 
 #[cfg(any(feature = "js", feature = "v8"))]
-fn results_to_values<Rets: WasmTypeList>(
+pub(crate) fn results_to_values<Rets: WasmTypeList>(
     store: &mut impl AsStoreMut,
     ty: &FunctionType,
     rets: Rets,

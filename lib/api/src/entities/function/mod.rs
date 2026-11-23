@@ -17,6 +17,8 @@ pub use call_wrapper::{CallWrapper, WasmCall};
 pub(crate) mod async_call;
 #[cfg(feature = "experimental-async")]
 pub(crate) mod async_host;
+#[cfg(feature = "experimental-async")]
+pub(crate) mod deferred;
 #[doc(hidden)]
 #[cfg(feature = "experimental-async")]
 pub use async_call::AsyncCallRequest;
@@ -24,6 +26,8 @@ pub use async_call::AsyncCallRequest;
 pub use async_call::{AsyncCall, AsyncCallStore};
 #[cfg(feature = "experimental-async")]
 pub use async_host::{AsyncEnv, AsyncHostFunction};
+#[cfg(feature = "experimental-async")]
+pub use deferred::{Deferred, DeferredHostFunction};
 
 use wasmer_types::{FunctionType, RawValue};
 
@@ -213,6 +217,32 @@ impl Function {
         Rets: WasmTypeList + 'static,
     {
         Self(BackendFunction::new_typed_async(store, env, func))
+    }
+
+    /// Creates a new host `Function` from a typed function that completes
+    /// its call at once or has the guest wait.
+    ///
+    /// The function takes a [`FunctionEnvMut`](crate::FunctionEnvMut) and its
+    /// Wasm arguments, as a sync host function does, and returns a
+    /// [`Deferred`] of its results, or of any type that implements
+    /// [`IntoResult`](crate::IntoResult) for them, such as `Result<Rets, E>`.
+    ///
+    /// On `sys`, a call that returns [`Deferred::ready`] costs what a call of
+    /// a sync host function costs, and works wherever one does. On the other
+    /// backends the function is an async host function, whose future is
+    /// ready at once.
+    #[cfg(feature = "experimental-async")]
+    pub fn new_typed_deferred<T, Args, Rets>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        func: impl DeferredHostFunction<T, Args, Rets> + Send + Sync,
+    ) -> Self
+    where
+        T: Send + 'static,
+        Args: WasmTypeList + 'static,
+        Rets: WasmTypeList + 'static,
+    {
+        Self(BackendFunction::new_typed_deferred(store, env, func))
     }
 
     /// Returns the [`FunctionType`] of the `Function`.

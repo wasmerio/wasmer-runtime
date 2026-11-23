@@ -5,7 +5,8 @@ pub(crate) mod typed;
 
 #[cfg(feature = "experimental-async")]
 use crate::{
-    AsyncEnv, AsyncHostFunction, StorePtrWrapper, WithSlice,
+    AsyncEnv, AsyncHostFunction, Deferred, DeferredHostFunction, StorePtrWrapper, WithSlice,
+    entities::function::deferred::DeferredState,
     sys::async_runtime::{HostWait, take_host_result, wait_for_host_future},
 };
 use crate::{
@@ -345,6 +346,58 @@ impl Function {
         };
         let call_trampoline =
             <F as AsyncHostTrampolines<T, Args, Rets>>::call_trampoline_address();
+        let anyfunc = VMCallerCheckedAnyfunc {
+            include_m0_param: false,
+            func_ptr,
+            type_signature_hash,
+            vmctx,
+            call_trampoline,
+        };
+
+        let vm_function = VMFunction {
+            anyfunc: MaybeInstanceOwned::Host(Box::new(UnsafeCell::new(anyfunc))),
+            kind: VMFunctionKind::Static,
+            signature: function_type,
+            host_data,
+        };
+        Self {
+            handle: StoreHandle::new(store.objects_mut().as_sys_mut(), vm_function),
+        }
+    }
+
+    /// Creates a host function from a typed function that returns
+    /// [`Deferred`]. Like [`Self::new_typed_with_env`], it is a static
+    /// function, and is called the same way.
+    #[cfg(feature = "experimental-async")]
+    pub(crate) fn new_typed_deferred<T, F, Args, Rets>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        func: F,
+    ) -> Self
+    where
+        T: Send + 'static,
+        F: DeferredHostFunction<T, Args, Rets>,
+        Args: WasmTypeList + 'static,
+        Rets: WasmTypeList + 'static,
+    {
+        let func_ptr = <F as DeferredHostTrampolines<T, Args, Rets>>::function_callback(&func);
+        let host_data = Box::new(StaticFunction {
+            store_id: store.objects_mut().id(),
+            env: env.clone(),
+            func,
+        });
+        let function_type = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
+
+        let type_signature_hash = store
+            .as_store_ref()
+            .engine()
+            .as_sys()
+            .register_signature(&function_type);
+        let vmctx = VMFunctionContext {
+            host_env: host_data.as_ref() as *const _ as *mut c_void,
+        };
+        let call_trampoline =
+            <F as DeferredHostTrampolines<T, Args, Rets>>::call_trampoline_address();
         let anyfunc = VMCallerCheckedAnyfunc {
             include_m0_param: false,
             func_ptr,
@@ -718,73 +771,124 @@ unsafe fn write_raw_results(results: &[RawValue], values_vec: *mut RawValue) {
     }
 }
 
-/// What the trampoline of a typed async host function does with the
-/// arguments the guest called it with, which `args` makes typed. It polls
-/// the future of the call once and, if the future is not ready, suspends the
-/// guest until it is.
+/// The outcome of a typed call that may have its guest wait, as the host
+/// stack gives it to the Wasm stack. The results come with the pointer of
+/// the store's active entry, which the host stack has in hand and the Wasm
+/// stack converts them with.
+#[cfg(feature = "experimental-async")]
+type TypedOutcome<Rets> = InvocationResult<(Rets, *mut StoreInner), RuntimeError>;
+
+/// The results of a typed call, or the error that ends it.
+#[cfg(feature = "experimental-async")]
+fn typed_results<R, Rets>(results: R) -> Result<Rets, RuntimeError>
+where
+    R: IntoResult<Rets>,
+    Rets: WasmTypeList,
+{
+    results
+        .into_result()
+        .map_err(|err| RuntimeError::from_dyn(Box::new(err)))
+}
+
+/// The outcome of a typed call that gave `results`, with the pointer of the
+/// store's active entry for the Wasm stack to convert them with.
+#[cfg(feature = "experimental-async")]
+#[inline]
+fn typed_outcome<R, Rets>(results: R, store: *mut StoreInner) -> TypedOutcome<Rets>
+where
+    R: IntoResult<Rets>,
+    Rets: WasmTypeList,
+{
+    match results.into_result() {
+        Ok(rets) => InvocationResult::Success((rets, store)),
+        Err(err) => to_invocation_result(Err(RuntimeError::from_dyn(Box::new(err)))),
+    }
+}
+
+/// Returns the results of a typed call to the guest, on the Wasm stack.
+///
+/// # Safety
+/// `store` is the pointer of the active entry of the store `store_id`, which
+/// nothing has replaced since the host stack took it.
+#[cfg(feature = "experimental-async")]
+#[inline]
+unsafe fn return_typed_results<Rets: WasmTypeList>(
+    store_id: StoreId,
+    rets: Rets,
+    store: *mut StoreInner,
+) -> Rets::CStruct {
+    #[cfg(feature = "experimental-host-interrupt")]
+    if interrupt_registry::is_interrupted(store_id) {
+        unsafe { raise_lib_trap(Trap::lib(TrapCode::HostInterrupt)) }
+    }
+    #[cfg(not(feature = "experimental-host-interrupt"))]
+    let _ = store_id;
+    // Safety: the pointer is used only for the duration of the call to
+    // `into_c_struct`.
+    unsafe { rets.into_c_struct(&mut *store) }
+}
+
+/// Polls the future of a typed call once, on the host stack, with the borrow
+/// of the store its trampoline took. `None` if the guest is to wait: its
+/// call then has the future.
 ///
 /// A future that is ready at once gives its results typed, as a typed sync
 /// host function does. Only one the guest waits for is made to give them
 /// raw, for the call to keep.
-///
-/// # Safety
-/// Called on the Wasm stack, by the trampoline of `env`'s function.
 #[cfg(feature = "experimental-async")]
-pub(crate) unsafe fn call_typed_async<T, F, Args, Rets>(
-    env: &StaticFunction<Rc<F>, T>,
-    args: impl FnOnce(&mut StoreMut<'_>) -> Args,
-) -> Rets::CStruct
+fn poll_typed_future<Fut, Rets>(
+    store: StorePtrWrapper,
+    future: Pin<Box<Fut>>,
+    suspendable: bool,
+) -> Option<TypedOutcome<Rets>>
 where
-    T: 'static,
-    F: AsyncHostFunction<T, Args, Rets>,
-    Args: WasmTypeList + 'static,
+    Fut: Future + ?Sized + 'static,
+    Fut::Output: IntoResult<Rets>,
     Rets: WasmTypeList + 'static,
 {
-    let store_id = env.store_id;
-    // Asked here, on the Wasm stack: whether this is the stack of a
-    // `call_async`, which an async import may suspend.
-    let suspendable = wasmer_vm::wasm_call_is_suspendable();
-    // `None` if the guest is to wait for the host future of the import. The
-    // results come with the pointer of the store's active entry, which the
-    // host stack has in hand and the Wasm stack converts them with.
-    let mut result = on_host_stack(|| {
-        panic::catch_unwind(AssertUnwindSafe(|| {
-            // Safety: this is the trampoline of an import, which borrows the
-            // active entry. The first poll of the future keeps the borrow.
-            let mut store = unsafe { StoreContext::get_current(store_id) };
-            let store_ptr = store.as_ptr();
-            let args = args(&mut store.as_mut());
-            let mut cx = AsyncEnv::new(env.env.clone(), store_id);
-            let func = Rc::clone(&env.func);
-            let future = Box::pin(async move { func.invoke(&mut cx, args).await });
-            let into_pending = |future: Pin<Box<_>>| -> RawHostFuture {
-                Box::pin(async move {
-                    let rets: Rets = future.await?;
-                    let slice = WithSlice::enter(store_id);
-                    // Safety: the slice is the only holder of the store, and
-                    // the trampoline reads the raw values back as `Rets`.
-                    let mut array = unsafe {
-                        let mut store = StoreMut::from_raw(slice.ptr());
-                        rets.into_array(&mut store)
-                    };
-                    Ok(RawResults::from_slice(array.as_mut()))
-                })
+    let store_id = store.id();
+    let store_ptr = store.as_ptr();
+    let into_pending = |future: Pin<Box<Fut>>| -> RawHostFuture {
+        Box::pin(async move {
+            let rets = typed_results(future.await)?;
+            let slice = WithSlice::enter(store_id);
+            // Safety: the slice is the only holder of the store, and the
+            // trampoline reads the raw values back as `Rets`.
+            let mut array = unsafe {
+                let mut store = StoreMut::from_raw(slice.ptr());
+                rets.into_array(&mut store)
             };
-            match wait_for_host_future(store, future, suspendable, into_pending) {
-                HostWait::Ready(result) => {
-                    Some(to_invocation_result(result.map(|rets| (rets, store_ptr))))
-                }
-                HostWait::Suspend => None,
-                HostWait::CannotSuspend => Some(InvocationResult::YieldOutsideAsyncContext),
-            }
-        }))
-    });
-    if matches!(result, Ok(None)) {
-        // The guest waits here, with nothing on this frame to release: its
-        // call polls the host future, and resumes it with what the future
-        // returned, or drops it.
+            Ok(RawResults::from_slice(array.as_mut()))
+        })
+    };
+    match wait_for_host_future(store, future, suspendable, into_pending) {
+        HostWait::Ready(results) => Some(typed_outcome(results, store_ptr)),
+        HostWait::Suspend => None,
+        HostWait::CannotSuspend => Some(InvocationResult::YieldOutsideAsyncContext),
+    }
+}
+
+/// The end of the trampoline of a typed host function that may have its
+/// guest wait, on the Wasm stack. `outcome` is what the host stack gave:
+/// `None` suspends the guest until its call has the results.
+///
+/// # Safety
+/// Called on the Wasm stack, by a trampoline whose frames hold nothing that
+/// a destructor would have to release: the call may be dropped while its
+/// guest waits.
+#[cfg(feature = "experimental-async")]
+unsafe fn finish_typed_call<Rets>(
+    store_id: StoreId,
+    mut outcome: std::thread::Result<Option<TypedOutcome<Rets>>>,
+) -> Rets::CStruct
+where
+    Rets: WasmTypeList + 'static,
+{
+    if matches!(outcome, Ok(None)) {
+        // The guest waits here: its call polls the host future, and resumes
+        // it with what the future returned, or drops it.
         unsafe { wasmer_vm::suspend_wasm_call() };
-        result = on_host_stack(|| {
+        outcome = on_host_stack(|| {
             panic::catch_unwind(AssertUnwindSafe(|| {
                 Some(to_invocation_result(take_host_result().map(|results| {
                     // Safety: the trampoline of an import again, on the entry
@@ -797,21 +901,16 @@ where
             }))
         });
     }
-    let result = result.map(|result| result.expect("a guest that waited was resumed"));
+    let outcome = outcome.map(|outcome| outcome.expect("a guest that waited was resumed"));
 
     // IMPORTANT: DO NOT ALLOCATE ON THE STACK,
     // AS WE ARE IN THE WASM STACK, NOT ON THE HOST ONE.
     // See: https://github.com/wasmerio/wasmer/pull/5700
-    match result {
+    match outcome {
+        // Safety: the pointer of the active entry, which nothing has replaced
+        // since the host stack took it.
         Ok(InvocationResult::Success((rets, store))) => unsafe {
-            #[cfg(feature = "experimental-host-interrupt")]
-            if interrupt_registry::is_interrupted(store_id) {
-                raise_lib_trap(Trap::lib(TrapCode::HostInterrupt))
-            }
-            // Safety: the pointer of the active entry, which nothing has
-            // replaced since the host stack took it. It is used only for the
-            // duration of the call to `into_c_struct`.
-            rets.into_c_struct(&mut *store)
+            return_typed_results(store_id, rets, store)
         },
         Ok(InvocationResult::Exception(exception)) => unsafe {
             // Note: can't acquire a proper ref-counted context ref here, since we can switch
@@ -835,6 +934,119 @@ where
         },
         Err(panic) => unsafe { resume_panic(panic) },
     }
+}
+
+/// What the trampoline of a typed async host function does with the
+/// arguments the guest called it with, which `args` makes typed. It polls
+/// the future of the call once and, if the future is not ready, suspends the
+/// guest until it is.
+///
+/// # Safety
+/// Called on the Wasm stack, by the trampoline of `env`'s function.
+#[cfg(feature = "experimental-async")]
+pub(crate) unsafe fn call_typed_async<T, F, Args, Rets>(
+    env: &StaticFunction<Rc<F>, T>,
+    args: impl FnOnce(&mut StoreMut<'_>) -> Args,
+) -> Rets::CStruct
+where
+    T: 'static,
+    F: AsyncHostFunction<T, Args, Rets>,
+    Args: WasmTypeList + 'static,
+    Rets: WasmTypeList + 'static,
+{
+    let store_id = env.store_id;
+    // Asked here, on the Wasm stack: whether this is the stack of a
+    // `call_async`, which an async import may suspend.
+    let suspendable = wasmer_vm::wasm_call_is_suspendable();
+    let outcome = on_host_stack(|| {
+        panic::catch_unwind(AssertUnwindSafe(|| {
+            // Safety: this is the trampoline of an import, which borrows the
+            // active entry. The first poll of the future keeps the borrow.
+            let mut store = unsafe { StoreContext::get_current(store_id) };
+            let args = args(&mut store.as_mut());
+            let mut cx = AsyncEnv::new(env.env.clone(), store_id);
+            let func = Rc::clone(&env.func);
+            let future = Box::pin(async move { func.invoke(&mut cx, args).await });
+            poll_typed_future(store, future, suspendable)
+        }))
+    });
+    match outcome {
+        // The usual end of a call that did not wait, kept short. Safety: as
+        // in `finish_typed_call`.
+        Ok(Some(InvocationResult::Success((rets, store)))) => unsafe {
+            return_typed_results(store_id, rets, store)
+        },
+        outcome => unsafe { finish_typed_call(store_id, outcome) },
+    }
+}
+
+/// What the trampoline of a typed host function that returns [`Deferred`]
+/// does with the arguments the guest called it with, which `args` makes
+/// typed. It calls the function as the trampoline of a sync host function
+/// does, and returns the results if the function gave them. Only if the
+/// function gave a future does it ask whether the guest can wait, and poll.
+///
+/// # Safety
+/// Called on the Wasm stack, by the trampoline of `env`'s function.
+#[cfg(feature = "experimental-async")]
+pub(crate) unsafe fn call_typed_deferred<T, F, Args, Rets>(
+    env: &StaticFunction<F, T>,
+    args: impl FnOnce(&mut StoreMut<'_>) -> Args,
+) -> Rets::CStruct
+where
+    T: Send + 'static,
+    F: DeferredHostFunction<T, Args, Rets>,
+    Args: WasmTypeList + 'static,
+    Rets: WasmTypeList + 'static,
+{
+    /// What the function made of its call.
+    enum Called<Rets, Fut: ?Sized> {
+        Over(TypedOutcome<Rets>),
+        Waits(Pin<Box<Fut>>),
+    }
+
+    let store_id = env.store_id;
+    let called = on_host_stack(|| {
+        panic::catch_unwind(AssertUnwindSafe(|| {
+            // Safety: this is the trampoline of an import, which borrows the
+            // active entry for as long as the function runs.
+            let mut store = unsafe { StoreContext::get_current(store_id) };
+            let store_ptr = store.as_ptr();
+            let mut store_mut = store.as_mut();
+            let args = args(&mut store_mut);
+            let f_env = crate::backend::sys::function::env::FunctionEnvMut {
+                store_mut,
+                func_env: env.env.as_sys().clone(),
+            }
+            .into();
+            match env.func.invoke(f_env, args).0 {
+                DeferredState::Ready(results) => Called::Over(typed_outcome(results, store_ptr)),
+                DeferredState::Pending(future) => Called::Waits(future),
+            }
+        }))
+    });
+    let outcome = match called {
+        // The function gave its results: the end of a call of a sync host
+        // function. Safety: as in `finish_typed_call`.
+        Ok(Called::Over(InvocationResult::Success((rets, store)))) => {
+            return unsafe { return_typed_results(store_id, rets, store) };
+        }
+        Ok(Called::Over(outcome)) => Ok(Some(outcome)),
+        // The function has returned, and given the store back. Its future is
+        // polled as the one of an async host function is.
+        Ok(Called::Waits(future)) => {
+            let suspendable = wasmer_vm::wasm_call_is_suspendable();
+            on_host_stack(|| {
+                panic::catch_unwind(AssertUnwindSafe(|| {
+                    // Safety: as above. The first poll keeps the borrow.
+                    let store = unsafe { StoreContext::get_current(store_id) };
+                    poll_typed_future(store, future, suspendable)
+                }))
+            })
+        }
+        Err(panic) => Err(panic),
+    };
+    unsafe { finish_typed_call(store_id, outcome) }
 }
 
 /// See [`Function::raw_entry`].
@@ -988,6 +1200,18 @@ pub(crate) struct StaticFunction<F, T> {
 /// function of this backend. Every [`AsyncHostFunction`] has them.
 #[cfg(feature = "experimental-async")]
 pub(crate) trait AsyncHostTrampolines<T, Args, Rets> {
+    /// The trampoline a guest calls the function through.
+    fn function_callback(&self) -> VMFunctionCallback;
+
+    /// The trampoline that calls the one above with an array of values.
+    fn call_trampoline_address() -> VMTrampoline;
+}
+
+/// The trampolines of a typed host function that returns [`Deferred`], which
+/// make it a static function of this backend. Every [`DeferredHostFunction`]
+/// has them.
+#[cfg(feature = "experimental-async")]
+pub(crate) trait DeferredHostTrampolines<T, Args, Rets> {
     /// The trampoline a guest calls the function through.
     fn function_callback(&self) -> VMFunctionCallback;
 
@@ -1257,6 +1481,42 @@ macro_rules! impl_host_function {
 
             /// The guest calls the trampoline as it calls the one of a
             /// function with an environment, so the two share this one.
+            fn call_trampoline_address() -> VMTrampoline {
+                [<gen_call_trampoline_address_ $c_struct_name:lower>]::<$( $x, )* Rets>()
+            }
+        }
+
+        #[cfg(feature = "experimental-async")]
+        #[allow(non_snake_case, unused_parens)]
+        impl<T, $( $x, )* Rets, RetsAsResult, Func> DeferredHostTrampolines<T, ( $( $x ),* ), Rets> for Func
+        where
+            T: Send + 'static,
+            Func: Fn(FunctionEnvMut<'_, T>, $( $x ),*) -> Deferred<RetsAsResult> + 'static,
+            RetsAsResult: IntoResult<Rets> + 'static,
+            Rets: WasmTypeList + 'static,
+            ( $( $x ),* ): WasmTypeList + 'static,
+            $( $x: FromToNativeWasmType + 'static, )*
+        {
+            fn function_callback(&self) -> VMFunctionCallback {
+                #[allow(unused_variables, clippy::unused_unit)]
+                unsafe extern "C-unwind" fn func_wrapper<T, $( $x, )* Rets, Func>( env: &StaticFunction<Func, T>, $( $x: <$x::Native as NativeWasmType>::Abi, )* ) -> Rets::CStruct
+                where
+                    T: Send + 'static,
+                    $( $x: FromToNativeWasmType + 'static, )*
+                    Rets: WasmTypeList + 'static,
+                    ( $( $x ),* ): WasmTypeList + 'static,
+                    Func: DeferredHostFunction<T, ( $( $x ),* ), Rets>,
+                {
+                    unsafe {
+                        call_typed_deferred(env, |store: &mut StoreMut<'_>| {
+                            ( $( FromToNativeWasmType::from_native(NativeWasmTypeInto::from_abi(&mut *store, $x)) ),* )
+                        })
+                    }
+                }
+                func_wrapper::< T, $( $x, )* Rets, Self > as _
+            }
+
+            /// As for a typed async host function.
             fn call_trampoline_address() -> VMTrampoline {
                 [<gen_call_trampoline_address_ $c_struct_name:lower>]::<$( $x, )* Rets>()
             }

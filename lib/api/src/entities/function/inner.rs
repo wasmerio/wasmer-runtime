@@ -2,6 +2,8 @@ use wasmer_types::{FunctionType, RawValue};
 
 #[cfg(all(feature = "experimental-async", any(feature = "js", feature = "v8")))]
 use crate::entities::function::async_host::{boxed_body, typed_host_body};
+#[cfg(all(feature = "experimental-async", any(feature = "js", feature = "v8")))]
+use crate::entities::function::deferred::deferred_host_body;
 use crate::{
     AsStoreMut, AsStoreRef, CallWrapper, ExportError, Exportable, Extern, FunctionEnv,
     FunctionEnvMut, HostFunction, StoreMut, StoreRef, TypedFunction, Value, WasmTypeList, WithEnv,
@@ -11,7 +13,7 @@ use crate::{
     vm::{VMExtern, VMExternFunction, VMFuncRef},
 };
 #[cfg(feature = "experimental-async")]
-use crate::{AsyncEnv, AsyncHostFunction};
+use crate::{AsyncEnv, AsyncHostFunction, DeferredHostFunction};
 
 /// A WebAssembly `function` instance.
 ///
@@ -279,6 +281,49 @@ impl BackendFunction {
             crate::BackendStore::Js(_) => {
                 let ty = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
                 let body = typed_host_body(func, ty.clone());
+                Self::Js(crate::backend::js::entities::function::Function::new_async(
+                    store, env, ty, body,
+                ))
+            }
+        }
+    }
+
+    /// Creates a host `Function` from a typed function that returns
+    /// [`Deferred`](crate::Deferred).
+    ///
+    /// On `sys` the function is a static one, called as a sync host function
+    /// is. The other backends call it as an async host function.
+    #[inline]
+    #[cfg(feature = "experimental-async")]
+    pub(crate) fn new_typed_deferred<T, Args, Rets>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        func: impl DeferredHostFunction<T, Args, Rets>,
+    ) -> Self
+    where
+        T: Send + 'static,
+        Args: WasmTypeList + 'static,
+        Rets: WasmTypeList + 'static,
+    {
+        match &store.as_store_mut().inner.store {
+            #[cfg(feature = "sys")]
+            crate::BackendStore::Sys(_) => Self::Sys(
+                crate::backend::sys::entities::function::Function::new_typed_deferred(
+                    store, env, func,
+                ),
+            ),
+            #[cfg(feature = "v8")]
+            crate::BackendStore::V8(_) => {
+                let ty = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
+                let body = deferred_host_body(func, ty.clone());
+                Self::V8(crate::backend::v8::entities::function::Function::new_async(
+                    store, env, ty, body,
+                ))
+            }
+            #[cfg(feature = "js")]
+            crate::BackendStore::Js(_) => {
+                let ty = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
+                let body = deferred_host_body(func, ty.clone());
                 Self::Js(crate::backend::js::entities::function::Function::new_async(
                     store, env, ty, body,
                 ))
