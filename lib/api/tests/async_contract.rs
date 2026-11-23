@@ -17,9 +17,9 @@ use std::{
 };
 
 use wasmer::{
-    AsStoreMut, AsStoreRef, AsyncEnv, Function, FunctionEnv, FunctionEnvMut, FunctionType,
-    Instance, Module, RuntimeError, SharedStore, Store, StoreMut, StoreObjects, StoreRef,
-    TypedFunction, Value, imports,
+    AsStoreMut, AsStoreRef, AsyncEnv, ExternRef, Function, FunctionEnv, FunctionEnvMut,
+    FunctionType, Instance, Module, RuntimeError, SharedStore, Store, StoreMut, StoreObjects,
+    StoreRef, TypedFunction, Value, imports,
 };
 use wasmer_vm::TrapCode;
 
@@ -69,8 +69,15 @@ struct Counter {
 /// A guest whose `wait(x)` import adds to the host state, waits for the
 /// gate, and returns `x * 2`.
 fn guest() -> (Store, Function, Rc<Cell<bool>>, FunctionEnv<Counter>) {
+    let (store, instance, gate, env) = instantiate(GUEST);
+    let run = instance.exports.get_function("run").unwrap().clone();
+    (store, run, gate, env)
+}
+
+/// An instance of `wat`, with the `wait` import of [`guest`].
+fn instantiate(wat: &str) -> (Store, Instance, Rc<Cell<bool>>, FunctionEnv<Counter>) {
     let mut store = Store::default();
-    let module = Module::new(&store, GUEST).unwrap();
+    let module = Module::new(&store, wat).unwrap();
     let gate = Rc::new(Cell::new(false));
     let env = FunctionEnv::new(
         &mut store,
@@ -94,8 +101,7 @@ fn guest() -> (Store, Function, Rc<Cell<bool>>, FunctionEnv<Counter>) {
     );
     let instance =
         Instance::new(&mut store, &module, &imports! { "h" => { "wait" => wait } }).unwrap();
-    let run = instance.exports.get_function("run").unwrap().clone();
-    (store, run, gate, env)
+    (store, instance, gate, env)
 }
 
 #[test]
@@ -143,6 +149,87 @@ fn a_typed_call_converts_its_arguments_and_results() {
         panic!("the call did not finish");
     };
     assert_eq!(result.unwrap(), 41);
+}
+
+/// The future of a typed call is free to move while its guest waits: the
+/// values the guest was called with are on the guest's own stack.
+#[test]
+fn a_typed_call_moves_while_its_guest_waits() {
+    let (mut store, run, gate, _env) = guest();
+    let typed: TypedFunction<i32, i32> = run.typed(&store).unwrap();
+    let cx = &mut Context::from_waker(Waker::noop());
+    let mut call = typed.call_async(&mut store, 20);
+    assert!(Pin::new(&mut call).poll(cx).is_pending());
+    let mut moved = Box::new(call);
+    gate.set(true);
+    let Poll::Ready(result) = Pin::new(&mut *moved).poll(cx) else {
+        panic!("the call did not finish");
+    };
+    assert_eq!(result.unwrap(), 41);
+}
+
+/// A typed call takes and returns more values than its guest keeps on its
+/// own stack, of every numeric type, whether it waits or not.
+#[test]
+fn a_typed_call_takes_and_returns_many_values() {
+    const MANY: &str = r#"(module
+      (import "h" "wait" (func $wait (param i32) (result i32)))
+      (func (export "rotate") (param i32 i64 f32 f64 i32) (result i64 f32 f64 i32 i32)
+        (local.get 1) (local.get 2) (local.get 3) (local.get 4)
+        (call $wait (local.get 0)))
+      (func (export "spread") (param i32) (result i32 i32 i32 i32 i32)
+        (local.get 0) (i32.const 2) (i32.const 3) (i32.const 4)
+        (call $wait (local.get 0))))"#;
+    type Rotated = (i64, f32, f64, i32, i32);
+    let (mut store, instance, gate, _env) = instantiate(MANY);
+    let exports = &instance.exports;
+    let rotate: TypedFunction<(i32, i64, f32, f64, i32), Rotated> =
+        exports.get_typed_function(&store, "rotate").unwrap();
+    let spread: TypedFunction<i32, (i32, i32, i32, i32, i32)> =
+        exports.get_typed_function(&store, "spread").unwrap();
+    let cx = &mut Context::from_waker(Waker::noop());
+
+    // It waits, and moves while it does.
+    let mut call = rotate.call_async(&mut store, 7, 1 << 40, 1.5, -2.5, 9);
+    assert!(Pin::new(&mut call).poll(cx).is_pending());
+    let mut moved = Box::new(call);
+    gate.set(true);
+    let Poll::Ready(result) = Pin::new(&mut *moved).poll(cx) else {
+        panic!("the call did not finish");
+    };
+    assert_eq!(result.unwrap(), (1 << 40, 1.5, -2.5, 9, 14));
+    drop(moved);
+
+    // More results than arguments, ready at once.
+    let mut call = spread.call_async(&mut store, 5);
+    let Poll::Ready(result) = Pin::new(&mut call).poll(cx) else {
+        panic!("the call did not finish");
+    };
+    assert_eq!(result.unwrap(), (5, 2, 3, 4, 10));
+}
+
+/// A typed call refuses an argument of another store, as a synchronous one
+/// does, and its store stays usable.
+#[test]
+fn a_typed_call_refuses_a_value_of_another_store() {
+    let mut store = Store::default();
+    let wat = r#"(module (func (export "take") (param externref)))"#;
+    let module = Module::new(&store, wat).unwrap();
+    let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+    let take: TypedFunction<Option<ExternRef>, ()> =
+        instance.exports.get_typed_function(&store, "take").unwrap();
+    let mut other = Store::default();
+    let foreign = ExternRef::new(&mut other, 1u8);
+    let mut call = Box::pin(take.call_async(&mut store, Some(foreign)));
+    let Poll::Ready(Err(error)) = poll(&mut call) else {
+        panic!("the call took a value of another store");
+    };
+    assert_eq!(error.message(), "cross-`Store` values are not supported");
+    drop(call);
+
+    let own = ExternRef::new(&mut store, 1u8);
+    let mut call = Box::pin(take.call_async(&mut store, Some(own)));
+    assert!(matches!(poll(&mut call), Poll::Ready(Ok(()))));
 }
 
 /// A typed import takes its arguments and gives its results as the
@@ -273,6 +360,35 @@ fn a_nested_call_suspends_and_resumes() {
         panic!("the call did not finish");
     };
     assert_eq!(results.unwrap()[0].unwrap_i32(), 103);
+}
+
+/// A typed call made through an `AsyncEnv` reads its arguments in a slice of
+/// the host function that makes it, and suspends and resumes like any other.
+#[test]
+fn a_nested_typed_call_suspends_and_resumes() {
+    struct Env {
+        inner: Option<TypedFunction<i32, i32>>,
+    }
+    let (mut store, inner, gate, _) = guest();
+    let inner = inner.typed(&store).unwrap();
+    let env = FunctionEnv::new(&mut store, Env { inner: Some(inner) });
+    let outer = Function::new_typed_async(
+        &mut store,
+        &env,
+        async |cx: &mut AsyncEnv<Env>, x: i32| -> Result<i32, RuntimeError> {
+            let inner = cx.with(|env| env.data().inner.clone().unwrap());
+            Ok(inner.call_async(cx, x).await? + 100)
+        },
+    );
+    let outer: TypedFunction<i32, i32> = outer.typed(&store).unwrap();
+    let mut call = Box::pin(outer.call_async(&mut store, 1));
+    assert!(poll(&mut call).is_pending());
+    assert!(poll(&mut call).is_pending());
+    gate.set(true);
+    let Poll::Ready(result) = poll(&mut call) else {
+        panic!("the call did not finish");
+    };
+    assert_eq!(result.unwrap(), 103);
 }
 
 #[test]

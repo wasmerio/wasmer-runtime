@@ -4990,6 +4990,7 @@ dependencies = [
  "region",
  "scopeguard",
  "serde",
+ "smallvec",
  "thiserror 2.0.21",
  "tracing",
  "wasmer-types",

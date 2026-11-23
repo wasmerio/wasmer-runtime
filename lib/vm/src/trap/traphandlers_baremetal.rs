@@ -155,13 +155,28 @@ thread_local! {
 
 type WasmYielder = Yielder<(), ()>;
 
+/// How many values a [`SuspendableCall`] keeps on its own stack.
+pub const INLINE_CALL_VALUES: usize = 4;
+
+/// The arguments of a [`SuspendableCall`], which its trampoline overwrites
+/// with the results; see the signal-based backend.
+#[derive(Clone, Copy)]
+pub enum CallValues {
+    /// Kept on the stack of the call, which returns them when it is over.
+    Inline([wasmer_types::RawValue; INLINE_CALL_VALUES]),
+    /// Kept by whoever makes the call, where they stay until the call is
+    /// finished or dropped.
+    At(*mut wasmer_types::RawValue),
+}
+
 /// What a [`SuspendableCall`] did when it was resumed.
 pub enum CallStep {
     /// It waits: an import it called suspended it (see
     /// [`suspend_wasm_call`]). It goes on when it is resumed again.
     Suspended,
-    /// It is over: it returned. A trap leaves through the unwinder.
-    Finished(Result<(), Trap>),
+    /// It is over: it returned, with its values as it was given them. A trap
+    /// leaves through the unwinder.
+    Finished(Result<CallValues, Trap>),
 }
 
 /// A Wasm call on a stack of its own that an import can suspend, and its
@@ -170,10 +185,9 @@ pub enum CallStep {
 ///
 /// Dropping a suspended call resets its stack: none of it runs again.
 pub struct SuspendableCall {
-    coroutine: Option<Coroutine<(), (), ()>>,
-    /// The coroutine's yielder, once it has started. Boxed: the coroutine
-    /// writes it through a pointer, wherever the call is moved.
-    yielder: Box<Cell<Option<NonNull<WasmYielder>>>>,
+    coroutine: Option<Coroutine<(), (), CallValues>>,
+    /// The coroutine's yielder, once it has suspended.
+    yielder: Option<NonNull<WasmYielder>>,
 }
 
 impl SuspendableCall {
@@ -181,22 +195,24 @@ impl SuspendableCall {
     /// resumed.
     ///
     /// # Safety
-    /// All pointer arguments must be valid until the call is finished or
-    /// dropped.
+    /// All pointer arguments, and the pointer of [`CallValues::At`], must be
+    /// valid until the call is finished or dropped.
     pub unsafe fn new(
         _config: &VMConfig,
         vmctx: crate::VMFunctionContext,
         trampoline: crate::VMTrampoline,
         callee: *const crate::VMFunctionBody,
-        values_vec: *mut u8,
+        values: CallValues,
     ) -> Result<Self, Trap> {
-        let yielder = Box::new(Cell::new(None));
-        let started: *const Cell<Option<NonNull<WasmYielder>>> = &*yielder;
         let coroutine = Coroutine::new(move |yielder: &WasmYielder, ()| {
             let yielder = NonNull::from(yielder);
-            // Safety: the call owns the cell, and outlives its coroutine.
-            unsafe { (*started).set(Some(yielder)) };
             SUSPENDABLE.with(|cell| cell.set(Some(yielder)));
+            // In this frame, on the call's own stack, from here on.
+            let mut values = values;
+            let values_vec = match &mut values {
+                CallValues::Inline(values) => values.as_mut_ptr(),
+                CallValues::At(values) => *values,
+            };
             unsafe {
                 // pointer types are ABI-compatible; transmute to unsafe fn to preserve unsafety
                 std::mem::transmute::<
@@ -210,12 +226,13 @@ impl SuspendableCall {
                         *const crate::VMFunctionBody,
                         *mut u8,
                     ),
-                >(trampoline)(vmctx, callee, values_vec);
+                >(trampoline)(vmctx, callee, values_vec.cast());
             }
+            values
         });
         Ok(Self {
             coroutine: Some(coroutine),
-            yielder,
+            yielder: None,
         })
     }
 
@@ -229,12 +246,13 @@ impl SuspendableCall {
         _trap_handler: Option<*const TrapHandlerFn<'static>>,
     ) -> CallStep {
         let coroutine = self.coroutine.as_mut().expect("the call is not over");
-        let outer = SUSPENDABLE.with(|cell| cell.replace(self.yielder.get()));
+        let outer = SUSPENDABLE.with(|cell| cell.replace(self.yielder));
         let resumed = coroutine.resume(());
-        SUSPENDABLE.with(|cell| cell.set(outer));
+        // The coroutine published its yielder when it started.
+        self.yielder = SUSPENDABLE.with(|cell| cell.replace(outer));
         match resumed {
             CoroutineResult::Yield(()) => CallStep::Suspended,
-            CoroutineResult::Return(()) => CallStep::Finished(Ok(())),
+            CoroutineResult::Return(values) => CallStep::Finished(Ok(values)),
         }
     }
 }

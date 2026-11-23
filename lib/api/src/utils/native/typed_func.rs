@@ -8,7 +8,7 @@
 //! let add_one_native: TypedFunction<i32, i32> = add_one.native().unwrap();
 //! ```
 #[cfg(feature = "experimental-async")]
-use crate::{AsyncCallRequest, AsyncCallStore, StoreMut, Value};
+use crate::{AsyncCallStore, StoreMut};
 use crate::{
     AsStoreMut, BackendStore, CallWrapper, FromToNativeWasmType, Function, NativeWasmTypeInto,
     RuntimeError, WasmTypeList, store::AsStoreRef,
@@ -109,19 +109,16 @@ macro_rules! impl_native_traits {
                 $(
                     let [<p_ $x>] = $x;
                 )*
-                let function = self.func.clone();
-                let ty_source = function.clone();
-                store.start_call(AsyncCallRequest::<Rets>::typed(function, move |store: &mut StoreMut<'_>| {
-                    let ty = ty_source.ty(store);
-                    let raw = [ $( [<p_ $x>].to_native().into_raw(store) ),* ];
-                    let mut values: Vec<Value> = Vec::with_capacity(raw.len());
-                    for (raw, ty) in raw.iter().zip(ty.params()) {
-                        // Safety: each raw value was made from an argument of
-                        // this function's parameter type.
-                        values.push(unsafe { Value::from_raw(store, *ty, *raw) });
+                store.start_typed_call(&self.func, move |store: &mut StoreMut<'_>| {
+                    // Ensure all parameters come from the same context.
+                    if $(!FromToNativeWasmType::is_from_store(&[<p_ $x>], store) ||)* false {
+                        return Err(RuntimeError::new(
+                            "cross-`Store` values are not supported",
+                        ));
                     }
-                    values
-                }))
+                    let args: [RawValue; _] = [ $( [<p_ $x>].to_native().into_raw(store) ),* ];
+                    Ok(args)
+                })
             }
 
             #[doc(hidden)]
