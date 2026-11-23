@@ -40,7 +40,8 @@ use crate::{
     entities::function::async_call::CallFinish,
 };
 use wasmer_types::{RawValue, StoreId, Type};
-use wasmer_vm::{CallStep, CallValues, INLINE_CALL_VALUES, SuspendableCall};
+use wasmer_vm::{CallStarted, CallStep, CallValues, INLINE_CALL_VALUES, SuspendableCall};
+use std::ptr::NonNull;
 
 #[cfg(feature = "experimental-host-interrupt")]
 type AsyncCallFutureId = u64;
@@ -97,9 +98,6 @@ thread_local! {
 /// The guest of a call.
 pub(crate) struct Guest {
     wasm: SuspendableCall,
-    /// The arguments, which the trampoline overwrites with the results, when
-    /// they are too many for the guest to keep on its own stack.
-    values: Vec<RawValue>,
     /// The store's interrupt registration, which follows the guest: it is on
     /// the thread while the guest runs, and kept here while it waits, so that
     /// an interrupt still finds the store.
@@ -168,8 +166,14 @@ pub(crate) trait Entry {
     /// What the call returns.
     type Output;
 
-    /// Makes the guest, in the first slice of the call.
-    fn start(&mut self, store: &mut StoreMut<'_>) -> Result<Guest, RuntimeError>;
+    /// What to call, in the first slice of the call: the function, and its
+    /// arguments with room for its results. They stay where they are until
+    /// [`Self::finish`]: the guest reads them from there, and keeps there
+    /// those that are too many for its own stack.
+    fn start(
+        &mut self,
+        store: &mut StoreMut<'_>,
+    ) -> Result<(&Function, &mut RawValues), RuntimeError>;
 
     /// What the call returns: of the values of a guest that returned, the
     /// results first, in the slice in which it did, or of what ended the call
@@ -187,6 +191,9 @@ pub(crate) struct AsyncCallFuture<'a, E: Entry> {
     waker_id: Option<AsyncCallFutureId>,
     store: CallStore<'a>,
     entry: E,
+    /// The values of the call, where the entry keeps them on the heap: too
+    /// many for the guest's own stack.
+    spilled: Option<NonNull<[RawValue]>>,
     guest: Option<Guest>,
     waiting: Waiting,
 }
@@ -203,6 +210,7 @@ impl<'a, E: Entry> AsyncCallFuture<'a, E> {
             waker_id: None,
             store,
             entry,
+            spilled: None,
             guest: None,
             waiting: Waiting {
                 cx: ptr::null_mut(),
@@ -347,22 +355,37 @@ impl<E: Entry> Future for AsyncCallFuture<'_, E> {
         // The store is taken for as long as the guest runs, and given up as
         // soon as it waits or returns.
         let slice = this.store.resolve().enter_slice();
-        if this.guest.is_none() {
+        // A call that starts in this poll makes no guest to keep unless the
+        // guest waits: most return at once.
+        let starting = if this.guest.is_none() {
             // Safety: the slice is the only holder of the store.
             let mut store = unsafe { StoreMut::from_raw(slice.ptr()) };
             match this.entry.start(&mut store) {
-                Ok(guest) => this.guest = Some(guest),
+                Ok((function, values)) => {
+                    let call_values = if values.spilled() {
+                        this.spilled = Some(NonNull::from(&mut values[..]));
+                        CallValues::At(values.as_mut_ptr())
+                    } else {
+                        CallValues::Inline(values.as_ptr(), values.len())
+                    };
+                    Some(Starting::new(&store, function, call_values))
+                }
                 Err(error) => {
                     let _waker = this.take_waker();
                     return Poll::Ready(this.entry.finish(Err(error)));
                 }
             }
-        }
-        let guest = this.guest.as_mut().expect("a guest that started");
+        } else {
+            None
+        };
         // Safety: as above; the handle is gone before the guest runs.
         let trap_handler = unsafe { StoreMut::from_raw(slice.ptr()) }
             .as_store_ref()
             .signal_handler();
+        let store_id = this.store.id();
+        // Where the guest's values go when it returns, unless they are too
+        // many: the results first.
+        let mut results = [RawValue { i32: 0 }; INLINE_CALL_VALUES];
         this.waiting.cx = ptr::from_mut(cx).cast();
         let step = {
             // The store is published for host futures only: a sync host
@@ -373,31 +396,47 @@ impl<E: Entry> Future for AsyncCallFuture<'_, E> {
             let entry = unsafe { StoreContext::new(slice.ptr()) };
             let _entered = unsafe { entry.install() };
             let _waiting = Resuming::enter(&mut this.waiting);
-            guest.resume(this.store.id(), trap_handler)
+            match starting {
+                Some(starting) => starting.run(store_id, &mut results, trap_handler),
+                None => {
+                    let guest = this.guest.as_mut().expect("a guest that waits");
+                    guest
+                        .resume(store_id, &mut results, trap_handler)
+                        .map(|step| match step {
+                            CallStep::Suspended => Step::Suspended(None),
+                            CallStep::Finished(returned) => Step::Finished(returned),
+                        })
+                }
+            }
         };
         this.waiting.cx = ptr::null_mut();
         let returned = match step {
-            Ok(CallStep::Suspended) => {
+            Ok(Step::Suspended(guest)) => {
+                if guest.is_some() {
+                    this.guest = guest;
+                }
                 drop(slice);
                 return this.wait(cx);
             }
-            Ok(CallStep::Finished(returned)) => returned.map_err(RuntimeError::from),
+            Ok(Step::Finished(returned)) => returned.map_err(RuntimeError::from),
             Err(error) => Err(error),
         };
-        let guest = this.guest.take().expect("the guest that ran");
+        // Only a guest that waited is there to drop.
+        if this.guest.is_some() {
+            this.guest = None;
+        }
         let _waker = this.take_waker();
         // Safety: the slice is the only holder of the store.
         let mut store = unsafe { StoreMut::from_raw(slice.ptr()) };
-        let inline;
-        let outcome = match returned {
-            Ok(CallValues::Inline(values)) => {
-                inline = values;
-                Ok((&mut store, &inline[..]))
-            }
-            Ok(CallValues::At(_)) => Ok((&mut store, &guest.values[..])),
-            Err(error) => Err(error),
+        let values = match this.spilled {
+            // Safety: the entry keeps them until `finish` is done with them.
+            Some(spilled) => unsafe { spilled.as_ref() },
+            None => &results[..],
         };
-        Poll::Ready(this.entry.finish(outcome))
+        let outcome = returned.map(|()| (&mut store, values));
+        let finished = this.entry.finish(outcome);
+        this.spilled = None;
+        Poll::Ready(finished)
     }
 }
 
@@ -407,49 +446,86 @@ impl<E: Entry> Drop for AsyncCallFuture<'_, E> {
     }
 }
 
-impl Guest {
-    /// The guest of a call of `function` with `values`, which have room for
-    /// its results.
-    pub(crate) fn new(
-        store: &mut StoreMut<'_>,
-        function: &Function,
-        values: RawValues,
-    ) -> Result<Self, RuntimeError> {
+/// What a poll of a call did with its guest.
+enum Step {
+    /// The guest waits. With the guest, if it started in this poll.
+    Suspended(Option<Guest>),
+    /// The guest is over.
+    Finished(Result<(), wasmer_vm::Trap>),
+}
+
+/// A call that is about to start: what [`SuspendableCall::start`] takes.
+struct Starting {
+    entry: RawEntry,
+    config: wasmer_vm::VMConfig,
+    values: CallValues,
+}
+
+impl Starting {
+    fn new(store: &StoreMut<'_>, function: &Function, values: CallValues) -> Self {
+        let entry = function.raw_entry(store);
+        let store = store.as_store_ref();
+        let wasm_stack_size = store.engine().tunables().vmconfig().wasm_stack_size;
+        Self {
+            entry,
+            config: wasmer_vm::VMConfig { wasm_stack_size },
+            values,
+        }
+    }
+
+    /// Runs the guest until it waits or is over.
+    fn run(
+        self,
+        store_id: StoreId,
+        results: &mut wasmer_vm::CallResults,
+        trap_handler: Option<*const wasmer_vm::TrapHandlerFn<'static>>,
+    ) -> Result<Step, RuntimeError> {
         let RawEntry {
             vmctx,
             trampoline,
             callee,
-        } = function.raw_entry(store);
-        let (call_values, values) = if values.spilled() {
-            // On the heap already, where they stay.
-            let mut values = values.into_vec();
-            (CallValues::At(values.as_mut_ptr()), values)
-        } else {
-            let mut inline = [RawValue { i32: 0 }; INLINE_CALL_VALUES];
-            inline[..values.len()].copy_from_slice(&values);
-            (CallValues::Inline(inline), Vec::new())
+        } = self.entry;
+        #[cfg(feature = "experimental-host-interrupt")]
+        let mut interrupts = Interrupts {
+            state: wasmer_vm::ActivationState::new(),
+            installed: None,
         };
-        let store = store.as_store_ref();
-        let config = store.engine().tunables().vmconfig();
-        // Safety: the function belongs to the store, which outlives the
-        // call, and values that are not inline are kept with it, on the heap.
-        let wasm = unsafe { SuspendableCall::new(config, vmctx, trampoline, callee, call_values) }
-            .map_err(RuntimeError::from)?;
-        Ok(Self {
-            wasm,
-            values,
+        let started = {
             #[cfg(feature = "experimental-host-interrupt")]
-            interrupts: Interrupts {
-                state: wasmer_vm::ActivationState::new(),
-                installed: None,
-            },
+            let _switch_back = interrupts.switch_in(store_id)?;
+            #[cfg(not(feature = "experimental-host-interrupt"))]
+            let _ = store_id;
+            // Safety: the function belongs to the store, which outlives the
+            // call, and its entry keeps the values until the call is over.
+            unsafe {
+                SuspendableCall::start(
+                    &self.config,
+                    vmctx,
+                    trampoline,
+                    callee,
+                    self.values,
+                    results,
+                    trap_handler,
+                )
+            }
+        };
+        Ok(match started {
+            CallStarted::Finished(returned) => Step::Finished(returned),
+            CallStarted::Suspended(wasm) => Step::Suspended(Some(Guest {
+                wasm,
+                #[cfg(feature = "experimental-host-interrupt")]
+                interrupts,
+            })),
         })
     }
+}
 
-    /// Runs the guest until it waits or is over.
+impl Guest {
+    /// Runs a guest that waits until it waits again or is over.
     fn resume(
         &mut self,
         store_id: StoreId,
+        results: &mut wasmer_vm::CallResults,
         trap_handler: Option<*const wasmer_vm::TrapHandlerFn<'static>>,
     ) -> Result<CallStep, RuntimeError> {
         #[cfg(feature = "experimental-host-interrupt")]
@@ -457,7 +533,7 @@ impl Guest {
         #[cfg(not(feature = "experimental-host-interrupt"))]
         let _ = store_id;
         // Safety: on the thread of the call, which is not over.
-        Ok(unsafe { self.wasm.resume(trap_handler) })
+        Ok(unsafe { self.wasm.resume(results, trap_handler) })
     }
 }
 
@@ -468,6 +544,8 @@ pub(crate) struct Converted<X> {
     request: Option<AsyncCallRequest<X>>,
     /// Once it started: the types of its results, and what makes `X` of them.
     results: Option<(Vec<Type>, CallFinish<X>)>,
+    /// Once it started: what it calls, until it is over.
+    started: Option<(Function, RawValues)>,
 }
 
 impl<X> Converted<X> {
@@ -475,6 +553,7 @@ impl<X> Converted<X> {
         Self {
             request: Some(request),
             results: None,
+            started: None,
         }
     }
 }
@@ -482,13 +561,17 @@ impl<X> Converted<X> {
 impl<X> Entry for Converted<X> {
     type Output = Result<X, RuntimeError>;
 
-    fn start(&mut self, store: &mut StoreMut<'_>) -> Result<Guest, RuntimeError> {
+    fn start(
+        &mut self,
+        store: &mut StoreMut<'_>,
+    ) -> Result<(&Function, &mut RawValues), RuntimeError> {
         let request = self.request.take().expect("polled after completion");
         let params = (request.params)(store)?;
         let function = request.function.as_sys();
         let (values, results) = function.raw_params(store, &params)?;
         self.results = Some((results, request.finish));
-        Guest::new(store, function, values)
+        let (function, values) = self.started.insert((function.clone(), values));
+        Ok((function, values))
     }
 
     fn finish(
@@ -503,6 +586,8 @@ impl<X> Entry for Converted<X> {
         let results: Vec<Value> = results
             .map(|(ty, raw)| unsafe { Value::from_raw(store, *ty, *raw) })
             .collect();
+        // The guest's values were read.
+        self.started = None;
         finish(store, &results)
     }
 }
@@ -536,18 +621,27 @@ impl<R> Typed<R> {
 impl<R> Entry for Typed<R> {
     type Output = R;
 
-    fn start(&mut self, store: &mut StoreMut<'_>) -> Result<Guest, RuntimeError> {
-        let values = self.values.take().expect("polled after completion")?;
-        Guest::new(store, &self.function, values)
+    fn start(
+        &mut self,
+        _: &mut StoreMut<'_>,
+    ) -> Result<(&Function, &mut RawValues), RuntimeError> {
+        if matches!(self.values, Some(Err(_))) {
+            return Err(self.values.take().and_then(Result::err).expect("the error"));
+        }
+        let values = self.values.as_mut().expect("polled after completion");
+        let values = values.as_mut().expect("values that are not an error");
+        Ok((&self.function, values))
     }
 
     fn finish(
         &mut self,
         outcome: Result<(&mut StoreMut<'_>, &[RawValue]), RuntimeError>,
     ) -> R {
-        // Dropped with the call, if it ended before it started.
+        let finished = (self.finish)(outcome);
+        // The guest's values, or those of a call that ended before it
+        // started.
         self.values = None;
-        (self.finish)(outcome)
+        finished
     }
 }
 

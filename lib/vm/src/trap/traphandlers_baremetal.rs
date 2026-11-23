@@ -184,14 +184,20 @@ type WasmYielder = Yielder<(), ()>;
 /// How many values a [`SuspendableCall`] keeps on its own stack.
 pub const INLINE_CALL_VALUES: usize = 4;
 
+/// Where the results of a [`SuspendableCall`] whose values are
+/// [`CallValues::Inline`] go; see the signal-based backend.
+pub type CallResults = [wasmer_types::RawValue; INLINE_CALL_VALUES];
+
 /// The arguments of a [`SuspendableCall`], which its trampoline overwrites
 /// with the results; see the signal-based backend.
 #[derive(Clone, Copy)]
 pub enum CallValues {
-    /// Kept on the stack of the call, which returns them when it is over.
-    Inline([wasmer_types::RawValue; INLINE_CALL_VALUES]),
+    /// This many values, read from here when the call starts and kept on the
+    /// stack of the call; the results are written to the [`CallResults`] of
+    /// the resumption in which the guest returns.
+    Inline(*const wasmer_types::RawValue, usize),
     /// Kept by whoever makes the call, where they stay until the call is
-    /// finished or dropped.
+    /// finished or dropped, and where the results are.
     At(*mut wasmer_types::RawValue),
 }
 
@@ -200,9 +206,9 @@ pub enum CallStep {
     /// It waits: an import it called suspended it (see
     /// [`suspend_wasm_call`]). It goes on when it is resumed again.
     Suspended,
-    /// It is over: it returned, with its values as it was given them. A trap
-    /// leaves through the unwinder.
-    Finished(Result<CallValues, Trap>),
+    /// It is over: it returned, with its results where its values said. A
+    /// trap leaves through the unwinder.
+    Finished(Result<(), Trap>),
 }
 
 /// A Wasm call on a stack of its own that an import can suspend, and its
@@ -211,33 +217,62 @@ pub enum CallStep {
 ///
 /// Dropping a suspended call resets its stack: none of it runs again.
 pub struct SuspendableCall {
-    coroutine: Option<Coroutine<(), (), CallValues>>,
+    coroutine: Option<Coroutine<(), (), Option<CallResults>>>,
     /// The coroutine's yielder, once it has suspended.
     yielder: Option<NonNull<WasmYielder>>,
 }
 
+/// What [`SuspendableCall::start`] did.
+pub enum CallStarted {
+    /// The guest waits: it goes on when the call is resumed.
+    Suspended(SuspendableCall),
+    /// It is over: it returned, with its results where its values said.
+    Finished(Result<(), Trap>),
+}
+
 impl SuspendableCall {
-    /// A call of `callee` through `trampoline`, which starts when it is first
-    /// resumed.
+    /// Calls `callee` through `trampoline`, until its guest waits or is over.
     ///
     /// # Safety
     /// All pointer arguments, and the pointer of [`CallValues::At`], must be
     /// valid until the call is finished or dropped.
-    pub unsafe fn new(
+    pub unsafe fn start(
+        config: &VMConfig,
+        vmctx: crate::VMFunctionContext,
+        trampoline: crate::VMTrampoline,
+        callee: *const crate::VMFunctionBody,
+        values: CallValues,
+        results: *mut CallResults,
+        trap_handler: Option<*const TrapHandlerFn<'static>>,
+    ) -> CallStarted {
+        // The values are read now: the coroutine starts within this call.
+        let mut call = unsafe { Self::new(config, vmctx, trampoline, callee, values) };
+        match unsafe { call.resume(results, trap_handler) } {
+            CallStep::Suspended => CallStarted::Suspended(call),
+            CallStep::Finished(result) => CallStarted::Finished(result),
+        }
+    }
+
+    unsafe fn new(
         _config: &VMConfig,
         vmctx: crate::VMFunctionContext,
         trampoline: crate::VMTrampoline,
         callee: *const crate::VMFunctionBody,
         values: CallValues,
-    ) -> Result<Self, Trap> {
+    ) -> Self {
         let coroutine = Coroutine::new(move |yielder: &WasmYielder, ()| {
             let yielder = NonNull::from(yielder);
             SUSPENDABLE.with(|cell| cell.set(Some(yielder)));
             // In this frame, on the call's own stack, from here on.
-            let mut values = values;
-            let values_vec = match &mut values {
-                CallValues::Inline(values) => values.as_mut_ptr(),
-                CallValues::At(values) => *values,
+            let mut inline = [wasmer_types::RawValue { i32: 0 }; INLINE_CALL_VALUES];
+            let values_vec = match values {
+                CallValues::Inline(values, len) => {
+                    for (i, slot) in inline.iter_mut().enumerate().take(len) {
+                        *slot = unsafe { *values.add(i) };
+                    }
+                    inline.as_mut_ptr()
+                }
+                CallValues::At(values) => values,
             };
             unsafe {
                 // pointer types are ABI-compatible; transmute to unsafe fn to preserve unsafety
@@ -254,21 +289,22 @@ impl SuspendableCall {
                     ),
                 >(trampoline)(vmctx, callee, values_vec.cast());
             }
-            values
+            matches!(values, CallValues::Inline(..)).then_some(inline)
         });
-        Ok(Self {
+        Self {
             coroutine: Some(coroutine),
             yielder: None,
-        })
+        }
     }
 
-    /// Runs the call until it waits or is over.
+    /// Runs a call whose guest waits until it waits again or is over.
     ///
     /// # Safety
     /// Called on the thread the call was made on, and not again once it is
     /// finished.
     pub unsafe fn resume(
         &mut self,
+        results: *mut CallResults,
         _trap_handler: Option<*const TrapHandlerFn<'static>>,
     ) -> CallStep {
         let coroutine = self.coroutine.as_mut().expect("the call is not over");
@@ -278,7 +314,12 @@ impl SuspendableCall {
         self.yielder = SUSPENDABLE.with(|cell| cell.replace(outer));
         match resumed {
             CoroutineResult::Yield(()) => CallStep::Suspended,
-            CoroutineResult::Return(values) => CallStep::Finished(Ok(values)),
+            CoroutineResult::Return(returned) => {
+                if let Some(returned) = returned {
+                    unsafe { results.write(returned) };
+                }
+                CallStep::Finished(Ok(()))
+            }
         }
     }
 }
