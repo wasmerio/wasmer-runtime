@@ -7,12 +7,13 @@
 ))]
 //! Where host functions called from Wasm run.
 //!
-//! A typed synchronous host function runs on the Wasm stack it was called
+//! Host functions run on the native stack, unless a typed synchronous one is
+//! set to run on the Wasm stack: it then runs on the Wasm stack it was called
 //! from when at least the host-call reserve is left on it, and on the native
-//! stack otherwise, or always when it is set to run there. Dynamic and
-//! asynchronous host functions always run on the native stack. Getting this
-//! wrong overflows the Wasm stack inside host code, which kills the process,
-//! so these tests have a test binary of their own.
+//! stack otherwise. Dynamic and asynchronous host functions always run on the
+//! native stack. Getting this wrong overflows the Wasm stack inside host
+//! code, which kills the process, so these tests have a test binary of their
+//! own.
 
 use std::{
     hint::black_box,
@@ -54,10 +55,10 @@ const RECURSE_WITH_HOST_CALLS: &str = r#"
             call $recurse))
 "#;
 
-/// The guest recurses, calling the host function at every level, until it
-/// overflows its stack. Near the end there is not room for the host
-/// function's frame on the Wasm stack, so it has to run on the native stack;
-/// the guest then traps cleanly with `StackOverflow`.
+/// The guest recurses, calling a host function set to run on the Wasm stack
+/// at every level, until it overflows its stack. Near the end there is not
+/// room for the host function's frame on the Wasm stack, so it has to run on
+/// the native stack; the guest then traps cleanly with `StackOverflow`.
 #[test]
 fn host_calls_switch_stacks_when_the_wasm_stack_runs_low() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -66,6 +67,7 @@ fn host_calls_switch_stacks_when_the_wasm_stack_runs_low() -> Result<(), Box<dyn
     let mut store = Store::default();
     let module = Module::new(&store, RECURSE_WITH_HOST_CALLS)?;
     let deep = Function::new_typed(&mut store, use_192_kib_of_stack);
+    deep.set_calls_on_native_stack(&mut store, false);
     let instance = Instance::new(
         &mut store,
         &module,
@@ -117,8 +119,8 @@ struct Env {
 }
 
 /// Runs typed, environment, dynamic and re-entrant host calls, and one that
-/// fails, and checks their results; with `on_native_stack`, every host
-/// function is set to run on the native stack.
+/// fails, and checks their results; without `on_native_stack`, every host
+/// function is set to run on the Wasm stack, which the typed ones do.
 fn run_host_calls(on_native_stack: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mut store = Store::default();
     let module = Module::new(&store, CALLS)?;
@@ -148,10 +150,8 @@ fn run_host_calls(on_native_stack: bool) -> Result<(), Box<dyn std::error::Error
     let fail = Function::new_typed(&mut store, || -> Result<(), RuntimeError> {
         Err(RuntimeError::new("failed on purpose"))
     });
-    if on_native_stack {
-        for function in [&typed, &with_env, &dynamic, &reenter, &fail] {
-            function.set_calls_on_native_stack(&mut store, true);
-        }
+    for function in [&typed, &with_env, &dynamic, &reenter, &fail] {
+        function.set_calls_on_native_stack(&mut store, on_native_stack);
     }
     let imports = imports! {
         "host" => {
@@ -182,7 +182,8 @@ fn host_calls_run_on_the_wasm_stack() -> Result<(), Box<dyn std::error::Error>> 
     run_host_calls(false)
 }
 
-/// The same calls, with every host call switching to the native stack.
+/// The same calls, with every host call switching to the native stack, as
+/// they do by default.
 #[test]
 fn host_calls_on_the_native_stack() -> Result<(), Box<dyn std::error::Error>> {
     run_host_calls(true)
@@ -207,12 +208,12 @@ fn mark_caller_frame(local: &u8) {
     CALLER_FRAME.store(black_box(local) as *const u8 as usize, Ordering::Relaxed);
 }
 
-/// A typed host function set to run on the native stack does from its next
-/// call on, while the others go on running on the Wasm stack, and runs there
-/// again once the setting is taken back. A dynamic host function always runs
-/// on the native stack.
+/// Host functions run on the native stack. A typed one set to run on the
+/// Wasm stack does from its next call on, while the others go on running on
+/// the native stack, and runs there again once the setting is taken back. A
+/// dynamic host function always runs on the native stack.
 #[test]
-fn a_host_function_can_run_on_the_native_stack() -> Result<(), Box<dyn std::error::Error>> {
+fn a_host_function_can_run_on_the_wasm_stack() -> Result<(), Box<dyn std::error::Error>> {
     let _lock = CALLER.lock().unwrap_or_else(|e| e.into_inner());
 
     let mut store = Store::default();
@@ -253,20 +254,20 @@ fn a_host_function_can_run_on_the_native_stack() -> Result<(), Box<dyn std::erro
 
     let typed_functions = [("typed", typed), ("with_env", with_env)];
     for (name, function) in &typed_functions {
-        assert!(!function.calls_on_native_stack(&store), "{name}");
-        assert!(!ran_on_native_stack(&mut store, name)?, "{name}");
-    }
-    for (name, function) in &typed_functions {
-        function.set_calls_on_native_stack(&mut store, true);
         assert!(function.calls_on_native_stack(&store), "{name}");
         assert!(ran_on_native_stack(&mut store, name)?, "{name}");
-        // The other function stays on the Wasm stack.
-        for (other, _) in typed_functions.iter().filter(|(other, _)| other != name) {
-            assert!(!ran_on_native_stack(&mut store, other)?, "{other}");
-        }
+    }
+    for (name, function) in &typed_functions {
         function.set_calls_on_native_stack(&mut store, false);
         assert!(!function.calls_on_native_stack(&store), "{name}");
         assert!(!ran_on_native_stack(&mut store, name)?, "{name}");
+        // The other function stays on the native stack.
+        for (other, _) in typed_functions.iter().filter(|(other, _)| other != name) {
+            assert!(ran_on_native_stack(&mut store, other)?, "{other}");
+        }
+        function.set_calls_on_native_stack(&mut store, true);
+        assert!(function.calls_on_native_stack(&store), "{name}");
+        assert!(ran_on_native_stack(&mut store, name)?, "{name}");
     }
 
     // A dynamic host function always runs on the native stack.
@@ -323,8 +324,8 @@ const REENTER_NATIVE_IN_PLACE: &str = r#"(module
 
 /// A host function running on the Wasm stack that calls back into the guest
 /// makes the call from the native stack: what that call runs on the native
-/// stack (here a host function set to) runs there, not on the Wasm stack of
-/// the host function, with what is left of its reserve.
+/// stack (here a host function left to run there) runs there, not on the Wasm
+/// stack of the host function, with what is left of its reserve.
 #[test]
 fn a_call_back_into_wasm_starts_from_the_native_stack() -> Result<(), Box<dyn std::error::Error>> {
     let _lock = CALLER.lock().unwrap_or_else(|e| e.into_inner());
@@ -342,9 +343,10 @@ fn a_call_back_into_wasm_starts_from_the_native_stack() -> Result<(), Box<dyn st
             inner * 2 + i32::from(in_place)
         },
     );
+    reenter.set_calls_on_native_stack(&mut store, false);
     let native = Function::new_typed(&mut store, || i32::from(on_native_stack()));
-    native.set_calls_on_native_stack(&mut store, true);
     let in_place = Function::new_typed(&mut store, || i32::from(!on_native_stack()));
+    in_place.set_calls_on_native_stack(&mut store, false);
     let imports = imports! {
         "host" => {
             "reenter" => reenter,
@@ -396,9 +398,10 @@ fn a_call_async_from_a_host_function_in_place_starts_from_the_native_stack()
             inner * 2 + i32::from(in_place)
         },
     );
+    reenter.set_calls_on_native_stack(&mut store, false);
     let native = Function::new_typed(&mut store, || i32::from(on_native_stack()));
-    native.set_calls_on_native_stack(&mut store, true);
     let in_place = Function::new_typed(&mut store, || i32::from(!on_native_stack()));
+    in_place.set_calls_on_native_stack(&mut store, false);
     let imports = imports! {
         "host" => {
             "reenter" => reenter,
@@ -427,13 +430,13 @@ fn the_stack_setting_of_a_host_function() {
     let typed = Function::new_typed(&mut store, |x: i32| x + 1);
     let with_env = Function::new_typed_with_env(&mut store, &env, |_: FunctionEnvMut<()>| 1);
     for function in [&typed, &with_env] {
-        assert!(!function.calls_on_native_stack(&store));
-        function.set_calls_on_native_stack(&mut store, true);
-        assert!(function.calls_on_native_stack(&store));
-        // Making more functions moves the list the others are in.
-        Function::new_typed(&mut store, || ());
         assert!(function.calls_on_native_stack(&store));
         function.set_calls_on_native_stack(&mut store, false);
         assert!(!function.calls_on_native_stack(&store));
+        // Making more functions moves the list the others are in.
+        Function::new_typed(&mut store, || ());
+        assert!(!function.calls_on_native_stack(&store));
+        function.set_calls_on_native_stack(&mut store, true);
+        assert!(function.calls_on_native_stack(&store));
     }
 }

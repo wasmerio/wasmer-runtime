@@ -88,14 +88,15 @@ pub fn get_stack_size() -> usize {
 /// How much of the Wasm stack must be left for a synchronous host function
 /// called from Wasm to run on it, in bytes: 256 KiB.
 ///
-/// A host function that may run in place (see [`host_call_in_place`]) runs on
-/// the Wasm stack it was called from when at least this much of that stack is
+/// A host function set to run in place (see [`host_call_in_place`];
+/// `Function::set_calls_on_native_stack(.., false)` in the API) runs on the
+/// Wasm stack it was called from when at least this much of that stack is
 /// left, which saves switching to the native stack and back again. With less
 /// left it runs on the native stack. The reserve is all the stack such a host
-/// function is sure to have there: one that may need more must be made to run
-/// on the native stack (`Function::set_calls_on_native_stack` in the API). A
-/// host function that overflows the Wasm stack aborts the process, as
-/// overflowing the native stack does.
+/// function is sure to have there: one that may need more must stay on the
+/// native stack, where host functions run by default. A host function that
+/// overflows the Wasm stack aborts the process, as overflowing the native
+/// stack does.
 ///
 /// The space is measured from the lowest address of the Wasm stack, above its
 /// guard page.

@@ -255,7 +255,8 @@ impl Function {
             store_id: store.objects_mut().id(),
             env,
             func,
-            on_native_stack: AtomicBool::new(false),
+            // Until set to run on the Wasm stack.
+            on_native_stack: AtomicBool::new(true),
         });
         let function_type = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
 
@@ -303,7 +304,8 @@ impl Function {
             store_id: store.objects_mut().id(),
             env: env.as_sys().clone().into(),
             func,
-            on_native_stack: AtomicBool::new(false),
+            // Until set to run on the Wasm stack.
+            on_native_stack: AtomicBool::new(true),
         });
         let function_type = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
 
@@ -1026,8 +1028,8 @@ pub(crate) struct StaticFunction<F, T> {
     pub(crate) store_id: StoreId,
     pub(crate) env: FunctionEnv<T>,
     pub(crate) func: F,
-    /// Whether every call runs on the native stack, which
-    /// [`crate::Function::set_calls_on_native_stack`] sets (see
+    /// Whether every call runs on the native stack: true unless
+    /// [`crate::Function::set_calls_on_native_stack`] sets it to false (see
     /// [`HostFunctionData`]). Only the thread that holds the store writes it.
     pub(crate) on_native_stack: AtomicBool,
 }
@@ -1118,11 +1120,12 @@ macro_rules! impl_host_function {
             /// This is a function that wraps the real host
             /// function. Its address will be used inside the
             /// runtime.
-            // With `IN_PLACE`, a call runs on the Wasm stack it came from when
-            // enough of it is left, and otherwise goes to the other instance,
-            // which switches to the native stack. That instance stays out of
-            // line, and with it the registers the switch makes every caller
-            // save.
+            // With `IN_PLACE`, a call of a function set to run on the Wasm
+            // stack runs on the stack it came from when enough of it is left,
+            // and otherwise goes to the other instance, which switches to the
+            // native stack, as every call of a function does by default. That
+            // instance stays out of line, and with it the registers the switch
+            // makes every caller save.
             #[inline(never)]
             unsafe extern "C-unwind" fn func_wrapper<const IN_PLACE: bool, $( $x, )* Rets, RetsAsResult, Func>( env: &StaticFunction<Func, ()>, $( $x: <$x::Native as NativeWasmType>::Abi, )* ) -> Rets::CStruct
             where

@@ -2,6 +2,8 @@
 //! guest, with Cranelift: calls into the guest (`TypedFunction::call` and
 //! `Function::call`), and calls from the guest to host functions (typed,
 //! with an environment, dynamic, and one that calls back into the guest).
+//! Typed host functions are measured on the native stack, where they run by
+//! default, and set to run on the Wasm stack (`_on_wasm_stack`).
 //!
 //! Run from the repository root:
 //!
@@ -85,6 +87,8 @@ struct Env {
 struct Guest {
     store: Store,
     instance: Instance,
+    /// The typed host functions: `typed`, `typed_env` and `reenter`.
+    typed: [Function; 3],
 }
 
 fn guest() -> Guest {
@@ -123,23 +127,28 @@ fn guest() -> Guest {
         });
     let imports = imports! {
         "h" => {
-            "typed" => typed,
-            "typed_env" => typed_env,
+            "typed" => typed.clone(),
+            "typed_env" => typed_env.clone(),
             "dyn" => dynamic,
             "dyn_env" => dynamic_env,
-            "reenter" => reenter,
+            "reenter" => reenter.clone(),
         }
     };
     let instance = Instance::new(&mut store, &module, &imports).unwrap();
     let inc = instance.exports.get_typed_function(&store, "inc").unwrap();
     env.as_mut(&mut store).inc = Some(inc);
-    Guest { store, instance }
+    Guest {
+        store,
+        instance,
+        typed: [typed, typed_env, reenter],
+    }
 }
 
 fn calls_into_the_guest(c: &mut Criterion) {
     let Guest {
         mut store,
         instance,
+        ..
     } = guest();
     let exports = &instance.exports;
     let const42: TypedFunction<(), i32> = exports.get_typed_function(&store, "const42").unwrap();
@@ -186,15 +195,34 @@ fn calls_from_the_guest(c: &mut Criterion) {
     let Guest {
         mut store,
         instance,
+        typed,
     } = guest();
     let mut group = c.benchmark_group("call_paths/from_guest");
-    for (case, export) in [
-        ("import_typed", "loop_typed"),
-        ("import_typed_with_env", "loop_typed_env"),
-        ("import_dynamic", "loop_dyn"),
-        ("import_dynamic_with_env", "loop_dyn_env"),
-        ("import_typed_calling_back_into_the_guest", "loop_reenter"),
+    for (case, export, on_wasm_stack) in [
+        ("import_typed", "loop_typed", false),
+        ("import_typed_on_wasm_stack", "loop_typed", true),
+        ("import_typed_with_env", "loop_typed_env", false),
+        (
+            "import_typed_with_env_on_wasm_stack",
+            "loop_typed_env",
+            true,
+        ),
+        ("import_dynamic", "loop_dyn", false),
+        ("import_dynamic_with_env", "loop_dyn_env", false),
+        (
+            "import_typed_calling_back_into_the_guest",
+            "loop_reenter",
+            false,
+        ),
+        (
+            "import_typed_calling_back_into_the_guest_on_wasm_stack",
+            "loop_reenter",
+            true,
+        ),
     ] {
+        for function in &typed {
+            function.set_calls_on_native_stack(&mut store, !on_wasm_stack);
+        }
         let function: TypedFunction<i32, i32> =
             instance.exports.get_typed_function(&store, export).unwrap();
         assert_eq!(function.call(&mut store, 1000).unwrap(), 1000);
