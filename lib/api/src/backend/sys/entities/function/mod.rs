@@ -5,12 +5,12 @@ pub(crate) mod typed;
 
 #[cfg(feature = "experimental-async")]
 use crate::{
-    AsyncEnv, AsyncHostFunction, StorePtrWrapper, WithSlice,
+    AsyncEnv, AsyncHostFunction, WithSlice,
     sys::async_runtime::{HostWait, take_host_result, wait_for_host_future},
 };
 use crate::{
     BackendFunction, CallWrapper, FunctionEnv, FunctionEnvMut, FunctionType, HostFunction,
-    RuntimeError, StoreContext, StoreInner, Value, WithEnv, WithoutEnv,
+    RuntimeError, StoreContext, StoreInner, StorePtrWrapper, Value, WithEnv, WithoutEnv,
     backend::sys::{engine::NativeEngineExt, vm::VMFunctionCallback},
     entities::function::call_wrapper::call_wrapped,
     entities::store::{AsStoreMut, AsStoreRef, StoreMut},
@@ -97,7 +97,8 @@ impl Function {
                     func_env: func_env.clone(),
                 }
                 .into();
-                HostCallOutcome::Ready(func(env, &args))
+                let result = func(env, &args);
+                HostCallOutcome::Ready(result, store_wrapper)
             }
         };
         let mut host_data = Box::new(VMDynamicFunctionContext {
@@ -690,33 +691,22 @@ fn check_dynamic_results(func_ty: &FunctionType, returns: &[Value]) -> Result<()
     Ok(())
 }
 
+/// Checks the results of a dynamic host function and writes them back for its
+/// trampoline, with the borrow of the store the host function ran with.
 fn write_dynamic_results(
-    store_id: StoreId,
+    store_wrapper: &mut StorePtrWrapper,
     func_ty: &FunctionType,
-    returns: Vec<Value>,
+    returns: &[Value],
     values_vec: *mut RawValue,
 ) -> Result<(), RuntimeError> {
-    let mut store_wrapper = unsafe { StoreContext::get_current(store_id) };
-    let mut store = store_wrapper.as_mut();
-    check_dynamic_results(func_ty, &returns)?;
+    let store = store_wrapper.as_mut();
+    check_dynamic_results(func_ty, returns)?;
     for (i, ret) in returns.iter().enumerate() {
         unsafe {
             values_vec.add(i).write_unaligned(ret.as_raw(&store));
         }
     }
     Ok(())
-}
-
-fn finalize_dynamic_call(
-    store_id: StoreId,
-    func_ty: &FunctionType,
-    values_vec: *mut RawValue,
-    result: Result<Vec<Value>, RuntimeError>,
-) -> Result<(), RuntimeError> {
-    match result {
-        Ok(values) => write_dynamic_results(store_id, func_ty, values, values_vec),
-        Err(err) => Err(err),
-    }
 }
 
 /// Gives the trampoline the results of an async import.
@@ -858,7 +848,9 @@ pub(crate) struct RawEntry {
 }
 
 pub(crate) enum HostCallOutcome {
-    Ready(Result<Vec<Value>, RuntimeError>),
+    /// The results of the host function, and the borrow of the store it ran
+    /// with, which writing the results back reuses.
+    Ready(Result<Vec<Value>, RuntimeError>, StorePtrWrapper),
     /// The future of an async import, and the borrow of the store its
     /// arguments were read with, which its first poll reuses.
     #[cfg(feature = "experimental-async")]
@@ -894,9 +886,11 @@ where
         #[allow(unused_mut)]
         let mut result = on_host_stack(|| {
             panic::catch_unwind(AssertUnwindSafe(|| match (this.ctx.func)(values_vec) {
-                HostCallOutcome::Ready(result) => Some(to_invocation_result(
-                    finalize_dynamic_call(this.ctx.store_id, &this.ctx.func_ty, values_vec, result),
-                )),
+                HostCallOutcome::Ready(result, mut store) => {
+                    Some(to_invocation_result(result.and_then(|values| {
+                        write_dynamic_results(&mut store, &this.ctx.func_ty, &values, values_vec)
+                    })))
+                }
                 #[cfg(feature = "experimental-async")]
                 HostCallOutcome::Future { future, store } => {
                     match wait_for_host_future(store, future, suspendable, |future| future) {
@@ -1049,13 +1043,15 @@ macro_rules! impl_host_function {
                 let result = on_host_stack(|| {
                     panic::catch_unwind(AssertUnwindSafe(|| {
                         let mut store_wrapper = unsafe { StoreContext::get_current(env.store_id) };
+                        let store_ptr = store_wrapper.as_ptr();
                         let mut store = store_wrapper.as_mut();
                         $(
                             let $x = unsafe {
                                 FromToNativeWasmType::from_native(NativeWasmTypeInto::from_abi(&mut store, $x))
                             };
                         )*
-                        to_invocation_result((env.func)($($x),* ).into_result())
+                        let result = (env.func)($($x),* ).into_result();
+                        to_invocation_result(result.map(|rets| (rets, store_ptr)))
                     }))
                 });
 
@@ -1063,18 +1059,16 @@ macro_rules! impl_host_function {
                 // AS WE ARE IN THE WASM STACK, NOT ON THE HOST ONE.
                 // See: https://github.com/wasmerio/wasmer/pull/5700
                 match result {
-                    Ok(InvocationResult::Success(result)) => unsafe {
-                        // Note: can't acquire a proper ref-counted context ref here, since we can switch
-                        // away from the WASM stack at any time.
-                        // Safety: The pointer is only used for the duration of the call to
-                        // `into_c_struct` and `get_current_transient`.
-                        let mut store_wrapper = StoreContext::get_current_transient(env.store_id);
-                        let mut store = store_wrapper.as_mut().unwrap();
+                    Ok(InvocationResult::Success((result, store))) => unsafe {
                         #[cfg(feature = "experimental-host-interrupt")]
-                        if interrupt_registry::is_interrupted(store.objects.id()) {
+                        if interrupt_registry::is_interrupted(env.store_id) {
                             raise_lib_trap(Trap::lib(TrapCode::HostInterrupt))
                         }
-                        return result.into_c_struct(store);
+                        // Safety: the pointer the host function borrowed the
+                        // store through, which is the active entry's: nothing
+                        // has replaced it since. It is used only for the
+                        // duration of the call to `into_c_struct`.
+                        return result.into_c_struct(&mut *store);
                     },
                     Ok(InvocationResult::Exception(exception)) => unsafe {
                         // Note: can't acquire a proper ref-counted context ref here, since we can switch
@@ -1149,6 +1143,7 @@ macro_rules! impl_host_function {
                 let result = wasmer_vm::on_host_stack(|| {
                     panic::catch_unwind(AssertUnwindSafe(|| {
                         let mut store_wrapper = unsafe { StoreContext::get_current(env.store_id) };
+                        let store_ptr = store_wrapper.as_ptr();
                         let mut store = store_wrapper.as_mut();
                         $(
                             let $x = unsafe {
@@ -1159,7 +1154,8 @@ macro_rules! impl_host_function {
                             store_mut: store,
                             func_env: env.env.as_sys().clone(),
                         }.into();
-                        to_invocation_result((env.func)(f_env, $($x),* ).into_result())
+                        let result = (env.func)(f_env, $($x),* ).into_result();
+                        to_invocation_result(result.map(|rets| (rets, store_ptr)))
                     }))
                 });
 
@@ -1167,18 +1163,16 @@ macro_rules! impl_host_function {
                 // AS WE ARE IN THE WASM STACK, NOT ON THE HOST ONE.
                 // See: https://github.com/wasmerio/wasmer/pull/5700
                 match result {
-                    Ok(InvocationResult::Success(result)) => unsafe {
-                        // Note: can't acquire a proper ref-counted context ref here, since we can switch
-                        // away from the WASM stack at any time.
-                        // Safety: The pointer is only used for the duration of the call to
-                        // `into_c_struct` and `get_current_transient`.
-                        let mut store_wrapper = StoreContext::get_current_transient(env.store_id);
-                        let mut store = store_wrapper.as_mut().unwrap();
+                    Ok(InvocationResult::Success((result, store))) => unsafe {
                         #[cfg(feature = "experimental-host-interrupt")]
-                        if interrupt_registry::is_interrupted(store.objects.id()) {
+                        if interrupt_registry::is_interrupted(env.store_id) {
                             raise_lib_trap(Trap::lib(TrapCode::HostInterrupt))
                         }
-                        return result.into_c_struct(store);
+                        // Safety: the pointer the host function borrowed the
+                        // store through, which is the active entry's: nothing
+                        // has replaced it since. It is used only for the
+                        // duration of the call to `into_c_struct`.
+                        return result.into_c_struct(&mut *store);
                     },
                     Ok(InvocationResult::Exception(exception)) => unsafe {
                         // Note: can't acquire a proper ref-counted context ref here, since we can switch

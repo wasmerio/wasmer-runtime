@@ -215,7 +215,9 @@ impl StorePtrWrapper {
         unsafe { StoreMut::from_raw(self.store_ptr) }
     }
 
-    #[cfg(feature = "experimental-async")]
+    /// The pointer the borrow was taken through, for a trampoline to use the
+    /// store on the Wasm stack once the borrow is given back.
+    #[cfg(feature = "sys")]
     pub(crate) fn as_ptr(&self) -> *mut StoreInner {
         self.store_ptr
     }
