@@ -206,6 +206,11 @@ impl StorePtrWrapper {
     pub(crate) fn as_ptr(&self) -> *mut StoreInner {
         self.store_ptr
     }
+
+    #[cfg(feature = "experimental-async")]
+    pub(crate) fn id(&self) -> StoreId {
+        self.id
+    }
 }
 
 impl Drop for StorePtrWrapper {

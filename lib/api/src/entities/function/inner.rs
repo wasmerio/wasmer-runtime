@@ -1,5 +1,7 @@
 use wasmer_types::{FunctionType, RawValue};
 
+#[cfg(all(feature = "experimental-async", any(feature = "js", feature = "v8")))]
+use crate::entities::function::async_host::{boxed_body, typed_host_body};
 use crate::{
     AsStoreMut, AsStoreRef, CallWrapper, ExportError, Exportable, Extern, FunctionEnv,
     FunctionEnvMut, HostFunction, StoreMut, StoreRef, TypedFunction, Value, WasmTypeList, WithEnv,
@@ -9,7 +11,7 @@ use crate::{
     vm::{VMExtern, VMExternFunction, VMFuncRef},
 };
 #[cfg(feature = "experimental-async")]
-use crate::{AsyncEnv, entities::function::async_host::HostFuture};
+use crate::{AsyncEnv, AsyncHostFunction};
 
 /// A WebAssembly `function` instance.
 ///
@@ -200,10 +202,11 @@ impl BackendFunction {
         }
     }
 
-    /// Creates an async host `Function` from its boxed body.
+    /// Creates an async host `Function` from its body, which takes the
+    /// arguments of a call and returns its future.
     #[inline]
     #[cfg(feature = "experimental-async")]
-    pub(crate) fn new_async<T, FT, F>(
+    pub(crate) fn new_async<T, FT, F, Fut>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
         ty: FT,
@@ -212,7 +215,8 @@ impl BackendFunction {
     where
         T: Send + 'static,
         FT: Into<FunctionType>,
-        F: Fn(AsyncEnv<T>, Vec<Value>) -> HostFuture + 'static,
+        F: Fn(AsyncEnv<T>, Vec<Value>) -> Fut + 'static,
+        Fut: Future<Output = Result<Vec<Value>, RuntimeError>> + 'static,
     {
         match &store.as_store_mut().inner.store {
             #[cfg(feature = "sys")]
@@ -220,13 +224,65 @@ impl BackendFunction {
                 crate::backend::sys::entities::function::Function::new_async(store, env, ty, func),
             ),
             #[cfg(feature = "v8")]
-            crate::BackendStore::V8(_) => Self::V8(
-                crate::backend::v8::entities::function::Function::new_async(store, env, ty, func),
-            ),
+            crate::BackendStore::V8(_) => {
+                Self::V8(crate::backend::v8::entities::function::Function::new_async(
+                    store,
+                    env,
+                    ty,
+                    boxed_body(func),
+                ))
+            }
             #[cfg(feature = "js")]
-            crate::BackendStore::Js(_) => Self::Js(
-                crate::backend::js::entities::function::Function::new_async(store, env, ty, func),
+            crate::BackendStore::Js(_) => {
+                Self::Js(crate::backend::js::entities::function::Function::new_async(
+                    store,
+                    env,
+                    ty,
+                    boxed_body(func),
+                ))
+            }
+        }
+    }
+
+    /// Creates an async host `Function` from a typed async function.
+    ///
+    /// On `sys` the function reads its arguments and writes its results as
+    /// the trampoline has them. The other backends call it as a dynamic one.
+    #[inline]
+    #[cfg(feature = "experimental-async")]
+    pub(crate) fn new_typed_async<T, Args, Rets>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        func: impl AsyncHostFunction<T, Args, Rets>,
+    ) -> Self
+    where
+        T: Send + 'static,
+        Args: WasmTypeList + 'static,
+        Rets: WasmTypeList + 'static,
+    {
+        match &store.as_store_mut().inner.store {
+            #[cfg(feature = "sys")]
+            crate::BackendStore::Sys(_) => Self::Sys(
+                crate::backend::sys::entities::function::Function::new_typed_async(
+                    store, env, func,
+                ),
             ),
+            #[cfg(feature = "v8")]
+            crate::BackendStore::V8(_) => {
+                let ty = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
+                let body = typed_host_body(func, ty.clone());
+                Self::V8(crate::backend::v8::entities::function::Function::new_async(
+                    store, env, ty, body,
+                ))
+            }
+            #[cfg(feature = "js")]
+            crate::BackendStore::Js(_) => {
+                let ty = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
+                let body = typed_host_body(func, ty.clone());
+                Self::Js(crate::backend::js::entities::function::Function::new_async(
+                    store, env, ty, body,
+                ))
+            }
         }
     }
 

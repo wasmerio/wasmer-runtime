@@ -1,16 +1,23 @@
 //! Async host functions: [`AsyncEnv`] and [`AsyncHostFunction`].
 
-use std::{future::Future, marker::PhantomData, pin::Pin, rc::Rc};
+use std::{future::Future, marker::PhantomData};
+#[cfg(any(feature = "js", feature = "v8"))]
+use std::{pin::Pin, rc::Rc};
 
-use wasmer_types::{FunctionType, StoreId};
+#[cfg(any(feature = "js", feature = "v8"))]
+use wasmer_types::FunctionType;
+use wasmer_types::StoreId;
 
+#[cfg(any(feature = "js", feature = "v8"))]
+use crate::{AsStoreMut, Value};
 use crate::{
-    AsStoreMut, FunctionEnv, FunctionEnvMut, RuntimeError, StoreMut, Value, WasmTypeList,
-    WithSlice,
+    FunctionEnv, FunctionEnvMut, RuntimeError, StoreMut, WasmTypeList, WithSlice,
     utils::{FromToNativeWasmType, IntoResult},
 };
 
-/// The future of one call of an async host function.
+/// The future of one call of an async host function, for a backend whose
+/// host functions take and return [`Value`]s.
+#[cfg(any(feature = "js", feature = "v8"))]
 pub(crate) type HostFuture =
     Pin<Box<dyn Future<Output = Result<Vec<Value>, RuntimeError>> + 'static>>;
 
@@ -71,11 +78,6 @@ mod sealed {
     pub trait Sealed<T, Args, Rets> {}
 }
 
-/// A typed host function's future, which gives its environment back for the
-/// results to be converted.
-type InvokeFuture<T, Rets> =
-    Pin<Box<dyn Future<Output = (AsyncEnv<T>, Result<Rets, RuntimeError>)>>>;
-
 /// An async function usable as a typed host function.
 ///
 /// Implemented for `for<'e> AsyncFn(&'e mut AsyncEnv<T>, Args..) -> Rets`,
@@ -86,7 +88,11 @@ where
     Rets: WasmTypeList,
 {
     #[doc(hidden)]
-    fn invoke(self: Rc<Self>, env: AsyncEnv<T>, args: Args) -> InvokeFuture<T, Rets>;
+    fn invoke(
+        &self,
+        env: &mut AsyncEnv<T>,
+        args: Args,
+    ) -> impl Future<Output = Result<Rets, RuntimeError>>;
 }
 
 macro_rules! impl_async_host_function {
@@ -112,19 +118,17 @@ macro_rules! impl_async_host_function {
         {
             #[allow(non_snake_case)]
             fn invoke(
-                self: Rc<Self>,
-                mut env: AsyncEnv<T>,
+                &self,
+                env: &mut AsyncEnv<T>,
                 args: ( $( $x ),* ),
-            ) -> InvokeFuture<T, Rets> {
+            ) -> impl Future<Output = Result<Rets, RuntimeError>> {
                 let ( $( $x ),* ) = args;
-                Box::pin(async move {
-                    let func: &F = &self;
-                    let result = func(&mut env, $( $x ),*)
+                async move {
+                    self(env, $( $x ),*)
                         .await
                         .into_result()
-                        .map_err(|err| RuntimeError::from_dyn(Box::new(err)));
-                    (env, result)
-                })
+                        .map_err(|err| RuntimeError::from_dyn(Box::new(err)))
+                }
             }
         }
     };
@@ -164,7 +168,20 @@ impl_async_host_function!(
     A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18, A19, A20
 );
 
-/// Turns a typed async host function into the body of a dynamic one.
+/// Boxes the futures of the body of an async host function, for a backend
+/// that keeps them as [`HostFuture`]s.
+#[cfg(any(feature = "js", feature = "v8"))]
+pub(crate) fn boxed_body<T, F, Fut>(body: F) -> impl Fn(AsyncEnv<T>, Vec<Value>) -> HostFuture
+where
+    F: Fn(AsyncEnv<T>, Vec<Value>) -> Fut,
+    Fut: Future<Output = Result<Vec<Value>, RuntimeError>> + 'static,
+{
+    move |cx, values| -> HostFuture { Box::pin(body(cx, values)) }
+}
+
+/// Turns a typed async host function into the body of a dynamic one, for a
+/// backend whose host functions take and return [`Value`]s.
+#[cfg(any(feature = "js", feature = "v8"))]
 pub(crate) fn typed_host_body<T, F, Args, Rets>(
     func: F,
     ty: FunctionType,
@@ -182,13 +199,13 @@ where
         let ty = Rc::clone(&ty);
         Box::pin(async move {
             let args = cx.with(|mut env| args_from_values::<Args>(&mut env, &ty, &values))?;
-            let (mut cx, result) = func.invoke(cx, args).await;
-            let rets = result?;
+            let rets = func.invoke(&mut cx, args).await?;
             Ok(cx.with(|mut env| results_to_values::<Rets>(&mut env, &ty, rets)))
         })
     }
 }
 
+#[cfg(any(feature = "js", feature = "v8"))]
 fn args_from_values<Args: WasmTypeList>(
     store: &mut impl AsStoreMut,
     ty: &FunctionType,
@@ -212,6 +229,7 @@ fn args_from_values<Args: WasmTypeList>(
     Ok(unsafe { Args::from_array(store, raw_array) })
 }
 
+#[cfg(any(feature = "js", feature = "v8"))]
 fn results_to_values<Rets: WasmTypeList>(
     store: &mut impl AsStoreMut,
     ty: &FunctionType,

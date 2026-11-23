@@ -145,6 +145,65 @@ fn a_typed_call_converts_its_arguments_and_results() {
     assert_eq!(result.unwrap(), 41);
 }
 
+/// A typed import takes its arguments and gives its results as the
+/// trampoline has them, whatever their types and their number, whether it is
+/// ready at once or waits.
+#[test]
+fn a_typed_import_converts_its_arguments_and_results() {
+    let mut store = Store::default();
+    let gate = Rc::new(Cell::new(true));
+    let counter = Counter {
+        value: 0,
+        gate: Some(OnOneThread(gate.clone())),
+    };
+    let env = FunctionEnv::new(&mut store, counter);
+    let double = Function::new_typed(&mut store, |x: i32| x * 2);
+    let import = Function::new_typed_async(
+        &mut store,
+        &env,
+        async |cx: &mut AsyncEnv<Counter>,
+               a: i32,
+               b: i64,
+               c: f32,
+               d: f64,
+               f: Option<Function>|
+               -> (f64, f32, i64, i32, Option<Function>) {
+            let gate = cx.with(|env| env.data().gate.as_ref().unwrap().get().clone());
+            Gate(gate).await;
+            (d, c, b, a, f)
+        },
+    );
+    let params = [
+        Value::I32(1),
+        Value::I64(-2),
+        Value::F32(3.5),
+        Value::F64(-4.5),
+        Value::FuncRef(Some(double)),
+    ];
+    let check = |store: &mut Store, results: &[Value]| {
+        assert_eq!(results[0].unwrap_f64(), -4.5);
+        assert_eq!(results[1].unwrap_f32(), 3.5);
+        assert_eq!(results[2].unwrap_i64(), -2);
+        assert_eq!(results[3].unwrap_i32(), 1);
+        let double = results[4].unwrap_funcref().as_ref().unwrap();
+        let doubled = double.call(store, &[Value::I32(21)]).unwrap();
+        assert_eq!(doubled[0].unwrap_i32(), 42);
+    };
+
+    let results = import.call(&mut store, &params).unwrap();
+    check(&mut store, &results);
+
+    gate.set(false);
+    let mut call = Box::pin(import.call_async(&mut store, &params));
+    assert!(poll(&mut call).is_pending());
+    gate.set(true);
+    let Poll::Ready(results) = poll(&mut call) else {
+        panic!("the call did not finish");
+    };
+    drop(call);
+    check(&mut store, &results.unwrap());
+}
+
 /// An async host function waits for a guest through its own `AsyncEnv`. The
 /// inner guest suspends, and both calls resume.
 #[test]

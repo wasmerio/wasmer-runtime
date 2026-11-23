@@ -32,9 +32,12 @@ use dashmap::DashMap;
 
 use crate::{
     AsStoreMut, AsStoreRef, AsyncCallRequest, CallStore, PollScope, PollStore, RuntimeError,
-    StoreContext, StoreMut, Value,
-    backend::sys::entities::{engine::NativeEngineExt, function::RawEntry},
-    entities::function::{async_call::CallFinish, async_host::HostFuture},
+    StoreContext, StoreMut, StorePtrWrapper, Value,
+    backend::sys::entities::{
+        engine::NativeEngineExt,
+        function::{RawEntry, RawHostFuture, RawResults},
+    },
+    entities::function::async_call::CallFinish,
 };
 use wasmer_types::{RawValue, StoreId, Type};
 use wasmer_vm::{CallStep, SuspendableCall};
@@ -79,10 +82,10 @@ struct Waiting {
     /// a host future.
     cx: *mut Context<'static>,
     /// The host future the guest waits for, once its first poll was pending.
-    pending: Option<HostFuture>,
+    pending: Option<RawHostFuture>,
     /// What that future returned, for the import to take when the guest is
     /// resumed.
-    ready: Option<Result<Vec<Value>, RuntimeError>>,
+    ready: Option<Result<RawResults, RuntimeError>>,
 }
 
 thread_local! {
@@ -420,7 +423,7 @@ impl Drop for Resuming {
 /// [`wait_for_host_future`].
 pub(crate) enum HostWait {
     /// The future was ready.
-    Ready(Result<Vec<Value>, RuntimeError>),
+    Ready(Result<RawResults, RuntimeError>),
     /// The guest is to be suspended: its call has the future.
     Suspend,
     /// The future was not ready, and the guest cannot be suspended.
@@ -429,22 +432,22 @@ pub(crate) enum HostWait {
 
 /// Polls the host future of an async import once, on behalf of the guest
 /// that called it, on the host stack. The store is reachable through the
-/// entry of the call beneath, whose borrow this holds so that nothing else
-/// can take it meanwhile.
+/// entry of the call beneath: `store` is the borrow of it that the import
+/// read its arguments with, kept for the poll so that nothing else can take
+/// it meanwhile.
 ///
 /// With `suspendable`, the guest runs on the stack of a `call_async`, which
 /// takes a future that is not ready. Otherwise the guest was entered
 /// synchronously, by a host function that holds a borrow of its store across
 /// the call: it cannot wait.
 pub(crate) fn wait_for_host_future(
-    store_id: StoreId,
-    future: HostFuture,
+    store: StorePtrWrapper,
+    future: RawHostFuture,
     suspendable: bool,
 ) -> HostWait {
-    // Safety: the entry's pointer is used only for the duration of this poll,
-    // in the slices the future takes, while the wrapper's borrow stands.
-    let wrapper = unsafe { StoreContext::get_current(store_id) };
-    let _scope = PollScope::enter(Some(PollStore::exclusive(store_id, wrapper.as_ptr())));
+    // The entry's pointer is used only for the duration of this poll, in the
+    // slices the future takes, while the borrow in `store` stands.
+    let _scope = PollScope::enter(Some(PollStore::exclusive(store.id(), store.as_ptr())));
     // Declared after the scope, so that its destructor runs with the store of
     // this entry, not whatever was published before.
     let mut future = future;
@@ -470,7 +473,7 @@ pub(crate) fn wait_for_host_future(
 
 /// What the host future of the import returned, for the guest that was
 /// resumed with it.
-pub(crate) fn take_host_result() -> Result<Vec<Value>, RuntimeError> {
+pub(crate) fn take_host_result() -> Result<RawResults, RuntimeError> {
     let waiting = WAITING.get();
     assert!(!waiting.is_null(), "a guest was resumed by no call");
     // Safety: as in `wait_for_host_future`.

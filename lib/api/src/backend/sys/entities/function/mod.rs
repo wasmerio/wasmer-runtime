@@ -5,8 +5,7 @@ pub(crate) mod typed;
 
 #[cfg(feature = "experimental-async")]
 use crate::{
-    AsyncEnv,
-    entities::function::async_host::HostFuture,
+    AsyncEnv, AsyncHostFunction, StorePtrWrapper, WithSlice,
     sys::async_runtime::{HostWait, take_host_result, wait_for_host_future},
 };
 use crate::{
@@ -18,8 +17,12 @@ use crate::{
     utils::{FromToNativeWasmType, IntoResult, NativeWasmTypeInto, WasmTypeList},
     vm::{VMExtern, VMExternFunction},
 };
+#[cfg(feature = "experimental-async")]
+use smallvec::SmallVec;
 use std::panic::{self, AssertUnwindSafe};
 use std::{cell::UnsafeCell, cmp::max, error::Error, ffi::c_void, marker::PhantomData, sync::Arc};
+#[cfg(feature = "experimental-async")]
+use std::{pin::Pin, rc::Rc};
 use wasmer_types::{NativeWasmType, RawValue, StoreId};
 #[cfg(feature = "experimental-host-interrupt")]
 use wasmer_vm::interrupt_registry;
@@ -29,6 +32,15 @@ use wasmer_vm::{
     VMFunctionContext, VMFunctionKind, VMTrampoline, on_host_stack, raise_lib_trap,
     raise_user_trap, resume_panic, wasmer_call_trampoline,
 };
+
+/// The results of an async import as its trampoline takes them, inline for
+/// the usual few, so that a call does not allocate for them.
+#[cfg(feature = "experimental-async")]
+pub(crate) type RawResults = SmallVec<[RawValue; 4]>;
+
+/// The future of one call of an async import.
+#[cfg(feature = "experimental-async")]
+pub(crate) type RawHostFuture = Pin<Box<dyn Future<Output = Result<RawResults, RuntimeError>>>>;
 
 #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,11 +136,10 @@ impl Function {
         }
     }
 
-    /// Creates an async host function from its body. The trampoline only
-    /// reads the arguments and builds the future: nothing of the host function
-    /// runs until the call polls it, on the executor's stack.
+    /// Creates an async host function from its body, which takes the
+    /// arguments of a call and returns its future.
     #[cfg(feature = "experimental-async")]
-    pub(crate) fn new_async<FT, F, T: Send + 'static>(
+    pub(crate) fn new_async<FT, F, Fut, T: Send + 'static>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
         ty: FT,
@@ -136,31 +147,101 @@ impl Function {
     ) -> Self
     where
         FT: Into<FunctionType>,
-        F: Fn(AsyncEnv<T>, Vec<Value>) -> HostFuture + 'static,
+        F: Fn(AsyncEnv<T>, Vec<Value>) -> Fut + 'static,
+        Fut: Future<Output = Result<Vec<Value>, RuntimeError>> + 'static,
     {
-        let function_type = ty.into();
-        let func_ty = function_type.clone();
+        let function_type: FunctionType = ty.into();
+        let func_ty = Rc::new(function_type.clone());
+        let store_id = store.objects_mut().id();
+        let start = move |store: &mut StoreMut<'_>, cx: AsyncEnv<T>, values_vec: *const RawValue| {
+            let params = func_ty.params().iter().enumerate();
+            // Safety: the trampoline gives `values_vec` one value per parameter.
+            let args = params
+                .map(|(i, ty)| unsafe {
+                    Value::from_raw(store, *ty, values_vec.add(i).read_unaligned())
+                })
+                .collect();
+            let future = func(cx, args);
+            let func_ty = Rc::clone(&func_ty);
+            async move {
+                let values = future.await?;
+                check_dynamic_results(&func_ty, &values)?;
+                let slice = WithSlice::enter(store_id);
+                // Safety: the slice is the only holder of the store.
+                let store = unsafe { StoreMut::from_raw(slice.ptr()) };
+                Ok(values.iter().map(|value| value.as_raw(&store)).collect())
+            }
+        };
+        Self::new_async_from(store, env, function_type, start)
+    }
+
+    /// Creates an async host function from a typed async function, which
+    /// reads its arguments and writes its results as the trampoline has them,
+    /// without making [`Value`]s of them.
+    #[cfg(feature = "experimental-async")]
+    pub(crate) fn new_typed_async<T, F, Args, Rets>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        func: F,
+    ) -> Self
+    where
+        T: Send + 'static,
+        F: AsyncHostFunction<T, Args, Rets>,
+        Args: WasmTypeList + 'static,
+        Rets: WasmTypeList + 'static,
+    {
+        let function_type = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
+        let func = Rc::new(func);
+        let start =
+            move |store: &mut StoreMut<'_>, mut cx: AsyncEnv<T>, values_vec: *const RawValue| {
+                let mut array = Args::empty_array();
+                // Safety: the trampoline gives `values_vec` one value per
+                // parameter, of the types of `Args`.
+                let args = unsafe {
+                    for (i, slot) in array.as_mut().iter_mut().enumerate() {
+                        *slot = values_vec.add(i).read_unaligned();
+                    }
+                    Args::from_array(store, array)
+                };
+                let func = Rc::clone(&func);
+                async move {
+                    let rets = func.invoke(&mut cx, args).await?;
+                    // Safety: the trampoline reads the raw values back as the
+                    // result types of `Rets`.
+                    let mut array = cx.with(|mut env| unsafe { rets.into_array(&mut env) });
+                    Ok(RawResults::from_slice(array.as_mut()))
+                }
+            };
+        Self::new_async_from(store, env, function_type, start)
+    }
+
+    /// Creates an async host function from `start`, which reads the arguments
+    /// of a call and returns its future. Nothing of the host function runs
+    /// until the call polls that future, on the executor's stack.
+    #[cfg(feature = "experimental-async")]
+    fn new_async_from<T, S, Fut>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        function_type: FunctionType,
+        start: S,
+    ) -> Self
+    where
+        T: Send + 'static,
+        S: Fn(&mut StoreMut<'_>, AsyncEnv<T>, *const RawValue) -> Fut + 'static,
+        Fut: Future<Output = Result<RawResults, RuntimeError>> + 'static,
+    {
         let func_env = env.clone();
         let store_id = store.objects_mut().id();
         let wrapper = move |values_vec: *mut RawValue| -> HostCallOutcome {
-            // Safety: the entry is held only while the arguments are read,
-            // and the trampoline gives `values_vec` one value per parameter.
-            let args = unsafe {
-                let mut store_wrapper = StoreContext::get_current(store_id);
-                let mut store_mut = store_wrapper.as_mut();
-                let mut args = Vec::with_capacity(func_ty.params().len());
-                for (i, ty) in func_ty.params().iter().enumerate() {
-                    args.push(Value::from_raw(
-                        &mut store_mut,
-                        *ty,
-                        values_vec.add(i).read_unaligned(),
-                    ));
-                }
-                args
-            };
+            // Safety: this is the trampoline of an import, which borrows the
+            // active entry. The borrow goes to the caller with the future,
+            // for its first poll.
+            let mut store = unsafe { StoreContext::get_current(store_id) };
+            let cx = AsyncEnv::new(func_env.clone(), store_id);
+            let future = start(&mut store.as_mut(), cx, values_vec);
             HostCallOutcome::Future {
-                future: func(AsyncEnv::new(func_env.clone(), store_id), args),
-                store_id,
+                future: Box::pin(future),
+                store,
             }
         };
         let mut host_data = Box::new(VMDynamicFunctionContext {
@@ -595,14 +676,8 @@ where
     }
 }
 
-fn write_dynamic_results(
-    store_id: StoreId,
-    func_ty: &FunctionType,
-    returns: Vec<Value>,
-    values_vec: *mut RawValue,
-) -> Result<(), RuntimeError> {
-    let mut store_wrapper = unsafe { StoreContext::get_current(store_id) };
-    let mut store = store_wrapper.as_mut();
+/// Checks the results of a dynamic host function against its signature.
+fn check_dynamic_results(func_ty: &FunctionType, returns: &[Value]) -> Result<(), RuntimeError> {
     let return_types = returns.iter().map(|ret| ret.ty());
     if return_types.ne(func_ty.results().iter().copied()) {
         return Err(RuntimeError::new(format!(
@@ -611,6 +686,18 @@ fn write_dynamic_results(
             returns.iter().map(|ret| ret.ty())
         )));
     }
+    Ok(())
+}
+
+fn write_dynamic_results(
+    store_id: StoreId,
+    func_ty: &FunctionType,
+    returns: Vec<Value>,
+    values_vec: *mut RawValue,
+) -> Result<(), RuntimeError> {
+    let mut store_wrapper = unsafe { StoreContext::get_current(store_id) };
+    let mut store = store_wrapper.as_mut();
+    check_dynamic_results(func_ty, &returns)?;
     for (i, ret) in returns.iter().enumerate() {
         unsafe {
             values_vec.add(i).write_unaligned(ret.as_raw(&store));
@@ -631,6 +718,17 @@ fn finalize_dynamic_call(
     }
 }
 
+/// Gives the trampoline the results of an async import.
+///
+/// # Safety
+/// `values_vec` must have room for the results of the import.
+#[cfg(feature = "experimental-async")]
+unsafe fn write_raw_results(results: &[RawValue], values_vec: *mut RawValue) {
+    for (i, raw) in results.iter().enumerate() {
+        unsafe { values_vec.add(i).write_unaligned(*raw) };
+    }
+}
+
 /// See [`Function::raw_entry`].
 #[cfg(feature = "experimental-async")]
 pub(crate) struct RawEntry {
@@ -645,10 +743,12 @@ pub(crate) struct RawEntry {
 
 pub(crate) enum HostCallOutcome {
     Ready(Result<Vec<Value>, RuntimeError>),
+    /// The future of an async import, and the borrow of the store its
+    /// arguments were read with, which its first poll reuses.
     #[cfg(feature = "experimental-async")]
     Future {
-        future: HostFuture,
-        store_id: StoreId,
+        future: RawHostFuture,
+        store: StorePtrWrapper,
     },
 }
 
@@ -682,16 +782,11 @@ where
                     finalize_dynamic_call(this.ctx.store_id, &this.ctx.func_ty, values_vec, result),
                 )),
                 #[cfg(feature = "experimental-async")]
-                HostCallOutcome::Future { future, store_id } => {
-                    match wait_for_host_future(store_id, future, suspendable) {
-                        HostWait::Ready(result) => {
-                            Some(to_invocation_result(finalize_dynamic_call(
-                                this.ctx.store_id,
-                                &this.ctx.func_ty,
-                                values_vec,
-                                result,
-                            )))
-                        }
+                HostCallOutcome::Future { future, store } => {
+                    match wait_for_host_future(store, future, suspendable) {
+                        HostWait::Ready(result) => Some(to_invocation_result(result.map(
+                            |results: RawResults| unsafe { write_raw_results(&results, values_vec) },
+                        ))),
                         HostWait::Suspend => None,
                         HostWait::CannotSuspend => Some(InvocationResult::YieldOutsideAsyncContext),
                     }
@@ -706,11 +801,8 @@ where
             unsafe { wasmer_vm::suspend_wasm_call() };
             result = on_host_stack(|| {
                 panic::catch_unwind(AssertUnwindSafe(|| {
-                    Some(to_invocation_result(finalize_dynamic_call(
-                        this.ctx.store_id,
-                        &this.ctx.func_ty,
-                        values_vec,
-                        take_host_result(),
+                    Some(to_invocation_result(take_host_result().map(
+                        |results: RawResults| unsafe { write_raw_results(&results, values_vec) },
                     )))
                 }))
             });
@@ -721,18 +813,14 @@ where
         // AS WE ARE IN THE WASM STACK, NOT ON THE HOST ONE.
         // See: https://github.com/wasmerio/wasmer/pull/5700
         match result {
-            Ok(InvocationResult::Success(())) => unsafe {
-                // Note: can't acquire a proper ref-counted context ref here, since we can switch
-                // away from the WASM stack at any time.
-                // Safety: The pointer is only used for the duration of the call to
-                // `get_current_transient`.
-                let mut store_wrapper = StoreContext::get_current_transient(this.ctx.store_id);
-                let mut store = store_wrapper.as_mut().unwrap();
+            // The results are in `values_vec` already, so the store is not
+            // looked up again.
+            Ok(InvocationResult::Success(())) => {
                 #[cfg(feature = "experimental-host-interrupt")]
-                if interrupt_registry::is_interrupted(store.objects.id()) {
-                    raise_lib_trap(Trap::lib(TrapCode::HostInterrupt))
+                if interrupt_registry::is_interrupted(this.ctx.store_id) {
+                    unsafe { raise_lib_trap(Trap::lib(TrapCode::HostInterrupt)) }
                 }
-            },
+            }
             Ok(InvocationResult::Exception(exception)) => unsafe {
                 // Note: can't acquire a proper ref-counted context ref here, since we can switch
                 // away from the WASM stack at any time.

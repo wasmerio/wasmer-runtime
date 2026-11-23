@@ -186,12 +186,12 @@ impl Function {
             + 'static,
     {
         let func = std::rc::Rc::new(func);
-        let body = move |mut cx: AsyncEnv<T>, values: Vec<Value>| -> async_host::HostFuture {
+        let body = move |mut cx: AsyncEnv<T>, values: Vec<Value>| {
             let func = std::rc::Rc::clone(&func);
-            Box::pin(async move {
+            async move {
                 let func: &F = &func;
                 func(&mut cx, &values).await
-            })
+            }
         };
         Self(BackendFunction::new_async(store, env, ty, body))
     }
@@ -212,9 +212,7 @@ impl Function {
         Args: WasmTypeList + 'static,
         Rets: WasmTypeList + 'static,
     {
-        let ty = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
-        let body = async_host::typed_host_body::<T, _, Args, Rets>(func, ty.clone());
-        Self(BackendFunction::new_async(store, env, ty, body))
+        Self(BackendFunction::new_typed_async(store, env, func))
     }
 
     /// Returns the [`FunctionType`] of the `Function`.
