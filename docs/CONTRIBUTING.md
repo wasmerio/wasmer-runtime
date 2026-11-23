@@ -3,9 +3,9 @@
 ## Issues and feature requests
 
 Use the [runtime issue tracker](https://github.com/wasmerio/wasmer-runtime/issues)
-for the Rust API, compilers, VM, and other runtime crates. Include the backend,
-Cargo features, host platform, and a minimal example if possible. For the CLI,
-WASI/WASIX, C API, and packaging, use the
+for the Rust API, C API, compilers, VM, and other runtime crates. Include the
+backend, Cargo features, host platform, and a minimal example if possible. For
+the CLI, WASI/WASIX, and packaging, use the
 [original Wasmer issue tracker](https://github.com/wasmerio/wasmer/issues).
 
 > [!WARNING]

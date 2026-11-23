@@ -32,6 +32,10 @@ members = [
   "fuzz",
   "lib/api",
   "lib/api/macro-wasmer-engine-test",
+  "lib/c-api",
+  "lib/c-api-imports",
+  "lib/c-api/examples/wasmer-capi-examples-runner",
+  "lib/c-api/tests/wasmer-c-api-test-runner",
   "lib/cache",
   "lib/compiler-cranelift",
   "lib/compiler-llvm",
@@ -45,7 +49,6 @@ members = [
   "tests/lib/test-generator",
   "tests/lib/wast",
 ]
-resolver = "2"
 
 [workspace.package]
 authors = ["Wasmer Engineering Team <engineering@wasmer.io>"]
@@ -62,21 +65,18 @@ shared-buffer = "0.1.4"
 loupe = "0.2.0"
 
 # Third-party crates
-addr2line = "0.27.0"
+addr2line = "0.27.1"
 anyhow = "1.0"
 backtrace = "0.3"
-bindgen = { version = "0.72.1", default-features = false }
+bindgen = { version = "0.73.2", default-features = false }
 blake3 = "1.0"
 build-deps = "0.1.4"
 bytecheck = { version = "0.8.2" }
 byteorder = "1.3"
 bytes = "1.11.1"
 bytesize = "2.3.1"
+cbindgen = { version = "0.29", default-features = false }
 cc = "1.2.47"
-clap = { version = "4.5.53", default-features = false }
-clap_builder = { version = "4.5.53" }
-clap_derive = { version = "4.5.49" }
-clap_lex = { version = "1" }
 cmake = "0.1.50"
 compiletest_rs = "0.11.2"
 corosensei = "0.3.0"
@@ -94,6 +94,7 @@ dynasm = "5.0.0"
 dynasmrt = "5.0.0"
 enum-iterator = "2.3.0"
 enumset = "1.1.0"
+field-offset = "0.3.3"
 fixedbitset = "0.5.7"
 fnv = "1.0.3"
 futures = "0.3.30"
@@ -104,6 +105,7 @@ hashbrown = "0.17.0"
 hex = "0.4"
 indexmap = "2"
 inkwell = { version = "0.11.0", default-features = false }
+inline-c = "0.1.8"
 itertools = "0.15"
 js-sys = "0.3.77"
 leb128 = "0.2"
@@ -127,6 +129,7 @@ rand = "0.10.1"
 rangemap = "1.7.1"
 rayon = "1.7.0"
 regalloc2 = "0.15.1"
+regex = "1.11"
 region = "4.0"
 reqwest = { version = "0.13.0", default-features = false }
 rkyv = { version = "0.8.13", features = ["indexmap-2", "bytes-1"] }
@@ -156,7 +159,9 @@ tokio = { version = "1.39.0", default-features = false }
 tracing = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", default-features = false }
 trybuild = "1.0.11"
+typetag = "0.2.21"
 ureq = "3.5.2"
+walkdir = "2.3.2"
 wasm-bindgen = "0.2.120"
 wasm-bindgen-futures = "0.4.70"
 wasm-bindgen-test = "0.3.70"
@@ -189,10 +194,6 @@ glob.workspace = true
 [dev-dependencies]
 anyhow.workspace = true
 bytesize.workspace = true
-clap.workspace = true
-clap_builder.workspace = true
-clap_derive.workspace = true
-clap_lex.workspace = true
 criterion = { workspace = true, features = ["csv_output"] }
 serial_test = { workspace = true, default-features = false }
 compiler-test-derive = { path = "tests/lib/compiler-test-derive" }

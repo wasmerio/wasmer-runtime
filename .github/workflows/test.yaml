@@ -48,10 +48,10 @@ jobs:
           toolchain: ${{ steps.load_toolchain.outputs.rust_toolchain }}
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
-      - name: Install libtinfo
+      - name: Install LLVM system dependencies
         shell: bash
         run: |
-          sudo apt-get update -y && sudo apt-get install -y libtinfo6
+          sudo apt-get update -y && sudo apt-get install -y libtinfo6 zlib1g-dev
       - uses: actions/setup-go@v6
         with:
           go-version: "1.26.0"
@@ -59,11 +59,14 @@ jobs:
       - run: go install github.com/google/yamlfmt/cmd/yamlfmt@v0.21.0
       - name: Install LLVM (Linux)
         # $HOME instead of /opt: not root-writable on hardened ARC runners
+        shell: bash
         run: |
-          mkdir -p $HOME/llvm-23
-          curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" --retry 3 --proto '=https' --tlsv1.2 -sSf https://github.com/wasmerio/llvm-custom-builds/releases/download/23.x/llvm-linux-amd64.tar.zst -L -o - | tar --zstd -xf - --strip-components=1 -C $HOME/llvm-23
-          echo "$HOME/llvm-23/bin" >> $GITHUB_PATH
-          echo "LLVM_SYS_231_PREFIX=$HOME/llvm-23" >> $GITHUB_ENV
+          LLVM_DIR="$HOME/llvm-23"
+          mkdir -p "$LLVM_DIR"
+          curl --retry 3 --proto '=https' --tlsv1.2 -fsSL https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.5/LLVM-23.1.5-Linux-X64.tar.zst |
+            tar -I 'zstd --long=30' -xf - --strip-components=1 -C "$LLVM_DIR"
+          echo "$LLVM_DIR/bin" >> "$GITHUB_PATH"
+          echo "LLVM_SYS_231_PREFIX=$LLVM_DIR" >> "$GITHUB_ENV"
       - name: Install taplo
         run: |
           mkdir -p $HOME/.local/bin
@@ -164,14 +167,14 @@ jobs:
           components: clippy
       - name: Install Nextest
         uses: taiki-e/install-action@nextest
-      - name: Install Ninja, Clang and binutils on Ubuntu
+      - name: Install build dependencies on Ubuntu
         if: matrix.metadata.build == 'linux-x64'
-        run: sudo apt-get update -y && sudo apt-get install -y ninja-build clang binutils
-      - name: Install Ninja and LLVM on macOS
+        run: sudo apt-get update -y && sudo apt-get install -y ninja-build clang binutils zlib1g-dev
+      - name: Install build dependencies on macOS
         if: matrix.metadata.build == 'macos-arm'
         run: |
-          brew install ninja llvm@23
-          echo "/opt/homebrew/opt/llvm@23/bin" >> "$GITHUB_PATH"
+          brew install ninja llvm
+          echo "/opt/homebrew/opt/llvm/bin" >> "$GITHUB_PATH"
       - name: Install Ninja on Windows
         if: matrix.metadata.build == 'windows-x64'
         run: choco install ninja
@@ -247,21 +250,22 @@ jobs:
             description: Examples
           - key: check-api-features
             description: API (sys)
+          - key: test-capi
+            description: C API
         metadata:
           - build: linux-x64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             v8: true
-            llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/23.x/llvm-linux-amd64.tar.zst"
+            llvm_url: "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.5/LLVM-23.1.5-Linux-X64.tar.zst"
           - build: linux-arm64
             os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-            llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/23.x/llvm-linux-aarch64.tar.zst"
+            llvm_url: "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.5/LLVM-23.1.5-Linux-ARM64.tar.zst"
           - build: macos-arm
             os: macos-15
             target: aarch64-apple-darwin
             v8: true
-            llvm_url: "https://github.com/wasmerio/llvm-custom-builds/releases/download/23.x/llvm-darwin-aarch64.tar.zst"
           - build: linux-musl
             target: x86_64-unknown-linux-musl
             os: ubuntu-22.04
@@ -339,7 +343,17 @@ jobs:
       - name: Install Nextest
         if: matrix.stage.key == 'test-all'
         uses: taiki-e/install-action@nextest
-      - name: Install LLVM
+      - name: Install Clang and LLVM on macOS
+        if: runner.os == 'macOS' && (matrix.stage.key == 'test-all' || matrix.stage.key == 'test-examples' || matrix.stage.key == 'check-api-features' || matrix.stage.key == 'test-capi')
+        shell: bash
+        run: |
+          brew install llvm
+          echo "/opt/homebrew/opt/llvm/bin" >> "$GITHUB_PATH"
+          echo "LLVM_SYS_231_PREFIX=/opt/homebrew/opt/llvm" >> "$GITHUB_ENV"
+      - name: Install zlib on glibc Linux
+        if: matrix.metadata.build == 'linux-x64' || matrix.metadata.build == 'linux-arm64'
+        run: sudo apt-get update -y && sudo apt-get install -y zlib1g-dev
+      - name: Install Clang and LLVM 23
         shell: bash
         if: matrix.metadata.llvm_url && (matrix.stage.key == 'test-all' || matrix.stage.key == 'test-examples' || matrix.stage.key == 'check-api-features')
         env:
@@ -347,9 +361,9 @@ jobs:
         run: |
           LLVM_DIR="$PWD/.llvm"
           mkdir -p "$LLVM_DIR"
-          curl -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" --retry 3 --proto '=https' --tlsv1.2 -sSf "$LLVM_URL" -L -o - | tar --zstd -xf - --strip-components=1 -C "$LLVM_DIR"
+          curl --retry 3 --proto '=https' --tlsv1.2 -fsSL "$LLVM_URL" |
+            zstd --long=30 -dc | tar -xf - --strip-components=1 -C "$LLVM_DIR"
           echo "$LLVM_DIR/bin" >> "$GITHUB_PATH"
-          echo "$LLVM_DIR/usr/bin" >> "$GITHUB_PATH"
           echo "LLVM_SYS_231_PREFIX=$LLVM_DIR" >> "$GITHUB_ENV"
       - name: Cache
         if: startsWith(runner.name, 'aux-')
@@ -378,7 +392,10 @@ jobs:
         env:
           TEST_PLATFORM: ${{ matrix.metadata.build }}
         run: |
-          args=(--workspace --release --locked)
+          # C API tests link a prebuilt libwasmer, which cannot include V8 on
+          # Linux, so the test-capi stage runs them with its own feature sets.
+          args=(--workspace --release --locked --exclude wasmer-c-api --exclude wasmer-c-api-imports
+            --exclude wasmer-c-api-test-runner --exclude wasmer-capi-examples-runner)
           features="$ARTIFACT_FEATURES,experimental-async,wasmer/experimental-host-interrupt"
           if [[ "$TEST_PLATFORM" == windows-x64 ]]; then
             # Use V8 as the default backend on Windows, as the Makefile did.
@@ -415,6 +432,30 @@ jobs:
       - name: Check sys API features
         if: matrix.stage.key == 'check-api-features'
         run: cargo check -p wasmer --features "$COMPILERS,$ARTIFACT_FEATURES,artifact-size,core,enable-serde" --locked
+      - name: Check C API feature sets
+        if: matrix.stage.key == 'test-capi'
+        shell: bash
+        run: |
+          for features in compiler-headless wat,compiler,middlewares,singlepass "wat,compiler,middlewares,cranelift,singlepass,$ARTIFACT_FEATURES"; do
+            cargo check -p wasmer-c-api --no-default-features --features "$features" --locked
+          done
+      - name: Test C API imports
+        if: matrix.stage.key == 'test-capi'
+        run: cargo test -p wasmer-c-api-imports --release --locked
+      # musl targets cannot produce the shared library these tests link against.
+      - name: Test C API (Cranelift)
+        if: matrix.stage.key == 'test-capi' && matrix.metadata.build != 'linux-musl'
+        uses: ./.github/actions/test_capi
+        with:
+          backend: cranelift
+          features: wat,compiler,middlewares,cranelift,singlepass,${{ env.ARTIFACT_FEATURES }}
+      # On Linux, wee8's hidden symbols prevent building a shared V8 C API.
+      - name: Test C API (V8)
+        if: matrix.stage.key == 'test-capi' && matrix.metadata.build == 'macos-arm'
+        uses: ./.github/actions/test_capi
+        with:
+          backend: v8
+          features: wat,v8-default
   ci_success:
     name: Tests CI
     runs-on: ${{ github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64' }}

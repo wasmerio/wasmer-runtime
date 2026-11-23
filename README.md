@@ -8,12 +8,13 @@
 # Wasmer Runtime
 
 Wasmer Runtime is the embeddable [WebAssembly](https://webassembly.org/) engine
-for Rust. It compiles, instantiates, and executes Wasm modules. This repository
-contains the `wasmer` Rust API, the virtual machine, the Cranelift, Singlepass,
-and LLVM compilers, the V8 and JavaScript backends, and runtime crates such as
-`wasmer-cache` and `wasmer-middlewares`.
+for Rust and C. It compiles, instantiates, and executes Wasm modules. This
+repository contains the `wasmer` Rust API, the [C API](./lib/c-api/README.md),
+the virtual machine, the Cranelift, Singlepass, and LLVM compilers, the V8 and
+JavaScript backends, and runtime crates such as `wasmer-cache` and
+`wasmer-middlewares`.
 
-The Wasmer CLI, WASI/WASIX support, C API, and packaging tools live in
+The Wasmer CLI, WASI/WASIX support, and packaging tools live in
 [`wasmerio/wasmer`](https://github.com/wasmerio/wasmer). For higher-level sandbox
 SDKs, see [`wasmerio/wasmer-sdk`](https://github.com/wasmerio/wasmer-sdk).
 

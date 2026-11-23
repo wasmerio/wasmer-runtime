@@ -5,7 +5,6 @@
 
 use core::fmt::{self, Display, Formatter};
 use core::str::FromStr;
-use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 #[cfg(feature = "enable-serde")]
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -13,22 +12,9 @@ use thiserror::Error;
 /// A trap code describing the reason for a trap.
 ///
 /// All trap instructions have an explicit trap code.
-#[derive(
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Debug,
-    Hash,
-    Error,
-    RkyvSerialize,
-    RkyvDeserialize,
-    Archive,
-    num_enum::TryFromPrimitive,
-)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Error, num_enum::TryFromPrimitive)]
 #[cfg_attr(feature = "enable-serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
-#[rkyv(derive(Debug), compare(PartialEq))]
 #[repr(u32)]
 pub enum TrapCode {
     /// The current stack space was exhausted.

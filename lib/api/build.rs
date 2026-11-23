@@ -128,6 +128,8 @@ fn build_v8() {
     let bindings = bindgen::Builder::default()
         .header(header_path.display().to_string())
         .clang_args(args)
+        // These libc declarations come from transitive includes and are not part of the V8 API.
+        .blocklist_function("memcpy|memmove|memset|memcmp|strlen|bcmp")
         .derive_default(true)
         .derive_debug(true)
         .parse_callbacks(Box::new(Wee8Renamer {}))

@@ -466,7 +466,13 @@ impl Wast {
                 .instances
                 .get(module_name)
                 .ok_or_else(|| anyhow!("constant expression required"))?;
-            imports.register_namespace(module_name, instance.exports.clone());
+            imports.register_namespace(
+                module_name,
+                instance
+                    .exports
+                    .iter()
+                    .map(|(name, export)| (name.clone(), export.clone())),
+            );
         }
 
         let instance = Instance::new(&mut self.store, &module, &imports)?;
@@ -558,6 +564,7 @@ impl Wast {
             || (expected.contains("unknown memory") && actual.contains("unknown memory"))
             || (expected.contains("unknown memory") && actual.contains("Data segment extends past end of the data section"))
             || (expected.contains("unknown elem segment") && actual.contains("unknown element segment"))
+            || (expected == "unknown type" && actual.contains("Validation error: type index greater than implementation limits"))
             // The same test here is asserted to have one error message in
             // `memory.wast` and a different error message in
             // `memory64/memory.wast`, so we equate these two error messages to get

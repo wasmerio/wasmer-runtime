@@ -30,7 +30,9 @@ llvm spec::linking
 singlepass spec::threads::imports
 cranelift spec::threads::imports
 llvm spec::threads::imports
-
+cranelift spec::cast::
+llvm spec::cast::
+singlepass spec::cast::
 
 # Tail-call
 singlepass return_call
@@ -38,9 +40,9 @@ cranelift return_call
 
 # Traps
 # Experimental Mach-O artifacts lack source-location DWARF; frame names and ordering work.
-singlepass+aarch64+macos traps::trap_display_pretty::singlepass::singlepass_
-singlepass+aarch64+macos traps::trap_display_multi_module::singlepass::singlepass_
-singlepass+aarch64+macos traps::start_trap_pretty::singlepass::singlepass_
+singlepass+aarch64+macos traps::trap_display_pretty::singlepass::singlepass
+singlepass+aarch64+macos traps::trap_display_multi_module::singlepass::singlepass
+singlepass+aarch64+macos traps::start_trap_pretty::singlepass::singlepass
 cranelift+aarch64+macos    traps::test_trap_trace
 llvm+aarch64    traps::test_trap_trace
 llvm+riscv64    traps::test_trap_trace

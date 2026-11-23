@@ -1,5 +1,3 @@
-#[cfg(feature = "unwind")]
-use crate::unwind_winx64::create_unwind_info_from_insts;
 use crate::{
     codegen_error,
     common_decl::*,
@@ -14,17 +12,16 @@ use dynasmrt::{DynasmError, VecAssembler, x64::X64Relocation};
 use fixedbitset::FixedBitSet;
 #[cfg(feature = "unwind")]
 use gimli::{X86_64, write::CallFrameInstruction};
+use object::{
+    RelocationEncoding, RelocationFlags, RelocationKind,
+    write::{Relocation, SymbolId},
+};
 use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
 };
 use wasmer_compiler::{
-    types::{
-        address_map::InstructionAddressMap,
-        function::FunctionBody,
-        relocation::{Relocation, RelocationKind, RelocationTarget},
-        section::{CustomSection, CustomSectionProtection, SectionBody},
-    },
+    types::{address_map::InstructionAddressMap, function::Compilation},
     wasmparser::MemArg,
 };
 use wasmer_types::{
@@ -4514,19 +4511,20 @@ impl Machine for MachineX86_64 {
         Ok(())
     }
 
-    fn emit_call_with_reloc(
-        &mut self,
-        reloc_target: RelocationTarget,
-    ) -> Result<Vec<Relocation>, CompileError> {
+    fn emit_call_with_reloc(&mut self, symbol: SymbolId) -> Result<Vec<Relocation>, CompileError> {
         let mut relocations = vec![];
         let next = self.get_label();
         let reloc_at = self.assembler.get_offset().0 + 1; // skip E8
         self.assembler.emit_call_label(next)?;
         self.emit_label(next)?;
         relocations.push(Relocation {
-            kind: RelocationKind::X86CallPCRel4,
-            reloc_target,
-            offset: reloc_at as u32,
+            flags: RelocationFlags::Generic {
+                kind: RelocationKind::Relative,
+                encoding: RelocationEncoding::X86Branch,
+                size: 32,
+            },
+            symbol,
+            offset: reloc_at as u64,
             addend: -4,
         });
         Ok(relocations)
@@ -8015,7 +8013,7 @@ impl Machine for MachineX86_64 {
         sig: &FunctionType,
         _calling_convention: CallingConvention,
         progress_callback: Option<&CompilationProgressCallback>,
-    ) -> Result<FunctionBody, CompileError> {
+    ) -> Result<Compilation, CompileError> {
         // the cpu feature here is irrelevant
         let mut a = AssemblerX64::new(0, None)?;
         let mut output_reporter = ChunkedOutputReporter::new(progress_callback);
@@ -8130,10 +8128,7 @@ impl Machine for MachineX86_64 {
         body.shrink_to_fit();
         output_reporter.finish(body.len())?;
 
-        Ok(FunctionBody {
-            body,
-            unwind_info: None,
-        })
+        Ok(body)
     }
     // Generates dynamic import function call trampoline for a function type.
 
@@ -8143,7 +8138,7 @@ impl Machine for MachineX86_64 {
         sig: &FunctionType,
         calling_convention: CallingConvention,
         progress_callback: Option<&CompilationProgressCallback>,
-    ) -> Result<FunctionBody, CompileError> {
+    ) -> Result<Compilation, CompileError> {
         // the cpu feature here is irrelevant
         let mut a = AssemblerX64::new(0, None)?;
         let mut output_reporter = ChunkedOutputReporter::new(progress_callback);
@@ -8234,10 +8229,7 @@ impl Machine for MachineX86_64 {
         let mut body = a.finalize().unwrap();
         body.shrink_to_fit();
         output_reporter.finish(body.len())?;
-        Ok(FunctionBody {
-            body,
-            unwind_info: None,
-        })
+        Ok(body)
     }
     // Singlepass calls import functions through a trampoline.
 
@@ -8248,7 +8240,7 @@ impl Machine for MachineX86_64 {
         sig: &FunctionType,
         calling_convention: CallingConvention,
         progress_callback: Option<&CompilationProgressCallback>,
-    ) -> Result<CustomSection, CompileError> {
+    ) -> Result<Vec<u8>, CompileError> {
         // the cpu feature here is irrelevant
         let mut a = AssemblerX64::new(0, None)?;
         let mut output_reporter = ChunkedOutputReporter::new(progress_callback);
@@ -8361,14 +8353,8 @@ impl Machine for MachineX86_64 {
         let mut contents = a.finalize().unwrap();
         contents.shrink_to_fit();
         output_reporter.finish(contents.len())?;
-        let section_body = SectionBody::new_with_vec(contents);
 
-        Ok(CustomSection {
-            protection: CustomSectionProtection::ReadExecute,
-            alignment: None,
-            bytes: section_body,
-            relocations: vec![],
-        })
+        Ok(contents)
     }
 
     #[cfg(feature = "unwind")]
@@ -8408,25 +8394,6 @@ impl Machine for MachineX86_64 {
     #[cfg(not(feature = "unwind"))]
 
     fn gen_dwarf_unwind_info(&mut self, _code_len: usize) -> Option<UnwindInstructions> {
-        None
-    }
-
-    #[cfg(feature = "unwind")]
-    fn gen_windows_unwind_info(&mut self, _code_len: usize) -> Option<Vec<u8>> {
-        let unwind_info = create_unwind_info_from_insts(&self.unwind_ops);
-        if let Some(unwind) = unwind_info {
-            let sz = unwind.emit_size();
-            let mut tbl = vec![0; sz];
-            unwind.emit(&mut tbl);
-            Some(tbl)
-        } else {
-            None
-        }
-    }
-
-    #[cfg(not(feature = "unwind"))]
-
-    fn gen_windows_unwind_info(&mut self, _code_len: usize) -> Option<Vec<u8>> {
         None
     }
 }

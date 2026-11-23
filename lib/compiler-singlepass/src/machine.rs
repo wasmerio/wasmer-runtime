@@ -9,18 +9,14 @@ use crate::{
 };
 
 use dynasmrt::{AssemblyOffset, DynamicLabel};
+use object::write::{Relocation, SymbolId};
 use std::{
     collections::{BTreeMap, HashMap},
     fmt::Debug,
 };
 use wasmer_compiler::{
     misc::CompiledKind,
-    types::{
-        address_map::InstructionAddressMap,
-        function::FunctionBody,
-        relocation::{Relocation, RelocationTarget},
-        section::CustomSection,
-    },
+    types::{address_map::InstructionAddressMap, function::Compilation},
     wasmparser::MemArg,
 };
 use wasmer_types::{
@@ -1091,11 +1087,8 @@ pub trait Machine {
         unaligned_atomic: Label,
     ) -> Result<(), CompileError>;
 
-    /// emit a move function address to GPR ready for call, using appropriate relocation
-    fn emit_call_with_reloc(
-        &mut self,
-        reloc_target: RelocationTarget,
-    ) -> Result<Vec<Relocation>, CompileError>;
+    /// Emit a call to an object symbol and return its object-file relocations.
+    fn emit_call_with_reloc(&mut self, symbol: SymbolId) -> Result<Vec<Relocation>, CompileError>;
     /// Add with location directly from the stack
     fn emit_binop_add64(
         &mut self,
@@ -2327,7 +2320,7 @@ pub trait Machine {
         sig: &FunctionType,
         calling_convention: CallingConvention,
         progress_callback: Option<&CompilationProgressCallback>,
-    ) -> Result<FunctionBody, CompileError>;
+    ) -> Result<Compilation, CompileError>;
     /// Generates dynamic import function call trampoline for a function type.
     fn gen_std_dynamic_import_trampoline(
         &self,
@@ -2335,7 +2328,7 @@ pub trait Machine {
         sig: &FunctionType,
         calling_convention: CallingConvention,
         progress_callback: Option<&CompilationProgressCallback>,
-    ) -> Result<FunctionBody, CompileError>;
+    ) -> Result<Compilation, CompileError>;
     /// Singlepass calls import functions through a trampoline.
     fn gen_import_call_trampoline(
         &self,
@@ -2344,11 +2337,9 @@ pub trait Machine {
         sig: &FunctionType,
         calling_convention: CallingConvention,
         progress_callback: Option<&CompilationProgressCallback>,
-    ) -> Result<CustomSection, CompileError>;
+    ) -> Result<Vec<u8>, CompileError>;
     /// generate eh_frame instruction (or None if not possible / supported)
     fn gen_dwarf_unwind_info(&mut self, code_len: usize) -> Option<UnwindInstructions>;
-    /// generate Windows unwind instructions (or None if not possible / supported)
-    fn gen_windows_unwind_info(&mut self, code_len: usize) -> Option<Vec<u8>>;
 }
 
 /// Standard entry trampoline generation
@@ -2356,9 +2347,9 @@ pub fn gen_std_trampoline(
     sig: &FunctionType,
     target: &Target,
     calling_convention: CallingConvention,
-    object: Option<&CompiledKind>,
+    kind: &CompiledKind,
     progress_callback: Option<&CompilationProgressCallback>,
-) -> Result<CompileOutput<FunctionBody>, CompileError> {
+) -> Result<CompileOutput, CompileError> {
     let body = match target.triple().architecture {
         Architecture::X86_64 => {
             let machine = MachineX86_64::new(Some(target.clone()))?;
@@ -2376,13 +2367,10 @@ pub fn gen_std_trampoline(
             "singlepass unimplemented arch for gen_std_trampoline".to_owned(),
         )),
     }?;
-    match object {
-        Some(kind) => Ok(CompileOutput::Object(
-            elf::emit_function_body(target, kind, &body)?,
-            None,
-        )),
-        None => Ok(CompileOutput::InMemory(body)),
-    }
+    Ok(CompileOutput {
+        object: elf::emit_function_body(target, kind, &body)?,
+        maximum_stack_usage: None,
+    })
 }
 
 /// Generates dynamic import function call trampoline for a function type.
@@ -2391,9 +2379,9 @@ pub fn gen_std_dynamic_import_trampoline(
     sig: &FunctionType,
     target: &Target,
     calling_convention: CallingConvention,
-    object: Option<&CompiledKind>,
+    kind: &CompiledKind,
     progress_callback: Option<&CompilationProgressCallback>,
-) -> Result<CompileOutput<FunctionBody>, CompileError> {
+) -> Result<CompileOutput, CompileError> {
     let body = match target.triple().architecture {
         Architecture::X86_64 => {
             let machine = MachineX86_64::new(Some(target.clone()))?;
@@ -2426,13 +2414,10 @@ pub fn gen_std_dynamic_import_trampoline(
             "singlepass unimplemented arch for gen_std_dynamic_import_trampoline".to_owned(),
         )),
     }?;
-    match object {
-        Some(kind) => Ok(CompileOutput::Object(
-            elf::emit_function_body(target, kind, &body)?,
-            None,
-        )),
-        None => Ok(CompileOutput::InMemory(body)),
-    }
+    Ok(CompileOutput {
+        object: elf::emit_function_body(target, kind, &body)?,
+        maximum_stack_usage: None,
+    })
 }
 /// Singlepass calls import functions through a trampoline.
 pub fn gen_import_call_trampoline(
@@ -2441,9 +2426,8 @@ pub fn gen_import_call_trampoline(
     sig: &FunctionType,
     target: &Target,
     calling_convention: CallingConvention,
-    experimental_artifact: bool,
     progress_callback: Option<&CompilationProgressCallback>,
-) -> Result<CompileOutput<CustomSection>, CompileError> {
+) -> Result<CompileOutput, CompileError> {
     let section = match target.triple().architecture {
         Architecture::X86_64 => {
             let machine = MachineX86_64::new(Some(target.clone()))?;
@@ -2479,18 +2463,14 @@ pub fn gen_import_call_trampoline(
             "singlepass unimplemented arch for gen_import_call_trampoline".to_owned(),
         )),
     }?;
-    if experimental_artifact {
-        Ok(CompileOutput::Object(
-            elf::emit_import_trampoline(
-                target,
-                &CompiledKind::ImportFunctionTrampoline(index, sig.to_owned()),
-                &section,
-            )?,
-            None,
-        ))
-    } else {
-        Ok(CompileOutput::InMemory(section))
-    }
+    Ok(CompileOutput {
+        object: elf::emit_import_trampoline(
+            target,
+            &CompiledKind::ImportFunctionTrampoline(index, sig.to_owned()),
+            &section,
+        )?,
+        maximum_stack_usage: None,
+    })
 }
 
 // Constants for the bounds of truncation operations. These are the least or
