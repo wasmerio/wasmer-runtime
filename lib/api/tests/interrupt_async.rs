@@ -19,7 +19,8 @@ use std::{
 use anyhow::Result;
 use futures::task::noop_waker;
 use wasmer::{
-    AsyncEnv, Function, FunctionEnv, Instance, Module, RuntimeError, Store, Value, imports,
+    AsyncEnv, Function, FunctionEnv, FunctionEnvMut, Instance, Interrupter, Module, RuntimeError,
+    Store, Value, imports,
 };
 use wasmer_vm::{TrapCode, interrupt_registry};
 
@@ -265,5 +266,102 @@ fn a_forgotten_call_on_an_exited_thread_is_not_signalled() -> Result<()> {
         interrupt_registry::interrupt(id),
         Err(interrupt_registry::InterruptError::StoreNotRunning)
     ));
+    Ok(())
+}
+
+/// The state of the import of `relaying_guest`.
+struct Relay {
+    interrupter: Interrupter,
+    /// The guest's export `plain`.
+    plain: Option<Function>,
+    /// What the import's call of `plain` returned.
+    nested: Option<Result<(), Option<TrapCode>>>,
+}
+
+/// A store whose export `async` calls the import that `make_relay` builds.
+/// Returns the export, and the environment of the import.
+fn relaying_guest(
+    make_relay: impl FnOnce(&mut Store, &FunctionEnv<Relay>) -> Function,
+) -> Result<(Store, FunctionEnv<Relay>, Function)> {
+    let wasm = wat::parse_str(WAT)?;
+    let mut store = Store::default();
+    let module = Module::new(&store, &wasm)?;
+    let relay = Relay {
+        interrupter: store.interrupter(),
+        plain: None,
+        nested: None,
+    };
+    let env = FunctionEnv::new(&mut store, relay);
+    let f = make_relay(&mut store, &env);
+    let instance = Instance::new(&mut store, &module, &imports! { "env" => { "f" => f } })?;
+    env.as_mut(&mut store).plain = Some(instance.exports.get_function("plain")?.clone());
+    let run = instance.exports.get_function("async")?.clone();
+    Ok((store, env, run))
+}
+
+/// A sync import interrupts its store, then calls into it again. The nested
+/// call is refused: the store was interrupted before it entered.
+#[test]
+fn a_sync_call_nested_after_an_interrupt_is_interrupted() -> Result<()> {
+    let (mut store, env, run) = relaying_guest(|store, env| {
+        Function::new_typed_with_env(
+            store,
+            env,
+            |mut env: FunctionEnvMut<Relay>| -> Result<(), RuntimeError> {
+                env.data().interrupter.interrupt();
+                let plain = env.data().plain.clone().unwrap();
+                let nested = plain.call(&mut env, &[]);
+                env.data_mut().nested = Some(nested.map(drop).map_err(|e| e.to_trap()));
+                Ok(())
+            },
+        )
+    })?;
+
+    let result = run.call(&mut store, &[]);
+    assert_eq!(result.unwrap_err().to_trap(), Some(TrapCode::HostInterrupt));
+    assert_eq!(
+        env.as_ref(&store).nested,
+        Some(Err(Some(TrapCode::HostInterrupt)))
+    );
+    Ok(())
+}
+
+/// The same through an async import, whose nested call is a `call_async`.
+// TODO: fails today, so it is ignored. The import runs while its call is
+// suspended, so that call's entry of the store is not on the thread when the
+// nested call enters it. `interrupt_registry::install` then gives the nested
+// entry a fresh flag, which it does so that a forgotten suspended call cannot
+// keep its store interrupted, and the nested guest runs as if the store was
+// never interrupted. A guest that loops there misses the interrupt until it
+// is sent again. Either drop that reset, or keep the stores of a suspended
+// call on the thread while it polls its host future. Found in the review of
+// https://github.com/wasmerio/wasmer-runtime/pull/18.
+#[test]
+#[ignore = "TODO: a call nested in an async import runs after its store was interrupted"]
+fn an_async_call_nested_after_an_interrupt_is_interrupted() -> Result<()> {
+    let (mut store, env, run) = relaying_guest(|store, env| {
+        Function::new_typed_async(
+            store,
+            env,
+            async |cx: &mut AsyncEnv<Relay>| -> Result<(), RuntimeError> {
+                let (interrupter, plain) = cx.with(|env| {
+                    let relay = env.data();
+                    (relay.interrupter.clone(), relay.plain.clone().unwrap())
+                });
+                interrupter.interrupt();
+                let nested = plain.call_async(cx, &[]).await;
+                let nested = nested.map(drop).map_err(|e| e.to_trap());
+                cx.with(|mut env| env.data_mut().nested = Some(nested));
+                Ok(())
+            },
+        )
+    })?;
+
+    let result = futures::executor::block_on(run.call_async(&mut store, &[]));
+    assert_eq!(result.unwrap_err().to_trap(), Some(TrapCode::HostInterrupt));
+    assert_eq!(
+        env.as_ref(&store).nested,
+        Some(Err(Some(TrapCode::HostInterrupt)))
+    );
     Ok(())
 }
