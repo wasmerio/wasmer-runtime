@@ -919,8 +919,9 @@ thread_local! {
 enum WasmYield {
     /// To unwind: the stack is reset, and none of it runs again.
     Unwind(UnwindReason),
-    /// To wait, in a [`SuspendableCall`]: the stack is resumed later.
-    Suspend,
+    /// To wait, in a [`SuspendableCall`]: the stack is resumed later, as the
+    /// one that may suspend, which its yielder says.
+    Suspend(NonNull<WasmYielder>),
 }
 
 type WasmYielder = Yielder<(), WasmYield>;
@@ -1229,7 +1230,7 @@ fn on_wasm_stack<F: FnOnce() -> T + 'static, T: 'static>(
                     }
                     Err(trap)
                 }
-                CoroutineResult::Yield(WasmYield::Suspend) => {
+                CoroutineResult::Yield(WasmYield::Suspend(_)) => {
                     unreachable!("a Wasm call that cannot be suspended was")
                 }
                 CoroutineResult::Return(result) => result,
@@ -1238,13 +1239,29 @@ fn on_wasm_stack<F: FnOnce() -> T + 'static, T: 'static>(
     })
 }
 
+/// How many values a [`SuspendableCall`] keeps on its own stack.
+pub const INLINE_CALL_VALUES: usize = 4;
+
+/// The arguments of a [`SuspendableCall`], which its trampoline overwrites
+/// with the results.
+#[derive(Clone, Copy)]
+pub enum CallValues {
+    /// Kept on the stack of the call, which returns them when it is over:
+    /// whoever makes the call can move, and needs nowhere to keep them.
+    Inline([wasmer_types::RawValue; INLINE_CALL_VALUES]),
+    /// Kept by whoever makes the call, where they stay until the call is
+    /// finished or dropped.
+    At(*mut wasmer_types::RawValue),
+}
+
 /// What a [`SuspendableCall`] did when it was resumed.
 pub enum CallStep {
     /// It waits: an import it called suspended it (see
     /// [`suspend_wasm_call`]). It goes on when it is resumed again.
     Suspended,
-    /// It is over: it returned, or trapped.
-    Finished(Result<(), Trap>),
+    /// It is over: it returned, with its values as it was given them, or
+    /// trapped.
+    Finished(Result<CallValues, Trap>),
 }
 
 /// A Wasm call on a stack of its own that an import can suspend, and its
@@ -1259,10 +1276,9 @@ pub enum CallStep {
 /// suspended it, which keeps nothing a destructor would have to release.
 /// Dropping the call resets the stack: none of it runs again.
 pub struct SuspendableCall {
-    coroutine: Option<Coroutine<(), WasmYield, Result<(), UnwindReason>, DefaultStack>>,
-    /// The coroutine's yielder, once it has started. Boxed: the coroutine
-    /// writes it through a pointer, wherever the call is moved.
-    yielder: Box<Cell<Option<NonNull<WasmYielder>>>>,
+    coroutine: Option<Coroutine<(), WasmYield, Result<CallValues, UnwindReason>, DefaultStack>>,
+    /// The coroutine's yielder, once it has suspended.
+    yielder: Option<NonNull<WasmYielder>>,
 }
 
 impl SuspendableCall {
@@ -1270,30 +1286,32 @@ impl SuspendableCall {
     /// resumed.
     ///
     /// # Safety
-    /// All pointer arguments must be valid until the call is finished or
-    /// dropped.
+    /// All pointer arguments, and the pointer of [`CallValues::At`], must be
+    /// valid until the call is finished or dropped.
     pub unsafe fn new(
         config: &VMConfig,
         vmctx: crate::VMFunctionContext,
         trampoline: crate::VMTrampoline,
         callee: *const crate::VMFunctionBody,
-        values_vec: *mut u8,
+        values: CallValues,
     ) -> Result<Self, Trap> {
         // Ensure that per-thread initialization is done.
         lazy_per_thread_init()?;
         let stack_size = config
             .wasm_stack_size
             .unwrap_or_else(|| DEFAULT_STACK_SIZE.load(Ordering::Relaxed));
-        let yielder = Box::new(Cell::new(None));
-        let started: *const Cell<Option<NonNull<WasmYielder>>> = &*yielder;
         let coroutine = Coroutine::with_stack(
             acquire_stack(stack_size),
             move |yielder: &WasmYielder, ()| {
                 let yielder = NonNull::from(yielder);
-                // Safety: the call owns the cell, and outlives its coroutine.
-                unsafe { (*started).set(Some(yielder)) };
                 SUSPENDABLE.with(|cell| cell.set(Some(yielder)));
                 YIELDER.with(|cell| cell.set(Some(yielder)));
+                // In this frame, on the call's own stack, from here on.
+                let mut values = values;
+                let values_vec = match &mut values {
+                    CallValues::Inline(values) => values.as_mut_ptr(),
+                    CallValues::At(values) => *values,
+                };
                 unsafe {
                     // pointer types are ABI-compatible; transmute to unsafe fn to preserve unsafety
                     std::mem::transmute::<
@@ -1307,14 +1325,14 @@ impl SuspendableCall {
                             *const crate::VMFunctionBody,
                             *mut u8,
                         ),
-                    >(trampoline)(vmctx, callee, values_vec);
+                    >(trampoline)(vmctx, callee, values_vec.cast());
                 }
-                Ok(())
+                Ok(values)
             },
         );
         Ok(Self {
             coroutine: Some(coroutine),
-            yielder,
+            yielder: None,
         })
     }
 
@@ -1330,7 +1348,7 @@ impl SuspendableCall {
     ) -> CallStep {
         let coroutine = self.coroutine.as_mut().expect("the call is not over");
         // Which Wasm stack may suspend, for as long as this one runs.
-        let outer = SUSPENDABLE.with(|cell| cell.replace(self.yielder.get()));
+        let outer = SUSPENDABLE.with(|cell| cell.replace(self.yielder));
         defer! {
             SUSPENDABLE.with(|cell| cell.set(outer));
             // A stack that suspended cleared it; one that is over did not.
@@ -1340,7 +1358,10 @@ impl SuspendableCall {
             coroutine.resume(())
         });
         let result = match resumed {
-            CoroutineResult::Yield(WasmYield::Suspend) => return CallStep::Suspended,
+            CoroutineResult::Yield(WasmYield::Suspend(yielder)) => {
+                self.yielder = Some(yielder);
+                return CallStep::Suspended;
+            }
             CoroutineResult::Yield(WasmYield::Unwind(reason)) => {
                 // This came from unwind_with which requires that there be only
                 // Wasm code on the stack.
@@ -1389,7 +1410,7 @@ pub unsafe fn suspend_wasm_call() {
         let yielder = YIELDER
             .with(|cell| cell.replace(None))
             .expect("not running on Wasm stack");
-        yielder.as_ref().suspend(WasmYield::Suspend);
+        yielder.as_ref().suspend(WasmYield::Suspend(yielder));
         YIELDER.with(|cell| cell.set(Some(yielder)));
     }
 }

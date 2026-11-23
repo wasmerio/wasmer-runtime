@@ -47,13 +47,27 @@ thread_local! {
     static STORE_CONTEXT_STACK: RefCell<Vec<StoreContext>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Runs `f` on the thread's stack of entries.
+///
+/// This is `LocalKey::with`, written with `try_with`, which is `#[inline]`
+/// where `with` is not: an instance of `with` is compiled apart from the
+/// function that calls it, and is inlined into it or not depending on how the
+/// crate happens to be split into codegen units. A host function looks its
+/// store up here on every call.
+#[inline]
+fn with_stack<R>(f: impl FnOnce(&RefCell<Vec<StoreContext>>) -> R) -> R {
+    STORE_CONTEXT_STACK
+        .try_with(f)
+        .expect("the store context of a thread was used during or after its destruction")
+}
+
 impl StoreContext {
     /// The depth of the stack, and the borrows of its top entry: for a
     /// backend whose host can unwind through Rust frames without running
     /// them.
     #[allow(dead_code)]
     pub(crate) fn checkpoint() -> (usize, u32) {
-        STORE_CONTEXT_STACK.with(|cell| {
+        with_stack(|cell| {
             let stack = cell.borrow();
             (stack.len(), stack.last().map_or(0, |top| top.borrow_count))
         })
@@ -63,7 +77,7 @@ impl StoreContext {
     /// skipped the frames that held its entries.
     #[allow(dead_code)]
     pub(crate) fn restore_checkpoint((depth, borrow_count): (usize, u32)) {
-        STORE_CONTEXT_STACK.with(|cell| {
+        with_stack(|cell| {
             let mut stack = cell.borrow_mut();
             stack.truncate(depth);
             if let Some(top) = stack.last_mut() {
@@ -94,7 +108,7 @@ impl StoreContext {
     /// guard is dropped.
     pub(crate) unsafe fn install(store_ptr: *mut StoreInner) -> StoreInstallGuard {
         let store_id = unsafe { store_ptr.as_ref().unwrap().objects.id() };
-        STORE_CONTEXT_STACK.with(|cell| {
+        with_stack(|cell| {
             let mut stack = cell.borrow_mut();
             // Nesting changes a pointer's provenance, never which store it
             // addresses, so the same store must arrive at the same address.
@@ -123,7 +137,7 @@ impl StoreContext {
     /// zero until somebody takes it — which is how an imported function lends
     /// its store to code it calls into.
     pub(crate) fn try_get_current_unborrowed() -> Option<StorePtrWrapper> {
-        STORE_CONTEXT_STACK.with(|cell| {
+        with_stack(|cell| {
             let mut stack = cell.borrow_mut();
             let top = stack.last_mut()?;
             if top.borrow_count != 0 {
@@ -140,8 +154,7 @@ impl StoreContext {
     /// [`Self::try_get_current_unborrowed`], if the active entry is `id`'s.
     #[cfg(feature = "experimental-async")]
     pub(crate) fn try_get_lent(id: StoreId) -> Option<StorePtrWrapper> {
-        let is_top =
-            STORE_CONTEXT_STACK.with(|cell| cell.borrow().last().is_some_and(|top| top.id == id));
+        let is_top = with_stack(|cell| cell.borrow().last().is_some_and(|top| top.id == id));
         if is_top {
             Self::try_get_current_unborrowed()
         } else {
@@ -158,7 +171,7 @@ impl StoreContext {
     /// The intended, valid use-case for this method is from within
     /// imported function trampolines.
     pub(crate) unsafe fn get_current(id: StoreId) -> StorePtrWrapper {
-        STORE_CONTEXT_STACK.with(|cell| {
+        with_stack(|cell| {
             let mut stack = cell.borrow_mut();
             let top = stack
                 .last_mut()
@@ -179,7 +192,7 @@ impl StoreContext {
     /// remains unchanged as long as the pointer is being accessed.
     #[cfg(feature = "sys")]
     pub(crate) unsafe fn get_current_transient(id: StoreId) -> *mut StoreInner {
-        STORE_CONTEXT_STACK.with(|cell| {
+        with_stack(|cell| {
             let stack = cell.borrow();
             let top = stack
                 .last()
@@ -233,7 +246,7 @@ impl Drop for StorePtrWrapper {
             return;
         }
         let id = self.id;
-        STORE_CONTEXT_STACK.with(|cell| {
+        with_stack(|cell| {
             let mut stack = cell.borrow_mut();
             let top = stack
                 .last_mut()
@@ -246,7 +259,7 @@ impl Drop for StorePtrWrapper {
 
 impl Drop for StoreInstallGuard {
     fn drop(&mut self) {
-        STORE_CONTEXT_STACK.with(|cell| {
+        with_stack(|cell| {
             let mut stack = cell.borrow_mut();
             match (stack.pop(), std::thread::panicking()) {
                 (Some(top), false) => {
@@ -410,7 +423,7 @@ mod unwinding {
     use crate::{AsStoreMut, Store};
 
     fn active_borrows() -> u32 {
-        STORE_CONTEXT_STACK.with(|cell| cell.borrow().last().unwrap().borrow_count)
+        with_stack(|cell| cell.borrow().last().unwrap().borrow_count)
     }
 
     /// A host function that catches a panic from a guest it called finds the

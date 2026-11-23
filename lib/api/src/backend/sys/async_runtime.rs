@@ -31,16 +31,16 @@ use std::{
 use dashmap::DashMap;
 
 use crate::{
-    AsStoreMut, AsStoreRef, AsyncCallRequest, CallStore, PollScope, PollStore, RuntimeError,
-    StoreContext, StoreMut, StorePtrWrapper, Value,
+    AsStoreRef, AsyncCallRequest, CallStore, PollScope, PollStore, RuntimeError, StoreContext,
+    StoreMut, StorePtrWrapper, Value,
     backend::sys::entities::{
         engine::NativeEngineExt,
-        function::{RawEntry, RawHostFuture, RawResults},
+        function::{Function, RawEntry, RawHostFuture, RawResults, RawValues},
     },
     entities::function::async_call::CallFinish,
 };
 use wasmer_types::{RawValue, StoreId, Type};
-use wasmer_vm::{CallStep, SuspendableCall};
+use wasmer_vm::{CallStep, CallValues, INLINE_CALL_VALUES, SuspendableCall};
 
 #[cfg(feature = "experimental-host-interrupt")]
 type AsyncCallFutureId = u64;
@@ -48,10 +48,11 @@ type AsyncCallFutureId = u64;
 #[cfg(feature = "experimental-host-interrupt")]
 static NEXT_ASYNC_CALL_FUTURE_ID: AtomicU64 = AtomicU64::new(0);
 
-/// The wakers of the calls that are in progress, by store, for
+/// The wakers of the calls that wait, by store, for
 /// [`notify_pending_futures_of_interrupt`]: a host interrupt is the only
 /// thing that wakes a call from outside. Everything else a call waits for
-/// is a host future, which has the waker itself.
+/// is a host future, which has the waker itself. A call that never waits
+/// has no waker here: an interrupt finds its guest running.
 ///
 /// A waker's `clone`, `wake` and `drop` are user code, so they never run under
 /// the map's locks: the map holds `Arc`s, which are cloned and dropped there.
@@ -93,13 +94,12 @@ thread_local! {
     static WAITING: Cell<*mut Waiting> = const { Cell::new(ptr::null_mut()) };
 }
 
-/// The guest of a call, once its arguments are converted.
-struct Guest {
+/// The guest of a call.
+pub(crate) struct Guest {
     wasm: SuspendableCall,
-    /// The arguments, which the trampoline overwrites with the results.
+    /// The arguments, which the trampoline overwrites with the results, when
+    /// they are too many for the guest to keep on its own stack.
     values: Vec<RawValue>,
-    /// The types of the results.
-    results: Vec<Type>,
     /// The store's interrupt registration, which follows the guest: it is on
     /// the thread while the guest runs, and kept here while it waits, so that
     /// an interrupt still finds the store.
@@ -162,30 +162,47 @@ impl Drop for Interrupts {
     }
 }
 
+/// What differs from one kind of call to another: how its guest is made, and
+/// what is made of its results.
+pub(crate) trait Entry {
+    /// What the call returns.
+    type Output;
+
+    /// Makes the guest, in the first slice of the call.
+    fn start(&mut self, store: &mut StoreMut<'_>) -> Result<Guest, RuntimeError>;
+
+    /// What the call returns: of the values of a guest that returned, the
+    /// results first, in the slice in which it did, or of what ended the call
+    /// before.
+    fn finish(
+        &mut self,
+        outcome: Result<(&mut StoreMut<'_>, &[RawValue]), RuntimeError>,
+    ) -> Self::Output;
+}
+
 /// The future of one call. `'a` is its borrow of the store, if it has one.
-pub(crate) struct AsyncCallFuture<'a, X: 'static> {
+pub(crate) struct AsyncCallFuture<'a, E: Entry> {
+    /// The key of the call's waker among those of its store, once it waited.
     #[cfg(feature = "experimental-host-interrupt")]
-    id: AsyncCallFutureId,
+    waker_id: Option<AsyncCallFutureId>,
     store: CallStore<'a>,
-    /// The call, until its first poll starts it.
-    request: Option<AsyncCallRequest<X>>,
-    finish: Option<CallFinish<X>>,
+    entry: E,
     guest: Option<Guest>,
     waiting: Waiting,
 }
 
-// Nothing here relies on being pinned: the guest's frames are on its own
-// stack, and the host future is boxed.
-impl<X> Unpin for AsyncCallFuture<'_, X> {}
+// Nothing here relies on being pinned: the guest's frames, and the values it
+// was called with, are on its own stack or the heap, and the host future is
+// boxed.
+impl<E: Entry> Unpin for AsyncCallFuture<'_, E> {}
 
-impl<'a, X: 'static> AsyncCallFuture<'a, X> {
-    pub(crate) fn new(store: CallStore<'a>, request: AsyncCallRequest<X>) -> Self {
+impl<'a, E: Entry> AsyncCallFuture<'a, E> {
+    pub(crate) fn new(store: CallStore<'a>, entry: E) -> Self {
         Self {
             #[cfg(feature = "experimental-host-interrupt")]
-            id: NEXT_ASYNC_CALL_FUTURE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            waker_id: None,
             store,
-            request: Some(request),
-            finish: None,
+            entry,
             guest: None,
             waiting: Waiting {
                 cx: ptr::null_mut(),
@@ -198,10 +215,11 @@ impl<'a, X: 'static> AsyncCallFuture<'a, X> {
     /// Takes the call's waker out of the wakers of its store. It is returned
     /// rather than dropped: dropping a waker is user code.
     #[cfg(feature = "experimental-host-interrupt")]
-    fn take_waker(&self) -> Option<Arc<Waker>> {
+    fn take_waker(&mut self) -> Option<Arc<Waker>> {
+        let id = self.waker_id.take()?;
         match ASYNC_CALL_FUTURE_WAKERS.entry(self.store.id()) {
             dashmap::Entry::Occupied(mut wakers) => {
-                let removed = wakers.get_mut().remove(&self.id);
+                let removed = wakers.get_mut().remove(&id);
                 if wakers.get().is_empty() {
                     wakers.remove();
                 }
@@ -214,27 +232,75 @@ impl<'a, X: 'static> AsyncCallFuture<'a, X> {
     /// There is none to take: without host interrupts, nothing wakes a call
     /// from outside.
     #[cfg(not(feature = "experimental-host-interrupt"))]
-    fn take_waker(&self) -> Option<std::sync::Arc<Waker>> {
+    fn take_waker(&mut self) -> Option<std::sync::Arc<Waker>> {
         None
     }
 
     /// Records the waker of the latest poll, which an interrupt has to wake.
     #[cfg(feature = "experimental-host-interrupt")]
-    fn register_waker(&self, waker: &Waker) {
+    fn register_waker(&mut self, waker: &Waker) {
         let store_id = self.store.id();
-        let current = ASYNC_CALL_FUTURE_WAKERS
-            .get(&store_id)
-            .is_some_and(|wakers| wakers.get(&self.id).is_some_and(|w| w.will_wake(waker)));
-        if current {
-            return;
-        }
+        let id = match self.waker_id {
+            Some(id) => {
+                let current = ASYNC_CALL_FUTURE_WAKERS
+                    .get(&store_id)
+                    .is_some_and(|wakers| wakers.get(&id).is_some_and(|w| w.will_wake(waker)));
+                if current {
+                    return;
+                }
+                id
+            }
+            None => {
+                let id =
+                    NEXT_ASYNC_CALL_FUTURE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.waker_id = Some(id);
+                id
+            }
+        };
         let waker = Arc::new(waker.clone());
         let previous = ASYNC_CALL_FUTURE_WAKERS
             .entry(store_id)
             .or_default()
-            .insert(self.id, waker);
+            .insert(id, waker);
         // After the map's lock is released.
         drop(previous);
+    }
+
+    /// Whether the store was interrupted where this call can see it: on the
+    /// thread, or in its own guest while that waits.
+    #[cfg(feature = "experimental-host-interrupt")]
+    fn interrupted(&self) -> bool {
+        let store_id = self.store.id();
+        super::vm::interrupt_registry::is_interrupted(store_id)
+            || self
+                .guest
+                .as_ref()
+                .is_some_and(|guest| guest.interrupts.state.is_interrupted(store_id))
+    }
+
+    /// Ends the call as an interrupt of its store does.
+    #[cfg(feature = "experimental-host-interrupt")]
+    fn interrupt(&mut self) -> E::Output {
+        self.cancel();
+        let interrupt = super::vm::Trap::lib(super::vm::TrapCode::HostInterrupt);
+        self.entry.finish(Err(interrupt.into()))
+    }
+
+    /// The call waits, with nothing of its store held. Only now does an
+    /// interrupt have to wake it: until here its guest ran, or was about to.
+    fn wait(&mut self, cx: &mut Context<'_>) -> Poll<E::Output> {
+        #[cfg(feature = "experimental-host-interrupt")]
+        {
+            // Before the interrupt is checked, so that one arriving after
+            // the check wakes this poll's waker.
+            self.register_waker(cx.waker());
+            if self.interrupted() {
+                return Poll::Ready(self.interrupt());
+            }
+        }
+        #[cfg(not(feature = "experimental-host-interrupt"))]
+        let _ = cx;
+        Poll::Pending
     }
 
     /// Ends the call before its guest returned: the host future it waits for
@@ -242,7 +308,6 @@ impl<'a, X: 'static> AsyncCallFuture<'a, X> {
     /// stack is reset. What the caller owns is dropped last.
     fn cancel(&mut self) {
         let _waker = self.take_waker();
-        self.request = None;
         if let Some(future) = self.waiting.pending.take() {
             let _scope = PollScope::enter(self.store.try_resolve());
             drop(future);
@@ -251,63 +316,49 @@ impl<'a, X: 'static> AsyncCallFuture<'a, X> {
     }
 }
 
-impl<X: 'static> Future for AsyncCallFuture<'_, X> {
-    type Output = Result<X, RuntimeError>;
+impl<E: Entry> Future for AsyncCallFuture<'_, E> {
+    type Output = E::Output;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
-        // Before the interrupt is checked, so that one arriving after the
-        // check wakes this poll's waker.
         #[cfg(feature = "experimental-host-interrupt")]
-        {
-            this.register_waker(cx.waker());
-            let store_id = this.store.id();
-            let interrupted = super::vm::interrupt_registry::is_interrupted(store_id)
-                || this
-                    .guest
-                    .as_ref()
-                    .is_some_and(|guest| guest.interrupts.state.is_interrupted(store_id));
-            if interrupted {
-                this.cancel();
-                return Poll::Ready(Err(super::vm::Trap::lib(
-                    super::vm::TrapCode::HostInterrupt,
-                )
-                .into()));
-            }
+        if this.interrupted() {
+            return Poll::Ready(this.interrupt());
         }
 
         // The guest waits for a host future: it is polled here, on this
         // stack, with the store in reach.
         if let Some(future) = this.waiting.pending.as_mut() {
-            let _scope = PollScope::enter(Some(this.store.resolve()));
-            match future.as_mut().poll(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(result) => {
+            let polled = {
+                let _scope = PollScope::enter(Some(this.store.resolve()));
+                let polled = future.as_mut().poll(cx);
+                if polled.is_ready() {
                     // Its destructors run with the store in reach too.
                     this.waiting.pending = None;
-                    this.waiting.ready = Some(result);
                 }
+                polled
+            };
+            match polled {
+                Poll::Pending => return this.wait(cx),
+                Poll::Ready(result) => this.waiting.ready = Some(result),
             }
         }
 
         // The store is taken for as long as the guest runs, and given up as
         // soon as it waits or returns.
         let slice = this.store.resolve().enter_slice();
-        if let Some(request) = this.request.take() {
+        if this.guest.is_none() {
             // Safety: the slice is the only holder of the store.
             let mut store = unsafe { StoreMut::from_raw(slice.ptr()) };
-            match Guest::new(&mut store, request.function, request.params) {
-                Ok(guest) => {
-                    this.guest = Some(guest);
-                    this.finish = Some(request.finish);
-                }
+            match this.entry.start(&mut store) {
+                Ok(guest) => this.guest = Some(guest),
                 Err(error) => {
                     let _waker = this.take_waker();
-                    return Poll::Ready(Err(error));
+                    return Poll::Ready(this.entry.finish(Err(error)));
                 }
             }
         }
-        let guest = this.guest.as_mut().expect("polled after completion");
+        let guest = this.guest.as_mut().expect("a guest that started");
         // Safety: as above; the handle is gone before the guest runs.
         let trap_handler = unsafe { StoreMut::from_raw(slice.ptr()) }
             .as_store_ref()
@@ -324,55 +375,68 @@ impl<X: 'static> Future for AsyncCallFuture<'_, X> {
             guest.resume(this.store.id(), trap_handler)
         };
         this.waiting.cx = ptr::null_mut();
-        let result = match step {
-            Ok(CallStep::Suspended) => return Poll::Pending,
-            Ok(CallStep::Finished(result)) => result.map_err(RuntimeError::from),
+        let returned = match step {
+            Ok(CallStep::Suspended) => {
+                drop(slice);
+                return this.wait(cx);
+            }
+            Ok(CallStep::Finished(returned)) => returned.map_err(RuntimeError::from),
             Err(error) => Err(error),
         };
         let guest = this.guest.take().expect("the guest that ran");
         let _waker = this.take_waker();
-        let finish = this.finish.take().expect("a call that started");
-        Poll::Ready(result.and_then(|()| {
-            // Safety: the slice is the only holder of the store.
-            let mut store = unsafe { StoreMut::from_raw(slice.ptr()) };
-            let results = guest.results(&mut store);
-            finish(&mut store, &results)
-        }))
+        // Safety: the slice is the only holder of the store.
+        let mut store = unsafe { StoreMut::from_raw(slice.ptr()) };
+        let inline;
+        let outcome = match returned {
+            Ok(CallValues::Inline(values)) => {
+                inline = values;
+                Ok((&mut store, &inline[..]))
+            }
+            Ok(CallValues::At(_)) => Ok((&mut store, &guest.values[..])),
+            Err(error) => Err(error),
+        };
+        Poll::Ready(this.entry.finish(outcome))
     }
 }
 
-impl<X: 'static> Drop for AsyncCallFuture<'_, X> {
+impl<E: Entry> Drop for AsyncCallFuture<'_, E> {
     fn drop(&mut self) {
         self.cancel();
     }
 }
 
 impl Guest {
-    fn new(
+    /// The guest of a call of `function` with `values`, which have room for
+    /// its results.
+    pub(crate) fn new(
         store: &mut StoreMut<'_>,
-        function: crate::Function,
-        params: crate::entities::function::async_call::CallParams,
+        function: &Function,
+        values: RawValues,
     ) -> Result<Self, RuntimeError> {
-        let params = params(store)?;
         let RawEntry {
             vmctx,
             trampoline,
             callee,
-            mut values,
-            results,
-        } = function.as_sys().raw_entry(store, &params)?;
+        } = function.raw_entry(store);
+        let (call_values, values) = if values.spilled() {
+            // On the heap already, where they stay.
+            let mut values = values.into_vec();
+            (CallValues::At(values.as_mut_ptr()), values)
+        } else {
+            let mut inline = [RawValue { i32: 0 }; INLINE_CALL_VALUES];
+            inline[..values.len()].copy_from_slice(&values);
+            (CallValues::Inline(inline), Vec::new())
+        };
         let store = store.as_store_ref();
         let config = store.engine().tunables().vmconfig();
         // Safety: the function belongs to the store, which outlives the
-        // call, and the values are kept with it.
-        let wasm = unsafe {
-            SuspendableCall::new(config, vmctx, trampoline, callee, values.as_mut_ptr().cast())
-        }
-        .map_err(RuntimeError::from)?;
+        // call, and values that are not inline are kept with it, on the heap.
+        let wasm = unsafe { SuspendableCall::new(config, vmctx, trampoline, callee, call_values) }
+            .map_err(RuntimeError::from)?;
         Ok(Self {
             wasm,
             values,
-            results,
             #[cfg(feature = "experimental-host-interrupt")]
             interrupts: Interrupts {
                 state: wasmer_vm::ActivationState::new(),
@@ -394,13 +458,95 @@ impl Guest {
         // Safety: on the thread of the call, which is not over.
         Ok(unsafe { self.wasm.resume(trap_handler) })
     }
+}
 
-    /// The results of a guest that returned.
-    fn results(&self, store: &mut StoreMut<'_>) -> Vec<Value> {
-        let results = self.results.iter().zip(&self.values);
-        results
+/// A call whose arguments and results are [`Value`]s, converted in slices of
+/// the call.
+pub(crate) struct Converted<X> {
+    /// The call, until its first poll starts it.
+    request: Option<AsyncCallRequest<X>>,
+    /// Once it started: the types of its results, and what makes `X` of them.
+    results: Option<(Vec<Type>, CallFinish<X>)>,
+}
+
+impl<X> Converted<X> {
+    pub(crate) fn new(request: AsyncCallRequest<X>) -> Self {
+        Self {
+            request: Some(request),
+            results: None,
+        }
+    }
+}
+
+impl<X> Entry for Converted<X> {
+    type Output = Result<X, RuntimeError>;
+
+    fn start(&mut self, store: &mut StoreMut<'_>) -> Result<Guest, RuntimeError> {
+        let request = self.request.take().expect("polled after completion");
+        let params = (request.params)(store)?;
+        let function = request.function.as_sys();
+        let (values, results) = function.raw_params(store, &params)?;
+        self.results = Some((results, request.finish));
+        Guest::new(store, function, values)
+    }
+
+    fn finish(
+        &mut self,
+        outcome: Result<(&mut StoreMut<'_>, &[RawValue]), RuntimeError>,
+    ) -> Self::Output {
+        // Dropped with the call, if it ended before it started.
+        self.request = None;
+        let (store, values) = outcome?;
+        let (types, finish) = self.results.take().expect("a call that started");
+        let results = types.iter().zip(values);
+        let results: Vec<Value> = results
             .map(|(ty, raw)| unsafe { Value::from_raw(store, *ty, *raw) })
-            .collect()
+            .collect();
+        finish(store, &results)
+    }
+}
+
+/// A typed call: its arguments were made raw values when it was made, and
+/// `finish` reads its results, so that nothing of it is on the heap.
+pub(crate) struct Typed<R> {
+    function: Function,
+    /// The arguments, with room for the results, until the call starts.
+    values: Option<Result<RawValues, RuntimeError>>,
+    finish: TypedFinish<R>,
+}
+
+/// What a typed call returns; see [`Entry::finish`].
+pub(crate) type TypedFinish<R> = fn(Result<(&mut StoreMut<'_>, &[RawValue]), RuntimeError>) -> R;
+
+impl<R> Typed<R> {
+    pub(crate) fn new(
+        function: Function,
+        values: Result<RawValues, RuntimeError>,
+        finish: TypedFinish<R>,
+    ) -> Self {
+        Self {
+            function,
+            values: Some(values),
+            finish,
+        }
+    }
+}
+
+impl<R> Entry for Typed<R> {
+    type Output = R;
+
+    fn start(&mut self, store: &mut StoreMut<'_>) -> Result<Guest, RuntimeError> {
+        let values = self.values.take().expect("polled after completion")?;
+        Guest::new(store, &self.function, values)
+    }
+
+    fn finish(
+        &mut self,
+        outcome: Result<(&mut StoreMut<'_>, &[RawValue]), RuntimeError>,
+    ) -> R {
+        // Dropped with the call, if it ended before it started.
+        self.values = None;
+        (self.finish)(outcome)
     }
 }
 

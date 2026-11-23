@@ -38,6 +38,12 @@ use wasmer_vm::{
 #[cfg(feature = "experimental-async")]
 pub(crate) type RawResults = SmallVec<[RawValue; 4]>;
 
+/// The arguments of a call as its trampoline takes them, which it overwrites
+/// with the results. As many as the guest keeps on its own stack are inline
+/// (see [`wasmer_vm::CallValues`]), so that a call does not allocate for them.
+#[cfg(feature = "experimental-async")]
+pub(crate) type RawValues = SmallVec<[RawValue; wasmer_vm::INLINE_CALL_VALUES]>;
+
 /// The future of one call of an async import.
 #[cfg(feature = "experimental-async")]
 pub(crate) type RawHostFuture = Pin<Box<dyn Future<Output = Result<RawResults, RuntimeError>>>>;
@@ -495,14 +501,26 @@ impl Function {
         Ok(())
     }
 
-    /// What `call_async` needs to enter the function on a stack of its own:
-    /// its parts, and `params` as its trampoline takes them.
+    /// What `call_async` needs to enter the function on a stack of its own.
     #[cfg(feature = "experimental-async")]
-    pub(crate) fn raw_entry(
+    pub(crate) fn raw_entry(&self, store: &impl AsStoreRef) -> RawEntry {
+        let function = self.handle.get(store.as_store_ref().objects().as_sys());
+        let anyfunc = unsafe { function.anyfunc.as_ptr().as_ref() };
+        RawEntry {
+            vmctx: anyfunc.vmctx,
+            trampoline: anyfunc.call_trampoline,
+            callee: anyfunc.func_ptr,
+        }
+    }
+
+    /// `params` as the trampoline of the function takes them, with room for
+    /// its results, and the types of those.
+    #[cfg(feature = "experimental-async")]
+    pub(crate) fn raw_params(
         &self,
         store: &mut impl AsStoreMut,
         params: &[Value],
-    ) -> Result<RawEntry, RuntimeError> {
+    ) -> Result<(RawValues, Vec<wasmer_types::Type>), RuntimeError> {
         let signature = self.ty(store);
         let types = |values: &[Value]| {
             let types = values.iter().map(|value| value.ty().to_string());
@@ -519,20 +537,14 @@ impl Function {
         if params.iter().any(|param| !param.is_from_store(store)) {
             return Err(RuntimeError::new("cross-`Store` values are not supported"));
         }
-        let mut values =
-            vec![RawValue { i32: 0 }; max(params.len(), signature.results().len())];
+        let mut values = RawValues::from_elem(
+            RawValue { i32: 0 },
+            max(params.len(), signature.results().len()),
+        );
         for (param, slot) in params.iter().zip(&mut values) {
             *slot = param.as_raw(store);
         }
-        let function = self.handle.get(store.objects_mut().as_sys());
-        let anyfunc = unsafe { function.anyfunc.as_ptr().as_ref() };
-        Ok(RawEntry {
-            vmctx: anyfunc.vmctx,
-            trampoline: anyfunc.call_trampoline,
-            callee: anyfunc.func_ptr,
-            values,
-            results: signature.results().to_vec(),
-        })
+        Ok((values, signature.results().to_vec()))
     }
 
     pub(crate) fn result_arity(&self, store: &impl AsStoreRef) -> usize {
@@ -843,10 +855,6 @@ pub(crate) struct RawEntry {
     pub(crate) vmctx: wasmer_vm::VMFunctionContext,
     pub(crate) trampoline: VMTrampoline,
     pub(crate) callee: *const wasmer_vm::VMFunctionBody,
-    /// The arguments, which the trampoline overwrites with the results.
-    pub(crate) values: Vec<RawValue>,
-    /// The types of the results.
-    pub(crate) results: Vec<wasmer_types::Type>,
 }
 
 pub(crate) enum HostCallOutcome {
