@@ -319,7 +319,7 @@ impl CraneliftCompiler {
                     FunctionIndex::from_u32(*index as u32),
                     func_type.clone(),
                 );
-                let trampoline = make_trampoline_dynamic_function(
+                let context = make_trampoline_dynamic_function(
                     &self.config().callbacks,
                     &*isa,
                     target.triple().architecture,
@@ -333,7 +333,9 @@ impl CraneliftCompiler {
                     progress.notify_steps(WASM_TRAMPOLINE_ESTIMATED_BODY_SIZE)?;
                 }
                 Ok(CompileOutput {
-                    object: wasmer_compiler::elf::emit_function_body(target, &kind, &trampoline)?,
+                    object: crate::elf::emit_dynamic_trampoline(
+                        &*isa, target, &kind, unwind, &context,
+                    )?,
                     maximum_stack_usage: None,
                 })
             })

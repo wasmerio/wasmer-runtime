@@ -23,7 +23,8 @@ use wasmer_compiler::{
 };
 use wasmer_compiler::{WasmSourceMap, dwarf::init_dwarf_unit};
 use wasmer_compiler::{
-    elf::emit_trap_section,
+    elf::{add_undefined_symbol, emit_trap_section},
+    get_object_for_target,
     misc::{CompiledFunctionExt, CompiledKind},
     types::function::{Compilation, CompiledFunctionFrameInfo},
 };
@@ -272,6 +273,25 @@ pub(crate) fn emit_local_function(
 
     unwind.emit(isa, context, &kind, &mut object, function_symbol)?;
 
+    write_object(&object)
+}
+
+pub(crate) fn emit_dynamic_trampoline(
+    isa: &dyn TargetIsa,
+    target: &Target,
+    kind: &CompiledKind,
+    unwind: UnwindKind,
+    context: &Context,
+) -> Result<Vec<u8>, CompileError> {
+    let mut object = get_object_for_target(target.triple())
+        .map_err(|e| CompileError::Codegen(format!("cannot create object: {e}")))?;
+    let symbol = add_undefined_symbol(&mut object, kind.linkage_name());
+    let text = object.section_id(StandardSection::Text);
+    let code = context.compiled_code().unwrap().code_buffer();
+    object.add_symbol_data(symbol, text, code, 4);
+
+    // A guest exception returned by the host must be able to unwind through this frame.
+    unwind.emit(isa, context, kind, &mut object, symbol)?;
     write_object(&object)
 }
 

@@ -341,3 +341,62 @@ fn nested_async_in_sync() -> Result<()> {
 
     Ok(())
 }
+
+/// An async import that returns the exception of a guest it called throws it
+/// back into its caller, which was suspended and resumed in between, and
+/// whose `try_table` catches it.
+#[test]
+#[cfg_attr(
+    feature = "v8-default",
+    ignore = "async functions are not supported by the default v8 backend"
+)]
+fn an_async_import_rethrows_a_guest_exception() -> Result<()> {
+    const WAT: &str = r#"
+    (module
+        (import "env" "relay" (func $relay))
+        (tag $e (param i32))
+        (func (export "thrower") (throw $e (i32.const 7)))
+        (func (export "run") (result i32)
+            (block $caught (result i32)
+                (try_table (catch $e $caught) (call $relay))
+                (i32.const 0)
+            )
+        )
+    )
+    "#;
+    let wasm = wat::parse_str(WAT).expect("valid WAT module");
+
+    let mut store = Store::default();
+    let module = Module::new(&store, wasm)?;
+
+    let env = FunctionEnv::new(&mut store, None::<Function>);
+    let relay = Function::new_typed_with_env_async(
+        &mut store,
+        &env,
+        async move |env: AsyncFunctionEnvMut<Option<Function>>| -> Result<(), RuntimeError> {
+            let thrower = env.read().await.data().clone().expect("thrower to be set");
+            tokio::task::yield_now().await;
+            thrower
+                .call_async(&env.as_store_async(), vec![])
+                .await
+                .map(drop)
+        },
+    );
+
+    let instance = Instance::new(
+        &mut store,
+        &module,
+        &imports! { "env" => { "relay" => relay } },
+    )?;
+    let run = instance.exports.get_function("run")?.clone();
+    *env.as_mut(&mut store) = Some(instance.exports.get_function("thrower")?.clone());
+
+    let results = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(run.call_async(&store.into_async(), vec![]))?;
+    assert_eq!(results.as_ref(), [Value::I32(7)]);
+
+    Ok(())
+}
