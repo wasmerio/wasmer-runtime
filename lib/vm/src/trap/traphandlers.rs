@@ -1010,8 +1010,7 @@ impl Drop for ThreadExit {
 struct Stacks {
     /// The Wasm stack that Wasm runs on: set on that stack at the start of
     /// each call, and taken while host code runs, on whichever stack. `None`
-    /// means that no Wasm runs at this point, which the signal handler relies
-    /// on to tell faults in host code from Wasm traps.
+    /// means that no Wasm runs at this point.
     wasm: Cell<Option<NonNull<WasmStack>>>,
     /// The Wasm stack that host code runs on in place, if it does (see
     /// [`host_call_in_place`]): set while such a host call runs, and cleared
@@ -1019,6 +1018,10 @@ struct Stacks {
     /// in place resumes its coroutine from the stack that this Wasm stack's
     /// coroutine was resumed from, and `on_host_stack` runs there too, so that
     /// the stack a coroutine switches back to is never another Wasm stack.
+    ///
+    /// The signal handler relies on it to tell a fault of host code on a Wasm
+    /// stack from one of the guest: host code elsewhere runs on the native
+    /// stack, outside the bounds of every Wasm stack.
     in_place: Cell<Option<NonNull<WasmStack>>>,
 }
 
@@ -1276,10 +1279,12 @@ impl TrapHandlerContext {
                 return true;
             }
 
-            // Host code runs with the Wasm stack taken, and may run on that
-            // stack (see `host_call_in_place`): a fault in it is the host's,
-            // and resetting the coroutine would skip its destructors.
-            if thread.stacks.wasm.get().is_none() {
+            // Host code may run in place on a Wasm stack (see
+            // `host_call_in_place`): a fault in it is the host's, and
+            // resetting the coroutine would skip its destructors. Host code
+            // anywhere else runs on the native stack, which the context of
+            // the coroutine tells from its own below.
+            if thread.stacks.in_place.get().is_some() {
                 return false;
             }
 
@@ -1913,37 +1918,70 @@ pub unsafe fn suspend_wasm_call() {
 // whichever codegen unit its instance lands in.
 #[inline]
 pub fn on_host_stack<F: FnOnce() -> T, T>(f: F) -> T {
-    let (wasm_stack, in_place) = with_stacks(|stacks| (stacks.wasm.get(), stacks.in_place.get()));
-    // Host code runs here: on the host stack already, as when a host function
-    // is called directly from the API, where `f` runs as it is, or in place
-    // on a Wasm stack, which it leaves as a call into Wasm from there does.
-    let Some(wasm_stack) = wasm_stack else {
-        return match in_place {
-            None => f(),
-            Some(in_place) => with_stacks(|stacks| on_parent_of_in_place(stacks, in_place, f)),
-        };
+    match try_on_host_stack(f) {
+        Ok(result) => result,
+        Err(f) => on_host_stack_from_host(f),
+    }
+}
+
+/// [`on_host_stack`] from Wasm: runs `f` on the native stack and returns what
+/// it returns if this runs on a Wasm stack, and gives `f` back otherwise, for
+/// [`on_host_stack_from_host`] to run.
+///
+/// For a caller that handles the result of each path apart: one result that
+/// may come from either is kept in memory by the caller, where the one that
+/// comes through the switch is copied with loads wider than the stores that
+/// wrote it, which wait for the stores to reach the cache.
+#[inline]
+pub fn try_on_host_stack<F: FnOnce() -> T, T>(f: F) -> Result<T, F> {
+    let stacks = &VmThread::get().stacks;
+    let Some(wasm_stack) = stacks.wasm.get() else {
+        return Err(f);
     };
     // Safety: it lives on the stack of the coroutine that is running.
     let yielder = unsafe { wasm_stack.as_ref().yielder.as_ref() };
+    // Take the Wasm stack for as long as `f` runs, and give it back once
+    // control is back here, whether `f` returns or unwinds. This is done on
+    // the Wasm stack, around the switch, where the thread's stacks are in hand
+    // already: on the native side it cost every host call more than the
+    // switch's own bookkeeping. The switch itself, on either side, runs on the
+    // Wasm stack as the guest's, which the signal handler tells from host code
+    // by `Stacks::in_place`: overflowing the stack there is the guest's stack
+    // overflow, which it turns into a trap, as it does in the guest's frames.
+    stacks.wasm.set(None);
+    defer! {
+        stacks.wasm.set(Some(wasm_stack));
+    }
     // Only the closure crosses the switch: it is read on the other side
     // right after it was written here.
     let wrapped = SendWrapper(f);
-    yielder.on_parent_stack(move || {
+    Ok(yielder.on_parent_stack(move || {
         let wrapped = wrapped;
-        // Take the Wasm stack for as long as `f` runs, once on the host
-        // stack, and give it back before switching back to the Wasm stack,
-        // whether `f` returns or unwinds. The switch itself, on either side,
-        // runs on the Wasm stack as the guest's: overflowing it there is the
-        // guest's stack overflow, which the signal handler turns into a trap,
-        // as it does in the guest's own frames.
-        with_stacks(|stacks| {
-            let wasm_stack = stacks.wasm.replace(None);
-            defer! {
-                stacks.wasm.set(wasm_stack);
-            }
-            (wrapped.0)()
-        })
-    })
+        (wrapped.0)()
+    }))
+}
+
+/// [`on_host_stack`] where host code runs already, which is when
+/// [`try_on_host_stack`] gives `f` back: on the host stack, as when a host
+/// function is called directly from the API, where `f` runs as it is, or in
+/// place on a Wasm stack, which it leaves as a call into Wasm from there does.
+///
+/// Out of line, and calling `f` from one place, so that `f` is called from two
+/// places in all: LLVM then inlines it into the switch from Wasm, the path of
+/// every host function called from Wasm, where with a third caller it did
+/// not.
+#[inline(never)]
+pub fn on_host_stack_from_host<F: FnOnce() -> T, T>(f: F) -> T {
+    let stacks = &VmThread::get().stacks;
+    let mut f = Some(f);
+    let mut result = None;
+    let mut run = || result = f.take().map(|f| f());
+    match stacks.in_place.get() {
+        None => run(),
+        Some(in_place) => on_parent_of_in_place(stacks, in_place, &mut run),
+    }
+    // Safety: `run` ran, and `f` returned if this is reached.
+    unsafe { result.unwrap_unchecked() }
 }
 
 /// Runs `f` on the stack that the coroutine of `wasm_stack`, where host code

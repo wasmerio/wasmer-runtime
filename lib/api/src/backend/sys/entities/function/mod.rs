@@ -845,6 +845,34 @@ where
     }
     let result = result.map(|result| result.expect("a guest that waited was resumed"));
 
+    // Safety: on the Wasm stack, in the trampoline of a function of
+    // `store_id`, with what its host function returned.
+    unsafe { finish_typed_host_call(store_id, result) }
+}
+
+/// What the host function of a typed trampoline gave it: its results, with the
+/// pointer of the store's active entry to convert them with, or the exception
+/// or trap it returned, or the panic it unwound with.
+type TypedHostResult<Rets, E> =
+    Result<InvocationResult<(Rets, *mut StoreInner), E>, Box<dyn Any + Send>>;
+
+/// What the trampoline of a typed host function does with what the host
+/// function returned, back on the Wasm stack: gives its results to Wasm, or
+/// raises its exception, trap or panic there.
+///
+/// Always inlined, into each place a trampoline has the result from: a result
+/// that comes from several places is kept in memory by the trampoline (see
+/// `wasmer_vm::try_on_host_stack`).
+///
+/// # Safety
+/// Called on the Wasm stack, by the trampoline of a host function of
+/// `store_id`, with what that host function returned and the pointer of the
+/// store's active entry it was called with.
+#[inline(always)]
+unsafe fn finish_typed_host_call<Rets: WasmTypeList, E: Error + Send + Sync + 'static>(
+    store_id: StoreId,
+    result: TypedHostResult<Rets, E>,
+) -> Rets::CStruct {
     // IMPORTANT: DO NOT ALLOCATE ON THE STACK,
     // AS WE ARE IN THE WASM STACK, NOT ON THE HOST ONE.
     // See: https://github.com/wasmerio/wasmer/pull/5700
@@ -1120,12 +1148,12 @@ macro_rules! impl_host_function {
             /// This is a function that wraps the real host
             /// function. Its address will be used inside the
             /// runtime.
-            // With `IN_PLACE`, a call of a function set to run on the Wasm
-            // stack runs on the stack it came from when enough of it is left,
-            // and otherwise goes to the other instance, which switches to the
-            // native stack, as every call of a function does by default. That
-            // instance stays out of line, and with it the registers the switch
-            // makes every caller save.
+            // `entry` calls the instance that switches to the native stack, as
+            // every call does by default, or, for a function set to run on the
+            // Wasm stack, the one that runs in place (`IN_PLACE`) when enough of
+            // the stack is left, which goes to the other otherwise. Each
+            // instance saves only the registers it uses itself: those the switch
+            // makes the caller save stay out of the one that runs in place.
             #[inline(never)]
             unsafe extern "C-unwind" fn func_wrapper<const IN_PLACE: bool, $( $x, )* Rets, RetsAsResult, Func>( env: &StaticFunction<Func, ()>, $( $x: <$x::Native as NativeWasmType>::Abi, )* ) -> Rets::CStruct
             where
@@ -1149,61 +1177,49 @@ macro_rules! impl_host_function {
                     }))
                 };
                 let result = if IN_PLACE {
-                    let in_place = if env.on_native_stack.load(Ordering::Relaxed) {
-                        None
-                    } else {
-                        wasmer_vm::host_call_in_place()
-                    };
-                    let Some(in_place) = in_place else {
+                    let Some(in_place) = wasmer_vm::host_call_in_place() else {
                         return unsafe { func_wrapper::<false, $( $x, )* Rets, RetsAsResult, Func>(env, $( $x ),*) };
                     };
                     let result = call();
                     drop(in_place);
                     result
                 } else {
-                    on_host_stack(call)
-                };
-
-                // IMPORTANT: DO NOT ALLOCATE ON THE STACK,
-                // AS WE ARE IN THE WASM STACK, NOT ON THE HOST ONE.
-                // See: https://github.com/wasmerio/wasmer/pull/5700
-                match result {
-                    Ok(InvocationResult::Success((result, store))) => unsafe {
-                        #[cfg(feature = "experimental-host-interrupt")]
-                        if interrupt_registry::is_interrupted(env.store_id) {
-                            raise_lib_trap(Trap::lib(TrapCode::HostInterrupt))
+                    match wasmer_vm::try_on_host_stack(call) {
+                        Ok(result) => result,
+                        // Called from host code rather than from Wasm. Its
+                        // result is handled apart, so that the one that comes
+                        // through the switch is not kept in memory with it.
+                        Err(call) => {
+                            let result = wasmer_vm::on_host_stack_from_host(call);
+                            // Safety: as below.
+                            return unsafe { finish_typed_host_call(env.store_id, result) };
                         }
-                        // Safety: the pointer the host function borrowed the
-                        // store through, which is the active entry's: nothing
-                        // has replaced it since. It is used only for the
-                        // duration of the call to `into_c_struct`.
-                        return result.into_c_struct(&mut *store);
-                    },
-                    Ok(InvocationResult::Exception(exception)) => unsafe {
-                        // Note: can't acquire a proper ref-counted context ref here, since we can switch
-                        // away from the WASM stack at any time.
-                        // Safety: The pointer is only used for the duration of the call to `throw` and
-                        // `is_interrupted`.
-                        let mut store_wrapper = StoreContext::get_current_transient(env.store_id);
-                        let mut store = store_wrapper.as_mut().unwrap();
-                        #[cfg(feature = "experimental-host-interrupt")]
-                        if interrupt_registry::is_interrupted(store.objects.id()) {
-                            raise_lib_trap(Trap::lib(TrapCode::HostInterrupt))
-                        }
-                        wasmer_vm::libcalls::throw(
-                            store.objects.as_sys(),
-                            exception.vm_exceptionref().unwrap_sys_ref().to_u32_exnref(),
-                        )
                     }
-                    Ok(InvocationResult::Trap(trap)) => unsafe { raise_user_trap(trap) },
-                    Ok(InvocationResult::YieldOutsideAsyncContext) => unsafe {
-                        raise_lib_trap(Trap::lib(TrapCode::YieldOutsideAsyncContext))
-                    },
-                    Err(panic) => unsafe { resume_panic(panic) },
+                };
+                // Safety: on the Wasm stack, in the trampoline of a function
+                // of the store, with what its host function returned.
+                unsafe { finish_typed_host_call(env.store_id, result) }
+            }
+
+            /// What Wasm calls: the instance that switches to the native
+            /// stack, or, for a function set to run on the Wasm stack, the
+            /// one that runs in place. It saves no registers of its own, so
+            /// that neither instance pays for those of the other.
+            unsafe extern "C-unwind" fn entry<$( $x, )* Rets, RetsAsResult, Func>( env: &StaticFunction<Func, ()>, $( $x: <$x::Native as NativeWasmType>::Abi, )* ) -> Rets::CStruct
+            where
+                $( $x: FromToNativeWasmType, )*
+                Rets: WasmTypeList,
+                RetsAsResult: IntoResult<Rets>,
+                Func: Fn($( $x , )*) -> RetsAsResult + 'static,
+            {
+                if env.on_native_stack.load(Ordering::Relaxed) {
+                    unsafe { func_wrapper::<false, $( $x, )* Rets, RetsAsResult, Func>(env, $( $x ),*) }
+                } else {
+                    unsafe { func_wrapper::<true, $( $x, )* Rets, RetsAsResult, Func>(env, $( $x ),*) }
                 }
             }
 
-            func_wrapper::< true, $( $x, )* Rets, RetsAsResult, Func > as _
+            entry::< $( $x, )* Rets, RetsAsResult, Func > as _
 
         }
 
@@ -1270,60 +1286,48 @@ macro_rules! impl_host_function {
                     }))
                 };
                 let result = if IN_PLACE {
-                    let in_place = if env.on_native_stack.load(Ordering::Relaxed) {
-                        None
-                    } else {
-                        wasmer_vm::host_call_in_place()
-                    };
-                    let Some(in_place) = in_place else {
+                    let Some(in_place) = wasmer_vm::host_call_in_place() else {
                         return unsafe { func_wrapper::<false, T, $( $x, )* Rets, RetsAsResult, Func>(env, $( $x ),*) };
                     };
                     let result = call();
                     drop(in_place);
                     result
                 } else {
-                    on_host_stack(call)
-                };
-
-                // IMPORTANT: DO NOT ALLOCATE ON THE STACK,
-                // AS WE ARE IN THE WASM STACK, NOT ON THE HOST ONE.
-                // See: https://github.com/wasmerio/wasmer/pull/5700
-                match result {
-                    Ok(InvocationResult::Success((result, store))) => unsafe {
-                        #[cfg(feature = "experimental-host-interrupt")]
-                        if interrupt_registry::is_interrupted(env.store_id) {
-                            raise_lib_trap(Trap::lib(TrapCode::HostInterrupt))
+                    match wasmer_vm::try_on_host_stack(call) {
+                        Ok(result) => result,
+                        // Called from host code rather than from Wasm. Its
+                        // result is handled apart, so that the one that comes
+                        // through the switch is not kept in memory with it.
+                        Err(call) => {
+                            let result = wasmer_vm::on_host_stack_from_host(call);
+                            // Safety: as below.
+                            return unsafe { finish_typed_host_call(env.store_id, result) };
                         }
-                        // Safety: the pointer the host function borrowed the
-                        // store through, which is the active entry's: nothing
-                        // has replaced it since. It is used only for the
-                        // duration of the call to `into_c_struct`.
-                        return result.into_c_struct(&mut *store);
-                    },
-                    Ok(InvocationResult::Exception(exception)) => unsafe {
-                        // Note: can't acquire a proper ref-counted context ref here, since we can switch
-                        // away from the WASM stack at any time.
-                        // Safety: The pointer is only used for the duration of the call to `throw` and
-                        // `is_interrupted`.
-                        let mut store_wrapper = StoreContext::get_current_transient(env.store_id);
-                        let mut store = store_wrapper.as_mut().unwrap();
-                        #[cfg(feature = "experimental-host-interrupt")]
-                        if interrupt_registry::is_interrupted(store.objects.id()) {
-                            raise_lib_trap(Trap::lib(TrapCode::HostInterrupt))
-                        }
-                        wasmer_vm::libcalls::throw(
-                            store.objects.as_sys(),
-                            exception.vm_exceptionref().unwrap_sys_ref().to_u32_exnref(),
-                        )
                     }
-                    Ok(InvocationResult::Trap(trap)) => unsafe { raise_user_trap(trap) },
-                    Ok(InvocationResult::YieldOutsideAsyncContext) => unsafe {
-                        raise_lib_trap(Trap::lib(TrapCode::YieldOutsideAsyncContext))
-                    },
-                    Err(panic) => unsafe { resume_panic(panic) },
+                };
+                // Safety: on the Wasm stack, in the trampoline of a function
+                // of the store, with what its host function returned.
+                unsafe { finish_typed_host_call(env.store_id, result) }
+            }
+
+            /// What Wasm calls: the instance that switches to the native
+            /// stack, or, for a function set to run on the Wasm stack, the
+            /// one that runs in place. It saves no registers of its own, so
+            /// that neither instance pays for those of the other.
+            unsafe extern "C-unwind" fn entry<T: Send + 'static, $( $x, )* Rets, RetsAsResult, Func>( env: &StaticFunction<Func, T>, $( $x: <$x::Native as NativeWasmType>::Abi, )* ) -> Rets::CStruct
+            where
+                $( $x: FromToNativeWasmType, )*
+                Rets: WasmTypeList,
+                RetsAsResult: IntoResult<Rets>,
+                Func: Fn(FunctionEnvMut<T>, $( $x , )*) -> RetsAsResult + 'static,
+            {
+                if env.on_native_stack.load(Ordering::Relaxed) {
+                    unsafe { func_wrapper::<false, T, $( $x, )* Rets, RetsAsResult, Func>(env, $( $x ),*) }
+                } else {
+                    unsafe { func_wrapper::<true, T, $( $x, )* Rets, RetsAsResult, Func>(env, $( $x ),*) }
                 }
             }
-            func_wrapper::< true, T, $( $x, )* Rets, RetsAsResult, Func > as _
+            entry::< T, $( $x, )* Rets, RetsAsResult, Func > as _
         }
 
         #[allow(non_snake_case)]
