@@ -265,6 +265,12 @@ jobs:
         run: |
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$GITHUB_WORKSPACE:/project" -w /project wasmer/riscv64 \
             cargo test --target riscv64gc-unknown-linux-gnu --release --features "cranelift,$ARTIFACT_FEATURES" --locked
+      # Singlepass support for riscv64 is experimental, so only the tests that
+      # run its code on purpose are enabled here, not the whole suite.
+      - name: Run RISC-V Singlepass tests
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$GITHUB_WORKSPACE:/project" -w /project wasmer/riscv64 \
+            cargo test --target riscv64gc-unknown-linux-gnu --release --features "cranelift,singlepass" --locked --test compilers issues::issue_32_
   test:
     name: ${{ matrix.stage.description }} - ${{ matrix.metadata.build }}
     runs-on: ${{ (matrix.metadata.build == 'linux-x64' || matrix.metadata.build == 'linux-musl') && (github.event_name == 'pull_request' && 'aux-pub-16cpu-amd64' || 'aux-pub-trusted-16cpu-amd64') || matrix.metadata.build == 'linux-arm64' && (github.event_name == 'pull_request' && 'aux-pub-16cpu-arm64' || 'aux-pub-trusted-16cpu-arm64') || matrix.metadata.os }}

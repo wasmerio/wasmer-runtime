@@ -2176,3 +2176,74 @@ fn fixed_funcref_table_external_mutations(config: crate::Config) -> Result<()> {
     }
     Ok(())
 }
+
+/// A Singlepass guest passes the `f32` arguments of an import NaN-boxed in
+/// their float registers, as the C ABI requires.
+///
+/// The import is a function compiled by Cranelift, which uses its arguments
+/// in the registers they arrive in: on riscv64, single-precision instructions
+/// read an `f32` that is not NaN-boxed as the canonical NaN. Both modules are
+/// instantiated in the same store, so the Singlepass guest calls the Cranelift
+/// function directly, through the trampoline that moves its float arguments to
+/// the float registers.
+///
+/// The callee returns the bits of its `f64` result as an `i64`: Singlepass
+/// reads the result of an import from an integer register, where Cranelift
+/// does not put a float one.
+///
+/// https://github.com/wasmerio/wasmer-runtime/issues/32
+#[cfg(all(feature = "singlepass", feature = "cranelift"))]
+#[test]
+fn issue_32_singlepass_passes_nan_boxed_f32_arguments_to_imports() -> Result<()> {
+    use wasmer::sys::EngineBuilder;
+
+    let singlepass: Engine =
+        EngineBuilder::new(wasmer_compiler_singlepass::Singlepass::default()).into();
+    let cranelift: Engine =
+        EngineBuilder::new(wasmer_compiler_cranelift::Cranelift::default()).into();
+    let mut store = Store::new(singlepass.clone());
+
+    // On riscv64, `$a` and `$d` arrive in `fa0` and `fa2` as `f32`s, and `$b`
+    // in `fa1` as an `f64`.
+    let callee = Module::new(
+        &cranelift,
+        r#"(module
+            (func (export "sum")
+                (param $a f32) (param $b f64) (param $c i32) (param $d f32) (result i64)
+                local.get $a
+                local.get $d
+                f32.add
+                f64.promote_f32
+                local.get $b
+                f64.add
+                local.get $c
+                f64.convert_i32_s
+                f64.add
+                i64.reinterpret_f64))"#,
+    )?;
+    let callee = Instance::new(&mut store, &callee, &imports! {})?;
+    let sum = callee.exports.get_function("sum")?.clone();
+
+    let caller = Module::new(
+        &singlepass,
+        r#"(module
+            (import "callee" "sum" (func $sum (param f32 f64 i32 f32) (result i64)))
+            (func (export "call_sum") (param f32 f64 i32 f32) (result i64)
+                local.get 0
+                local.get 1
+                local.get 2
+                local.get 3
+                call $sum))"#,
+    )?;
+    let caller = Instance::new(
+        &mut store,
+        &caller,
+        &imports! { "callee" => { "sum" => sum } },
+    )?;
+    let call_sum: TypedFunction<(f32, f64, i32, f32), i64> =
+        caller.exports.get_typed_function(&store, "call_sum")?;
+
+    let bits = call_sum.call(&mut store, 1.5, 10.0, 100, 2.25)?;
+    assert_eq!(f64::from_bits(bits as u64), 113.75);
+    Ok(())
+}
