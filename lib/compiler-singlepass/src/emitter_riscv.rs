@@ -2120,7 +2120,14 @@ pub fn gen_import_call_trampoline_riscv(
                     continue;
                 }
             };
-            a.emit_ld(Size::S64, false, targ, prev_loc)?;
+            // An `f32` is loaded on its own (`flw`), which NaN-boxes it in its
+            // 64-bit register as the ABI requires: one that is not NaN-boxed
+            // reads as the canonical NaN once the callee uses it as an `f32`.
+            let size = match (ty, targ) {
+                (Type::F32, Location::SIMD(_)) => Size::S32,
+                _ => Size::S64,
+            };
+            a.emit_ld(size, false, targ, prev_loc)?;
             output_reporter.check(a.offset().0)?;
         }
 
@@ -2172,4 +2179,59 @@ pub fn gen_import_call_trampoline_riscv(
     output_reporter.finish(contents.len())?;
 
     Ok(contents)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use wasmer_types::{ModuleInfo, entity::EntityRef};
+
+    /// The float loads of the trampoline that calls an import of signature
+    /// `params -> ()`, in order: the float register each one loads, and
+    /// whether it loads 32 bits (`flw`) or 64 (`fld`).
+    fn float_loads_of_import_trampoline(params: &[Type]) -> Vec<(u32, &'static str)> {
+        let mut module = ModuleInfo::new();
+        module.num_imported_functions = 1;
+        let vmoffsets = VMOffsets::try_new(8, &module).unwrap();
+        let signature = FunctionType::new(params.to_vec(), vec![]);
+        let code = gen_import_call_trampoline_riscv(
+            &vmoffsets,
+            FunctionIndex::new(0),
+            &signature,
+            CallingConvention::SystemV,
+            None,
+        )
+        .unwrap();
+        // Without the C extension, every instruction is 32 bits wide.
+        let (instructions, rest) = code.as_chunks::<4>();
+        assert!(rest.is_empty());
+        instructions
+            .iter()
+            .map(|word| u32::from_le_bytes(*word))
+            .filter(|instruction| instruction & 0x7f == 0b000_0111) // LOAD-FP
+            .map(|instruction| {
+                let rd = (instruction >> 7) & 0x1f;
+                let width = match (instruction >> 12) & 0x7 {
+                    0b010 => "flw",
+                    0b011 => "fld",
+                    other => panic!("unexpected LOAD-FP width {other:#05b}"),
+                };
+                (rd, width)
+            })
+            .collect()
+    }
+
+    /// Singlepass passes every argument in an integer register, and the
+    /// trampoline of an import moves the float ones to the float registers of
+    /// the C ABI. The ABI requires an `f32` there to be NaN-boxed, with the
+    /// upper 32 bits set, which `flw` does and `fld` of the 8-byte slot the
+    /// argument was stored in does not: a callee that uses the register as an
+    /// `f32` reads the canonical NaN instead of the argument.
+    #[test]
+    fn import_trampoline_nan_boxes_f32_arguments() {
+        assert_eq!(
+            float_loads_of_import_trampoline(&[Type::F32, Type::F64, Type::I32, Type::F32]),
+            [(10, "flw"), (11, "fld"), (12, "flw")],
+        );
+    }
 }
