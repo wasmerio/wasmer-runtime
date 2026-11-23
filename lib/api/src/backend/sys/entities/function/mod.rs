@@ -19,7 +19,19 @@ use crate::{
 };
 use smallvec::{SmallVec, smallvec};
 use std::panic::{self, AssertUnwindSafe};
-use std::{cell::UnsafeCell, cmp::max, error::Error, ffi::c_void, marker::PhantomData, sync::Arc};
+use std::{
+    any::Any,
+    cell::UnsafeCell,
+    cmp::max,
+    error::Error,
+    ffi::c_void,
+    marker::PhantomData,
+    ptr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 #[cfg(feature = "experimental-async")]
 use std::{pin::Pin, rc::Rc};
 use wasmer_types::{NativeWasmType, RawValue, StoreId, Type};
@@ -243,6 +255,7 @@ impl Function {
             store_id: store.objects_mut().id(),
             env,
             func,
+            on_native_stack: AtomicBool::new(false),
         });
         let function_type = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
 
@@ -268,7 +281,7 @@ impl Function {
             anyfunc: MaybeInstanceOwned::Host(Box::new(UnsafeCell::new(anyfunc))),
             kind: VMFunctionKind::Static,
             signature: function_type,
-            host_data,
+            host_data: HostFunctionData::boxed(host_data, |state| &state.on_native_stack, true),
         };
         Self {
             handle: StoreHandle::new(store.objects_mut().as_sys_mut(), vm_function),
@@ -290,6 +303,7 @@ impl Function {
             store_id: store.objects_mut().id(),
             env: env.as_sys().clone().into(),
             func,
+            on_native_stack: AtomicBool::new(false),
         });
         let function_type = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
 
@@ -315,7 +329,7 @@ impl Function {
             anyfunc: MaybeInstanceOwned::Host(Box::new(UnsafeCell::new(anyfunc))),
             kind: VMFunctionKind::Static,
             signature: function_type,
-            host_data,
+            host_data: HostFunctionData::boxed(host_data, |state| &state.on_native_stack, true),
         };
         Self {
             handle: StoreHandle::new(store.objects_mut().as_sys_mut(), vm_function),
@@ -338,10 +352,13 @@ impl Function {
         Rets: WasmTypeList + 'static,
     {
         let func_ptr = <F as AsyncHostTrampolines<T, Args, Rets>>::function_callback(&func);
+        // Its future may suspend the coroutine the call came from, which it
+        // must do from the native stack: it always runs there.
         let host_data = Box::new(StaticFunction {
             store_id: store.objects_mut().id(),
             env: env.clone(),
             func: Rc::new(func),
+            on_native_stack: AtomicBool::new(true),
         });
         let function_type = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
 
@@ -367,7 +384,7 @@ impl Function {
             anyfunc: MaybeInstanceOwned::Host(Box::new(UnsafeCell::new(anyfunc))),
             kind: VMFunctionKind::Static,
             signature: function_type,
-            host_data,
+            host_data: HostFunctionData::boxed(host_data, |state| &state.on_native_stack, false),
         };
         Self {
             handle: StoreHandle::new(store.objects_mut().as_sys_mut(), vm_function),
@@ -628,6 +645,27 @@ impl Function {
     /// Checks whether this `Function` can be used with the given store.
     pub(crate) fn is_from_store(&self, store: &impl AsStoreRef) -> bool {
         self.handle.store_id() == store.as_store_ref().objects().id()
+    }
+
+    /// See [`crate::Function::set_calls_on_native_stack`].
+    pub(crate) fn set_calls_on_native_stack(&self, store: &mut impl AsStoreMut, always: bool) {
+        let objects = store.objects_mut().as_sys_mut();
+        if let Some(data) = self.handle.get(objects).host_data.downcast_ref::<HostFunctionData>()
+            && data.in_place
+        {
+            data.on_native_stack().store(always, Ordering::Relaxed);
+        }
+    }
+
+    /// See [`crate::Function::calls_on_native_stack`].
+    pub(crate) fn calls_on_native_stack(&self, store: &impl AsStoreRef) -> bool {
+        let store = store.as_store_ref();
+        let function = self.handle.get(store.objects().as_sys());
+        match function.host_data.downcast_ref::<HostFunctionData>() {
+            Some(data) => data.on_native_stack().load(Ordering::Relaxed),
+            // A dynamic host function always runs on the native stack.
+            None => function.kind == VMFunctionKind::Dynamic,
+        }
     }
 
     pub(crate) fn to_vm_extern(&self) -> VMExtern {
@@ -988,6 +1026,49 @@ pub(crate) struct StaticFunction<F, T> {
     pub(crate) store_id: StoreId,
     pub(crate) env: FunctionEnv<T>,
     pub(crate) func: F,
+    /// Whether every call runs on the native stack, which
+    /// [`crate::Function::set_calls_on_native_stack`] sets (see
+    /// [`HostFunctionData`]). Only the thread that holds the store writes it.
+    pub(crate) on_native_stack: AtomicBool,
+}
+
+/// What the `VMFunction` of a typed host function owns: the function's state,
+/// and where in it the setting is that
+/// [`crate::Function::set_calls_on_native_stack`] writes.
+struct HostFunctionData {
+    /// Where the setting is in `_state`, in bytes from its start. An offset
+    /// rather than a pointer: moving the box asserts that it is the only way
+    /// to its contents, which would invalidate a pointer taken before.
+    on_native_stack_offset: usize,
+    /// Whether a call may run on the Wasm stack at all: false for
+    /// asynchronous functions, whose setting says they always run on the
+    /// native stack, and keeps saying so.
+    in_place: bool,
+    _state: Box<dyn Any>,
+}
+
+impl HostFunctionData {
+    fn boxed<S: 'static>(
+        state: Box<S>,
+        on_native_stack: fn(&S) -> &AtomicBool,
+        in_place: bool,
+    ) -> Box<dyn Any> {
+        let setting = ptr::from_ref(on_native_stack(&state)).addr();
+        let on_native_stack_offset = setting - ptr::from_ref::<S>(&state).addr();
+        Box::new(Self {
+            on_native_stack_offset,
+            in_place,
+            _state: state,
+        })
+    }
+
+    fn on_native_stack(&self) -> &AtomicBool {
+        let state = ptr::from_ref::<dyn Any>(&*self._state).cast::<u8>();
+        // Safety: `boxed` measured where the setting is in the state, which is
+        // still of the type it was measured in, and the reference is derived
+        // from a borrow of the state that it does not outlive.
+        unsafe { &*state.add(self.on_native_stack_offset).cast::<AtomicBool>() }
+    }
 }
 
 /// The trampolines of a typed async host function, which make it a static
@@ -1037,14 +1118,20 @@ macro_rules! impl_host_function {
             /// This is a function that wraps the real host
             /// function. Its address will be used inside the
             /// runtime.
-            unsafe extern "C-unwind" fn func_wrapper<$( $x, )* Rets, RetsAsResult, Func>( env: &StaticFunction<Func, ()>, $( $x: <$x::Native as NativeWasmType>::Abi, )* ) -> Rets::CStruct
+            // With `IN_PLACE`, a call runs on the Wasm stack it came from when
+            // enough of it is left, and otherwise goes to the other instance,
+            // which switches to the native stack. That instance stays out of
+            // line, and with it the registers the switch makes every caller
+            // save.
+            #[inline(never)]
+            unsafe extern "C-unwind" fn func_wrapper<const IN_PLACE: bool, $( $x, )* Rets, RetsAsResult, Func>( env: &StaticFunction<Func, ()>, $( $x: <$x::Native as NativeWasmType>::Abi, )* ) -> Rets::CStruct
             where
                 $( $x: FromToNativeWasmType, )*
                 Rets: WasmTypeList,
                 RetsAsResult: IntoResult<Rets>,
                 Func: Fn($( $x , )*) -> RetsAsResult + 'static,
             {
-                let result = on_host_stack(|| {
+                let call = || {
                     panic::catch_unwind(AssertUnwindSafe(|| {
                         let mut store_wrapper = unsafe { StoreContext::get_current(env.store_id) };
                         let store_ptr = store_wrapper.as_ptr();
@@ -1057,7 +1144,22 @@ macro_rules! impl_host_function {
                         let result = (env.func)($($x),* ).into_result();
                         to_invocation_result(result.map(|rets| (rets, store_ptr)))
                     }))
-                });
+                };
+                let result = if IN_PLACE {
+                    let in_place = if env.on_native_stack.load(Ordering::Relaxed) {
+                        None
+                    } else {
+                        wasmer_vm::host_call_in_place()
+                    };
+                    let Some(in_place) = in_place else {
+                        return unsafe { func_wrapper::<false, $( $x, )* Rets, RetsAsResult, Func>(env, $( $x ),*) };
+                    };
+                    let result = call();
+                    drop(in_place);
+                    result
+                } else {
+                    on_host_stack(call)
+                };
 
                 // IMPORTANT: DO NOT ALLOCATE ON THE STACK,
                 // AS WE ARE IN THE WASM STACK, NOT ON THE HOST ONE.
@@ -1098,7 +1200,7 @@ macro_rules! impl_host_function {
                 }
             }
 
-            func_wrapper::< $( $x, )* Rets, RetsAsResult, Func > as _
+            func_wrapper::< true, $( $x, )* Rets, RetsAsResult, Func > as _
 
         }
 
@@ -1137,14 +1239,16 @@ macro_rules! impl_host_function {
             /// This is a function that wraps the real host
             /// function. Its address will be used inside the
             /// runtime.
-            unsafe extern "C-unwind" fn func_wrapper<T: Send + 'static, $( $x, )* Rets, RetsAsResult, Func>( env: &StaticFunction<Func, T>, $( $x: <$x::Native as NativeWasmType>::Abi, )* ) -> Rets::CStruct
+            // See the function without an environment.
+            #[inline(never)]
+            unsafe extern "C-unwind" fn func_wrapper<const IN_PLACE: bool, T: Send + 'static, $( $x, )* Rets, RetsAsResult, Func>( env: &StaticFunction<Func, T>, $( $x: <$x::Native as NativeWasmType>::Abi, )* ) -> Rets::CStruct
                 where
                 $( $x: FromToNativeWasmType, )*
                 Rets: WasmTypeList,
                 RetsAsResult: IntoResult<Rets>,
                 Func: Fn(FunctionEnvMut<T>, $( $x , )*) -> RetsAsResult + 'static,
             {
-                let result = wasmer_vm::on_host_stack(|| {
+                let call = || {
                     panic::catch_unwind(AssertUnwindSafe(|| {
                         let mut store_wrapper = unsafe { StoreContext::get_current(env.store_id) };
                         let store_ptr = store_wrapper.as_ptr();
@@ -1161,7 +1265,22 @@ macro_rules! impl_host_function {
                         let result = (env.func)(f_env, $($x),* ).into_result();
                         to_invocation_result(result.map(|rets| (rets, store_ptr)))
                     }))
-                });
+                };
+                let result = if IN_PLACE {
+                    let in_place = if env.on_native_stack.load(Ordering::Relaxed) {
+                        None
+                    } else {
+                        wasmer_vm::host_call_in_place()
+                    };
+                    let Some(in_place) = in_place else {
+                        return unsafe { func_wrapper::<false, T, $( $x, )* Rets, RetsAsResult, Func>(env, $( $x ),*) };
+                    };
+                    let result = call();
+                    drop(in_place);
+                    result
+                } else {
+                    on_host_stack(call)
+                };
 
                 // IMPORTANT: DO NOT ALLOCATE ON THE STACK,
                 // AS WE ARE IN THE WASM STACK, NOT ON THE HOST ONE.
@@ -1201,7 +1320,7 @@ macro_rules! impl_host_function {
                     Err(panic) => unsafe { resume_panic(panic) },
                 }
             }
-            func_wrapper::< T, $( $x, )* Rets, RetsAsResult, Func > as _
+            func_wrapper::< true, T, $( $x, )* Rets, RetsAsResult, Func > as _
         }
 
         #[allow(non_snake_case)]

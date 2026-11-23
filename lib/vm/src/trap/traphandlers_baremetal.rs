@@ -125,6 +125,21 @@ pub fn on_host_stack<F: FnOnce() -> T, T>(f: F) -> T {
     f()
 }
 
+/// See the `std` variant. Host code always runs where it is called here, so
+/// the reserve is never measured.
+pub const HOST_CALL_RESERVE: usize = 256 * 1024;
+
+/// See the `std` variant. Host code always runs where it is called here.
+#[must_use = "the host call ends when this is dropped"]
+pub struct HostCallInPlace(());
+
+/// See the `std` variant. Host code always runs where it is called here: the
+/// guard does nothing.
+#[inline(always)]
+pub fn host_call_in_place() -> Option<HostCallInPlace> {
+    Some(HostCallInPlace(()))
+}
+
 /// Just run the `closure` and return its result wrapped in `Ok()`. Nothing is
 /// caught in `baremetal` mode.
 ///
