@@ -1699,6 +1699,10 @@ pub unsafe fn suspend_wasm_call() {
 /// the control of untrusted code. Malicious code could artificially induce a
 /// stack overflow in the middle of a sensitive host operations (e.g. growing
 /// a memory) which would be hard to recover from.
+//
+// `#[inline]`, so that every host function trampoline gets it inlined, in
+// whichever codegen unit its instance lands in.
+#[inline]
 pub fn on_host_stack<F: FnOnce() -> T, T>(f: F) -> T {
     // Reset YIEDER to None for the duration of this call to indicate that we
     // are no longer on the Wasm stack.
