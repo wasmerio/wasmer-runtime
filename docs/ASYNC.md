@@ -302,14 +302,18 @@ it holds. A new call on the store gets a fresh flag, so that a forgotten call
 cannot keep the store interrupted, and the store's interrupt entries are
 released when it drops.
 
-This has a known gap. A call nested behind a coroutine switch is taken for a
+This has a known gap. A call nested behind a switch of stacks is taken for a
 new call, so it can run after its caller was interrupted. That happens when an
-async import calls `call_async(cx, ..)`, or when an interrupt lands between the
-poll and the entry of a `call_async` made from a sync host function.
-`an_async_call_nested_after_an_interrupt_is_interrupted` in
+async import calls `call_async(cx, ..)` after its future waited, since its own
+call's entry of the store is off the thread while the guest waits, or when an
+interrupt lands between the poll and the entry of a `call_async` made from a
+sync host function. A nested call made in the first poll of an import's future
+is refused, as that poll runs with its call on the thread
+(`an_async_call_nested_after_an_interrupt_is_interrupted`).
+`an_async_call_nested_after_waiting_is_interrupted` in
 [`interrupt_async.rs`](../lib/api/tests/interrupt_async.rs) and a unit test in
 [`interrupt_registry/unix.rs`](../lib/vm/src/interrupt_registry/unix.rs) record
-it, and are ignored until it is fixed.
+the gap, and are ignored until it is fixed.
 
 ## Limitations and porting notes
 

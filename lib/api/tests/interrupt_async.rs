@@ -372,24 +372,75 @@ fn a_sync_call_nested_after_an_interrupt_is_interrupted() -> Result<()> {
     Ok(())
 }
 
-/// The same through an async import, whose nested call is a `call_async`.
-// TODO: fails today, so it is ignored. The import runs while its call is
-// suspended, so that call's entry of the store is not on the thread when the
-// nested call enters it. `interrupt_registry::install` then gives the nested
-// entry a fresh flag, which it does so that a forgotten suspended call cannot
-// keep its store interrupted, and the nested guest runs as if the store was
-// never interrupted. A guest that loops there misses the interrupt until it
-// is sent again. Either drop that reset, or keep the stores of a suspended
-// call on the thread while it polls its host future. Found in the review of
-// https://github.com/wasmerio/wasmer-runtime/pull/18.
+/// The same through an async import, whose nested call is a `call_async`
+/// made in the first poll of the import's future. That poll runs while the
+/// import's own call is on the thread, with its entry of the store, so the
+/// nested call is refused as a nested sync call is.
 #[test]
-#[ignore = "TODO: a call nested in an async import runs after its store was interrupted"]
 fn an_async_call_nested_after_an_interrupt_is_interrupted() -> Result<()> {
     let (mut store, env, run) = relaying_guest(|store, env| {
         Function::new_typed_async(
             store,
             env,
             async |cx: &mut AsyncEnv<Relay>| -> Result<(), RuntimeError> {
+                let (interrupter, plain) = cx.with(|env| {
+                    let relay = env.data();
+                    (relay.interrupter.clone(), relay.plain.clone().unwrap())
+                });
+                interrupter.interrupt();
+                let nested = plain.call_async(cx, &[]).await;
+                let nested = nested.map(drop).map_err(|e| e.to_trap());
+                cx.with(|mut env| env.data_mut().nested = Some(nested));
+                Ok(())
+            },
+        )
+    })?;
+
+    let result = futures::executor::block_on(run.call_async(&mut store, &[]));
+    assert_eq!(result.unwrap_err().to_trap(), Some(TrapCode::HostInterrupt));
+    assert_eq!(
+        env.as_ref(&store).nested,
+        Some(Err(Some(TrapCode::HostInterrupt)))
+    );
+    Ok(())
+}
+
+/// Pending on its first poll, which wakes it, and ready on the next.
+struct YieldOnce(bool);
+
+impl Future for YieldOnce {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
+
+/// The same, with the import's future waiting once before it interrupts the
+/// store and makes the nested call.
+// TODO: fails today, so it is ignored. While the guest waits, its call's
+// entry of the store is off the thread, and the call future polls the
+// import's future from there: the nested call enters a store that the thread
+// does not list as entered, `interrupt_registry::install` gives it a fresh
+// flag, which it does so that a forgotten suspended call cannot keep its
+// store interrupted, and the nested guest runs as if the store was never
+// interrupted. Either drop that reset, or keep the stores of a suspended call
+// on the thread while it polls its host future. Found in the review of
+// https://github.com/wasmerio/wasmer-runtime/pull/18.
+#[test]
+#[ignore = "TODO: a call nested in an async import that waited runs after its store was interrupted"]
+fn an_async_call_nested_after_waiting_is_interrupted() -> Result<()> {
+    let (mut store, env, run) = relaying_guest(|store, env| {
+        Function::new_typed_async(
+            store,
+            env,
+            async |cx: &mut AsyncEnv<Relay>| -> Result<(), RuntimeError> {
+                YieldOnce(false).await;
                 let (interrupter, plain) = cx.with(|env| {
                     let relay = env.data();
                     (relay.interrupter.clone(), relay.plain.clone().unwrap())
