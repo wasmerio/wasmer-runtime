@@ -221,7 +221,8 @@ impl Module {
             let mut instance =
                 std::mem::ManuallyDrop::new(std::ptr::read(handle.get(objects.as_sys())));
 
-            let store_install_guard = StoreContext::install(store_ptr);
+            let store_entry = StoreContext::new(store_ptr);
+            let store_install_guard = store_entry.install();
 
             // After the instance handle is created, we need to initialize
             // the data, call the start function and so. If any of these steps

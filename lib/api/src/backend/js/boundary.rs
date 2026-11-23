@@ -12,7 +12,7 @@
 use wasm_bindgen::{JsValue, closure::ScopedClosure, prelude::wasm_bindgen};
 
 use crate::{
-    PollStore, StoreContext,
+    PollStore, StoreContext, StoreContextCheckpoint,
     entities::store::{published_store, publish_store},
     js::{function, lent},
 };
@@ -26,7 +26,7 @@ extern "C" {
 /// What the frames inside a boundary may leave changed.
 struct Saved {
     lends: (usize, bool),
-    context: (usize, u32),
+    context: StoreContextCheckpoint,
     published: Option<PollStore>,
     busy: Option<bool>,
     entered: bool,

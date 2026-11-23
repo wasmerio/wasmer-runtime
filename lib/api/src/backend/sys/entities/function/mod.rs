@@ -470,8 +470,9 @@ impl Function {
                 // returns, and the store mut is valid for its duration. It is
                 // installed only while Wasm runs: the wrapper holds the store
                 // between entries, so it must not be lendable then.
-                let _store_install_guard =
-                    unsafe { StoreContext::install(store.as_store_mut().inner as *mut _) };
+                let store_entry =
+                    unsafe { StoreContext::new(store.as_store_mut().inner as *mut _) };
+                let _store_install_guard = unsafe { store_entry.install() };
                 let storeref = store.as_store_ref();
                 let vm_function = self.handle.get(storeref.objects().as_sys());
                 let config = storeref.engine().tunables().vmconfig();
