@@ -103,9 +103,20 @@ pub fn emit_eh_frame_section(
     function_symbol: SymbolId,
     lsda_section_symbol: Option<SymbolId>,
 ) -> Result<(), CompileError> {
+    let is_macho = object.format() == object::BinaryFormat::MachO;
     let section = object.add_section(
-        object.segment_name(StandardSegment::Debug).to_vec(),
-        crate::EH_FRAME_SECTION_NAME.to_vec(),
+        object
+            .segment_name(if is_macho {
+                StandardSegment::Text
+            } else {
+                StandardSegment::Debug
+            })
+            .to_vec(),
+        if is_macho {
+            b"__eh_frame".to_vec()
+        } else {
+            crate::EH_FRAME_SECTION_NAME.to_vec()
+        },
         SectionKind::Other,
     );
     let data_offset = object.append_section_data(section, eh_frame_bytes, 4);
@@ -167,19 +178,38 @@ pub fn emit_eh_frame_section(
                 )
             })?,
         };
+        // Mach-O encodes PC-relative data references as symbol differences.
+        let subtractor =
+            (is_macho && relocation.kind == ObjectRelocationKind::Relative).then(|| {
+                object.add_symbol(Symbol {
+                    name: format!("eh_frame_base_{}", relocation.offset).into_bytes(),
+                    value: data_offset + relocation.offset,
+                    size: 0,
+                    kind: SymbolKind::Data,
+                    scope: SymbolScope::Compilation,
+                    weak: false,
+                    section: SymbolSection::Section(section),
+                    flags: SymbolFlags::None,
+                })
+            });
         object
-            .add_relocation(
+            .add_relocation_with_subtractor(
                 section,
                 ObjectRelocation {
                     offset: data_offset + relocation.offset,
                     flags: RelocationFlags::Generic {
-                        kind: relocation.kind,
+                        kind: if subtractor.is_some() {
+                            ObjectRelocationKind::Absolute
+                        } else {
+                            relocation.kind
+                        },
                         encoding: RelocationEncoding::Generic,
                         size: 8 * relocation.size,
                     },
                     symbol,
                     addend: relocation.addend,
                 },
+                subtractor,
             )
             .map_err(|e| {
                 CompileError::Codegen(format!("failed to add .eh_frame relocation: {e}"))

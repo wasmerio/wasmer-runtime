@@ -19,7 +19,7 @@ use object::{
 use std::collections::HashMap;
 use wasmer_compiler::elf::emit_eh_frame_section;
 use wasmer_compiler::{
-    UNWIND_HAS_LSDA, WASMER_EH_TAGS_SECTION_NAME,
+    WASMER_EH_TAGS_SECTION_NAME,
     dwarf::{EhRelocation, EhTarget, WriterRelocate},
 };
 use wasmer_compiler::{WasmSourceMap, dwarf::init_dwarf_unit};
@@ -235,7 +235,6 @@ pub(crate) fn emit_local_function(
     source_map: &WasmSourceMap,
     fde: Option<FrameDescriptionEntry>,
     lsda: Option<FunctionLsdaData>,
-    compact_unwind_encoding: Option<u32>,
 ) -> Result<Vec<u8>, CompileError> {
     let kind = CompiledKind::Local(index, String::new());
     // Emit the function body into the text section.
@@ -273,7 +272,7 @@ pub(crate) fn emit_local_function(
     emit_trap_section(&mut object, &kind, &frame_info.traps);
 
     let pointer_bytes = isa.frontend_config().pointer_bytes();
-    let macho_compact_unwind = compact_unwind_encoding.is_some();
+    let is_macho = object.format() == object::BinaryFormat::MachO;
 
     // Emit the LSDA into `.gcc_except_table`, plus a per-object tag section
     // holding the exception tag constants referenced by its type table.
@@ -282,7 +281,7 @@ pub(crate) fn emit_local_function(
 
         let gcc_section = object.add_section(
             object.segment_name(StandardSegment::Data).to_vec(),
-            if macho_compact_unwind {
+            if is_macho {
                 b"__gcc_except_tab".to_vec()
             } else {
                 b".gcc_except_table".to_vec()
@@ -291,7 +290,7 @@ pub(crate) fn emit_local_function(
         );
         let lsda_offset =
             object.append_section_data(gcc_section, &lsda.bytes, u64::from(pointer_bytes));
-        let subtractor = macho_compact_unwind.then(|| {
+        let subtractor = is_macho.then(|| {
             use wasmer_compiler::WASMER_LSDA_SECTION_NAME;
 
             object.add_symbol(Symbol {
@@ -307,7 +306,7 @@ pub(crate) fn emit_local_function(
         });
         // Mach-O represents PC-relative data as a symbol difference.
         let tag_relocation_flags = RelocationFlags::Generic {
-            kind: if macho_compact_unwind {
+            kind: if is_macho {
                 object::RelocationKind::Absolute
             } else {
                 object::RelocationKind::Relative
@@ -334,12 +333,7 @@ pub(crate) fn emit_local_function(
                         offset: lsda_offset + reloc.offset as u64,
                         flags: tag_relocation_flags,
                         symbol: tag_symbol,
-                        addend: tag_offset as i64
-                            - if macho_compact_unwind {
-                                reloc.offset as i64
-                            } else {
-                                0
-                            },
+                        addend: tag_offset as i64 - if is_macho { reloc.offset as i64 } else { 0 },
                     },
                     subtractor,
                 )
@@ -347,48 +341,10 @@ pub(crate) fn emit_local_function(
                     CompileError::Codegen(format!("failed to add LSDA relocation: {e}"))
                 })?;
         }
-        Some(object.section_symbol(gcc_section))
+        Some(subtractor.unwrap_or_else(|| object.section_symbol(gcc_section)))
     } else {
         None
     };
-
-    if let Some(encoding) = compact_unwind_encoding {
-        let function_length = body.len().try_into().map_err(|_| {
-            CompileError::Codegen("function body too large for Mach-O compact unwind".into())
-        })?;
-        let personality_symbol = wasmer_compiler::elf::add_libcall_symbol(
-            &mut object,
-            wasmer_types::LibCall::EHPersonality,
-        );
-        let text_symbol = object.section_symbol(text);
-        let (compact_bytes, compact_relocations) = crate::eh::build_compact_unwind_section(
-            [crate::eh::CompactUnwindEntryData {
-                function_length,
-                compact_encoding: encoding
-                    | if lsda_section_symbol.is_some() {
-                        UNWIND_HAS_LSDA
-                    } else {
-                        0
-                    },
-                lsda_offset: lsda_section_symbol.map(|_| 0),
-            }],
-            text_symbol,
-            personality_symbol,
-            lsda_section_symbol,
-        )
-        .ok_or_else(|| CompileError::Codegen("missing compact unwind entry for function".into()))?;
-        let section = object.add_section(
-            object.segment_name(StandardSegment::Data).to_vec(),
-            b"__compact_unwind".to_vec(),
-            SectionKind::ReadOnlyData,
-        );
-        object.append_section_data(section, &compact_bytes, 8);
-        for relocation in compact_relocations {
-            object.add_relocation(section, relocation).map_err(|e| {
-                CompileError::Codegen(format!("failed to add compact unwind relocation: {e}"))
-            })?;
-        }
-    }
 
     if let Some(fde) = fde
         && let Some(mut cie) = isa.create_systemv_cie()

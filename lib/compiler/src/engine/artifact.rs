@@ -518,7 +518,7 @@ impl Artifact {
                             .collect_vec()
                     });
                 }
-                crate::EH_FRAME_SECTION_NAME => {
+                crate::EH_FRAME_SECTION_NAME | b"__eh_frame" => {
                     engine_inner.publish_elf_eh_frame(section.address(), section.size())?;
                 }
                 _ => {}

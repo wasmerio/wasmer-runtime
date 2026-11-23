@@ -1,6 +1,6 @@
 //! Support for compiling with Cranelift.
 
-use crate::eh::{FunctionLsdaData, build_function_lsda, compact_unwind_encoding_aarch64};
+use crate::eh::{FunctionLsdaData, build_function_lsda};
 
 use crate::translator::{CraneliftUnwindInfo, compiled_function_unwind_info};
 use crate::{
@@ -40,7 +40,6 @@ use wasmer_compiler::{
     types::function::CompiledFunctionFrameInfo,
 };
 use wasmer_compiler::{build_function_buckets, translate_function_buckets};
-use wasmer_types::entity::EntityRef;
 use wasmer_types::entity::PrimaryMap;
 use wasmer_types::target::CallingConvention;
 use wasmer_types::target::Target;
@@ -54,7 +53,6 @@ pub struct CraneliftCompiledFunction {
     frame_info: CompiledFunctionFrameInfo,
     fde: Option<FrameDescriptionEntry>,
     function_lsda: Option<FunctionLsdaData>,
-    compact_unwind_encoding: Option<u32>,
 }
 
 impl wasmer_compiler::CompiledFunction for CraneliftCompiledFunction {}
@@ -98,15 +96,6 @@ impl CraneliftCompiler {
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
         let frontend_config = isa.frontend_config();
         let pointer_bytes = frontend_config.pointer_bytes();
-        let emit_macho_compact_unwind = matches!(
-            target.triple(),
-            target_lexicon::Triple {
-                binary_format: target_lexicon::BinaryFormat::Macho,
-                operating_system: target_lexicon::OperatingSystem::Darwin(_),
-                architecture: target_lexicon::Architecture::Aarch64(_),
-                ..
-            }
-        );
         let memory_styles = &compile_info.memory_styles;
         let table_styles = &compile_info.table_styles;
         let module = &compile_info.module;
@@ -139,7 +128,7 @@ impl CraneliftCompiler {
         let emit_dwarf_unwind = !function_body_inputs.is_empty()
             && matches!(
                 target.triple().default_calling_convention(),
-                Ok(CallingConvention::SystemV)
+                Ok(CallingConvention::SystemV | CallingConvention::AppleAarch64)
             )
             && isa.create_systemv_cie().is_some();
 
@@ -249,22 +238,7 @@ impl CraneliftCompiler {
                 .map(mach_trap_to_trap)
                 .collect::<Vec<_>>();
 
-            let emit_lsda = emit_dwarf_unwind || emit_macho_compact_unwind;
-
-            let compact_unwind_encoding = if emit_macho_compact_unwind {
-                Some(
-                    compact_unwind_encoding_aarch64(result.buffer.unwind_info()).map_err(|error| {
-                        CompileError::Codegen(format!(
-                            "failed to encode aarch64 Mach-O compact unwind for function {}: {error}",
-                            i.index()
-                        ))
-                    })?,
-                )
-            } else {
-                None
-            };
-
-            let function_lsda = if emit_lsda {
+            let function_lsda = if emit_dwarf_unwind {
                 build_function_lsda(
                     result.buffer.call_sites(),
                     result.buffer.data().len(),
@@ -304,7 +278,6 @@ impl CraneliftCompiler {
                 frame_info: CompiledFunctionFrameInfo { address_map, traps },
                 fde,
                 function_lsda,
-                compact_unwind_encoding,
             };
 
             let object = crate::elf::emit_local_function(
@@ -321,7 +294,6 @@ impl CraneliftCompiler {
                 &source_map,
                 compiled.fde,
                 compiled.function_lsda,
-                compiled.compact_unwind_encoding,
             )?;
             Ok(CompileOutput {
                 object,
