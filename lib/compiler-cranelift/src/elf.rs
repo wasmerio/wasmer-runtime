@@ -1,15 +1,14 @@
 //! Emission of per-function relocatable ELF objects for the experimental
 //! ELF artifact format.
 
-use crate::eh::FunctionLsdaData;
+use crate::eh::{FunctionLsdaData, build_function_lsda, compact_unwind_encoding_aarch64};
 use cranelift_codegen::gimli::{
     RunTimeEndian, SectionId as GimliSectionId, constants,
-    write::{
-        Address, EhFrame, EndianVec, FrameDescriptionEntry, FrameTable, Result as GimliResult,
-        Writer,
-    },
+    write::{Address, EhFrame, EndianVec, FrameTable, Result as GimliResult, Writer},
 };
-use cranelift_codegen::isa::TargetIsa;
+use cranelift_codegen::isa::{TargetIsa, unwind::UnwindInfo};
+use cranelift_codegen::print_errors::pretty_error;
+use cranelift_codegen::{CompiledCode, Context};
 use object::RelocationKind as ObjectRelocationKind;
 use object::write::{Object, Relocation as ObjectRelocation, StandardSection, SymbolId};
 use object::{
@@ -25,7 +24,7 @@ use wasmer_compiler::{
 use wasmer_compiler::{WasmSourceMap, dwarf::init_dwarf_unit};
 use wasmer_compiler::{
     elf::emit_trap_section,
-    misc::CompiledKind,
+    misc::{CompiledFunctionExt, CompiledKind},
     types::function::{Compilation, CompiledFunctionFrameInfo},
 };
 use wasmer_types::{CompileError, LocalFunctionIndex, target::Target};
@@ -233,9 +232,8 @@ pub(crate) fn emit_local_function(
     function_symbol: SymbolId,
     relocations: Vec<ObjectRelocation>,
     source_map: &WasmSourceMap,
-    fde: Option<FrameDescriptionEntry>,
-    lsda: Option<FunctionLsdaData>,
-    compact_unwind_encoding: Option<u32>,
+    unwind: UnwindKind,
+    context: &Context,
 ) -> Result<Vec<u8>, CompileError> {
     let kind = CompiledKind::Local(index, String::new());
     // Emit the function body into the text section.
@@ -272,13 +270,67 @@ pub(crate) fn emit_local_function(
 
     emit_trap_section(&mut object, &kind, &frame_info.traps);
 
-    let pointer_bytes = isa.frontend_config().pointer_bytes();
-    let macho_compact_unwind = compact_unwind_encoding.is_some();
+    unwind.emit(isa, context, &kind, &mut object, function_symbol)?;
 
-    // Emit the LSDA into `.gcc_except_table`, plus a per-object tag section
-    // holding the exception tag constants referenced by its type table.
-    let lsda_section_symbol = if let Some(lsda) = &lsda {
-        let tag_section_symbol = emit_eh_tag_section(&mut object, lsda);
+    write_object(&object)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum UnwindKind {
+    DwarfUnwind,
+    CompactUnwind,
+}
+
+impl UnwindKind {
+    pub(crate) fn for_isa(isa: &dyn TargetIsa) -> Self {
+        let triple = isa.triple();
+        if matches!(
+            triple,
+            target_lexicon::Triple {
+                binary_format: target_lexicon::BinaryFormat::Macho,
+                operating_system: target_lexicon::OperatingSystem::Darwin(_),
+                architecture: target_lexicon::Architecture::Aarch64(_),
+                ..
+            }
+        ) {
+            Self::CompactUnwind
+        } else if isa.create_systemv_cie().is_some() {
+            Self::DwarfUnwind
+        } else {
+            unreachable!("no supported unwind format for Cranelift target {triple}")
+        }
+    }
+
+    fn emit(
+        self,
+        isa: &dyn TargetIsa,
+        context: &Context,
+        kind: &CompiledKind,
+        object: &mut Object<'static>,
+        function_symbol: SymbolId,
+    ) -> Result<(), CompileError> {
+        let code = context.compiled_code().unwrap();
+        let lsda_symbol =
+            build_function_lsda(code.buffer.call_sites(), code.buffer.data().len(), true)
+                .map(|lsda| self.emit_lsda(object, &lsda))
+                .transpose()?;
+
+        match self {
+            Self::DwarfUnwind => {
+                Self::emit_dwarf(isa, context, code, object, function_symbol, lsda_symbol)
+            }
+            Self::CompactUnwind => Self::emit_compact(code, kind, object, lsda_symbol),
+        }
+    }
+
+    // Emit the LSDA and the per-object tag constants referenced by its type table.
+    fn emit_lsda(
+        self,
+        object: &mut Object<'static>,
+        lsda: &FunctionLsdaData,
+    ) -> Result<SymbolId, CompileError> {
+        let macho_compact_unwind = matches!(self, Self::CompactUnwind);
+        let tag_section_symbol = emit_eh_tag_section(object, lsda);
 
         let gcc_section = object.add_section(
             object.segment_name(StandardSegment::Data).to_vec(),
@@ -289,8 +341,7 @@ pub(crate) fn emit_local_function(
             },
             SectionKind::ReadOnlyData,
         );
-        let lsda_offset =
-            object.append_section_data(gcc_section, &lsda.bytes, u64::from(pointer_bytes));
+        let lsda_offset = object.append_section_data(gcc_section, &lsda.bytes, 8);
         let subtractor = macho_compact_unwind.then(|| {
             use wasmer_compiler::WASMER_LSDA_SECTION_NAME;
 
@@ -347,19 +398,29 @@ pub(crate) fn emit_local_function(
                     CompileError::Codegen(format!("failed to add LSDA relocation: {e}"))
                 })?;
         }
-        Some(object.section_symbol(gcc_section))
-    } else {
-        None
-    };
+        Ok(object.section_symbol(gcc_section))
+    }
 
-    if let Some(encoding) = compact_unwind_encoding {
-        let function_length = body.len().try_into().map_err(|_| {
+    fn emit_compact(
+        code: &CompiledCode,
+        kind: &CompiledKind,
+        object: &mut Object<'static>,
+        lsda_section_symbol: Option<SymbolId>,
+    ) -> Result<(), CompileError> {
+        let encoding =
+            compact_unwind_encoding_aarch64(code.buffer.unwind_info()).map_err(|error| {
+                CompileError::Codegen(format!(
+                    "failed to encode aarch64 Mach-O compact unwind for function {}: {error}",
+                    kind.linkage_name()
+                ))
+            })?;
+        let function_length = code.code_buffer().len().try_into().map_err(|_| {
             CompileError::Codegen("function body too large for Mach-O compact unwind".into())
         })?;
-        let personality_symbol = wasmer_compiler::elf::add_libcall_symbol(
-            &mut object,
-            wasmer_types::LibCall::EHPersonality,
-        );
+        let personality_symbol = lsda_section_symbol.map(|_| {
+            wasmer_compiler::elf::add_libcall_symbol(object, wasmer_types::LibCall::EHPersonality)
+        });
+        let text = object.section_id(StandardSection::Text);
         let text_symbol = object.section_symbol(text);
         let (compact_bytes, compact_relocations) = crate::eh::build_compact_unwind_section(
             [crate::eh::CompactUnwindEntryData {
@@ -388,15 +449,39 @@ pub(crate) fn emit_local_function(
                 CompileError::Codegen(format!("failed to add compact unwind relocation: {e}"))
             })?;
         }
+        Ok(())
     }
 
-    if let Some(fde) = fde
-        && let Some(mut cie) = isa.create_systemv_cie()
-    {
+    fn emit_dwarf(
+        isa: &dyn TargetIsa,
+        context: &Context,
+        code: &CompiledCode,
+        object: &mut Object<'static>,
+        function_symbol: SymbolId,
+        lsda_section_symbol: Option<SymbolId>,
+    ) -> Result<(), CompileError> {
+        let unwind_info = code
+            .create_unwind_info(isa)
+            .map_err(|error| CompileError::Codegen(pretty_error(&context.func, error)))?;
+        let (Some(UnwindInfo::SystemV(unwind)), Some(mut cie)) =
+            (unwind_info, isa.create_systemv_cie())
+        else {
+            return Ok(());
+        };
+
+        // For the ELF artifact format each function's
+        // `.eh_frame` relocates against its own text symbol,
+        // so the FDE's initial location must not be shifted.
+        let mut fde = unwind.to_fde(Address::Symbol {
+            // The symbol is the kind of relocation.
+            // "0" is used for functions
+            symbol: WriterRelocate::FUNCTION_SYMBOL,
+            addend: 0,
+        });
+
         // The ELF image may be mapped at any base address, so make the FDE's
         // function reference position-independent.
         cie.fde_address_encoding = constants::DW_EH_PE_pcrel | constants::DW_EH_PE_sdata4;
-        let mut fde = fde;
         if lsda_section_symbol.is_some() {
             // Reference the personality pointer indirectly and PC-relative.
             // The shared ELF emitter creates the local pointer slot and its
@@ -429,14 +514,16 @@ pub(crate) fn emit_local_function(
 
         let relocations = std::mem::take(&mut eh_frame.0.relocs);
         emit_eh_frame_section(
-            &mut object,
+            object,
             &eh_frame.0.into_bytes(),
             &relocations,
             function_symbol,
             lsda_section_symbol,
-        )?;
+        )
     }
+}
 
+fn write_object(object: &Object<'static>) -> Result<Vec<u8>, CompileError> {
     let mut bytes = object
         .write()
         .map_err(|e| CompileError::Codegen(format!("failed to serialize object: {e}")))?;
