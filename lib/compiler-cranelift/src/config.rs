@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 use std::{num::NonZero, path::PathBuf};
-use target_lexicon::{OperatingSystem, Vendor};
+use target_lexicon::OperatingSystem;
 use wasmer_compiler::{
     Compiler, CompilerConfig, DEFAULT_MAX_TABLE_ELEMENTS, Debugger, Engine, EngineBuilder,
     ModuleMiddleware,
@@ -289,12 +289,6 @@ impl Cranelift {
                 &self.enable_nan_canonicalization.to_string(),
             )
             .expect("should be valid flag");
-
-        if matches!(target.triple().vendor, Vendor::Apple) {
-            flags
-                .enable("enable_compact_unwind_abi")
-                .expect("should be valid flag");
-        }
 
         settings::Flags::new(flags)
     }

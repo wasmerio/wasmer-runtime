@@ -117,8 +117,9 @@ impl UnwindRegistry {
                     last_len = 0;
                     continue;
                 }
-                // The first record after a terminator is always a CIE.
-                let is_cie = last_len == 0;
+                // Mach-O linkers may merge CIEs and omit zero terminators.
+                // A CIE's ID is zero; an FDE holds a backwards CIE pointer.
+                let is_cie = eh_frame[current + 4..current + 8] == [0; 4];
                 last_len = len;
                 let record = eh_frame.as_ptr() as usize + current;
                 current = current + len as usize + 4;
@@ -137,10 +138,12 @@ impl UnwindRegistry {
                 }
             }
 
-            assert_eq!(
-                last_len, 0,
-                "The last record in the `.eh_frame` must be a terminator (but it actually has length {last_len})"
-            );
+            if !using_libunwind {
+                assert_eq!(
+                    last_len, 0,
+                    "The last record in the `.eh_frame` must be a terminator (but it actually has length {last_len})"
+                );
+            }
             assert_eq!(
                 current,
                 eh_frame.len(),

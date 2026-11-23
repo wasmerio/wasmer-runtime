@@ -1238,6 +1238,60 @@ fn issue_return_call_sret_multivalue(mut config: crate::Config) -> Result<()> {
     Ok(())
 }
 
+//#[cfg(all(feature = "cranelift", target_os = "macos", target_arch = "aarch64"))]
+#[compiler_test(issues)]
+fn issue_return_call_compact_unwind_stack_args(mut config: crate::Config) -> Result<()> {
+    // if !matches!(config.compiler, crate::Compiler::Cranelift) {
+    //     return Ok(());
+    // }
+
+    let mut features = wasmer::sys::Features::default();
+    features.tail_call(true).exceptions(true);
+    config.set_features(features);
+    let mut store = config.store();
+    let wasm_bytes = wat2wasm(
+        br#"
+        (module
+            (tag $error (param i32))
+            (func $throw
+                i32.const 42
+                throw $error)
+            (func $target
+                (param i64 i64 i64 i64 i64 i64 i64 i64
+                       i64 i64 i64 i64 i64 i64 i64 i64)
+                (result i32)
+                i32.const 7)
+            (func $bridge (param $fail i32) (result i32)
+                local.get $fail
+                if
+                    call $throw
+                end
+                i64.const 0 i64.const 0 i64.const 0 i64.const 0
+                i64.const 0 i64.const 0 i64.const 0 i64.const 0
+                i64.const 0 i64.const 0 i64.const 0 i64.const 0
+                i64.const 0 i64.const 0 i64.const 0 i64.const 0
+                return_call $target)
+            (func (export "run") (param $fail i32) (result i32)
+                (block $caught (result i32)
+                    (try_table (result i32) (catch $error $caught)
+                        local.get $fail
+                        call $bridge))))
+        "#,
+    )?;
+
+    let module = Module::new(&store, wasm_bytes)?;
+    let instance = Instance::new(&mut store, &module, &imports! {})?;
+    let run: TypedFunction<i32, i32> = instance.exports.get_typed_function(&store, "run")?;
+    assert_eq!(run.call(&mut store, 0).context("normal tail-call path")?, 7);
+    // Unwind through $bridge before its tail call removes the frame. Its extra
+    // stack-argument area cannot be described by frame-mode compact unwind.
+    assert_eq!(
+        run.call(&mut store, 1).context("exception-unwind path")?,
+        42
+    );
+    Ok(())
+}
+
 #[cfg(feature = "llvm")]
 #[compiler_test(issues)]
 fn issue_return_call_indirect_import(mut config: crate::Config) -> Result<()> {
