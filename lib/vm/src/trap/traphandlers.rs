@@ -1921,6 +1921,7 @@ unsafe fn resume_suspendable(
 
 /// Whether the Wasm stack that is running is that of the [`SuspendedCall`]
 /// being resumed: whether an import called from it may suspend it.
+#[inline]
 pub fn wasm_call_is_suspendable() -> bool {
     let thread = VmThread::get();
     let wasm_stack = thread.stacks.wasm.get();

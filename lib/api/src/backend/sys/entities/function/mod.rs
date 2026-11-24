@@ -690,6 +690,7 @@ enum InvocationResult<T, E> {
     YieldOutsideAsyncContext,
 }
 
+#[inline(always)]
 fn to_invocation_result<T, E>(result: Result<T, E>) -> InvocationResult<T, E>
 where
     E: Error + 'static,

@@ -64,6 +64,7 @@ thread_local! {
 impl PollStore {
     /// The store for a poll made by a synchronous entry, whose host frame
     /// holds `ptr` for as long as the poll runs.
+    #[inline]
     pub(crate) fn exclusive(id: StoreId, ptr: *mut StoreInner) -> Self {
         Self {
             id,
@@ -75,6 +76,7 @@ impl PollStore {
     ///
     /// # Panics
     /// Panics if a shared store is already in a slice.
+    #[inline]
     pub(crate) fn enter_slice(self) -> StoreSlice {
         match self.access {
             StoreAccess::Exclusive(ptr) => StoreSlice { ptr, shared: None },
@@ -171,6 +173,7 @@ impl StoreSlice {
 }
 
 impl Drop for StoreSlice {
+    #[inline]
     fn drop(&mut self) {
         if let Some(state) = self.shared {
             // Safety: see `PollStore::enter_slice`.
@@ -186,6 +189,7 @@ pub(crate) struct PollScope {
 }
 
 impl PollScope {
+    #[inline]
     pub(crate) fn enter(store: Option<PollStore>) -> Self {
         Self {
             previous: POLL_STORE.replace(store),
@@ -194,6 +198,7 @@ impl PollScope {
 }
 
 impl Drop for PollScope {
+    #[inline]
     fn drop(&mut self) {
         POLL_STORE.set(self.previous);
     }
@@ -209,6 +214,7 @@ pub(crate) struct WithSlice {
 impl WithSlice {
     /// # Panics
     /// Panics unless the call being polled is on the store `id`.
+    #[inline]
     pub(crate) fn enter(id: StoreId) -> Self {
         let Some(poll) = POLL_STORE.take() else {
             panic!(
@@ -236,12 +242,14 @@ impl WithSlice {
         }
     }
 
+    #[inline]
     pub(crate) fn ptr(&self) -> *mut StoreInner {
         self.slice.ptr()
     }
 }
 
 impl Drop for WithSlice {
+    #[inline]
     fn drop(&mut self) {
         // Safety: dropped once, here.
         unsafe { ManuallyDrop::drop(&mut self.slice) };

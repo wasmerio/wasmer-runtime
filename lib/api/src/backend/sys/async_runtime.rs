@@ -626,6 +626,7 @@ pub(crate) enum HostWait<R> {
 /// takes a future that is not ready, as `into_pending` makes it: with raw
 /// results. Otherwise the guest was entered synchronously, by a host function
 /// that holds a borrow of its store across the call: it cannot wait.
+#[inline]
 pub(crate) fn wait_for_host_future<B: HostFutureBox>(
     store: StorePtrWrapper,
     future: B,
