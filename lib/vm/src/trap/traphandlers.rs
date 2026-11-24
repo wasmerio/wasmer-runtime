@@ -908,18 +908,22 @@ thread_local! {
 ///
 /// The caller must be able to unwind via a Wasm trap without running destructors.
 pub unsafe fn check_stack_space() {
-    /// Stack headroom reserved before entering `_Unwind_RaiseException`.
-    /// Conservative safety margin for the native unwinder + sanitizer overhead.
-    const UNWIND_STACK_HEADROOM: usize = ByteSize::kib(8).as_u64() as usize;
+    #[cfg(not(miri))]
+    {
+        /// Stack headroom reserved before entering `_Unwind_RaiseException`.
+        /// Conservative safety margin for the native unwinder + sanitizer overhead.
+        const UNWIND_STACK_HEADROOM: usize = ByteSize::kib(8).as_u64() as usize;
 
-    let limit = WASM_STACK_LIMIT.with(Cell::get);
-    if limit != 0 {
-        let sp = psm::stack_pointer() as usize;
-        if sp.saturating_sub(limit) < UNWIND_STACK_HEADROOM {
-            // WARNING: We might be very close to the stack limit, and so we can't effort
-            // a failure in `backtrace` as we might be holding a lock!
-            let trap = on_host_stack(|| crate::Trap::lib(wasmer_types::TrapCode::StackOverflow));
-            unsafe { crate::raise_lib_trap(trap) }
+        let limit = WASM_STACK_LIMIT.with(Cell::get);
+        if limit != 0 {
+            let sp = psm::stack_pointer() as usize;
+            if sp.saturating_sub(limit) < UNWIND_STACK_HEADROOM {
+                // WARNING: We might be very close to the stack limit, and so we can't afford
+                // a failure in `backtrace` as we might be holding a lock!
+                let trap =
+                    on_host_stack(|| crate::Trap::lib(wasmer_types::TrapCode::StackOverflow));
+                unsafe { crate::raise_lib_trap(trap) }
+            }
         }
     }
 }
