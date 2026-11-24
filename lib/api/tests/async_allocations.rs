@@ -14,8 +14,8 @@ use std::{
 };
 
 use wasmer::{
-    AsStoreMut, Function, FunctionEnv, FunctionEnvMut, Instance, Module, Store, TypedFunction,
-    imports,
+    AsStoreMut, AsyncEnv, Function, FunctionEnv, FunctionEnvMut, Instance, Module, Store,
+    TypedFunction, imports,
 };
 
 /// Counts the allocations of each thread.
@@ -87,6 +87,44 @@ fn a_typed_call_that_does_not_wait_allocates_as_a_synchronous_one() {
     assert_eq!(asynchronous, sync);
     #[cfg(not(feature = "experimental-host-interrupt"))]
     assert_eq!(asynchronous, 0);
+}
+
+/// A typed async import whose future is ready at once allocates as a sync one
+/// does, from its second call on: its future is made in the block the last
+/// one was dropped from.
+#[test]
+fn a_typed_async_import_that_does_not_wait_allocates_as_a_sync_one() {
+    let mut store = Store::default();
+    let module = Module::new(&store, GUEST).unwrap();
+    let env = FunctionEnv::new(&mut store, ());
+    let sync = Function::new_typed(&mut store, |x: i32| x * 2);
+    let asynchronous = Function::new_typed_async(
+        &mut store,
+        &env,
+        async |_: &mut AsyncEnv<()>, x: i32| -> i32 { x * 2 },
+    );
+    let mut run = |import: Function| -> TypedFunction<(i32, i32), i32> {
+        let imports = imports! { "h" => { "double" => import } };
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        instance.exports.get_typed_function(&store, "run").unwrap()
+    };
+    let (run_sync, run_async) = (run(sync), run(asynchronous));
+
+    let mut count = |run: &TypedFunction<(i32, i32), i32>| {
+        // The first calls take a stack for their guest, and the import's
+        // block, which later ones reuse.
+        assert_eq!(run.call(&mut store, 20, 2).unwrap(), 42);
+        assert_eq!(ready(run.call_async(&mut store, 20, 2)).unwrap(), 42);
+
+        let (call, result) = allocations(|| run.call(&mut store, 20, 2));
+        assert_eq!(result.unwrap(), 42);
+        let (call_async, result) = allocations(|| ready(run.call_async(&mut store, 20, 2)));
+        assert_eq!(result.unwrap(), 42);
+        (call, call_async)
+    };
+    assert_eq!(count(&run_async), count(&run_sync));
+    #[cfg(not(feature = "experimental-host-interrupt"))]
+    assert_eq!(count(&run_async), (0, 0));
 }
 
 /// Nor does a typed call that a host function makes of a guest of its own

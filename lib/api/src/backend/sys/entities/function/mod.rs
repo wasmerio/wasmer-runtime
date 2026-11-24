@@ -6,7 +6,7 @@ pub(crate) mod typed;
 #[cfg(feature = "experimental-async")]
 use crate::{
     AsyncEnv, AsyncHostFunction, WithSlice,
-    sys::async_runtime::{HostWait, take_host_result, wait_for_host_future},
+    sys::async_runtime::{FutureBlock, HostWait, take_host_result, wait_for_host_future},
 };
 use crate::{
     BackendFunction, CallWrapper, FunctionEnv, FunctionEnvMut, FunctionType, HostFunction,
@@ -359,7 +359,10 @@ impl Function {
         let host_data = Box::new(StaticFunction {
             store_id: store.objects_mut().id(),
             env: env.clone(),
-            func: Rc::new(func),
+            func: AsyncHost {
+                func: Rc::new(func),
+                block: FutureBlock::default(),
+            },
             on_native_stack: AtomicBool::new(true),
         });
         let function_type = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
@@ -777,7 +780,7 @@ unsafe fn write_raw_results(results: &[RawValue], values_vec: *mut RawValue) {
 /// Called on the Wasm stack, by the trampoline of `env`'s function.
 #[cfg(feature = "experimental-async")]
 pub(crate) unsafe fn call_typed_async<T, F, Args, Rets>(
-    env: &StaticFunction<Rc<F>, T>,
+    env: &StaticFunction<AsyncHost<F>, T>,
     args: impl FnOnce(&mut StoreMut<'_>) -> Args,
 ) -> Rets::CStruct
 where
@@ -801,8 +804,9 @@ where
             let store_ptr = store.as_ptr();
             let args = args(&mut store.as_mut());
             let mut cx = AsyncEnv::new(env.env.clone(), store_id);
-            let func = Rc::clone(&env.func);
-            let future = Box::pin(async move { func.invoke(&mut cx, args).await });
+            let func = Rc::clone(&env.func.func);
+            // In the block of the last call's future, if that one was ready.
+            let future = env.func.block.place(async move { func.invoke(&mut cx, args).await });
             let into_pending = |future: Pin<Box<_>>| -> RawHostFuture {
                 Box::pin(async move {
                     let rets: Rets = future.await?;
@@ -1047,6 +1051,14 @@ where
             Self::func_wrapper(dynamic_function, args);
         }
     }
+}
+
+/// The host function of a typed async import, with the block of the heap
+/// the future of its next call is made in.
+#[cfg(feature = "experimental-async")]
+pub(crate) struct AsyncHost<F> {
+    pub(crate) func: Rc<F>,
+    pub(crate) block: FutureBlock,
 }
 
 /// Represents a low-level Wasm static host function. See
@@ -1370,7 +1382,7 @@ macro_rules! impl_host_function {
         {
             fn function_callback(&self) -> VMFunctionCallback {
                 #[allow(unused_variables, clippy::unused_unit)]
-                unsafe extern "C-unwind" fn func_wrapper<T, $( $x, )* Rets, Func>( env: &StaticFunction<Rc<Func>, T>, $( $x: <$x::Native as NativeWasmType>::Abi, )* ) -> Rets::CStruct
+                unsafe extern "C-unwind" fn func_wrapper<T, $( $x, )* Rets, Func>( env: &StaticFunction<AsyncHost<Func>, T>, $( $x: <$x::Native as NativeWasmType>::Abi, )* ) -> Rets::CStruct
                 where
                     T: 'static,
                     $( $x: FromToNativeWasmType + 'static, )*

@@ -20,8 +20,10 @@ use std::{
     sync::{Arc, LazyLock, atomic::AtomicU64},
 };
 use std::{
+    alloc::{Layout, alloc, dealloc, handle_alloc_error},
     cell::Cell,
     future::Future,
+    mem::ManuallyDrop,
     pin::Pin,
     ptr,
     task::{Context, Poll, Waker},
@@ -624,12 +626,12 @@ pub(crate) enum HostWait<R> {
 /// takes a future that is not ready, as `into_pending` makes it: with raw
 /// results. Otherwise the guest was entered synchronously, by a host function
 /// that holds a borrow of its store across the call: it cannot wait.
-pub(crate) fn wait_for_host_future<Fut: Future + ?Sized>(
+pub(crate) fn wait_for_host_future<B: HostFutureBox>(
     store: StorePtrWrapper,
-    future: Pin<Box<Fut>>,
+    future: B,
     suspendable: bool,
-    into_pending: impl FnOnce(Pin<Box<Fut>>) -> RawHostFuture,
-) -> HostWait<Fut::Output> {
+    into_pending: impl FnOnce(Pin<Box<B::Future>>) -> RawHostFuture,
+) -> HostWait<<B::Future as Future>::Output> {
     // The entry's pointer is used only for the duration of this poll, in the
     // slices the future takes, while the borrow in `store` stands.
     let _scope = PollScope::enter(Some(PollStore::exclusive(store.id(), store.as_ptr())));
@@ -642,17 +644,152 @@ pub(crate) fn wait_for_host_future<Fut: Future + ?Sized>(
         // is beneath on this stack.
         let waiting = unsafe { &mut *waiting };
         let cx = unsafe { &mut *waiting.cx.cast::<Context<'_>>() };
-        return match future.as_mut().poll(cx) {
+        return match future.as_pin_mut().poll(cx) {
             Poll::Ready(result) => HostWait::Ready(result),
             Poll::Pending => {
-                waiting.pending = Some(into_pending(future));
+                waiting.pending = Some(into_pending(future.into_box()));
                 HostWait::Suspend
             }
         };
     }
-    match future.as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+    match future.as_pin_mut().poll(&mut Context::from_waker(Waker::noop())) {
         Poll::Ready(result) => HostWait::Ready(result),
         Poll::Pending => HostWait::CannotSuspend,
+    }
+}
+
+/// Where the host future of an async import is for its first poll: a box, or
+/// a block its function keeps (see [`FutureBlock`]).
+pub(crate) trait HostFutureBox {
+    type Future: Future + ?Sized;
+
+    /// The future, for its first poll.
+    fn as_pin_mut(&mut self) -> Pin<&mut Self::Future>;
+
+    /// For a future that was not ready: it stays where it is, in a box.
+    fn into_box(self) -> Pin<Box<Self::Future>>;
+}
+
+impl<Fut: Future + ?Sized> HostFutureBox for Pin<Box<Fut>> {
+    type Future = Fut;
+
+    fn as_pin_mut(&mut self) -> Pin<&mut Fut> {
+        self.as_mut()
+    }
+
+    fn into_box(self) -> Self {
+        self
+    }
+}
+
+/// The block of the heap an async host function keeps for the future of its
+/// next call. A future that is ready in its first poll is dropped where it is,
+/// and gives the block back, so that a call that does not wait allocates
+/// nothing. One that waits keeps its block, as a `Box`.
+///
+/// Only the trampoline of the function takes and gives back the block, on the
+/// thread that holds its store.
+///
+/// What a call does with the block is `#[inline]`: otherwise the part of the
+/// trampoline that runs on the host stack is not inlined into the switch to
+/// it, which costs about 1 ns.
+#[derive(Default)]
+pub(crate) struct FutureBlock(Cell<Option<(NonNull<u8>, Layout)>>);
+
+impl FutureBlock {
+    /// Moves `future` to the heap, in the kept block if there is one of its
+    /// layout.
+    #[inline]
+    pub(crate) fn place<Fut>(&self, future: Fut) -> Placed<'_, Fut> {
+        let layout = Layout::new::<Fut>();
+        let block = match self.0.take() {
+            Some((block, kept)) if kept == layout => block,
+            kept => {
+                if let Some((block, kept)) = kept {
+                    // Safety: allocated below, with `kept`.
+                    unsafe { dealloc(block.as_ptr(), kept) };
+                }
+                if layout.size() == 0 {
+                    NonNull::<Fut>::dangling().cast()
+                } else {
+                    // Safety: the layout is not empty.
+                    let block = unsafe { alloc(layout) };
+                    NonNull::new(block).unwrap_or_else(|| handle_alloc_error(layout))
+                }
+            }
+        };
+        let ptr = block.cast::<Fut>();
+        // Safety: the block has the layout of `Fut`, and nothing in it.
+        unsafe { ptr.write(future) };
+        Placed { ptr, block: self }
+    }
+
+    /// Keeps the block of a future that was dropped, unless one is kept
+    /// already.
+    #[inline]
+    fn give_back(&self, block: NonNull<u8>, layout: Layout) {
+        if layout.size() == 0 {
+            return;
+        }
+        match self.0.take() {
+            None => self.0.set(Some((block, layout))),
+            // A call made while this one ran gave its block back first.
+            kept => {
+                self.0.set(kept);
+                // Safety: allocated by `place`, with `layout`.
+                unsafe { dealloc(block.as_ptr(), layout) };
+            }
+        }
+    }
+}
+
+impl Drop for FutureBlock {
+    fn drop(&mut self) {
+        if let Some((block, layout)) = self.0.take() {
+            // Safety: allocated by `place`, with `layout`.
+            unsafe { dealloc(block.as_ptr(), layout) };
+        }
+    }
+}
+
+/// A future in a block of a [`FutureBlock`], which it gives back when it is
+/// dropped.
+pub(crate) struct Placed<'b, Fut> {
+    ptr: NonNull<Fut>,
+    block: &'b FutureBlock,
+}
+
+impl<Fut: Future> HostFutureBox for Placed<'_, Fut> {
+    type Future = Fut;
+
+    #[inline]
+    fn as_pin_mut(&mut self) -> Pin<&mut Fut> {
+        // Safety: the future is not moved out of its block until it drops.
+        unsafe { Pin::new_unchecked(self.ptr.as_mut()) }
+    }
+
+    #[inline]
+    fn into_box(self) -> Pin<Box<Fut>> {
+        let this = ManuallyDrop::new(self);
+        // Safety: the global allocator allocated the block with the layout of
+        // `Fut`, and the future stays in it.
+        Box::into_pin(unsafe { Box::from_raw(this.ptr.as_ptr()) })
+    }
+}
+
+impl<Fut> Drop for Placed<'_, Fut> {
+    #[inline]
+    fn drop(&mut self) {
+        struct GiveBack<'b>(&'b FutureBlock, NonNull<u8>, Layout);
+        impl Drop for GiveBack<'_> {
+            fn drop(&mut self) {
+                self.0.give_back(self.1, self.2);
+            }
+        }
+        // Even if the future's destructor panics.
+        let _give_back = GiveBack(self.block, self.ptr.cast(), Layout::new::<Fut>());
+        // Safety: the future is in its block, and dropped only here.
+        unsafe { ptr::drop_in_place(self.ptr.as_ptr()) };
     }
 }
 
@@ -812,5 +949,130 @@ mod published_store {
             Poll::Ready(Ok(_))
         ));
         assert_eq!(seen.get(), Some(false));
+    }
+}
+
+#[cfg(test)]
+mod future_block {
+    use std::{
+        panic::{self, AssertUnwindSafe},
+        rc::Rc,
+    };
+
+    use super::*;
+
+    /// A future the size of a small host future's, which counts its drops.
+    struct Counted(Rc<Cell<u32>>, [u64; 8]);
+
+    impl Counted {
+        fn new(drops: &Rc<Cell<u32>>) -> Self {
+            Self(drops.clone(), [0; 8])
+        }
+    }
+
+    impl Future for Counted {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            Poll::Ready(())
+        }
+    }
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    fn address<Fut>(placed: &Placed<'_, Fut>) -> *mut u8 {
+        placed.ptr.as_ptr().cast()
+    }
+
+    /// The block `block` keeps, if it keeps one.
+    fn kept(block: &FutureBlock) -> Option<*mut u8> {
+        let kept = block.0.take();
+        block.0.set(kept);
+        kept.map(|(block, _)| block.as_ptr())
+    }
+
+    #[test]
+    fn a_future_that_was_ready_leaves_its_block_to_the_next() {
+        let block = FutureBlock::default();
+        let drops = Rc::new(Cell::new(0));
+        let mut first = block.place(Counted::new(&drops));
+        let polled = first.as_pin_mut().poll(&mut Context::from_waker(Waker::noop()));
+        assert!(polled.is_ready());
+        let at = address(&first);
+        drop(first);
+        assert_eq!(drops.get(), 1, "the future is dropped where it is");
+        assert_eq!(kept(&block), Some(at));
+
+        let second = block.place(Counted::new(&drops));
+        assert_eq!(address(&second), at);
+        assert_eq!(kept(&block), None);
+    }
+
+    #[test]
+    fn a_future_that_waits_keeps_its_block() {
+        let block = FutureBlock::default();
+        let drops = Rc::new(Cell::new(0));
+        let first = block.place(Counted::new(&drops));
+        let at = address(&first);
+        let boxed = first.into_box();
+        assert_eq!(ptr::from_ref::<Counted>(&boxed).cast_mut().cast(), at);
+        assert_eq!(drops.get(), 0, "the future is not moved");
+        assert_eq!(kept(&block), None);
+
+        drop(boxed);
+        assert_eq!(drops.get(), 1);
+        assert_eq!(kept(&block), None, "a box frees its block");
+    }
+
+    #[test]
+    fn a_nested_call_has_a_block_of_its_own_and_one_is_kept() {
+        let block = FutureBlock::default();
+        let drops = Rc::new(Cell::new(0));
+        let outer = block.place(Counted::new(&drops));
+        let nested = block.place(Counted::new(&drops));
+        assert_ne!(address(&outer), address(&nested));
+
+        let nested_at = address(&nested);
+        drop(nested);
+        assert_eq!(kept(&block), Some(nested_at));
+        drop(outer);
+        assert_eq!(kept(&block), Some(nested_at), "the second block is freed");
+        assert_eq!(drops.get(), 2);
+    }
+
+    #[test]
+    fn a_destructor_that_panics_still_gives_the_block_back() {
+        struct Panics([u64; 8]);
+        impl Drop for Panics {
+            fn drop(&mut self) {
+                panic!("the future's destructor panicked");
+            }
+        }
+        let block = FutureBlock::default();
+        let placed = block.place(Panics([0; 8]));
+        let at = address(&placed);
+        assert!(panic::catch_unwind(AssertUnwindSafe(|| drop(placed))).is_err());
+        assert_eq!(kept(&block), Some(at));
+    }
+
+    #[test]
+    fn an_empty_future_takes_no_block() {
+        struct Empty;
+        impl Future for Empty {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+                Poll::Ready(())
+            }
+        }
+        let block = FutureBlock::default();
+        drop(block.place(Empty));
+        assert_eq!(kept(&block), None);
+        drop(block.place(Empty).into_box());
+        assert_eq!(kept(&block), None);
     }
 }

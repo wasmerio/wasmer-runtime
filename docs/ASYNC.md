@@ -235,7 +235,9 @@ polls the call. If the future is pending, the import suspends the guest, with
 only engine and guest frames on its stack, and the call future polls the host
 future on the executor's stack, then resumes the guest with what it returned.
 A deep host future therefore cannot overflow the guest's Wasm stack, and an
-import whose future is ready at once switches no stack.
+import whose future is ready at once switches no stack. A typed async host
+function also keeps the heap block of a future that was ready at once, and
+makes its next future there, so such a call does not allocate either.
 
 Nothing a call leaves on the thread outlives the slice that put it there. Each
 resumption installs what a synchronous call installs, the store context entry
