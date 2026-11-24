@@ -9,8 +9,8 @@ use std::{cell::RefCell, sync::OnceLock};
 use anyhow::Result;
 use futures::future;
 use wasmer::{
-    AsyncEnv, Function, FunctionEnv, FunctionEnvMut, FunctionType, Instance, Module, Store, Type,
-    TypedFunction, Value, imports,
+    AsyncEnv, Function, FunctionEnv, FunctionEnvMut, FunctionType, Instance, Module, RuntimeError,
+    Store, Type, TypedFunction, Value, imports,
 };
 use wasmer_vm::TrapCode;
 
@@ -370,16 +370,13 @@ fn an_async_import_rethrows_a_guest_exception() -> Result<()> {
     let module = Module::new(&store, wasm)?;
 
     let env = FunctionEnv::new(&mut store, None::<Function>);
-    let relay = Function::new_typed_with_env_async(
+    let relay = Function::new_typed_async(
         &mut store,
         &env,
-        async move |env: AsyncFunctionEnvMut<Option<Function>>| -> Result<(), RuntimeError> {
-            let thrower = env.read().await.data().clone().expect("thrower to be set");
+        async |cx: &mut AsyncEnv<Option<Function>>| -> Result<(), RuntimeError> {
+            let thrower = cx.with(|env| env.data().clone().expect("thrower to be set"));
             tokio::task::yield_now().await;
-            thrower
-                .call_async(&env.as_store_async(), vec![])
-                .await
-                .map(drop)
+            thrower.call_async(cx, &[]).await.map(drop)
         },
     );
 
@@ -395,7 +392,7 @@ fn an_async_import_rethrows_a_guest_exception() -> Result<()> {
         .enable_all()
         .build()
         .unwrap()
-        .block_on(run.call_async(&store.into_async(), vec![]))?;
+        .block_on(run.call_async(&mut store, &[]))?;
     assert_eq!(results.as_ref(), [Value::I32(7)]);
 
     Ok(())
