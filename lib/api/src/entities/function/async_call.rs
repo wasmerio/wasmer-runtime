@@ -55,10 +55,11 @@ impl<R> Future for AsyncCall<'_, R> {
     type Output = R;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
-        match &mut self.get_mut().inner {
+        // Safety: the call is not moved out of its variant.
+        match unsafe { &mut self.get_unchecked_mut().inner } {
             Inner::Boxed(call) => call.as_mut().poll(cx),
             #[cfg(feature = "sys")]
-            Inner::Typed(call) => Pin::new(call).poll(cx),
+            Inner::Typed(call) => unsafe { Pin::new_unchecked(call) }.poll(cx),
         }
     }
 }

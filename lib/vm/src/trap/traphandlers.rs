@@ -905,7 +905,7 @@ struct VmThread {
     /// while a call runs: set from outside the Wasm stack. Atomic, since the
     /// signal handler reads it.
     trap_handler: AtomicPtr<TrapHandlerContext>,
-    /// The Wasm stack of the [`SuspendableCall`] that is being resumed on
+    /// The Wasm stack of the [`SuspendedCall`] that is being resumed on
     /// this thread, if one is. The Wasm stack that is running may be
     /// suspended only if it is that call's own: a call made from a host
     /// function it reached runs on another stack, with that host function
@@ -1060,19 +1060,19 @@ impl WasmStack {
 }
 
 /// The yielder of a Wasm stack: that of an entry coroutine (see
-/// [`EntrySlots`]) or of a [`SuspendableCall`].
+/// [`EntrySlots`]) or of a [`SuspendedCall`].
 ///
 /// Only word-sized values cross its switches, which corosensei passes in a
 /// register; larger ones go through memory, where they are read right after
 /// being written. An entry coroutine is resumed with the call it is to run
-/// (a [`SuspendableCall`] with null), and a Wasm stack gives control back
+/// (a suspendable call with null), and a Wasm stack gives control back
 /// with null when that call returned, with [`SUSPENDED`] when an import
-/// suspended a [`SuspendableCall`], or with a pointer to the reason given to
+/// suspended a [`SuspendedCall`], or with a pointer to the reason given to
 /// [`unwind_with`], on the stack itself. A trap handler makes the coroutine
 /// return instead (see [`FromUnwind`]).
 type WasmYielder = Yielder<*const EntryJob, *mut UnwindReason>;
 
-/// What a [`SuspendableCall`] gives control back with when an import
+/// What a [`SuspendedCall`] gives control back with when an import
 /// suspends it: an address no reason is ever at.
 const SUSPENDED: *mut UnwindReason = ptr::dangling_mut();
 
@@ -1094,7 +1094,7 @@ impl<T> FromUnwind for Result<T, UnwindReason> {
     }
 }
 
-/// What a suspended [`SuspendableCall`] keeps registered beyond its thread:
+/// What a suspended [`SuspendedCall`] keeps registered beyond its thread:
 /// with `experimental-host-interrupt`, the stores it entered, which an
 /// interrupt has to find while their guest waits. Without that feature it
 /// holds nothing.
@@ -1438,7 +1438,7 @@ const ENTRY_SLOTS: usize = 2;
 /// [`WasmYielder`]).
 ///
 /// A call takes the first slot no running call uses. Slots are not tied to a
-/// nesting depth, though calls only ever nest here: a [`SuspendableCall`],
+/// nesting depth, though calls only ever nest here: a [`SuspendedCall`],
 /// which may wait with Wasm frames on its stack, runs on a coroutine of its
 /// own. A coroutine that finished, after a trap or a panic, is not kept: its
 /// stack goes back to the stack cache. [`ThreadExit`] returns their stacks to
@@ -1475,6 +1475,26 @@ impl EntrySlots {
         }
         // SAFETY: filled above if it was empty.
         unsafe { slot.as_mut().unwrap_unchecked() }
+    }
+
+    /// Takes back the coroutine of a [`SuspendedCall`] that is over: into a
+    /// slot that has none, if the coroutine can run another call and the
+    /// thread `keeps` them, and to the stack cache otherwise.
+    fn give_back(&self, entry: EntryCoroutine, keeps: bool) {
+        if keeps && !entry.coro.done() {
+            for (i, slot) in self.entries.iter().enumerate() {
+                if self.busy.get() & (1 << i) != 0 {
+                    continue;
+                }
+                // SAFETY: not busy, so no call holds a reference into the slot.
+                let slot = unsafe { &mut *slot.get() };
+                if slot.is_none() {
+                    *slot = Some(entry);
+                    return;
+                }
+            }
+        }
+        release_stack(retire_entry(entry));
     }
 
     /// Takes the coroutines that no running call uses, as their stacks.
@@ -1705,183 +1725,201 @@ fn retire_entry(mut entry: EntryCoroutine) -> DefaultStack {
     entry.coro.into_stack()
 }
 
-/// How many values a [`SuspendableCall`] keeps on its own stack.
-pub const INLINE_CALL_VALUES: usize = 4;
-
-/// The arguments of a [`SuspendableCall`], which its trampoline overwrites
-/// with the results.
-#[derive(Clone, Copy)]
-pub enum CallValues {
-    /// Kept on the stack of the call, which returns them when it is over:
-    /// whoever makes the call can move, and needs nowhere to keep them.
-    Inline([wasmer_types::RawValue; INLINE_CALL_VALUES]),
-    /// Kept by whoever makes the call, where they stay until the call is
-    /// finished or dropped.
-    At(*mut wasmer_types::RawValue),
+/// [`wasmer_call_trampoline`], for a guest that an import it calls may
+/// suspend, as `Function::call_async` in the API crate needs.
+///
+/// The call is one resume of an entry coroutine the thread keeps, as a
+/// synchronous call is (see [`EntrySlots`]). If the guest returns, that is
+/// all. If an import suspends it (see [`suspend_wasm_call`]), the coroutine
+/// leaves its slot with the [`SuspendedCall`] this returns.
+///
+/// # Safety
+///
+/// As for [`wasmer_call_trampoline`], and `vmctx`, `callee` and `values_vec`
+/// must be valid until the call is over or dropped: the guest keeps them
+/// while it waits.
+pub unsafe fn wasmer_call_trampoline_suspendable(
+    trap_handler: Option<*const TrapHandlerFn<'static>>,
+    config: &VMConfig,
+    vmctx: crate::VMFunctionContext,
+    trampoline: crate::VMTrampoline,
+    callee: *const crate::VMFunctionBody,
+    values_vec: *mut u8,
+) -> Result<Option<SuspendedCall>, Trap> {
+    unsafe fn run<F: FnOnce()>(f: *const u8, _: *mut u8) {
+        unsafe { ptr::read(f.cast::<F>())() }
+    }
+    fn job_of<F: FnOnce()>(f: &ManuallyDrop<F>) -> EntryJob {
+        EntryJob {
+            run: run::<F>,
+            f: ptr::from_ref(&**f).cast(),
+            result: ptr::null_mut(),
+        }
+    }
+    // Moved onto the Wasm stack when the call starts, where it stays while
+    // the guest waits.
+    let f = ManuallyDrop::new(move || {
+        let thread = VmThread::get();
+        // This stack is the one that may suspend, for as long as it runs.
+        thread.suspendable.set(thread.stacks.wasm.get());
+        unsafe {
+            // pointer types are ABI-compatible
+            let trampoline = mem::transmute::<
+                crate::VMTrampoline,
+                unsafe extern "C" fn(
+                    crate::VMFunctionContext,
+                    *const crate::VMFunctionBody,
+                    *mut u8,
+                ),
+            >(trampoline);
+            trampoline(vmctx, callee, values_vec);
+        }
+    });
+    let job = job_of(&f);
+    let stack_size = config
+        .wasm_stack_size
+        .unwrap_or_else(|| DEFAULT_STACK_SIZE.load(Ordering::Relaxed));
+    let thread = VmThread::get();
+    let keeps = thread.prepare()?;
+    let slots = &thread.entries;
+    let busy = slots.busy.get();
+    let index = busy.trailing_ones() as usize;
+    if !(keeps && index < ENTRY_SLOTS) {
+        // Every slot is in use, or the thread exits: on a coroutine of the
+        // call's own.
+        let mut call = SuspendedCall {
+            entry: Some(new_entry(stack_size)),
+            wasm_stack: None,
+        };
+        return Ok(unsafe { call.resume_with(&job, trap_handler) }?.map(|()| call));
+    }
+    slots.busy.set(busy | (1 << index));
+    let _release = SlotRelease { slots, index };
+    // SAFETY: the slot is this call's until `_release` releases it.
+    let entry = unsafe { slots.entry(index, stack_size) };
+    let suspended =
+        unsafe { resume_suspendable(thread, &mut entry.coro, &job, None, trap_handler) }?;
+    Ok(suspended.map(|wasm_stack| SuspendedCall {
+        // The guest waits: its coroutine leaves the slot with it.
+        // SAFETY: the slot is still this call's.
+        entry: unsafe { (*slots.entries[index].get()).take() },
+        wasm_stack,
+    }))
 }
 
-/// What a [`SuspendableCall`] did when it was resumed.
-pub enum CallStep {
-    /// It waits: an import it called suspended it (see
-    /// [`suspend_wasm_call`]). It goes on when it is resumed again.
-    Suspended,
-    /// It is over: it returned, with its values as it was given them, or
-    /// trapped.
-    Finished(Result<CallValues, Trap>),
-}
-
-/// The coroutine of a [`SuspendableCall`]: it is resumed with no call (see
-/// [`WasmYielder`]), and returns the call's values or, if a trap handler made
-/// it return, the reason of the trap.
-type SuspendableCoro =
-    Coroutine<*const EntryJob, *mut UnwindReason, Result<CallValues, UnwindReason>, DefaultStack>;
-
-/// A Wasm call on a stack of its own that an import can suspend, and its
-/// caller resume later, as `Function::call_async` in the API crate does.
+/// A call made with [`wasmer_call_trampoline_suspendable`] whose guest waits.
 ///
-/// Nothing of the call stays on the thread while it is suspended: each
-/// [`resume`](Self::resume) installs what the signal handler needs and takes
-/// it off when control comes back, as a synchronous call does. Suspended
-/// calls can therefore be resumed in any order.
+/// Nothing of it stays on the thread: each [`resume`](Self::resume) installs
+/// what the signal handler needs and takes it off when control comes back,
+/// as a synchronous call does. Suspended calls can therefore be resumed in
+/// any order.
 ///
-/// A suspended stack holds the frames of the guest and of the import that
-/// suspended it, which keeps nothing a destructor would have to release.
-/// Dropping the call resets the stack: none of it runs again.
-pub struct SuspendableCall {
-    coroutine: Option<SuspendableCoro>,
+/// Its stack holds the frames of the guest and of the import that suspended
+/// it, which keeps nothing a destructor would have to release. Dropping the
+/// call resets the stack: none of it runs again.
+pub struct SuspendedCall {
+    /// The call's coroutine, until the call is over.
+    entry: Option<EntryCoroutine>,
     /// The coroutine's Wasm stack, once it has suspended.
     wasm_stack: Option<NonNull<WasmStack>>,
 }
 
-impl SuspendableCall {
-    /// A call of `callee` through `trampoline`, which starts when it is first
-    /// resumed.
-    ///
-    /// # Safety
-    /// All pointer arguments, and the pointer of [`CallValues::At`], must be
-    /// valid until the call is finished or dropped.
-    pub unsafe fn new(
-        config: &VMConfig,
-        vmctx: crate::VMFunctionContext,
-        trampoline: crate::VMTrampoline,
-        callee: *const crate::VMFunctionBody,
-        values: CallValues,
-    ) -> Result<Self, Trap> {
-        VmThread::get().prepare()?;
-        let stack_size = config
-            .wasm_stack_size
-            .unwrap_or_else(|| DEFAULT_STACK_SIZE.load(Ordering::Relaxed));
-        let stack = acquire_stack(stack_size);
-        let limit = WasmStack::limit_of(&stack);
-        let coroutine =
-            Coroutine::with_stack(stack, move |yielder: &WasmYielder, _: *const EntryJob| {
-                let wasm_stack = WasmStack {
-                    yielder: NonNull::from(yielder),
-                    limit,
-                };
-                let wasm_stack = NonNull::from(&wasm_stack);
-                let thread = VmThread::get();
-                thread.suspendable.set(Some(wasm_stack));
-                thread.stacks.wasm.set(Some(wasm_stack));
-                // In this frame, on the call's own stack, from here on.
-                let mut values = values;
-                let values_vec = match &mut values {
-                    CallValues::Inline(values) => values.as_mut_ptr(),
-                    CallValues::At(values) => *values,
-                };
-                unsafe {
-                    // pointer types are ABI-compatible; transmute to unsafe fn to preserve unsafety
-                    std::mem::transmute::<
-                        unsafe extern "C" fn(
-                            *mut crate::VMContext,
-                            *const crate::VMFunctionBody,
-                            *mut wasmer_types::RawValue,
-                        ),
-                        unsafe extern "C" fn(
-                            crate::VMFunctionContext,
-                            *const crate::VMFunctionBody,
-                            *mut u8,
-                        ),
-                    >(trampoline)(vmctx, callee, values_vec.cast());
-                }
-                Ok(values)
-            });
-        Ok(Self {
-            coroutine: Some(coroutine),
-            wasm_stack: None,
-        })
-    }
-
-    /// Runs the call until it waits or is over.
+impl SuspendedCall {
+    /// Runs the guest until it waits again, which is `Ok(None)`, or is over.
     ///
     /// # Safety
     /// Called from host code, on the thread the call was made on, and not
-    /// again once it is finished. `trap_handler` must be valid for the
-    /// duration of the resumption.
+    /// again once it is over. `trap_handler` must be valid for the duration
+    /// of the resumption.
     pub unsafe fn resume(
         &mut self,
         trap_handler: Option<*const TrapHandlerFn<'static>>,
-    ) -> CallStep {
-        let coroutine = self.coroutine.as_mut().expect("the call is not over");
-        let thread = VmThread::get();
-        let stacks = &thread.stacks;
-        // Which Wasm stack may suspend, for as long as this one runs.
-        let outer = thread.suspendable.replace(self.wasm_stack);
-        defer! {
-            thread.suspendable.set(outer);
-            // A stack that suspended cleared it; one that is over did not.
-            stacks.wasm.set(None);
-        }
-        let resumed =
-            TrapHandlerContext::install(thread, trap_handler, coroutine.trap_handler(), || {
-                // From host code in place, from the stack beneath it, as a call
-                // into Wasm does (see `Stacks::in_place`).
-                match stacks.in_place.get() {
-                    None => coroutine.resume(ptr::null()),
-                    Some(in_place) => {
-                        on_parent_of_in_place(stacks, in_place, || coroutine.resume(ptr::null()))
-                    }
-                }
-            });
-        let result = match resumed {
-            CoroutineResult::Yield(reason) if reason == SUSPENDED => {
-                // The coroutine made itself the one that may suspend when it
-                // started, and it still is.
-                self.wasm_stack = thread.suspendable.get();
-                return CallStep::Suspended;
-            }
-            // This came from unwind_with which requires that there be only
-            // Wasm code on the stack: take the reason off it, then discard
-            // the stack.
-            CoroutineResult::Yield(reason) => unsafe {
-                let reason = ptr::read(reason);
-                coroutine.force_reset();
-                Err(reason)
+    ) -> Result<Option<()>, Trap> {
+        Ok(
+            match unsafe { self.resume_with(ptr::null(), trap_handler) }? {
+                Some(()) => None,
+                None => Some(()),
             },
-            CoroutineResult::Return(result) => result,
-        };
-        CallStep::Finished(result.map_err(UnwindReason::into_trap))
+        )
     }
-}
 
-impl Drop for SuspendableCall {
-    fn drop(&mut self) {
-        let Some(mut coroutine) = self.coroutine.take() else {
-            return;
+    /// Resumes the call's coroutine, with `job` to start it. `Some` if the
+    /// guest waits. Lets go of the coroutine if the call is over.
+    unsafe fn resume_with(
+        &mut self,
+        job: *const EntryJob,
+        trap_handler: Option<*const TrapHandlerFn<'static>>,
+    ) -> Result<Option<()>, Trap> {
+        let thread = VmThread::get();
+        let entry = self.entry.as_mut().expect("the call is not over");
+        let resumed = unsafe {
+            resume_suspendable(thread, &mut entry.coro, job, self.wasm_stack, trap_handler)
         };
-        if !coroutine.started() {
-            // Never resumed: there is only its function to drop.
-            coroutine.force_unwind();
-        } else if !coroutine.done() {
-            // Safety: a suspended stack holds nothing to release (see the
-            // type), and is never resumed.
-            unsafe { coroutine.force_reset() };
+        if let Ok(Some(wasm_stack)) = resumed {
+            self.wasm_stack = wasm_stack;
+            return Ok(Some(()));
         }
-        release_stack(coroutine.into_stack());
+        let entry = self.entry.take().expect("the coroutine that ran");
+        thread.entries.give_back(entry, thread.keeps());
+        resumed.map(|_| None)
     }
 }
 
-/// Whether the Wasm stack that is running is that of the [`SuspendableCall`]
+impl Drop for SuspendedCall {
+    fn drop(&mut self) {
+        // Safety (in `retire_entry`): a suspended stack holds nothing to
+        // release (see the type), and is never resumed.
+        if let Some(entry) = self.entry.take() {
+            release_stack(retire_entry(entry));
+        }
+    }
+}
+
+/// Resumes a coroutine that runs a suspendable call: with `job` to start the
+/// call, or with its `wasm_stack` if it waits. `Some` if the guest waits,
+/// with its Wasm stack for the next resumption.
+///
+/// # Safety
+///
+/// As for [`SuspendedCall::resume`]. Nothing else may use `coro` until this
+/// returns.
+#[inline(always)]
+#[allow(clippy::type_complexity)]
+unsafe fn resume_suspendable(
+    thread: &VmThread,
+    coro: &mut EntryCoro,
+    job: *const EntryJob,
+    wasm_stack: Option<NonNull<WasmStack>>,
+    trap_handler: Option<*const TrapHandlerFn<'static>>,
+) -> Result<Option<Option<NonNull<WasmStack>>>, Trap> {
+    let stacks = &thread.stacks;
+    // Which Wasm stack may suspend, for as long as this one runs.
+    let outer = thread.suspendable.replace(wasm_stack);
+    defer! {
+        thread.suspendable.set(outer);
+        // A stack that suspended cleared it; one that is over did not.
+        stacks.wasm.set(None);
+    }
+    let resumed = TrapHandlerContext::install(thread, trap_handler, coro.trap_handler(), || {
+        // From host code in place, from the stack beneath it, as a call into
+        // Wasm does (see `Stacks::in_place`).
+        match stacks.in_place.get() {
+            None => coro.resume(job),
+            Some(in_place) => on_parent_of_in_place(stacks, in_place, || coro.resume(job)),
+        }
+    });
+    match resumed {
+        // The coroutine made itself the one that may suspend when the call
+        // started, and it still is.
+        CoroutineResult::Yield(reason) if reason == SUSPENDED => Ok(Some(thread.suspendable.get())),
+        // The rest is how a synchronous call ends.
+        resumed => unsafe { entry_outcome(coro, resumed) }
+            .map(|()| None)
+            .map_err(UnwindReason::into_trap),
+    }
+}
+
+/// Whether the Wasm stack that is running is that of the [`SuspendedCall`]
 /// being resumed: whether an import called from it may suspend it.
 pub fn wasm_call_is_suspendable() -> bool {
     let thread = VmThread::get();

@@ -151,25 +151,8 @@ fn a_typed_call_converts_its_arguments_and_results() {
     assert_eq!(result.unwrap(), 41);
 }
 
-/// The future of a typed call is free to move while its guest waits: the
-/// values the guest was called with are on the guest's own stack.
-#[test]
-fn a_typed_call_moves_while_its_guest_waits() {
-    let (mut store, run, gate, _env) = guest();
-    let typed: TypedFunction<i32, i32> = run.typed(&store).unwrap();
-    let cx = &mut Context::from_waker(Waker::noop());
-    let mut call = typed.call_async(&mut store, 20);
-    assert!(Pin::new(&mut call).poll(cx).is_pending());
-    let mut moved = Box::new(call);
-    gate.set(true);
-    let Poll::Ready(result) = Pin::new(&mut *moved).poll(cx) else {
-        panic!("the call did not finish");
-    };
-    assert_eq!(result.unwrap(), 41);
-}
-
-/// A typed call takes and returns more values than its guest keeps on its
-/// own stack, of every numeric type, whether it waits or not.
+/// A typed call takes and returns more values than its future keeps inline,
+/// of every numeric type, whether it waits or not.
 #[test]
 fn a_typed_call_takes_and_returns_many_values() {
     const MANY: &str = r#"(module
@@ -187,22 +170,20 @@ fn a_typed_call_takes_and_returns_many_values() {
         exports.get_typed_function(&store, "rotate").unwrap();
     let spread: TypedFunction<i32, (i32, i32, i32, i32, i32)> =
         exports.get_typed_function(&store, "spread").unwrap();
-    let cx = &mut Context::from_waker(Waker::noop());
 
-    // It waits, and moves while it does.
-    let mut call = rotate.call_async(&mut store, 7, 1 << 40, 1.5, -2.5, 9);
-    assert!(Pin::new(&mut call).poll(cx).is_pending());
-    let mut moved = Box::new(call);
+    // It waits.
+    let mut call = Box::pin(rotate.call_async(&mut store, 7, 1 << 40, 1.5, -2.5, 9));
+    assert!(poll(&mut call).is_pending());
     gate.set(true);
-    let Poll::Ready(result) = Pin::new(&mut *moved).poll(cx) else {
+    let Poll::Ready(result) = poll(&mut call) else {
         panic!("the call did not finish");
     };
     assert_eq!(result.unwrap(), (1 << 40, 1.5, -2.5, 9, 14));
-    drop(moved);
+    drop(call);
 
     // More results than arguments, ready at once.
-    let mut call = spread.call_async(&mut store, 5);
-    let Poll::Ready(result) = Pin::new(&mut call).poll(cx) else {
+    let mut call = Box::pin(spread.call_async(&mut store, 5));
+    let Poll::Ready(result) = poll(&mut call) else {
         panic!("the call did not finish");
     };
     assert_eq!(result.unwrap(), (5, 2, 3, 4, 10));

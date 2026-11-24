@@ -55,10 +55,10 @@ type InlineValues<T> = SmallVec<[T; 8]>;
 pub(crate) type RawResults = SmallVec<[RawValue; 4]>;
 
 /// The arguments of a call as its trampoline takes them, which it overwrites
-/// with the results. As many as the guest keeps on its own stack are inline
-/// (see [`wasmer_vm::CallValues`]), so that a call does not allocate for them.
+/// with the results, inline for the usual few, so that a call does not
+/// allocate for them.
 #[cfg(feature = "experimental-async")]
-pub(crate) type RawValues = SmallVec<[RawValue; wasmer_vm::INLINE_CALL_VALUES]>;
+pub(crate) type RawValues = SmallVec<[RawValue; 4]>;
 
 /// The future of one call of an async import.
 #[cfg(feature = "experimental-async")]
