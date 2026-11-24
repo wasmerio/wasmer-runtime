@@ -39,7 +39,6 @@ pub struct FunctionLsdaData {
 pub fn build_function_lsda<'a>(
     call_sites: impl Iterator<Item = MachCallSiteItem<'a>>,
     function_length: usize,
-    pointer_bytes: u8,
     pcrel_type_table: bool,
 ) -> Option<FunctionLsdaData> {
     let mut sites = Vec::new();
@@ -158,7 +157,7 @@ pub fn build_function_lsda<'a>(
     let (type_table_bytes, type_table_relocs) = if pcrel_type_table {
         type_entries.encode_relocated()
     } else {
-        type_entries.encode(pointer_bytes)
+        type_entries.encode(8)
     };
 
     let call_site_table_len = call_site_table.len() as u64;
@@ -233,7 +232,7 @@ pub struct CompactUnwindEntryData {
 pub fn build_compact_unwind_section(
     entries: impl IntoIterator<Item = CompactUnwindEntryData>,
     function_symbol: SymbolId,
-    personality_symbol: SymbolId,
+    personality_symbol: Option<SymbolId>,
     lsda_symbol: Option<SymbolId>,
 ) -> Option<(Vec<u8>, Vec<Relocation>)> {
     const ENTRY_SIZE: usize = 32;
@@ -269,12 +268,14 @@ pub fn build_compact_unwind_section(
             offset: u64::from(base + FUNCTION_ADDR_OFFSET),
             addend: 0,
         });
-        relocations.push(Relocation {
-            flags,
-            symbol: personality_symbol,
-            offset: u64::from(base + PERSONALITY_ADDR_OFFSET),
-            addend: 0,
-        });
+        if let Some(symbol) = personality_symbol {
+            relocations.push(Relocation {
+                flags,
+                symbol,
+                offset: u64::from(base + PERSONALITY_ADDR_OFFSET),
+                addend: 0,
+            });
+        }
 
         if let Some(lsda_offset) = entry.lsda_offset {
             relocations.push(Relocation {
