@@ -11,6 +11,7 @@ use std::{
     cell::Cell,
     marker::PhantomData,
     mem::ManuallyDrop,
+    ptr,
     rc::{Rc, Weak},
 };
 
@@ -59,6 +60,23 @@ thread_local! {
     /// The store of the call being polled on this thread. Empty inside a
     /// slice, so that a slice cannot be taken twice.
     static POLL_STORE: Cell<Option<PollStore>> = const { Cell::new(None) };
+}
+
+/// Where this thread's store is published, for a guard that takes it and
+/// puts it back to look it up once.
+///
+/// The pointer is valid for as long as the thread runs: the thread-local has
+/// no destructor. A guard that keeps it holds a pointer to its store as well,
+/// so it is not `Send`, and it is dropped before the poll it was made in
+/// returns: it never leaves the thread.
+///
+/// This is `LocalKey::with`, written with `try_with`, which is `#[inline]`
+/// where `with` is not (see `with_top` in `context.rs`).
+#[inline]
+fn published() -> *const Cell<Option<PollStore>> {
+    POLL_STORE
+        .try_with(ptr::from_ref)
+        .expect("the published store of a thread was used during or after its destruction")
 }
 
 impl PollStore {
@@ -149,6 +167,7 @@ impl PollStore {
     }
 
     /// [`Self::enter_slice`], or `None` if the store is in a slice.
+    #[inline]
     pub(crate) fn try_enter_slice(self) -> Option<StoreSlice> {
         if let StoreAccess::Shared(state) = self.access
             // Safety: as for `keeper`.
@@ -186,13 +205,18 @@ impl Drop for StoreSlice {
 /// its host future.
 pub(crate) struct PollScope {
     previous: Option<PollStore>,
+    /// See [`published`].
+    published: *const Cell<Option<PollStore>>,
 }
 
 impl PollScope {
     #[inline]
     pub(crate) fn enter(store: Option<PollStore>) -> Self {
+        let published = published();
         Self {
-            previous: POLL_STORE.replace(store),
+            // Safety: see `published`.
+            previous: unsafe { &*published }.replace(store),
+            published,
         }
     }
 }
@@ -200,7 +224,8 @@ impl PollScope {
 impl Drop for PollScope {
     #[inline]
     fn drop(&mut self) {
-        POLL_STORE.set(self.previous);
+        // Safety: see `published`.
+        unsafe { &*self.published }.set(self.previous);
     }
 }
 
@@ -209,6 +234,32 @@ impl Drop for PollScope {
 pub(crate) struct WithSlice {
     slice: ManuallyDrop<StoreSlice>,
     poll: PollStore,
+    /// See [`published`].
+    published: *const Cell<Option<PollStore>>,
+}
+
+/// The panics of [`WithSlice::enter`]. Out of line, so that the slice of an
+/// `AsyncEnv::with`, which is all that most host futures do with the store,
+/// is small enough to be inlined into it.
+#[cold]
+#[inline(never)]
+fn not_published() -> ! {
+    panic!(
+        "AsyncEnv::with can only be used while its host function is being polled, \
+         and not inside another `with`"
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn published_for_another_store() -> ! {
+    panic!("AsyncEnv::with was used during a poll of another store's call")
+}
+
+#[cold]
+#[inline(never)]
+fn slice_is_running() -> ! {
+    panic!("the shared store is already running a slice on this thread")
 }
 
 impl WithSlice {
@@ -216,29 +267,26 @@ impl WithSlice {
     /// Panics unless the call being polled is on the store `id`.
     #[inline]
     pub(crate) fn enter(id: StoreId) -> Self {
-        let Some(poll) = POLL_STORE.take() else {
-            panic!(
-                "AsyncEnv::with can only be used while its host function is being polled, \
-                 and not inside another `with`"
-            );
+        let published = published();
+        // Safety: see `published`.
+        let cell = unsafe { &*published };
+        let Some(poll) = cell.take() else {
+            not_published()
         };
+        // The published store is put back before a panic: it is not this
+        // slice's to keep.
         if poll.id != id {
-            POLL_STORE.set(Some(poll));
-            panic!("AsyncEnv::with was used during a poll of another store's call");
+            cell.set(Some(poll));
+            published_for_another_store()
         }
-        // Restores the published store if the slice cannot be taken.
-        struct Restore(PollStore);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                POLL_STORE.set(Some(self.0));
-            }
-        }
-        let restore = Restore(poll);
-        let slice = poll.enter_slice();
-        std::mem::forget(restore);
+        let Some(slice) = poll.try_enter_slice() else {
+            cell.set(Some(poll));
+            slice_is_running()
+        };
         Self {
             slice: ManuallyDrop::new(slice),
             poll,
+            published,
         }
     }
 
@@ -253,7 +301,8 @@ impl Drop for WithSlice {
     fn drop(&mut self) {
         // Safety: dropped once, here.
         unsafe { ManuallyDrop::drop(&mut self.slice) };
-        POLL_STORE.set(Some(self.poll));
+        // Safety: see `published`.
+        unsafe { &*self.published }.set(Some(self.poll));
     }
 }
 
