@@ -832,6 +832,93 @@ fn issue_exnref_global(mut config: crate::Config) {
         .unwrap();
 }
 
+/// A host function that returns the exception of a guest it called throws it
+/// back into its caller, where a `try_table` catches it. A dynamic host
+/// function is called through a trampoline, which the unwinder has to pass:
+/// the one of the module that imported it last, also when that module has no
+/// function of its own and only puts it in a table.
+#[cfg(not(target_os = "windows"))]
+#[compiler_test(issues)]
+fn host_function_rethrows_guest_exception(mut config: crate::Config) -> Result<()> {
+    if matches!(
+        config.compiler,
+        crate::Compiler::Singlepass | crate::Compiler::V8
+    ) {
+        return Ok(());
+    }
+
+    type Thrower = Option<Function>;
+    fn throw(mut env: FunctionEnvMut<Thrower>) -> Result<(), RuntimeError> {
+        let thrower = env.data().clone().expect("the thrower is set");
+        thrower.call(&mut env, &[]).map(drop)
+    }
+
+    let wat = r#"(module
+        (import "host" "relay" (func $relay (param i32 i64) (result i64 i32)))
+        (tag $e (param i32))
+        (func (export "thrower") (throw $e (i32.const 7)))
+        (table (export "table") 1 funcref)
+        (func (export "run") (param $through_table i32) (result i32)
+            (block $caught (result i32)
+                (try_table (catch $e $caught)
+                    (if (local.get $through_table)
+                        (then
+                            (call_indirect (param i32 i64) (result i64 i32)
+                                (i32.const 1) (i64.const 2) (i32.const 0))
+                            (return))
+                        (else
+                            (call $relay (i32.const 1) (i64.const 2))
+                            (return))))
+                unreachable)))"#;
+    let filler = r#"(module
+        (import "host" "relay" (func $relay (param i32 i64) (result i64 i32)))
+        (import "host" "table" (table 1 funcref))
+        (elem (i32.const 0) $relay))"#;
+    let ty = FunctionType::new(vec![Type::I32, Type::I64], vec![Type::I64, Type::I32]);
+
+    let mut store = config.store();
+    let module = Module::new(&store, wat2wasm(wat.as_bytes())?)?;
+    let filler = Module::new(&store, wat2wasm(filler.as_bytes())?)?;
+    for kind in ["typed", "dynamic", "dynamic through a table"] {
+        let env = FunctionEnv::new(&mut store, None);
+        let relay = match kind {
+            "typed" => Function::new_typed_with_env(
+                &mut store,
+                &env,
+                |env: FunctionEnvMut<Thrower>,
+                 _: i32,
+                 _: i64|
+                 -> Result<(i64, i32), RuntimeError> {
+                    throw(env).map(|()| (0, 0))
+                },
+            ),
+            _ => Function::new_with_env(&mut store, &env, &ty, |env, _| {
+                throw(env).map(|()| vec![Value::I64(0), Value::I32(0)])
+            }),
+        };
+        let instance = Instance::new(
+            &mut store,
+            &module,
+            &imports! { "host" => { "relay" => relay.clone() } },
+        )?;
+        *env.as_mut(&mut store) = Some(instance.exports.get_function("thrower")?.clone());
+        let through_table = kind == "dynamic through a table";
+        if through_table {
+            let table = instance.exports.get_table("table")?.clone();
+            let imports = imports! { "host" => { "relay" => relay, "table" => table } };
+            Instance::new(&mut store, &filler, &imports)?;
+        }
+        let run = instance.exports.get_function("run")?;
+        assert_eq!(
+            run.call(&mut store, &[Value::I32(through_table as i32)])?
+                .as_ref(),
+            [Value::I32(7)],
+            "{kind}"
+        );
+    }
+    Ok(())
+}
+
 /// Exception payloads must use the VM's RawValue slots in both directions.
 #[compiler_test(issues)]
 fn issue_7036_exception_payload(mut config: crate::Config) -> Result<()> {
