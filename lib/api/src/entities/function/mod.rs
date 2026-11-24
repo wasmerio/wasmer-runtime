@@ -17,13 +17,19 @@ pub use call_wrapper::{CallWrapper, WasmCall};
 pub(crate) mod async_call;
 #[cfg(feature = "experimental-async")]
 pub(crate) mod async_host;
+#[cfg(feature = "experimental-async")]
+pub(crate) mod deferred;
 #[doc(hidden)]
 #[cfg(feature = "experimental-async")]
 pub use async_call::AsyncCallRequest;
 #[cfg(feature = "experimental-async")]
 pub use async_call::{AsyncCall, AsyncCallStore};
 #[cfg(feature = "experimental-async")]
-pub use async_host::{AsyncEnv, AsyncHostFunction};
+pub use async_host::{
+    AsyncDynamicHostFunction, AsyncEnv, AsyncHostFunction, ReturnsDeferred, ReturnsFuture,
+};
+#[cfg(feature = "experimental-async")]
+pub use deferred::Deferred;
 
 use wasmer_types::{FunctionType, RawValue};
 
@@ -168,12 +174,20 @@ impl Function {
     /// If you know the signature of the host function at compile time,
     /// consider using [`Self::new_typed_async`] for less runtime overhead.
     ///
+    /// The function takes `&mut AsyncEnv<T>` and the arguments of a call as
+    /// [`Value`]s, and is one of two kinds:
+    ///
+    /// - an `async` function that returns `Result<Vec<Value>, RuntimeError>`;
+    /// - a function that returns a [`Deferred`] of that: the results at once,
+    ///   or a future for them. See [`Self::new_typed_async`]; a dynamic
+    ///   function is called through a future either way.
+    ///
     /// The function reaches the store with [`AsyncEnv::with`]. Called through
     /// [`Function::call_async`], it may wait. Called synchronously, it must be
     /// ready at once, or the guest traps with `YieldOutsideAsyncContext`; on
     /// `js` it traps there either way.
     #[cfg(feature = "experimental-async")]
-    pub fn new_async<T, FT, F>(
+    pub fn new_async<T, FT, F, Kind>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
         ty: FT,
@@ -182,35 +196,48 @@ impl Function {
     where
         T: Send + 'static,
         FT: Into<FunctionType>,
-        F: for<'e> AsyncFn(&'e mut AsyncEnv<T>, &'e [Value]) -> Result<Vec<Value>, RuntimeError>
-            + 'static,
+        F: AsyncDynamicHostFunction<T, Kind>,
     {
         let func = std::rc::Rc::new(func);
         let body = move |mut cx: AsyncEnv<T>, values: Vec<Value>| {
             let func = std::rc::Rc::clone(&func);
-            async move {
-                let func: &F = &func;
-                func(&mut cx, &values).await
-            }
+            async move { func.invoke(&mut cx, &values).await }
         };
         Self(BackendFunction::new_async(store, env, ty, body))
     }
 
-    /// Creates a new async host `Function` from a typed async function.
+    /// Creates a new async host `Function` from a typed function.
     ///
-    /// The function takes `&mut AsyncEnv<T>` and its Wasm arguments, and
-    /// returns the results, or any type that implements
-    /// [`IntoResult`](crate::IntoResult) for them, such as `Result<Rets, E>`.
+    /// The function takes `&mut AsyncEnv<T>` and its Wasm arguments, and is
+    /// one of two kinds:
+    ///
+    /// - an `async` function, whose call is the future it returns. It returns
+    ///   the results, or any type that implements
+    ///   [`IntoResult`](crate::IntoResult) for them, such as
+    ///   `Result<Rets, E>`.
+    /// - a function that returns a [`Deferred`] of those: the results at
+    ///   once ([`Deferred::ready`]), or a future for them
+    ///   ([`Deferred::pending`]).
+    ///
+    /// Either reaches the store with [`AsyncEnv::with`], and holds none of it
+    /// in between.
+    ///
+    /// An `async` function pays for being able to wait on every call. On
+    /// `sys`, a call of the other kind that returns [`Deferred::ready`] makes
+    /// no future, and costs what a call of a sync host function costs. On
+    /// the other backends that function is called as an `async` one, whose
+    /// future is ready at once.
     #[cfg(feature = "experimental-async")]
-    pub fn new_typed_async<T, Args, Rets>(
+    pub fn new_typed_async<T, Args, Rets, Kind>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
-        func: impl AsyncHostFunction<T, Args, Rets>,
+        func: impl AsyncHostFunction<T, Args, Rets, Kind>,
     ) -> Self
     where
         T: Send + 'static,
         Args: WasmTypeList + 'static,
         Rets: WasmTypeList + 'static,
+        Kind: 'static,
     {
         Self(BackendFunction::new_typed_async(store, env, func))
     }

@@ -14,7 +14,7 @@ use std::{
 };
 
 use wasmer::{
-    AsStoreMut, AsyncEnv, Function, FunctionEnv, FunctionEnvMut, Instance, Module, Store,
+    AsStoreMut, AsyncEnv, Deferred, Function, FunctionEnv, FunctionEnvMut, Instance, Module, Store,
     TypedFunction, imports,
 };
 
@@ -125,6 +125,50 @@ fn a_typed_async_import_that_does_not_wait_allocates_as_a_sync_one() {
     assert_eq!(count(&run_async), count(&run_sync));
     #[cfg(not(feature = "experimental-host-interrupt"))]
     assert_eq!(count(&run_async), (0, 0));
+}
+
+/// A typed import that returns `Deferred::ready` allocates as a sync one
+/// does, from its first call on: it makes no future, so it has no block to
+/// take. It reaches the store in a slice, as an `async` one does.
+#[test]
+fn a_deferred_import_that_is_ready_allocates_as_a_sync_one() {
+    let mut store = Store::default();
+    let module = Module::new(&store, GUEST).unwrap();
+    let env = FunctionEnv::new(&mut store, 0i32);
+    let sync = Function::new_typed(&mut store, |x: i32| x * 2);
+    let deferred = Function::new_typed_async(
+        &mut store,
+        &env,
+        |cx: &mut AsyncEnv<i32>, x: i32| -> Deferred<i32> {
+            cx.with(|mut env| *env.data_mut() += 1);
+            Deferred::ready(x * 2)
+        },
+    );
+    let mut run = |import: Function| -> TypedFunction<(i32, i32), i32> {
+        let imports = imports! { "h" => { "double" => import } };
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        instance.exports.get_typed_function(&store, "run").unwrap()
+    };
+    let (run_sync, run_deferred) = (run(sync), run(deferred));
+
+    // The first calls take a stack for their guest, which later ones reuse.
+    assert_eq!(run_sync.call(&mut store, 20, 2).unwrap(), 42);
+    assert_eq!(ready(run_sync.call_async(&mut store, 20, 2)).unwrap(), 42);
+
+    let mut count = |run: &TypedFunction<(i32, i32), i32>| {
+        let (call, result) = allocations(|| run.call(&mut store, 20, 2));
+        assert_eq!(result.unwrap(), 42);
+        let (call_async, result) = allocations(|| ready(run.call_async(&mut store, 20, 2)));
+        assert_eq!(result.unwrap(), 42);
+        (call, call_async)
+    };
+    // The very first calls of the import, then later ones.
+    let sync = count(&run_sync);
+    assert_eq!(count(&run_deferred), sync);
+    assert_eq!(count(&run_deferred), sync);
+    #[cfg(not(feature = "experimental-host-interrupt"))]
+    assert_eq!(sync, (0, 0));
+    assert_eq!(*env.as_ref(&store), 4);
 }
 
 /// Nor does a typed call that a host function makes of a guest of its own

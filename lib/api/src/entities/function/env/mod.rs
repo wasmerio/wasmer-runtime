@@ -94,6 +94,15 @@ impl<T: Send + 'static> FunctionEnvMut<'_, T> {
         self.0.data_and_store()
     }
 
+    /// A handle to this environment that holds no borrow of the store, for
+    /// code that outlives this borrow to keep. It reaches the store with
+    /// [`AsyncEnv::with`](crate::AsyncEnv::with) while a call on the store is
+    /// polled.
+    #[cfg(feature = "experimental-async")]
+    pub fn async_env(&self) -> crate::AsyncEnv<T> {
+        crate::AsyncEnv::new(self.as_ref(), self.as_store_ref().objects().id())
+    }
+
     /// The store's shared handle, if it has one: see [`Store::into_shared`](crate::Store::into_shared).
     #[cfg(feature = "experimental-async")]
     pub fn shared(&self) -> Option<SharedStore> {

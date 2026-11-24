@@ -1,4 +1,5 @@
-//! Async host functions: [`AsyncEnv`] and [`AsyncHostFunction`].
+//! Async host functions: [`AsyncEnv`], [`AsyncHostFunction`] and
+//! [`AsyncDynamicHostFunction`].
 
 use std::{future::Future, marker::PhantomData};
 #[cfg(any(feature = "js", feature = "v8"))]
@@ -8,10 +9,11 @@ use std::{pin::Pin, rc::Rc};
 use wasmer_types::FunctionType;
 use wasmer_types::StoreId;
 
+use super::deferred::Deferred;
 #[cfg(any(feature = "js", feature = "v8"))]
-use crate::{AsStoreMut, Value};
+use crate::AsStoreMut;
 use crate::{
-    FunctionEnv, FunctionEnvMut, RuntimeError, StoreMut, WasmTypeList, WithSlice,
+    FunctionEnv, FunctionEnvMut, RuntimeError, StoreMut, Value, WasmTypeList, WithSlice,
     utils::{FromToNativeWasmType, IntoResult},
 };
 
@@ -40,11 +42,41 @@ pub(crate) type HostFuture =
 /// [`Function::call_async`](crate::Function::call_async). A guest called
 /// synchronously, with `cx.with(|mut env| f.call(&mut env, &params))`, cannot
 /// suspend.
+///
+/// A clone is another handle to the same environment, for a future that
+/// outlives the borrow its function was given: the one of
+/// [`Deferred::pending`]. No two handles have the store at once: `with`
+/// panics inside another `with`.
 pub struct AsyncEnv<T> {
     env: FunctionEnv<T>,
     store_id: StoreId,
     _not_send: PhantomData<*mut ()>,
 }
+
+impl<T> Clone for AsyncEnv<T> {
+    fn clone(&self) -> Self {
+        Self::new(self.env.clone(), self.store_id)
+    }
+}
+
+/// How a host function made with
+/// [`Function::new_typed_async`](crate::Function::new_typed_async) or
+/// [`Function::new_async`](crate::Function::new_async) gives the results of
+/// a call: the function is `async`, and its call is the future it returns.
+///
+/// This and [`ReturnsDeferred`] are the last type parameter of
+/// [`AsyncHostFunction`] and [`AsyncDynamicHostFunction`], which the compiler
+/// infers from the function.
+#[derive(Debug, Clone, Copy)]
+pub struct ReturnsFuture;
+
+/// How a host function made with
+/// [`Function::new_typed_async`](crate::Function::new_typed_async) or
+/// [`Function::new_async`](crate::Function::new_async) gives the results of
+/// a call: the function returns a [`Deferred`], the results or a future for
+/// them. See [`ReturnsFuture`].
+#[derive(Debug, Clone, Copy)]
+pub struct ReturnsDeferred;
 
 impl<T> AsyncEnv<T> {
     pub(crate) fn new(env: FunctionEnv<T>, store_id: StoreId) -> Self {
@@ -76,23 +108,36 @@ impl<T> AsyncEnv<T> {
 
 mod sealed {
     /// On `sys`, a typed async host function is a static function, and the
-    /// backend has the trampolines of every one.
+    /// backend has the trampolines of every one, of either kind.
     #[cfg(feature = "sys")]
     #[allow(private_bounds)]
-    pub trait Sealed<T, Args, Rets>:
-        crate::backend::sys::function::AsyncHostTrampolines<T, Args, Rets>
+    pub trait Sealed<T, Args, Rets, Kind>:
+        crate::backend::sys::function::AsyncHostTrampolines<T, Args, Rets, Kind>
     {
     }
 
     #[cfg(not(feature = "sys"))]
-    pub trait Sealed<T, Args, Rets> {}
+    pub trait Sealed<T, Args, Rets, Kind> {}
+
+    /// The functions [`Function::new_async`](crate::Function::new_async)
+    /// takes.
+    pub trait SealedDynamic<T, Kind> {}
 }
 
-/// An async function usable as a typed host function.
+/// A function usable as a typed async host function: what
+/// [`Function::new_typed_async`](crate::Function::new_typed_async) takes.
 ///
-/// Implemented for `for<'e> AsyncFn(&'e mut AsyncEnv<T>, Args..) -> Rets`,
-/// where `Rets` may be a `Result`. The trait is sealed.
-pub trait AsyncHostFunction<T, Args, Rets>: sealed::Sealed<T, Args, Rets> + 'static
+/// Implemented for two kinds of function, where `Rets` may be a `Result`:
+///
+/// - `for<'e> AsyncFn(&'e mut AsyncEnv<T>, Args..) -> Rets`, an `async`
+///   function ([`ReturnsFuture`]);
+/// - `for<'e> Fn(&'e mut AsyncEnv<T>, Args..) -> Deferred<Rets>`, a function
+///   that gives its results at once or a future for them
+///   ([`ReturnsDeferred`]).
+///
+/// The trait is sealed.
+pub trait AsyncHostFunction<T, Args, Rets, Kind = ReturnsFuture>:
+    sealed::Sealed<T, Args, Rets, Kind> + 'static
 where
     Args: WasmTypeList,
     Rets: WasmTypeList,
@@ -107,7 +152,8 @@ where
 
 macro_rules! impl_async_host_function {
     ( $( $x:ident ),* ) => {
-        impl<$( $x, )* Rets, RetsAsResult, T, F> sealed::Sealed<T, ( $( $x ),* ), Rets> for F
+        impl<$( $x, )* Rets, RetsAsResult, T, F>
+            sealed::Sealed<T, ( $( $x ),* ), Rets, ReturnsFuture> for F
         where
             T: 'static,
             F: for<'e> AsyncFn(&'e mut AsyncEnv<T>, $( $x ),*) -> RetsAsResult + 'static,
@@ -118,7 +164,49 @@ macro_rules! impl_async_host_function {
         {
         }
 
-        impl<$( $x, )* Rets, RetsAsResult, T, F> AsyncHostFunction<T, ( $( $x ),* ), Rets> for F
+        impl<$( $x, )* Rets, RetsAsResult, T, F>
+            sealed::Sealed<T, ( $( $x ),* ), Rets, ReturnsDeferred> for F
+        where
+            T: 'static,
+            F: for<'e> Fn(&'e mut AsyncEnv<T>, $( $x ),*) -> Deferred<RetsAsResult> + 'static,
+            RetsAsResult: IntoResult<Rets> + 'static,
+            Rets: WasmTypeList + 'static,
+            ( $( $x ),* ): WasmTypeList + 'static,
+            $( $x: FromToNativeWasmType + 'static, )*
+        {
+        }
+
+        impl<$( $x, )* Rets, RetsAsResult, T, F>
+            AsyncHostFunction<T, ( $( $x ),* ), Rets, ReturnsDeferred> for F
+        where
+            T: 'static,
+            F: for<'e> Fn(&'e mut AsyncEnv<T>, $( $x ),*) -> Deferred<RetsAsResult> + 'static,
+            RetsAsResult: IntoResult<Rets> + 'static,
+            Rets: WasmTypeList + 'static,
+            ( $( $x ),* ): WasmTypeList + 'static,
+            $( $x: FromToNativeWasmType + 'static, )*
+        {
+            // The function runs in the first poll, where it has the store.
+            // On `sys` its trampoline calls it instead, without a future.
+            #[allow(non_snake_case)]
+            fn invoke(
+                &self,
+                env: &mut AsyncEnv<T>,
+                args: ( $( $x ),* ),
+            ) -> impl Future<Output = Result<Rets, RuntimeError>> {
+                let ( $( $x ),* ) = args;
+                async move {
+                    self(env, $( $x ),*)
+                        .into_results()
+                        .await
+                        .into_result()
+                        .map_err(|err| RuntimeError::from_dyn(Box::new(err)))
+                }
+            }
+        }
+
+        impl<$( $x, )* Rets, RetsAsResult, T, F>
+            AsyncHostFunction<T, ( $( $x ),* ), Rets, ReturnsFuture> for F
         where
             T: 'static,
             F: for<'e> AsyncFn(&'e mut AsyncEnv<T>, $( $x ),*) -> RetsAsResult + 'static,
@@ -213,16 +301,89 @@ where
     move |cx, values| -> HostFuture { Box::pin(body(cx, values)) }
 }
 
+/// A function usable as a dynamic async host function: what
+/// [`Function::new_async`](crate::Function::new_async) takes.
+///
+/// Implemented for two kinds of function:
+///
+/// - `for<'e> AsyncFn(&'e mut AsyncEnv<T>, &'e [Value]) -> Result<Vec<Value>,
+///   RuntimeError>`, an `async` function ([`ReturnsFuture`]);
+/// - `for<'e> Fn(&'e mut AsyncEnv<T>, &'e [Value]) ->
+///   Deferred<Result<Vec<Value>, RuntimeError>>`, a function that gives its
+///   results at once or a future for them ([`ReturnsDeferred`]).
+///
+/// The trait is sealed.
+pub trait AsyncDynamicHostFunction<T, Kind = ReturnsFuture>:
+    sealed::SealedDynamic<T, Kind> + 'static
+{
+    #[doc(hidden)]
+    fn invoke<'e>(
+        &'e self,
+        env: &'e mut AsyncEnv<T>,
+        values: &'e [Value],
+    ) -> impl Future<Output = Result<Vec<Value>, RuntimeError>> + 'e;
+}
+
+impl<T, F> sealed::SealedDynamic<T, ReturnsFuture> for F
+where
+    T: 'static,
+    F: for<'e> AsyncFn(&'e mut AsyncEnv<T>, &'e [Value]) -> Result<Vec<Value>, RuntimeError>
+        + 'static,
+{
+}
+
+impl<T, F> AsyncDynamicHostFunction<T, ReturnsFuture> for F
+where
+    T: 'static,
+    F: for<'e> AsyncFn(&'e mut AsyncEnv<T>, &'e [Value]) -> Result<Vec<Value>, RuntimeError>
+        + 'static,
+{
+    fn invoke<'e>(
+        &'e self,
+        env: &'e mut AsyncEnv<T>,
+        values: &'e [Value],
+    ) -> impl Future<Output = Result<Vec<Value>, RuntimeError>> + 'e {
+        self(env, values)
+    }
+}
+
+impl<T, F> sealed::SealedDynamic<T, ReturnsDeferred> for F
+where
+    T: 'static,
+    F: for<'e> Fn(&'e mut AsyncEnv<T>, &'e [Value]) -> Deferred<Result<Vec<Value>, RuntimeError>>
+        + 'static,
+{
+}
+
+impl<T, F> AsyncDynamicHostFunction<T, ReturnsDeferred> for F
+where
+    T: 'static,
+    F: for<'e> Fn(&'e mut AsyncEnv<T>, &'e [Value]) -> Deferred<Result<Vec<Value>, RuntimeError>>
+        + 'static,
+{
+    // Called in the first poll of the call, where the function has the
+    // store. A dynamic function is called through a future on every backend:
+    // one that is ready at once does not skip it, as a typed one does.
+    fn invoke<'e>(
+        &'e self,
+        env: &'e mut AsyncEnv<T>,
+        values: &'e [Value],
+    ) -> impl Future<Output = Result<Vec<Value>, RuntimeError>> + 'e {
+        self(env, values).into_results()
+    }
+}
+
 /// Turns a typed async host function into the body of a dynamic one, for a
 /// backend whose host functions take and return [`Value`]s.
 #[cfg(any(feature = "js", feature = "v8"))]
-pub(crate) fn typed_host_body<T, F, Args, Rets>(
+pub(crate) fn typed_host_body<T, F, Args, Rets, Kind>(
     func: F,
     ty: FunctionType,
 ) -> impl Fn(AsyncEnv<T>, Vec<Value>) -> HostFuture + 'static
 where
     T: 'static,
-    F: AsyncHostFunction<T, Args, Rets>,
+    Kind: 'static,
+    F: AsyncHostFunction<T, Args, Rets, Kind>,
     Args: WasmTypeList + 'static,
     Rets: WasmTypeList + 'static,
 {

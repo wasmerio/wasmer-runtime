@@ -44,6 +44,36 @@ Host future               [ with ] . await, no borrow . [ with ]
  . . .   holds no store borrow
 ```
 
+An async host function need not be `async`. `Function::new_typed_async` and
+`Function::new_async` also take a function that returns a `Deferred`: the
+results of the call at once, or a future for them. It receives the same
+`&mut AsyncEnv<T>`, and reaches the store through the same slices. A host
+function that usually has its results at once is written this way, because an
+`async` function pays for being able to wait on every call (see
+[`sys`](#sys)).
+
+```rust
+fn read(cx: &mut AsyncEnv<State>, fd: i32) -> Deferred<i32> {
+    if let Some(byte) = cx.with(|mut env| env.data_mut().buffered(fd)) {
+        return Deferred::ready(byte);             // the call is over
+    }
+    let mut cx = cx.clone();                      // for the future to keep
+    Deferred::pending(async move {                // the guest waits
+        let byte = receive(fd).await;
+        cx.with(|mut env| env.data_mut().count(fd));
+        byte
+    })
+}
+
+let read = Function::new_typed_async(&mut store, &env, read);
+```
+
+`Deferred::pending` takes a `'static` future, which keeps a clone of the
+`AsyncEnv`. A clone is a handle and holds no borrow, like the one
+`FunctionEnvMut::async_env` gives a sync host function. `with` still decides
+at each use whether the store can be had: it panics outside a poll of a call
+on its store, and inside another `with`.
+
 ### Exclusive calls
 
 ```rust
@@ -56,28 +86,50 @@ impl Function {
         params: &'a [Value],
     ) -> S::Call<'a, Result<Box<[Value]>, RuntimeError>>;
 
-    pub fn new_typed_async<T: Send + 'static, Args, Rets>(
+    /// `Kind` is inferred: `ReturnsFuture` for an `async` function,
+    /// `ReturnsDeferred` for one that returns a `Deferred`.
+    pub fn new_typed_async<T: Send + 'static, Args, Rets, Kind>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
-        func: impl AsyncHostFunction<T, Args, Rets>,
+        func: impl AsyncHostFunction<T, Args, Rets, Kind>,
     ) -> Self;
 }
 
+/// `Clone`: a handle, which holds no borrow.
 impl<T> AsyncEnv<T> {
     /// Borrows the store for one synchronous slice of a poll.
     pub fn with<R>(&mut self, f: impl FnOnce(FunctionEnvMut<'_, T>) -> R) -> R;
+}
+
+/// The results of a call, or a future for them.
+pub struct Deferred<R> { /* private */ }
+
+impl<R> Deferred<R> {
+    pub fn ready(results: R) -> Self;
+    pub fn pending(future: impl Future<Output = R> + 'static) -> Self;
+}
+
+impl<T> FunctionEnvMut<'_, T> {
+    /// A handle for code that outlives this borrow to keep.
+    pub fn async_env(&self) -> AsyncEnv<T>;
 }
 ```
 
 `AsyncCallStore` is sealed. Its `Call<'a, R>` is `AsyncCall<'a, R>`, or
 `AsyncCall<'static, R>` for a `SharedStore`. `AsyncHostFunction` is sealed too,
-and implemented for `for<'e> AsyncFn(&'e mut AsyncEnv<T>, Args..) -> Rets`.
-`new_async` is the dynamic form. The `with` closure receives the ordinary
+and implemented for `for<'e> AsyncFn(&'e mut AsyncEnv<T>, Args..) -> Rets` and
+for `for<'e> Fn(&'e mut AsyncEnv<T>, Args..) -> Deferred<Rets>`. `new_async` is
+the dynamic form, and takes the same two kinds of function
+(`AsyncDynamicHostFunction`). The `with` closure receives the ordinary
 `FunctionEnvMut`, so sync and async host functions can share helpers.
 
 `AsyncEnv` methods take `&mut self`, so a recursive `with` and two overlapping
-nested calls through one `AsyncEnv` are compile errors. A sync call from an
-async host function is `cx.with(|mut env| f.call(&mut env, &params))`.
+nested calls through one `AsyncEnv` are compile errors. Through a second
+handle, a clone or the one of `FunctionEnvMut::async_env`, they are not: a
+recursive `with` panics, and two nested calls that overlap are two guest
+stacks on one store, which is only correct for a guest built for it, as on a
+`SharedStore`. A sync call from an async host function is
+`cx.with(|mut env| f.call(&mut env, &params))`.
 
 ### Shared stores
 
@@ -238,6 +290,16 @@ A deep host future therefore cannot overflow the guest's Wasm stack, and an
 import whose future is ready at once switches no stack. A typed async host
 function also keeps the heap block of a future that was ready at once, and
 makes its next future there, so such a call does not allocate either.
+
+A typed function that returns `Deferred` has a trampoline of its own. It
+calls the function as the trampoline of a sync host function does, with the
+store published for the slices the function takes, and returns the results if
+the function gave them: no future is made, placed or polled, and the call
+costs what a call of a sync host function costs. Only if the function gave a
+future does the trampoline ask whether the guest can wait, and poll, as the
+one of an `async` function does. The function has returned before its guest
+waits. A dynamic function that returns `Deferred` is called through a future
+like any other dynamic one.
 
 Nothing a call leaves on the thread outlives the slice that put it there. Each
 resumption installs what a synchronous call installs, the store context entry

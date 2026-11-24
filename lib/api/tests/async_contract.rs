@@ -17,9 +17,9 @@ use std::{
 };
 
 use wasmer::{
-    AsStoreMut, AsStoreRef, AsyncEnv, ExternRef, Function, FunctionEnv, FunctionEnvMut,
+    AsStoreMut, AsStoreRef, AsyncEnv, Deferred, ExternRef, Function, FunctionEnv, FunctionEnvMut,
     FunctionType, Instance, Module, RuntimeError, SharedStore, Store, StoreMut, StoreObjects,
-    StoreRef, TypedFunction, Value, imports,
+    StoreRef, Type, TypedFunction, Value, imports,
 };
 use wasmer_vm::TrapCode;
 
@@ -313,6 +313,242 @@ fn a_guest_waits_in_a_typed_import_it_calls_through_a_table() {
         panic!("the call did not finish");
     };
     assert_eq!(results.unwrap()[0].unwrap_i32(), 8);
+}
+
+/// A function that returns `Deferred::ready` completes its call at once,
+/// wherever a sync host function would. It is made as an `async` host
+/// function is, and reaches the store the same way.
+#[test]
+fn a_deferred_function_that_is_ready_never_waits() {
+    let mut store = Store::default();
+    let env = FunctionEnv::new(&mut store, Counter::default());
+    let double = Function::new_typed_async(
+        &mut store,
+        &env,
+        |cx: &mut AsyncEnv<Counter>, x: i32| -> Deferred<Result<i32, RuntimeError>> {
+            cx.with(|mut env| env.data_mut().value += 1);
+            Deferred::ready(if x < 0 {
+                Err(RuntimeError::new("negative"))
+            } else {
+                Ok(x * 2)
+            })
+        },
+    );
+
+    let params = [Value::I32(4)];
+    assert_eq!(double.call(&mut store, &params).unwrap()[0].unwrap_i32(), 8);
+    let mut call = Box::pin(double.call_async(&mut store, &params));
+    let Poll::Ready(results) = poll(&mut call) else {
+        panic!("the call waited");
+    };
+    assert_eq!(results.unwrap()[0].unwrap_i32(), 8);
+    drop(call);
+
+    let error = double.call(&mut store, &[Value::I32(-1)]).unwrap_err();
+    assert_eq!(error.message(), "negative");
+    assert_eq!(env.as_ref(&store).value, 3);
+}
+
+/// A guest waits for the future of a function that returns
+/// `Deferred::pending`. The future reaches the store through a clone of the
+/// `AsyncEnv` the function was called with.
+#[test]
+fn a_guest_waits_for_a_deferred_function() {
+    let mut store = Store::default();
+    let module = Module::new(&store, GUEST).unwrap();
+    let gate = Rc::new(Cell::new(false));
+    let counter = Counter {
+        value: 0,
+        gate: Some(OnOneThread(gate.clone())),
+    };
+    let env = FunctionEnv::new(&mut store, counter);
+    let wait = Function::new_typed_async(
+        &mut store,
+        &env,
+        |cx: &mut AsyncEnv<Counter>, x: i32| -> Deferred<i32> {
+            let gate = cx.with(|mut env| {
+                env.data_mut().value += 1;
+                env.data().gate.as_ref().unwrap().get().clone()
+            });
+            if gate.get() {
+                return Deferred::ready(x * 2);
+            }
+            let mut cx = cx.clone();
+            Deferred::pending(async move {
+                Gate(gate).await;
+                cx.with(|mut env| env.data_mut().value += 10);
+                x * 2
+            })
+        },
+    );
+    let instance =
+        Instance::new(&mut store, &module, &imports! { "h" => { "wait" => wait } }).unwrap();
+    let run = instance.exports.get_function("run").unwrap().clone();
+    let params = [Value::I32(4)];
+
+    // A guest entered synchronously cannot wait.
+    let error = run.call(&mut store, &params).unwrap_err();
+    assert_eq!(error.to_trap(), Some(TrapCode::YieldOutsideAsyncContext));
+    assert_eq!(env.as_ref(&store).value, 1);
+
+    let mut call = Box::pin(run.call_async(&mut store, &params));
+    assert!(poll(&mut call).is_pending());
+    gate.set(true);
+    let Poll::Ready(results) = poll(&mut call) else {
+        panic!("the call did not finish");
+    };
+    assert_eq!(results.unwrap()[0].unwrap_i32(), 9);
+    drop(call);
+    assert_eq!(env.as_ref(&store).value, 12);
+
+    // The same function is ready once the gate is open, on a sync entry too.
+    let results = run.call(&mut store, &params).unwrap();
+    assert_eq!(results[0].unwrap_i32(), 9);
+    assert_eq!(env.as_ref(&store).value, 13);
+}
+
+/// A function that returns `Deferred` holds no store while it runs: it
+/// takes one slice after another, and a guest it calls in one of them runs.
+#[test]
+fn a_deferred_function_takes_the_store_in_slices() {
+    let mut store = Store::default();
+    let env = FunctionEnv::new(&mut store, Counter::default());
+    let double = Function::new_typed(&mut store, |x: i32| x * 2);
+    let import = Function::new_typed_async(
+        &mut store,
+        &env,
+        move |cx: &mut AsyncEnv<Counter>, x: i32| -> Deferred<i32> {
+            cx.with(|mut env| env.data_mut().value += 1);
+            let doubled =
+                cx.with(|mut env| double.call(&mut env, &[Value::I32(x)]).unwrap()[0].unwrap_i32());
+            cx.with(|mut env| env.data_mut().value += doubled);
+            Deferred::ready(doubled)
+        },
+    );
+    let results = import.call(&mut store, &[Value::I32(21)]).unwrap();
+    assert_eq!(results[0].unwrap_i32(), 42);
+    assert_eq!(env.as_ref(&store).value, 43);
+}
+
+/// A function that returns `Deferred` takes its arguments and gives its
+/// results whatever their types and their number, at once or after waiting.
+#[test]
+fn a_deferred_function_converts_its_arguments_and_results() {
+    type Results = (f64, f32, i64, i32, Option<Function>);
+
+    let mut store = Store::default();
+    let gate = Rc::new(Cell::new(true));
+    let counter = Counter {
+        value: 0,
+        gate: Some(OnOneThread(gate.clone())),
+    };
+    let env = FunctionEnv::new(&mut store, counter);
+    let double = Function::new_typed(&mut store, |x: i32| x * 2);
+    let import = Function::new_typed_async(
+        &mut store,
+        &env,
+        |cx: &mut AsyncEnv<Counter>,
+         a: i32,
+         b: i64,
+         c: f32,
+         d: f64,
+         f: Option<Function>|
+         -> Deferred<Results> {
+            let gate = cx.with(|env| env.data().gate.as_ref().unwrap().get().clone());
+            if gate.get() {
+                return Deferred::ready((d, c, b, a, f));
+            }
+            Deferred::pending(async move {
+                Gate(gate).await;
+                (d, c, b, a, f)
+            })
+        },
+    );
+    let params = [
+        Value::I32(1),
+        Value::I64(-2),
+        Value::F32(3.5),
+        Value::F64(-4.5),
+        Value::FuncRef(Some(double)),
+    ];
+    let check = |store: &mut Store, results: &[Value]| {
+        assert_eq!(results[0].unwrap_f64(), -4.5);
+        assert_eq!(results[1].unwrap_f32(), 3.5);
+        assert_eq!(results[2].unwrap_i64(), -2);
+        assert_eq!(results[3].unwrap_i32(), 1);
+        let double = results[4].unwrap_funcref().as_ref().unwrap();
+        let doubled = double.call(store, &[Value::I32(21)]).unwrap();
+        assert_eq!(doubled[0].unwrap_i32(), 42);
+    };
+
+    let results = import.call(&mut store, &params).unwrap();
+    check(&mut store, &results);
+
+    gate.set(false);
+    let mut call = Box::pin(import.call_async(&mut store, &params));
+    assert!(poll(&mut call).is_pending());
+    gate.set(true);
+    let Poll::Ready(results) = poll(&mut call) else {
+        panic!("the call did not finish");
+    };
+    drop(call);
+    check(&mut store, &results.unwrap());
+}
+
+/// A dynamic function returns `Deferred` as a typed one does: it is ready at
+/// once, or its guest waits.
+#[test]
+fn a_dynamic_function_returns_deferred() {
+    let mut store = Store::default();
+    let gate = Rc::new(Cell::new(true));
+    let counter = Counter {
+        value: 0,
+        gate: Some(OnOneThread(gate.clone())),
+    };
+    let env = FunctionEnv::new(&mut store, counter);
+    let double = Function::new_async(
+        &mut store,
+        &env,
+        FunctionType::new([Type::I32], [Type::I32]),
+        |cx: &mut AsyncEnv<Counter>,
+         values: &[Value]|
+         -> Deferred<Result<Vec<Value>, RuntimeError>> {
+            let x = values[0].unwrap_i32();
+            let gate = cx.with(|mut env| {
+                env.data_mut().value += 1;
+                env.data().gate.as_ref().unwrap().get().clone()
+            });
+            if x < 0 {
+                return Deferred::ready(Err(RuntimeError::new("negative")));
+            }
+            if gate.get() {
+                return Deferred::ready(Ok(vec![Value::I32(x * 2)]));
+            }
+            let mut cx = cx.clone();
+            Deferred::pending(async move {
+                Gate(gate).await;
+                cx.with(|mut env| env.data_mut().value += 10);
+                Ok(vec![Value::I32(x * 2)])
+            })
+        },
+    );
+    let params = [Value::I32(4)];
+    assert_eq!(double.call(&mut store, &params).unwrap()[0].unwrap_i32(), 8);
+    let error = double.call(&mut store, &[Value::I32(-1)]).unwrap_err();
+    assert_eq!(error.message(), "negative");
+
+    gate.set(false);
+    let error = double.call(&mut store, &params).unwrap_err();
+    assert_eq!(error.to_trap(), Some(TrapCode::YieldOutsideAsyncContext));
+    let mut call = Box::pin(double.call_async(&mut store, &params));
+    assert!(poll(&mut call).is_pending());
+    gate.set(true);
+    let Poll::Ready(results) = poll(&mut call) else {
+        panic!("the call did not finish");
+    };
+    assert_eq!(results.unwrap()[0].unwrap_i32(), 8);
+    drop(call);
+    assert_eq!(env.as_ref(&store).value, 14);
 }
 
 /// An async host function waits for a guest through its own `AsyncEnv`. The

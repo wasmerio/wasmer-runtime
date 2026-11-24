@@ -244,21 +244,24 @@ impl BackendFunction {
         }
     }
 
-    /// Creates an async host `Function` from a typed async function.
+    /// Creates an async host `Function` from a typed function of either
+    /// kind.
     ///
     /// On `sys` the function reads its arguments and writes its results as
-    /// the trampoline has them. The other backends call it as a dynamic one.
+    /// the trampoline has them, and one that returns `Deferred` is called
+    /// without a future. The other backends call it as a dynamic one.
     #[inline]
     #[cfg(feature = "experimental-async")]
-    pub(crate) fn new_typed_async<T, Args, Rets>(
+    pub(crate) fn new_typed_async<T, Args, Rets, Kind>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
-        func: impl AsyncHostFunction<T, Args, Rets>,
+        func: impl AsyncHostFunction<T, Args, Rets, Kind>,
     ) -> Self
     where
         T: Send + 'static,
         Args: WasmTypeList + 'static,
         Rets: WasmTypeList + 'static,
+        Kind: 'static,
     {
         match &store.as_store_mut().inner.store {
             #[cfg(feature = "sys")]
