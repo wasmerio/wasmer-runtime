@@ -201,7 +201,7 @@ impl Module {
             // Before the store takes the instance: one refused here has put
             // nothing anywhere, and is dropped.
             #[cfg(feature = "experimental-host-interrupt")]
-            let interrupt_guard = match interrupt_registry::install(objects.id()) {
+            let interrupt_guard = match interrupt_registry::install(objects.as_sys()) {
                 Ok(x) => x,
                 Err(interrupt_registry::InstallError::AlreadyInterrupted) => {
                     return Err(InstantiationError::Start(

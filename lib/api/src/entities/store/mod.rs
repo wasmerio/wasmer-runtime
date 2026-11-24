@@ -224,27 +224,17 @@ impl Store {
         Some(f(&mut store.as_mut()))
     }
 
-    /// Builds an [`Interrupter`] for this store. Calling [`Interrupter::interrupt`]
-    /// will cause running WASM code to terminate immediately with a
-    /// [`HostInterrupt`](crate::backend::sys::vm::TrapCode::HostInterrupt) trap.
+    /// Builds an [`Interrupter`] for this store. An interrupt requests a
+    /// [`HostInterrupt`](crate::backend::sys::vm::TrapCode::HostInterrupt) trap
+    /// for calls that have already entered the store. New entries are refused
+    /// until all installed entries exit. A request on an idle store has no
+    /// effect. A forgotten suspended call can prevent the flag from clearing.
     ///
-    /// Best effort is made to ensure interrupts are handled. However, there is no
-    /// guarantee; under rare circumstances, it is possible for the interrupt to be
-    /// missed. One such case is when the target thread is about to call WASM code
-    /// but has not yet made the call.
-    ///
-    /// To make sure the code is interrupted, the target thread should notify
-    /// the signalling thread that it has finished running in some way, and
-    /// the signalling thread must wait for that notification and retry the
-    /// interrupt if the notification is not received after some time. Embedders
-    /// are expected to implement this logic.
-    ///
-    /// If an interrupt is delivered while an imported function is running,
-    /// the interrupt will simply be stored and processed only when the
-    /// imported function returns control to WASM code. No effort is made
-    /// to interrupt running imported functions. Embedders are expected to
-    /// implement support for interruption of long-running or blocking
-    /// imported functions separately.
+    /// With Cranelift, code compiled with `experimental-host-interrupt` checks
+    /// at Wasm function entry and loop headers. Other compilers do not emit
+    /// these checks. An interrupt cannot preempt straight-line Wasm code,
+    /// blocking `memory.atomic.wait`, or running host imports. A suspended
+    /// async call can observe the interrupt on its next poll.
     #[cfg(all(unix, feature = "experimental-host-interrupt"))]
     pub fn interrupter(&self) -> Interrupter {
         self.inner.objects.interrupter()

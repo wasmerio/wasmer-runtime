@@ -385,8 +385,7 @@ impl<'a, X: 'static> AsyncCallFuture<'a, X> {
         {
             if !StoreContext::thread_can_unwind() {
                 // What the unwind needs of the thread is gone: the coroutine
-                // is forgotten, with its stack, and so are the registrations
-                // its calls hold.
+                // is forgotten with its stack.
                 std::mem::forget(self.coroutine.take());
                 self.activation.vm.abandon();
                 return;
@@ -412,9 +411,7 @@ impl<X: 'static> Future for AsyncCallFuture<'_, X> {
             #[cfg(feature = "experimental-host-interrupt")]
             {
                 let store_id = this.store.id();
-                if super::vm::interrupt_registry::is_interrupted(store_id)
-                    || this.activation.vm.is_interrupted(store_id)
-                {
+                if super::vm::interrupt_registry::is_interrupted(store_id) {
                     this.remove_from_wakers_list();
                     // The call ends here, so its coroutine goes now, and with
                     // it the installations that keep the store interrupted.

@@ -236,15 +236,13 @@ coroutine stack.
 Everything a call leaves on the thread moves with its stack, at one switch
 point, `AsyncCallFuture::switch_to_coroutine`: the store context entries of
 its calls, the coroutine the thread runs on, and
-`wasmer_vm::ActivationState`, which holds the trap handler and the stores the
-interrupt registry sees as entered. A guard swaps them back however control
-returns, including by unwinding.
+`wasmer_vm::ActivationState`, which holds the trap handler. A guard swaps
+these back however control returns, including by unwinding.
 
 A coroutine that returned gives its stack, a 1 MiB mapping, back to a pool of
 up to 16 per thread. A dropped call unwinds its coroutine, which runs no guest
 code. A call dropped as its thread exits is forgotten instead, because the
-thread locals the unwind needs may be gone, and it gives up its interrupt
-registrations.
+thread locals the unwind needs may be gone.
 
 `baremetal` does not support `experimental-async`, and the two features fail
 to build together. A `baremetal` trap leaves through the embedder's unwinder,
@@ -293,21 +291,16 @@ for a task that cannot run until it returns.
 
 ## Interrupts
 
-With `experimental-host-interrupt` on `sys`, an interrupt reaches every call
-that has entered the store, also a suspended one: the interrupt wakes it, and
-it ends with `HostInterrupt` at its next poll. A forgotten call keeps the flag
-it holds. A new call on the store gets a fresh flag, so that a forgotten call
-cannot keep the store interrupted, and the store's interrupt entries are
-released when it drops.
+Host interruption is cooperative. Cranelift code compiled with
+`experimental-host-interrupt` polls at function entry and loop headers.
+Recompile older artifacts to get these polls. LLVM and Singlepass do not
+emit polls; blocking instructions such as `memory.atomic.wait` and running
+host imports cannot be preempted.
 
-This has a known gap. A call nested behind a coroutine switch is taken for a
-new call, so it can run after its caller was interrupted. That happens when an
-async import calls `call_async(cx, ..)`, or when an interrupt lands between the
-poll and the entry of a `call_async` made from a sync host function.
-`an_async_call_nested_after_an_interrupt_is_interrupted` in
-[`interrupt_async.rs`](../lib/api/tests/interrupt_async.rs) and a unit test in
-[`interrupt_registry/unix.rs`](../lib/vm/src/interrupt_registry/unix.rs) record
-it, and are ignored until it is fixed.
+All instances in a store poll the same flag. An interrupt wakes suspended
+calls so they can end with `HostInterrupt` at their next poll. Until the last
+installed entry exits, new calls are also refused. A forgotten suspended call
+can therefore leave its store interrupted until the store is dropped.
 
 ## Limitations and porting notes
 

@@ -505,7 +505,7 @@ fn translate_ir_trapcode(trap: ir::TrapCode) -> TrapCode {
     } else if trap == crate::TRAP_UNREACHABLE {
         TrapCode::UnreachableCodeReached
     } else if trap == crate::TRAP_INTERRUPT {
-        unimplemented!("Interrupts not supported")
+        TrapCode::HostInterrupt
     } else if trap == crate::TRAP_NULL_REFERENCE || trap == crate::TRAP_NULL_I31_REF {
         unimplemented!("Null reference not supported")
     } else {

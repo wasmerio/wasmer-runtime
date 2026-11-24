@@ -83,5 +83,5 @@ pub const TRAP_UNREACHABLE: TrapCode = TrapCode::unwrap_user(TRAP_USER_OFFSET + 
 pub const TRAP_NULL_REFERENCE: TrapCode = TrapCode::unwrap_user(TRAP_USER_OFFSET + 5);
 /// Trap reported when a null i31 reference is observed.
 pub const TRAP_NULL_I31_REF: TrapCode = TrapCode::unwrap_user(TRAP_USER_OFFSET + 6);
-/// Trap reported for interrupts (not currently supported).
+/// Trap reported for host interrupts.
 pub const TRAP_INTERRUPT: TrapCode = TrapCode::unwrap_user(TRAP_USER_OFFSET + 7);

@@ -10,8 +10,8 @@
 //!
 //! Several `call_async` futures can be suspended on one thread and resumed in
 //! any order. What the runtime keeps per running call (the trap handler the
-//! signal handler consults, the interrupt registry's active stores, the
-//! current coroutine) has to follow the coroutine that is running, not the
+//! signal handler consults and the current coroutine) has to follow the
+//! coroutine that is running, not the
 //! order in which the calls started.
 //!
 //! A regression here ends with the process killed by a signal, so those
@@ -421,20 +421,16 @@ fn pending_import_under_nested_sync_entry() {
 }
 
 /// A runs guest code while B, which entered Wasm after it, is suspended, and
-/// one of the two stores is interrupted from another thread. The signal has
-/// to be judged against the store that is running: aimed at B it must leave A
-/// alone, aimed at A it must trap it.
-#[cfg(all(unix, feature = "experimental-host-interrupt"))]
+/// one of the two stores is interrupted from another thread. Aimed at B, the
+/// request must leave A alone; aimed at A, it must trap it.
+#[cfg(all(unix, feature = "cranelift", feature = "experimental-host-interrupt"))]
 fn interrupt_while_another_call_is_suspended(target: &str) {
-    use wasmer_vm::interrupt_registry::{self, InterruptError};
-
     let at_running = target == "running";
     let g = gates();
     let guest_a = Guest::new(&g);
     let guest_b = Guest::new(&g);
-    // Aimed at B, A spins until the signal was taken. Aimed at A, it spins
-    // for much longer than that takes and then returns without going back to
-    // the host, where a missed interrupt would be noticed after all.
+    // Aimed at B, A spins until the requester lets it exit. Aimed at A,
+    // it must observe the interrupt without returning to host code.
     let spin_args = if at_running {
         [0, i32::MAX, 0]
     } else {
@@ -449,23 +445,12 @@ fn interrupt_while_another_call_is_suspended(target: &str) {
     let interrupter = if at_running { &guest_a } else { &guest_b }
         .interrupter
         .clone();
-    let store_b = guest_b.id;
     let other = std::thread::spawn(move || {
         while !spin.started.load(Ordering::SeqCst) {
             std::thread::yield_now();
         }
         interrupter.interrupt();
         if !at_running {
-            // A second request is accepted only once the thread has taken
-            // the signal of the first. Its own signal is harmless wherever
-            // it lands: the thread is running A or host code, never B.
-            loop {
-                match interrupt_registry::interrupt(store_b) {
-                    Ok(()) => break,
-                    Err(InterruptError::OtherInterruptInProgress) => std::thread::yield_now(),
-                    Err(e) => panic!("{e}"),
-                }
-            }
             spin.stop.store(true, Ordering::SeqCst);
         }
     });
@@ -528,7 +513,7 @@ fn child_scenario() {
         "host_panic_then_sync_call" => host_panic_then_sync_call(),
         "nested_sync_entry" => pending_import_under_nested_sync_entry(),
         "thread_exit" => suspended_call_dropped_as_its_thread_exits(),
-        #[cfg(all(unix, feature = "experimental-host-interrupt"))]
+        #[cfg(all(unix, feature = "cranelift", feature = "experimental-host-interrupt"))]
         "interrupt" => interrupt_while_another_call_is_suspended(parts[1]),
         other => panic!("unknown scenario {other}"),
     }
@@ -645,7 +630,7 @@ fn a_suspended_call_dropped_as_its_thread_exits_is_forgotten() {
     run_children(["thread_exit".to_string()]);
 }
 
-#[cfg(all(unix, feature = "experimental-host-interrupt"))]
+#[cfg(all(unix, feature = "cranelift", feature = "experimental-host-interrupt"))]
 #[test]
 fn an_interrupt_is_judged_against_the_store_that_is_running() {
     run_children(["suspended", "running"].map(|target| format!("interrupt:{target}")));

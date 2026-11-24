@@ -8,8 +8,6 @@
 
 use super::trap::UnwindReason;
 use crate::Trap;
-#[cfg(feature = "experimental-host-interrupt")]
-use crate::interrupt_registry;
 use backtrace::Backtrace;
 use bytesize::ByteSize;
 use core::ptr::{read, read_unaligned};
@@ -259,11 +257,8 @@ cfg_select! {
         static mut PREV_SIGILL: MaybeUninit<libc::sigaction> = MaybeUninit::uninit();
         static mut PREV_SIGFPE: MaybeUninit<libc::sigaction> = MaybeUninit::uninit();
 
-        #[cfg(feature = "experimental-host-interrupt")]
-        static mut PREV_SIGUSR1: MaybeUninit<libc::sigaction> = MaybeUninit::uninit();
-
         unsafe fn platform_init() { unsafe {
-            let register = |slot: &mut MaybeUninit<libc::sigaction>, signal: i32, nodefer: bool| {
+            let register = |slot: &mut MaybeUninit<libc::sigaction>, signal: i32| {
                 let mut handler: libc::sigaction = mem::zeroed();
                 // The flags here are relatively careful, and they are...
                 //
@@ -278,10 +273,7 @@ cfg_select! {
                 // SA_NODEFER allows us to reenter the signal handler if we
                 // crash while handling the signal, and fall through to the
                 // Breakpad handler by testing handlingSegFault.
-                handler.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-                if nodefer {
-                    handler.sa_flags |= libc::SA_NODEFER;
-                }
+                handler.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_NODEFER;
                 handler.sa_sigaction = trap_handler as *const () as usize;
                 libc::sigemptyset(&mut handler.sa_mask);
                 if libc::sigaction(signal, &handler, slot.as_mut_ptr()) != 0 {
@@ -293,27 +285,20 @@ cfg_select! {
             };
 
             // Allow handling OOB with signals on all architectures
-            register(&mut PREV_SIGSEGV, libc::SIGSEGV, true);
+            register(&mut PREV_SIGSEGV, libc::SIGSEGV);
 
             // Handle `unreachable` instructions which execute `ud2` right now
-            register(&mut PREV_SIGILL, libc::SIGILL, true);
-
-            // SIGUSR1 is used to interrupt long-running WASM code.
-            // It doesn't use NODEFER since, if a second interruption
-            // request comes in while one is already being processed,
-            // there's nothing meaningful we can do.
-            #[cfg(feature = "experimental-host-interrupt")]
-            register(&mut PREV_SIGUSR1, libc::SIGUSR1, false);
+            register(&mut PREV_SIGILL, libc::SIGILL);
 
             // x86 uses SIGFPE to report division by zero
             if cfg!(target_arch = "x86") || cfg!(target_arch = "x86_64") {
-                register(&mut PREV_SIGFPE, libc::SIGFPE, true);
+                register(&mut PREV_SIGFPE, libc::SIGFPE);
             }
 
             // On ARM, handle Unaligned Accesses.
             // On Darwin, guard page accesses are raised as SIGBUS.
             if cfg!(target_arch = "arm") || cfg!(target_vendor = "apple") {
-                register(&mut PREV_SIGBUS, libc::SIGBUS, true);
+                register(&mut PREV_SIGBUS, libc::SIGBUS);
             }
 
             // This is necessary to support debugging under LLDB on Darwin.
@@ -364,8 +349,6 @@ cfg_select! {
                 libc::SIGBUS => &PREV_SIGBUS,
                 libc::SIGFPE => &PREV_SIGFPE,
                 libc::SIGILL => &PREV_SIGILL,
-                #[cfg(feature = "experimental-host-interrupt")]
-                libc::SIGUSR1 => &PREV_SIGUSR1,
                 _ => panic!("unknown signal: {signum}"),
             };
             // We try to get the fault address associated to this signal
@@ -381,15 +364,6 @@ cfg_select! {
                     let addr = (*siginfo).si_addr() as usize;
                     process_illegal_op(addr)
                 }
-                #[cfg(feature = "experimental-host-interrupt")]
-                libc::SIGUSR1 => {
-                    // If we're not running WASM code from the specific store for which
-                    // an interrupt was requested, there's nothing to do.
-                    if !interrupt_registry::on_interrupted() {
-                        return;
-                    }
-                    Some(TrapCode::HostInterrupt)
-                }
                 _ => None,
             };
             let ucontext = &mut *(context as *mut ucontext_t);
@@ -404,13 +378,6 @@ cfg_select! {
             );
 
             if handled {
-                return;
-            }
-
-            // If we're not running WASM code at all, there's nothing to
-            // do for an interrupt.
-            #[cfg(feature = "experimental-host-interrupt")]
-            if signum == libc::SIGUSR1 {
                 return;
             }
 
@@ -900,9 +867,8 @@ thread_local! {
 }
 
 /// The thread-local state of one *activation*: a chain of Wasm entries whose
-/// frames all live on one host stack. It is what the signal handler consults
-/// to find the Wasm code that is running: the trap handler and, with
-/// `experimental-host-interrupt`, the interrupt registry's active stores.
+/// frames all live on one host stack. It holds the trap handler for the Wasm
+/// code running on that stack.
 ///
 /// A thread that runs all its Wasm calls on one host stack never needs this
 /// type: its calls nest, and each entry restores what it found. It is for
@@ -916,8 +882,6 @@ thread_local! {
 /// same around its own switches.
 pub struct ActivationState {
     trap_handler: *mut TrapHandlerContext,
-    #[cfg(feature = "experimental-host-interrupt")]
-    active_stores: interrupt_registry::ActiveStores,
 }
 
 impl Default for ActivationState {
@@ -931,8 +895,6 @@ impl ActivationState {
     pub const fn new() -> Self {
         Self {
             trap_handler: ptr::null_mut(),
-            #[cfg(feature = "experimental-host-interrupt")]
-            active_stores: interrupt_registry::ActiveStores::new(),
         }
     }
 
@@ -964,15 +926,6 @@ impl ActivationState {
             self.trap_handler = ptr.swap(self.trap_handler, Ordering::Relaxed);
         });
         compiler_fence(Ordering::Acquire);
-        #[cfg(feature = "experimental-host-interrupt")]
-        self.active_stores.swap();
-    }
-
-    /// Whether this activation, while it is not running, has entered
-    /// `store_id` and the store was interrupted.
-    #[cfg(feature = "experimental-host-interrupt")]
-    pub fn is_interrupted(&self, store_id: wasmer_types::StoreId) -> bool {
-        self.active_stores.is_interrupted(store_id)
     }
 
     /// Whether the calling thread still has what swapping a state in, and
@@ -980,33 +933,20 @@ impl ActivationState {
     /// locals are being destroyed, as it exits. A stack suspended then is to
     /// be forgotten rather than unwound.
     pub fn thread_is_usable() -> bool {
-        let usable = TLS_STACK.try_with(|_| ()).is_ok();
-        #[cfg(feature = "experimental-host-interrupt")]
-        let usable = usable && interrupt_registry::thread_is_usable();
-        usable
+        TLS_STACK.try_with(|_| ()).is_ok()
     }
 
     /// Whether nothing is installed: true before an activation first runs and
     /// after it has finished, when nothing may be left pointing into its stack.
     pub fn is_empty(&self) -> bool {
-        #[cfg(feature = "experimental-host-interrupt")]
-        if !self.active_stores.is_empty() {
-            return false;
-        }
         self.trap_handler.is_null()
     }
 
     /// Forgets the state of an activation whose stack is forgotten rather
-    /// than unwound, while the state is not swapped in: its calls never
-    /// return. What they keep beyond the thread is given up as their return
-    /// would, the interrupt registrations of the stores they entered, which
-    /// would otherwise keep those stores interrupted, and aimed at this
-    /// thread, for good. The thread's own state is not touched: it may be
-    /// gone (see [`Self::thread_is_usable`]).
+    /// than unwound, while the state is not swapped in. The thread's own
+    /// state is not touched: it may already be gone.
     pub fn abandon(&mut self) {
         self.trap_handler = ptr::null_mut();
-        #[cfg(feature = "experimental-host-interrupt")]
-        self.active_stores.abandon();
     }
 }
 
