@@ -1,7 +1,7 @@
 //! Emission of per-function relocatable ELF objects for the experimental
 //! ELF artifact format.
 
-use crate::eh::{FunctionLsdaData, build_function_lsda, compact_unwind_encoding_aarch64};
+use crate::eh::{FunctionLsdaData, build_function_lsda};
 use cranelift_codegen::gimli::{
     RunTimeEndian, SectionId as GimliSectionId, constants,
     write::{Address, EhFrame, EndianVec, FrameTable, Result as GimliResult, Writer},
@@ -18,7 +18,8 @@ use object::{
 use std::collections::HashMap;
 use wasmer_compiler::elf::emit_eh_frame_section;
 use wasmer_compiler::{
-    UNWIND_HAS_LSDA, WASMER_EH_TAGS_SECTION_NAME,
+    ELF_GCC_EXCEPT_TABLE_SECTION_NAME, MACHO_GCC_EXCEPT_TABLE_SECTION_NAME,
+    WASMER_EH_TAGS_SECTION_NAME,
     dwarf::{EhRelocation, EhTarget, WriterRelocate},
 };
 use wasmer_compiler::{WasmSourceMap, dwarf::init_dwarf_unit};
@@ -296,26 +297,13 @@ pub(crate) fn emit_dynamic_trampoline(
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum UnwindKind {
-    DwarfUnwind,
-    CompactUnwind,
-}
+pub(crate) struct UnwindKind;
 
 impl UnwindKind {
     pub(crate) fn for_isa(isa: &dyn TargetIsa) -> Self {
         let triple = isa.triple();
-        if matches!(
-            triple,
-            target_lexicon::Triple {
-                binary_format: target_lexicon::BinaryFormat::Macho,
-                operating_system: target_lexicon::OperatingSystem::Darwin(_),
-                architecture: target_lexicon::Architecture::Aarch64(_),
-                ..
-            }
-        ) {
-            Self::CompactUnwind
-        } else if isa.create_systemv_cie().is_some() {
-            Self::DwarfUnwind
+        if isa.create_systemv_cie().is_some() {
+            Self
         } else {
             unreachable!("no supported unwind format for Cranelift target {triple}")
         }
@@ -325,7 +313,7 @@ impl UnwindKind {
         self,
         isa: &dyn TargetIsa,
         context: &Context,
-        kind: &CompiledKind,
+        _kind: &CompiledKind,
         object: &mut Object<'static>,
         function_symbol: SymbolId,
     ) -> Result<(), CompileError> {
@@ -335,12 +323,7 @@ impl UnwindKind {
                 .map(|lsda| self.emit_lsda(object, &lsda))
                 .transpose()?;
 
-        match self {
-            Self::DwarfUnwind => {
-                Self::emit_dwarf(isa, context, code, object, function_symbol, lsda_symbol)
-            }
-            Self::CompactUnwind => Self::emit_compact(code, kind, object, lsda_symbol),
-        }
+        Self::emit_dwarf(isa, context, code, object, function_symbol, lsda_symbol)
     }
 
     // Emit the LSDA and the per-object tag constants referenced by its type table.
@@ -349,20 +332,20 @@ impl UnwindKind {
         object: &mut Object<'static>,
         lsda: &FunctionLsdaData,
     ) -> Result<SymbolId, CompileError> {
-        let macho_compact_unwind = matches!(self, Self::CompactUnwind);
+        let is_macho = object.format() == object::BinaryFormat::MachO;
         let tag_section_symbol = emit_eh_tag_section(object, lsda);
 
         let gcc_section = object.add_section(
             object.segment_name(StandardSegment::Data).to_vec(),
-            if macho_compact_unwind {
-                b"__gcc_except_tab".to_vec()
+            if is_macho {
+                MACHO_GCC_EXCEPT_TABLE_SECTION_NAME.to_vec()
             } else {
-                b".gcc_except_table".to_vec()
+                ELF_GCC_EXCEPT_TABLE_SECTION_NAME.to_vec()
             },
             SectionKind::ReadOnlyData,
         );
         let lsda_offset = object.append_section_data(gcc_section, &lsda.bytes, 8);
-        let subtractor = macho_compact_unwind.then(|| {
+        let subtractor = is_macho.then(|| {
             use wasmer_compiler::WASMER_LSDA_SECTION_NAME;
 
             object.add_symbol(Symbol {
@@ -378,7 +361,7 @@ impl UnwindKind {
         });
         // Mach-O represents PC-relative data as a symbol difference.
         let tag_relocation_flags = RelocationFlags::Generic {
-            kind: if macho_compact_unwind {
+            kind: if is_macho {
                 object::RelocationKind::Absolute
             } else {
                 object::RelocationKind::Relative
@@ -405,12 +388,7 @@ impl UnwindKind {
                         offset: lsda_offset + reloc.offset as u64,
                         flags: tag_relocation_flags,
                         symbol: tag_symbol,
-                        addend: tag_offset as i64
-                            - if macho_compact_unwind {
-                                reloc.offset as i64
-                            } else {
-                                0
-                            },
+                        addend: tag_offset as i64 - if is_macho { reloc.offset as i64 } else { 0 },
                     },
                     subtractor,
                 )
@@ -418,58 +396,7 @@ impl UnwindKind {
                     CompileError::Codegen(format!("failed to add LSDA relocation: {e}"))
                 })?;
         }
-        Ok(object.section_symbol(gcc_section))
-    }
-
-    fn emit_compact(
-        code: &CompiledCode,
-        kind: &CompiledKind,
-        object: &mut Object<'static>,
-        lsda_section_symbol: Option<SymbolId>,
-    ) -> Result<(), CompileError> {
-        let encoding =
-            compact_unwind_encoding_aarch64(code.buffer.unwind_info()).map_err(|error| {
-                CompileError::Codegen(format!(
-                    "failed to encode aarch64 Mach-O compact unwind for function {}: {error}",
-                    kind.linkage_name()
-                ))
-            })?;
-        let function_length = code.code_buffer().len().try_into().map_err(|_| {
-            CompileError::Codegen("function body too large for Mach-O compact unwind".into())
-        })?;
-        let personality_symbol = lsda_section_symbol.map(|_| {
-            wasmer_compiler::elf::add_libcall_symbol(object, wasmer_types::LibCall::EHPersonality)
-        });
-        let text = object.section_id(StandardSection::Text);
-        let text_symbol = object.section_symbol(text);
-        let (compact_bytes, compact_relocations) = crate::eh::build_compact_unwind_section(
-            [crate::eh::CompactUnwindEntryData {
-                function_length,
-                compact_encoding: encoding
-                    | if lsda_section_symbol.is_some() {
-                        UNWIND_HAS_LSDA
-                    } else {
-                        0
-                    },
-                lsda_offset: lsda_section_symbol.map(|_| 0),
-            }],
-            text_symbol,
-            personality_symbol,
-            lsda_section_symbol,
-        )
-        .ok_or_else(|| CompileError::Codegen("missing compact unwind entry for function".into()))?;
-        let section = object.add_section(
-            object.segment_name(StandardSegment::Data).to_vec(),
-            b"__compact_unwind".to_vec(),
-            SectionKind::ReadOnlyData,
-        );
-        object.append_section_data(section, &compact_bytes, 8);
-        for relocation in compact_relocations {
-            object.add_relocation(section, relocation).map_err(|e| {
-                CompileError::Codegen(format!("failed to add compact unwind relocation: {e}"))
-            })?;
-        }
-        Ok(())
+        Ok(subtractor.unwrap_or_else(|| object.section_symbol(gcc_section)))
     }
 
     fn emit_dwarf(
