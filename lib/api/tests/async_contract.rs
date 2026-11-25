@@ -632,6 +632,87 @@ fn dropping_a_call_leaves_the_store_usable() {
     assert_eq!(results[0].unwrap_i32(), 3);
 }
 
+/// A call dropped while its guest waits resets the guest's stack, which runs
+/// no destructor: the trampoline of the import the guest waits in must hold
+/// nothing by then. Whichever kind of async import it is, the future of the
+/// import is dropped with the call, with what it captured, and the store has
+/// no borrow left out, so that it runs the guest again.
+#[test]
+fn dropping_a_call_that_waits_releases_what_its_import_held() {
+    fn gate_of(cx: &mut AsyncEnv<Counter>) -> Rc<Cell<bool>> {
+        cx.with(|mut env| {
+            env.data_mut().value += 1;
+            env.data().gate.as_ref().unwrap().get().clone()
+        })
+    }
+    type Import = fn(&mut Store, &FunctionEnv<Counter>) -> Function;
+    let typed: Import = |store, env| {
+        Function::new_typed_async(store, env, async |cx: &mut AsyncEnv<Counter>, x: i32| {
+            Gate(gate_of(cx)).await;
+            x * 2
+        })
+    };
+    let deferred: Import = |store, env| {
+        Function::new_typed_async(
+            store,
+            env,
+            |cx: &mut AsyncEnv<Counter>, x: i32| -> Deferred<i32> {
+                let gate = gate_of(cx);
+                Deferred::pending(async move {
+                    Gate(gate).await;
+                    x * 2
+                })
+            },
+        )
+    };
+    let dynamic: Import = |store, env| {
+        Function::new_async(
+            store,
+            env,
+            FunctionType::new([Type::I32], [Type::I32]),
+            async |cx: &mut AsyncEnv<Counter>, values: &[Value]| {
+                let x = values[0].unwrap_i32();
+                Gate(gate_of(cx)).await;
+                Ok(vec![Value::I32(x * 2)])
+            },
+        )
+    };
+
+    for (kind, import) in [
+        ("typed", typed),
+        ("deferred", deferred),
+        ("dynamic", dynamic),
+    ] {
+        let mut store = Store::default();
+        let module = Module::new(&store, GUEST).unwrap();
+        let gate = Rc::new(Cell::new(false));
+        let counter = Counter {
+            value: 0,
+            gate: Some(OnOneThread(gate.clone())),
+        };
+        let env = FunctionEnv::new(&mut store, counter);
+        let wait = import(&mut store, &env);
+        let instance =
+            Instance::new(&mut store, &module, &imports! { "h" => { "wait" => wait } }).unwrap();
+        let run = instance.exports.get_function("run").unwrap().clone();
+
+        // This one and the host state's.
+        assert_eq!(Rc::strong_count(&gate), 2, "{kind}");
+        let mut call = Box::pin(run.call_async(&mut store, &[Value::I32(1)]));
+        assert!(poll(&mut call).is_pending(), "{kind}");
+        // The future of the import waits with its own.
+        assert_eq!(Rc::strong_count(&gate), 3, "{kind}");
+        drop(call);
+        assert_eq!(Rc::strong_count(&gate), 2, "{kind}");
+        assert_eq!(env.as_ref(&store).value, 1, "{kind}");
+
+        gate.set(true);
+        let results = run.call(&mut store, &[Value::I32(1)]).unwrap();
+        assert_eq!(results[0].unwrap_i32(), 3, "{kind}");
+        assert_eq!(Rc::strong_count(&gate), 2, "{kind}");
+    }
+}
+
 /// The stack is leaked, and nothing refers to it: its state left the thread
 /// when it suspended.
 #[test]

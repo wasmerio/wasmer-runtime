@@ -220,6 +220,16 @@ impl StoreContext {
         })
     }
 
+    /// Whether no borrow of the active entry is live, or none is installed.
+    ///
+    /// An async import asks before it has its guest wait: the frames the
+    /// guest waits on are reset, not unwound, if its call is dropped, so a
+    /// borrow they held would never be given back.
+    #[cfg(all(feature = "sys", feature = "experimental-async"))]
+    pub(crate) fn top_is_unborrowed() -> bool {
+        with_top(|top| top_entry(top).is_none_or(|entry| entry.borrow_count.get() == 0))
+    }
+
     /// Safety: This method lets you borrow multiple mutable references
     /// to the currently active store context. The caller must ensure that:
     ///   * there is only one mutable reference alive, or
@@ -461,6 +471,25 @@ mod unwinding {
 
     fn active_borrows() -> u32 {
         with_top(|top| top_entry(top).unwrap().borrow_count.get())
+    }
+
+    /// What an async import checks before its guest waits: a borrow of the
+    /// active entry that is still held shows.
+    #[cfg(all(feature = "sys", feature = "experimental-async"))]
+    #[test]
+    fn a_live_borrow_of_the_active_entry_shows() {
+        assert!(StoreContext::top_is_unborrowed());
+        let mut store = Store::default();
+        let id = store.id();
+        let mut caller = store.as_store_mut();
+        let entry = unsafe { StoreContext::new(caller.as_store_mut().inner as *mut _) };
+        let install = unsafe { entry.install() };
+        assert!(StoreContext::top_is_unborrowed());
+        let wrapper = unsafe { StoreContext::get_current(id) };
+        assert!(!StoreContext::top_is_unborrowed());
+        drop(wrapper);
+        assert!(StoreContext::top_is_unborrowed());
+        drop(install);
     }
 
     /// A host function that catches a panic from a guest it called finds the

@@ -633,30 +633,45 @@ pub(crate) fn wait_for_host_future<B: HostFutureBox>(
     suspendable: bool,
     into_pending: impl FnOnce(Pin<Box<B::Future>>) -> RawHostFuture,
 ) -> HostWait<<B::Future as Future>::Output> {
-    // The entry's pointer is used only for the duration of this poll, in the
-    // slices the future takes, while the borrow in `store` stands.
-    let _scope = PollScope::enter(Some(PollStore::exclusive(store.id(), store.as_ptr())));
-    // Declared after the scope, so that its destructor runs with the store of
-    // this entry, not whatever was published before.
-    let mut future = future;
-    let waiting = WAITING.get();
-    if suspendable && !waiting.is_null() {
-        // Safety: the call that is being resumed published it, and its poll
-        // is beneath on this stack.
-        let waiting = unsafe { &mut *waiting };
-        let cx = unsafe { &mut *waiting.cx.cast::<Context<'_>>() };
-        return match future.as_pin_mut().poll(cx) {
-            Poll::Ready(result) => HostWait::Ready(result),
-            Poll::Pending => {
-                waiting.pending = Some(into_pending(future.into_box()));
-                HostWait::Suspend
+    let wait = {
+        // The borrow ends with the poll, before the check below.
+        let store = store;
+        // The entry's pointer is used only for the duration of this poll, in
+        // the slices the future takes, while the borrow in `store` stands.
+        let _scope = PollScope::enter(Some(PollStore::exclusive(store.id(), store.as_ptr())));
+        // Declared after the scope, so that its destructor runs with the
+        // store of this entry, not whatever was published before.
+        let mut future = future;
+        let waiting = WAITING.get();
+        if suspendable && !waiting.is_null() {
+            // Safety: the call that is being resumed published it, and its
+            // poll is beneath on this stack.
+            let waiting = unsafe { &mut *waiting };
+            let cx = unsafe { &mut *waiting.cx.cast::<Context<'_>>() };
+            match future.as_pin_mut().poll(cx) {
+                Poll::Ready(result) => HostWait::Ready(result),
+                Poll::Pending => {
+                    waiting.pending = Some(into_pending(future.into_box()));
+                    HostWait::Suspend
+                }
             }
-        };
-    }
-    match future.as_pin_mut().poll(&mut Context::from_waker(Waker::noop())) {
-        Poll::Ready(result) => HostWait::Ready(result),
-        Poll::Pending => HostWait::CannotSuspend,
-    }
+        } else {
+            match future.as_pin_mut().poll(&mut Context::from_waker(Waker::noop())) {
+                Poll::Ready(result) => HostWait::Ready(result),
+                Poll::Pending => HostWait::CannotSuspend,
+            }
+        }
+    };
+    // The guest waits on the frames of the import's trampoline, which are
+    // reset, not unwound, if its call is dropped: nothing on them may need a
+    // destructor. A borrow of the entry is what a trampoline is most likely
+    // to keep by mistake, and the one thing that can be counted from here,
+    // on the host stack, where a failure unwinds as a panic of the import.
+    debug_assert!(
+        !matches!(wait, HostWait::Suspend) || StoreContext::top_is_unborrowed(),
+        "an async import has its guest wait while it holds a borrow of the store"
+    );
+    wait
 }
 
 /// Where the host future of an async import is for its first poll: a box, or
