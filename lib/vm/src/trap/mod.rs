@@ -19,8 +19,15 @@ pub use trap::{Trap, UnwindReason};
 #[cfg(feature = "baremetal")]
 pub use traphandlers::install_unwinder;
 pub use traphandlers::{
-    ActivationState, MAX_STACK_SIZE, TrapHandlerFn, VMConfig, catch_traps, drain_stack_pool,
-    get_stack_size, on_host_stack, raise_lib_trap, raise_user_trap, set_stack_size,
+    ActivationState, HOST_CALL_RESERVE, HostCallInPlace, MAX_STACK_SIZE, TrapHandlerFn, VMConfig,
+    catch_traps, drain_stack_pool, get_stack_size, host_call_in_place, on_host_stack,
+    on_host_stack_from_host, raise_lib_trap, raise_user_trap, set_stack_size, try_on_host_stack,
+};
+// A guest that an import may suspend runs on a stack of its own, which a
+// `baremetal` trap, leaving through the embedder's unwinder, cannot stop at.
+#[cfg(not(feature = "baremetal"))]
+pub use traphandlers::{
+    SuspendedCall, suspend_wasm_call, wasm_call_is_suspendable, wasmer_call_trampoline_suspendable,
 };
 pub use traphandlers::{init_traps, resume_panic};
 pub use wasmer_types::TrapCode;

@@ -698,6 +698,138 @@ pub mod reference_types {
         Ok(())
     }
 
+    #[engine_test]
+    #[cfg_attr(
+        feature = "v8-default",
+        ignore = "function and extern refs are not supported by the default v8 backend"
+    )]
+    fn function_call_with_reference_arguments_and_results() -> Result<()> {
+        let mut store = Store::default();
+        let wat = r#"(module
+    (type $ret_i32_ty (func (result i32)))
+    (table $table 1 funcref)
+    (func (export "swap") (param $f funcref) (param $e externref) (param $x i32)
+          (result externref funcref i32)
+          (local.get $e)
+          (local.get $f)
+          (local.get $x))
+    (func (export "call_ref") (param $f funcref) (result i32)
+          (table.set $table (i32.const 0) (local.get $f))
+          (call_indirect $table (type $ret_i32_ty) (i32.const 0)))
+)"#;
+        let module = Module::new(&store, wat)?;
+        let instance = Instance::new(&mut store, &module, &imports! {})?;
+        let swap: &Function = instance.exports.get_function("swap")?;
+        let call_ref: &Function = instance.exports.get_function("call_ref")?;
+
+        let callee = Function::new_typed(&mut store, || -> i32 { 77 });
+        let extern_ref = ExternRef::new(&mut store, 5usize);
+        let results = swap.call(
+            &mut store,
+            &[
+                Value::FuncRef(Some(callee)),
+                Value::ExternRef(Some(extern_ref)),
+                Value::I32(3),
+            ],
+        )?;
+        assert_eq!(results.len(), 3);
+        let returned_extern = results[0].unwrap_externref().as_ref().unwrap();
+        assert_eq!(returned_extern.downcast::<usize>(&store), Some(&5));
+        let returned_func = results[1].unwrap_funcref().clone();
+        assert!(returned_func.is_some());
+        assert_eq!(results[2], Value::I32(3));
+        let called = call_ref.call(&mut store, &[Value::FuncRef(returned_func)])?;
+        assert_eq!(&*called, &[Value::I32(77)]);
+
+        let results = swap.call(
+            &mut store,
+            &[Value::FuncRef(None), Value::ExternRef(None), Value::I32(4)],
+        )?;
+        assert!(results[0].unwrap_externref().is_none());
+        assert!(results[1].unwrap_funcref().is_none());
+        assert_eq!(results[2], Value::I32(4));
+
+        // A reference argument of the wrong type is still refused.
+        let error = swap
+            .call(
+                &mut store,
+                &[
+                    Value::ExternRef(None),
+                    Value::ExternRef(None),
+                    Value::I32(4),
+                ],
+            )
+            .unwrap_err();
+        assert!(
+            error.message().contains("did not match signature"),
+            "{error}"
+        );
+
+        Ok(())
+    }
+
+    #[engine_test]
+    #[cfg_attr(
+        feature = "v8-default",
+        ignore = "function refs are not supported by the default v8 backend"
+    )]
+    fn function_call_survives_an_import_creating_functions() -> Result<()> {
+        // The import adds functions to the store while the call runs, which
+        // grows (and moves) the store's function list: the call must not keep
+        // a borrow of the callee's entry in it.
+        let mut store = Store::default();
+        let wat = r#"(module
+    (import "env" "grow" (func $grow (param funcref i32) (result funcref)))
+    (type $ret_i32_ty (func (result i32)))
+    (table $table 1 funcref)
+    (func (export "run") (param $f funcref) (param $n i32) (result funcref i32 externref)
+          (call $grow (local.get $f) (local.get $n))
+          (local.get $n)
+          (ref.null extern))
+    (func (export "call_ref") (param $f funcref) (result i32)
+          (table.set $table (i32.const 0) (local.get $f))
+          (call_indirect $table (type $ret_i32_ty) (i32.const 0)))
+)"#;
+        let module = Module::new(&store, wat)?;
+        let env = FunctionEnv::new(&mut store, ());
+        let grow = Function::new_with_env(
+            &mut store,
+            &env,
+            FunctionType::new([Type::FuncRef, Type::I32], [Type::FuncRef]),
+            |mut env: FunctionEnvMut<()>, values: &[Value]| -> Result<Vec<Value>, RuntimeError> {
+                let n = values[1].unwrap_i32();
+                for i in 0..n {
+                    Function::new_typed(&mut env, move || -> i32 { i });
+                }
+                Ok(vec![values[0].clone()])
+            },
+        );
+        let instance = Instance::new(
+            &mut store,
+            &module,
+            &imports! { "env" => { "grow" => grow } },
+        )?;
+        let run: &Function = instance.exports.get_function("run")?;
+        let call_ref: &Function = instance.exports.get_function("call_ref")?;
+
+        let callee = Function::new_typed(&mut store, || -> i32 { 91 });
+        for n in [1, 1000, 5000] {
+            let results = run.call(
+                &mut store,
+                &[Value::FuncRef(Some(callee.clone())), Value::I32(n)],
+            )?;
+            assert_eq!(results.len(), 3);
+            assert_eq!(results[1], Value::I32(n));
+            assert!(results[2].unwrap_externref().is_none());
+            let returned = results[0].unwrap_funcref().clone();
+            assert!(returned.is_some());
+            let called = call_ref.call(&mut store, &[Value::FuncRef(returned)])?;
+            assert_eq!(&*called, &[Value::I32(91)]);
+        }
+
+        Ok(())
+    }
+
     // The tests below return a reference from a host function: one of the
     // store the function is in, which the guest and the caller get, and one of
     // another store, which ends the call as passing it in does.
@@ -1140,6 +1272,218 @@ pub mod reference_types {
         let error = RuntimeError::exception(&other, theirs);
         let caught = catch(&mut store, error)?;
         assert_refused(&mut store, "an exception of another store", caught);
+
+        Ok(())
+    }
+
+    // The async host functions below take the paths of this backend that the
+    // tests above do not: a future the guest waits for gives its results raw,
+    // and a function that returns `Deferred` has a trampoline of its own.
+
+    /// Pending once, then ready: the guest of an import that awaits it waits.
+    #[cfg(feature = "experimental-async")]
+    struct Once(bool);
+
+    #[cfg(feature = "experimental-async")]
+    impl std::future::Future for Once {
+        type Output = ();
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<()> {
+            if std::mem::replace(&mut self.0, true) {
+                return std::task::Poll::Ready(());
+            }
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    }
+
+    /// A kind of async host function, whether its guest waits for it, and
+    /// one that returns a given value.
+    #[cfg(feature = "experimental-async")]
+    type AsyncKind = (&'static str, bool, Function);
+
+    /// The typed async host functions of a store that return `$value`, of the
+    /// type `$ty`: an `async` one that waits, and those that return each
+    /// form of `Deferred`.
+    #[cfg(feature = "experimental-async")]
+    macro_rules! typed_async_kinds {
+        ($store:expr, $env:expr, $value:expr, $ty:ty) => {{
+            let value: $ty = $value;
+            let (waits, ready, polled, pending) =
+                (value.clone(), value.clone(), value.clone(), value);
+            let kinds: Vec<AsyncKind> = vec![
+                (
+                    "an async function that waits",
+                    true,
+                    Function::new_typed_async(
+                        $store,
+                        $env,
+                        async move |_: &mut AsyncEnv<()>| -> $ty {
+                            Once(false).await;
+                            waits.clone()
+                        },
+                    ),
+                ),
+                (
+                    "a function that returns `Deferred::ready`",
+                    false,
+                    Function::new_typed_async(
+                        $store,
+                        $env,
+                        move |_: &mut AsyncEnv<()>| -> Deferred<$ty> {
+                            Deferred::ready(ready.clone())
+                        },
+                    ),
+                ),
+                (
+                    "a function that returns a `Deferred` that is ready when polled",
+                    false,
+                    Function::new_typed_async(
+                        $store,
+                        $env,
+                        move |_: &mut AsyncEnv<()>| -> Deferred<$ty> {
+                            let polled = polled.clone();
+                            Deferred::pending(async move { polled })
+                        },
+                    ),
+                ),
+                (
+                    "a function that returns a `Deferred` that waits",
+                    true,
+                    Function::new_typed_async(
+                        $store,
+                        $env,
+                        move |_: &mut AsyncEnv<()>| -> Deferred<$ty> {
+                            let pending = pending.clone();
+                            Deferred::pending(async move {
+                                Once(false).await;
+                                pending
+                            })
+                        },
+                    ),
+                ),
+            ];
+            kinds
+        }};
+    }
+
+    /// The dynamic async host functions of `store` that return `value`: an
+    /// `async` one that waits, and one that returns `Deferred`.
+    #[cfg(feature = "experimental-async")]
+    fn dynamic_async_kinds(
+        store: &mut Store,
+        env: &FunctionEnv<()>,
+        value: Value,
+    ) -> Vec<AsyncKind> {
+        let ty = FunctionType::new([], [value.ty()]);
+        let (waits, ready) = (value.clone(), value);
+        vec![
+            (
+                "a dynamic async function that waits",
+                true,
+                Function::new_async(
+                    store,
+                    env,
+                    ty.clone(),
+                    async move |_: &mut AsyncEnv<()>, _: &[Value]| {
+                        Once(false).await;
+                        Ok(vec![waits.clone()])
+                    },
+                ),
+            ),
+            (
+                "a dynamic function that returns `Deferred::ready`",
+                false,
+                Function::new_async(store, env, ty, move |_: &mut AsyncEnv<()>, _: &[Value]| {
+                    Deferred::ready(Ok(vec![ready.clone()]))
+                }),
+            ),
+        ]
+    }
+
+    /// Every kind of async host function of `store` that returns `function`,
+    /// and every kind that returns `object`.
+    #[cfg(feature = "experimental-async")]
+    fn async_kinds(
+        store: &mut Store,
+        function: Option<Function>,
+        object: Option<ExternRef>,
+    ) -> Vec<AsyncKind> {
+        let env = FunctionEnv::new(store, ());
+        let mut kinds = typed_async_kinds!(&mut *store, &env, function.clone(), Option<Function>);
+        kinds.extend(typed_async_kinds!(
+            &mut *store,
+            &env,
+            object.clone(),
+            Option<ExternRef>
+        ));
+        kinds.extend(dynamic_async_kinds(store, &env, Value::FuncRef(function)));
+        kinds.extend(dynamic_async_kinds(store, &env, Value::ExternRef(object)));
+        kinds
+    }
+
+    /// The results of `host`, called by the embedder and by a guest: on a
+    /// coroutine, and in place too unless its guest has to wait, which it
+    /// cannot do there.
+    #[cfg(feature = "experimental-async")]
+    fn call_where_it_can_wait(
+        store: &mut Store,
+        host: &Function,
+        waits: bool,
+    ) -> Result<Vec<Result<Box<[Value]>, RuntimeError>>> {
+        let guest = guest_caller(store, host)?;
+        let mut results = Vec::new();
+        for function in [host, &guest] {
+            results.push(futures::executor::block_on(function.call_async(store, &[])));
+            if !waits {
+                results.push(function.call(store, &[]));
+            }
+        }
+        Ok(results)
+    }
+
+    #[cfg(feature = "experimental-async")]
+    #[engine_test]
+    #[cfg_attr(
+        feature = "v8-default",
+        ignore = "function and extern refs are not supported by the default v8 backend"
+    )]
+    fn refs_of_another_store_returned_by_every_kind_of_async_host_function() -> Result<()> {
+        let (mut store, mut other) = (Store::default(), Store::default());
+        let _mine = references(&mut store, "mine", 1);
+        let (function, object) = references(&mut other, "theirs", 2);
+
+        for (kind, waits, host) in async_kinds(&mut store, Some(function), Some(object)) {
+            for result in call_where_it_can_wait(&mut store, &host, waits)? {
+                assert_refused(&mut store, kind, result);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "experimental-async")]
+    #[engine_test]
+    #[cfg_attr(
+        feature = "v8-default",
+        ignore = "function and extern refs are not supported by the default v8 backend"
+    )]
+    fn refs_of_own_store_returned_by_every_kind_of_async_host_function() -> Result<()> {
+        let mut store = Store::default();
+        let (function, object) = references(&mut store, "mine", 1);
+
+        for (function, object, expected) in [
+            (Some(function), Some(object), Some(("mine", 1))),
+            (None, None, None),
+        ] {
+            for (_kind, waits, host) in async_kinds(&mut store, function, object) {
+                let results = call_where_it_can_wait(&mut store, &host, waits)?;
+                assert_result_returned(&mut store, results, expected)?;
+            }
+        }
 
         Ok(())
     }

@@ -86,6 +86,14 @@ impl<T> BackendFunctionEnv<T> {
         })
     }
 
+    /// The store this environment is in.
+    #[cfg(feature = "experimental-async")]
+    pub(crate) fn store_id(&self) -> wasmer_types::StoreId {
+        match_rt!(on self => f {
+            f.handle.store_id()
+        })
+    }
+
     /// A `FunctionEnvMut` of this environment on `store_mut`.
     #[cfg(feature = "experimental-async")]
     pub(crate) fn on_store<'s>(&self, store_mut: StoreMut<'s>) -> FunctionEnvMut<'s, T> {

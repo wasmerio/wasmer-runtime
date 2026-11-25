@@ -44,6 +44,46 @@ Host future               [ with ] . await, no borrow . [ with ]
  . . .   holds no store borrow
 ```
 
+An async host function need not be `async`. `Function::new_typed_async` and
+`Function::new_async` also take a function that returns a `Deferred`: the
+results of the call at once, or a future for them. It receives the same
+`&mut AsyncEnv<T>`, and reaches the store through the same slices. A host
+function that usually has its results at once is written this way, because an
+`async` function pays for being able to wait on every call (see
+[`sys`](#sys)).
+
+```rust
+fn read(cx: &mut AsyncEnv<State>, fd: i32) -> Deferred<i32> {
+    if let Some(byte) = cx.with(|mut env| env.data_mut().buffered(fd)) {
+        return Deferred::ready(byte);             // the call is over
+    }
+    let mut cx = cx.clone();                      // for the future to keep
+    Deferred::pending(async move {                // the guest waits
+        let byte = receive(fd).await;
+        cx.with(|mut env| env.data_mut().count(fd));
+        byte
+    })
+}
+
+let read = Function::new_typed_async(&mut store, &env, read);
+```
+
+`Deferred::pending` takes a `'static` future, which keeps a clone of the
+`AsyncEnv`. A clone is a handle and holds no borrow, like the one
+`FunctionEnvMut::async_env` gives a sync host function. `with` still decides
+at each use whether the store can be had: it panics outside a poll of a call
+on its store, and inside another `with`. So does `try_with`, which only
+reports a shared store that is busy in another slice.
+
+Code that cannot know where it runs asks with `with_if_in_reach`, which
+returns `None` in each of those places. That is code a host function reaches
+through frames that carry no reference, such as a callback of an embedded
+engine: it makes a handle from its environment (`FunctionEnv::async_env`),
+gets the store under an async host function of that store that holds no
+slice, and is refused under a synchronous one, which has the store itself.
+Where it gets the store it can also call a guest and wait for it, with
+`call_async` on the same handle.
+
 ### Exclusive calls
 
 ```rust
@@ -56,13 +96,16 @@ impl Function {
         params: &'a [Value],
     ) -> S::Call<'a, Result<Box<[Value]>, RuntimeError>>;
 
-    pub fn new_typed_async<T: Send + 'static, Args, Rets>(
+    /// `Kind` is inferred: `ReturnsFuture` for an `async` function,
+    /// `ReturnsDeferred` for one that returns a `Deferred`.
+    pub fn new_typed_async<T: Send + 'static, Args, Rets, Kind>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
-        func: impl AsyncHostFunction<T, Args, Rets>,
+        func: impl AsyncHostFunction<T, Args, Rets, Kind>,
     ) -> Self;
 }
 
+/// `Clone`: a handle, which holds no borrow.
 impl<T> AsyncEnv<T> {
     /// Borrows the store for one synchronous slice of a poll.
     pub fn with<R>(&mut self, f: impl FnOnce(FunctionEnvMut<'_, T>) -> R) -> R;
@@ -71,18 +114,48 @@ impl<T> AsyncEnv<T> {
         &mut self,
         f: impl FnOnce(FunctionEnvMut<'_, T>) -> R,
     ) -> Result<R, StoreBusy>;
+    /// `with`, for code that cannot tell whether the store is in its reach:
+    /// `None` wherever `with` panics.
+    pub fn with_if_in_reach<R>(
+        &mut self,
+        f: impl FnOnce(FunctionEnvMut<'_, T>) -> R,
+    ) -> Option<R>;
+}
+
+/// The results of a call, or a future for them.
+pub struct Deferred<R> { /* private */ }
+
+impl<R> Deferred<R> {
+    pub fn ready(results: R) -> Self;
+    pub fn pending(future: impl Future<Output = R> + 'static) -> Self;
+}
+
+impl<T> FunctionEnvMut<'_, T> {
+    /// A handle for code that outlives this borrow to keep.
+    pub fn async_env(&self) -> AsyncEnv<T>;
+}
+
+impl<T> FunctionEnv<T> {
+    /// The same handle, made without the store.
+    pub fn async_env(&self) -> AsyncEnv<T>;
 }
 ```
 
 `AsyncCallStore` is sealed. Its `Call<'a, R>` is `AsyncCall<'a, R>`, or
 `AsyncCall<'static, R>` for a `SharedStore`. `AsyncHostFunction` is sealed too,
-and implemented for `for<'e> AsyncFn(&'e mut AsyncEnv<T>, Args..) -> Rets`.
-`new_async` is the dynamic form. The `with` closure receives the ordinary
+and implemented for `for<'e> AsyncFn(&'e mut AsyncEnv<T>, Args..) -> Rets` and
+for `for<'e> Fn(&'e mut AsyncEnv<T>, Args..) -> Deferred<Rets>`. `new_async` is
+the dynamic form, and takes the same two kinds of function
+(`AsyncDynamicHostFunction`). The `with` closure receives the ordinary
 `FunctionEnvMut`, so sync and async host functions can share helpers.
 
 `AsyncEnv` methods take `&mut self`, so a recursive `with` and two overlapping
-nested calls through one `AsyncEnv` are compile errors. A sync call from an
-async host function is `cx.with(|mut env| f.call(&mut env, &params))`.
+nested calls through one `AsyncEnv` are compile errors. Through a second
+handle, a clone or the one of `FunctionEnvMut::async_env`, they are not: a
+recursive `with` panics, and two nested calls that overlap are two guest
+stacks on one store, which is only correct for a guest built for it, as on a
+`SharedStore`. A sync call from an async host function is
+`cx.with(|mut env| f.call(&mut env, &params))`.
 
 ### Shared stores
 
@@ -140,9 +213,9 @@ stack that can point into it. Each invariant follows from those two facts.
 3. **Suspended stacks hold no host frames.** Only engine and guest frames may
    remain. Host locals on a parked stack would hide borrows and `!Send` data
    from the compiler.
-4. **Call state lives with its stack.** Trap handlers and other per-call state
-   are on the thread only while that stack runs, because stacks resume in any
-   order.
+4. **Call state does not outlive its slice.** Trap handlers and other
+   per-call state are on the thread only while that stack runs, because stacks
+   resume in any order.
 5. **Cancel and leak are safe.** Dropping a call ends its stack without running
    guest or host code. Forgetting it leaves nothing that the store or thread
    still depends on.
@@ -168,7 +241,7 @@ compile error or a safe runtime failure.
 | 1. One mutator | `&'a mut` on the call; `&mut self` on `AsyncEnv` | Overlapping calls, store use or drop during a call | `StoreBusy` on a shared store |
 | 2. No borrow crosses a suspension | `with` takes a synchronous closure with a higher-ranked lifetime | `.await` inside `with`; returning a store borrow | None |
 | 3. No host frames on suspended stacks | Host futures live in the call future; sync frames cannot suspend | Not expressible in types | `YieldOutsideAsyncContext` trap |
-| 4. Call state lives with its stack | One private switch point | Not expressible in types | Internal assertion |
+| 4. Call state does not outlive its slice | Installed and removed around each resumption | Not expressible in types | Internal assertion |
 | 5. Cancel and leak are safe | Follows from 3 and 4 | Not expressible in types | The stack is discarded, or leaked |
 | 6. Thread affinity | `Store: !Send` carries into every future | Sending a call future | None |
 | 7. Interleaving is opt-in | Only `SharedStore` can overlap calls | Overlapping calls on a plain store | Guest correctness is the embedder's under `SharedStore` |
@@ -197,8 +270,9 @@ The hard cases:
 
 Obligations of the private `unsafe` code:
 
-1. State is exchanged at exactly one switch point, also when control returns
-   by unwinding.
+1. A suspended stack holds the frames of the guest and of the import that
+   suspended it, with nothing a destructor would have to release: it is reset,
+   not unwound.
 2. `AsyncEnv` holds a store pointer only during a poll by its own call.
 3. Discarding a suspended stack never touches the store.
 4. A shared store hands out at most one slice at a time, including across
@@ -212,7 +286,9 @@ Checks that stay dynamic, and fail safely:
 
 - Using a handle with the wrong store panics.
 - Polling a task from inside a slice of its own store panics. An executor
-  whose `wake` polls inline must defer that poll.
+  whose `wake` polls inline must defer that poll. On `sys`, the first poll of
+  an async host function under a `call_async` is not such a slice, though its
+  guest still has the store (see [`sys`](#sys)).
 - `with` panics if a task is dropped inside another slice of its shared store
   and its host future's destructor asks for the store. A destructor that needs
   the store asks with `try_with`, which fails with `StoreBusy` there.
@@ -225,37 +301,60 @@ view, and V8's C API cannot switch stacks.
 
 |  | `sys` | JavaScript (JSPI) | V8 |
 | --- | --- | --- | --- |
-| Guest stack | A `corosensei` coroutine owned by the call future | An engine-owned JSPI stack | The calling OS stack, never suspended |
+| Guest stack | A Wasm stack of the VM, owned by the call future while its guest waits | An engine-owned JSPI stack | The calling OS stack, never suspended |
 | Exclusive calls | Full | Full. The engine drives the call, and host futures run on the microtask queue | `poll` blocks while a pending import's future is driven |
 | Shared stores | Full | Full | Lexical nesting only. A task whose import must wait fails with a trap |
 | Cancellation | Drop the host future, then discard the stack | Drop the host future, and unwind the guest with a trap it cannot catch | Not during an import, because `poll` has not returned |
 
 ### `sys`
 
-Each `call_async` runs on its own coroutine stack
-([`async_runtime.rs`](../lib/api/src/backend/sys/async_runtime.rs)). When the
-guest waits in an async import, the coroutine suspends with only engine and
-guest frames on its stack, and the call future polls the host future on the
-executor's stack. A deep host future therefore cannot overflow the fixed
-coroutine stack.
+Each `call_async` runs its guest on a Wasm stack of its own, which a
+`wasmer_vm::SuspendedCall` keeps while the guest waits
+([`async_runtime.rs`](../lib/api/src/backend/sys/async_runtime.rs)). An async
+import polls its host future once where it is called, on the stack of whoever
+polls the call. If the future is pending, the import suspends the guest, with
+only engine and guest frames on its stack, and the call future polls the host
+future on the executor's stack, then resumes the guest with what it returned.
+A deep host future therefore cannot overflow the guest's Wasm stack, and an
+import whose future is ready at once switches no stack. A typed async host
+function also keeps the heap block of a future that was ready at once, and
+makes its next future there, so such a call does not allocate either.
 
-Everything a call leaves on the thread moves with its stack, at one switch
-point, `AsyncCallFuture::switch_to_coroutine`: the store context entries of
-its calls, the coroutine the thread runs on, and
-`wasmer_vm::ActivationState`, which holds the trap handler and the stores the
-interrupt registry sees as entered. A guard swaps them back however control
-returns, including by unwinding.
+In that first poll the guest still has the store, which is published for the
+host function alone. On a shared store, under a guest that a `call_async`
+runs, a handle reaches it there as the `AsyncEnv` of the host function does:
+`SharedStore::try_with` takes it, one holder at a time, and a task of the
+store that the host function polls runs with it. So a host function finds its
+store the same in its first poll as in the later ones, which the call makes
+with no slice held. A guest that was entered synchronously lends nothing: its
+caller holds the store, `try_with` fails with `StoreBusy`, and a task polled
+there panics.
 
-A coroutine that returned gives its stack, a 1 MiB mapping, back to a pool of
-up to 16 per thread. A dropped call unwinds its coroutine, which runs no guest
-code. A call dropped as its thread exits is forgotten instead, because the
-thread locals the unwind needs may be gone, and it gives up its interrupt
-registrations.
+A typed function that returns `Deferred` has a trampoline of its own. It
+calls the function as the trampoline of a sync host function does, with the
+store published for the slices the function takes, and returns the results if
+the function gave them: no future is made, placed or polled, and the call
+costs what a call of a sync host function costs. Only if the function gave a
+future does the trampoline ask whether the guest can wait, and poll, as the
+one of an `async` function does. The function has returned before its guest
+waits. A dynamic function that returns `Deferred` is called through a future
+like any other dynamic one.
+
+Nothing a call leaves on the thread outlives the slice that put it there. Each
+resumption installs what a synchronous call installs, the store context entry
+of the call and the trap handler, and `wasmer_vm::ActivationState`, which holds
+the stores the interrupt registry sees as entered, and takes them off when
+control comes back, whether the guest waits, returns or unwinds.
+
+A call's Wasm stack comes from the VM's stack cache and goes back to it when
+the call is over or dropped. A dropped call drops its host future and resets
+its stack, which runs no guest or host code: a suspended stack holds only the
+frames of the guest and of the import that suspended it. A call dropped as its
+thread exits gives up its interrupt registrations.
 
 `baremetal` does not support `experimental-async`, and the two features fail
 to build together. A `baremetal` trap leaves through the embedder's unwinder,
-which cannot stop at a call's coroutine, and a dropped call could not be
-unwound either.
+which cannot stop at the coroutine a call's guest runs on.
 
 ### JavaScript
 
@@ -306,14 +405,18 @@ it holds. A new call on the store gets a fresh flag, so that a forgotten call
 cannot keep the store interrupted, and the store's interrupt entries are
 released when it drops.
 
-This has a known gap. A call nested behind a coroutine switch is taken for a
+This has a known gap. A call nested behind a switch of stacks is taken for a
 new call, so it can run after its caller was interrupted. That happens when an
-async import calls `call_async(cx, ..)`, or when an interrupt lands between the
-poll and the entry of a `call_async` made from a sync host function.
-`an_async_call_nested_after_an_interrupt_is_interrupted` in
+async import calls `call_async(cx, ..)` after its future waited, since its own
+call's entry of the store is off the thread while the guest waits, or when an
+interrupt lands between the poll and the entry of a `call_async` made from a
+sync host function. A nested call made in the first poll of an import's future
+is refused, as that poll runs with its call on the thread
+(`an_async_call_nested_after_an_interrupt_is_interrupted`).
+`an_async_call_nested_after_waiting_is_interrupted` in
 [`interrupt_async.rs`](../lib/api/tests/interrupt_async.rs) and a unit test in
 [`interrupt_registry/unix.rs`](../lib/vm/src/interrupt_registry/unix.rs) record
-it, and are ignored until it is fixed.
+the gap, and are ignored until it is fixed.
 
 ## Owning-thread execution
 
@@ -331,7 +434,7 @@ need that the contract already meets, so none of them is ported:
 | Take work from other threads | Outside these APIs | The embedder's: a channel to the owning thread, and wakers that only ask it to poll |
 | Refuse work once the guest ended | `NativeInvocationScope::close` | The embedder drops its tasks and its handles, and a `WeakSharedStore` stops upgrading |
 | Know when the calls on the native stack are over | `close_and_wait`, `NativeAncestrySettlement` | Calls nest, so they are over when the owning thread's outermost entry returns. Until then `try_with` fails with `StoreBusy` and `into_store` gives the handle back |
-| Keep a suspended call from resuming under a foreign frame | `WeakNativeInvocation`, `NativeFrameGuard`, `NativeCleanupGuard` | Nothing to keep: a suspended stack holds no host frame (invariant 3), and a guest under one traps instead of waiting |
+| Keep a suspended call from resuming under a foreign frame | `WeakNativeInvocation`, `NativeFrameGuard`, `NativeCleanupGuard` | Nothing to keep: a suspended stack holds no frame of a host function (invariant 3), and a guest under one traps instead of waiting |
 | Run clean-up that needs the store once those calls are over | `NativeCleanupOwner`, with its fences, seals and exit boundaries | A destructor asks a handle. On `StoreBusy` the embedder queues the work, and runs it when its outermost entry returns |
 
 A task that waits can be dropped from inside a call of its store, for example
@@ -339,10 +442,11 @@ by the import that ends the guest: its host future is dropped first, and its
 guest is discarded without running. `AsyncEnv::with` panics in such a
 destructor, which is why one that needs the store asks a handle.
 
-Host code stays on the owning thread, but not always on that thread's own
-stack: under a `call_async`, a synchronous host function runs on the coroutine
-stack of the call. Bindings that need the thread's own stack are entered
-through `try_with`.
+Host code stays on the owning thread, and on the stack of whoever entered the
+guest: the caller of `call`, or whoever polls the future of a `call_async`.
+The exception is a typed host function set to run on the Wasm stack with
+`Function::set_calls_on_native_stack`, which bindings that need the thread's
+own stack must not be.
 
 [`async_owning_thread.rs`](../lib/api/tests/async_owning_thread.rs) runs all
 of it on an embedder thread, and the documentation of `SharedStore` tells an
@@ -378,10 +482,10 @@ embedder how.
 | One `call_async`, with the difference in a sealed trait | `AsyncEnv::call` and `SharedStore::call` | One way to call, and `cx` reborrows like a store |
 | `SharedStore` owns the store behind `Rc` | A scoped `run_concurrent` that borrows the store | A forgotten scope would end the borrow while handles still reach the store |
 | `try_with` fails instead of waiting | Async acquisition | On one thread, a busy store means the holder is below you on the stack |
-| Owning-thread execution adds no API | Port `NativeInvocationScope` and the `NativeCleanup*` family | A store is bound to its thread by its type, calls nest, and a suspended stack holds no host frame, so there is nothing to settle that the embedder cannot see |
+| Owning-thread execution adds no API | Port `NativeInvocationScope` and the `NativeCleanup*` family | A store is bound to its thread by its type, calls nest, and a suspended stack holds no frame of a host function, so there is nothing to settle that the embedder cannot see |
 | `data_and_store` returns `StoreRef` | A new view type | No new types, and WASIX compiles after sequencing a few borrows |
 | No `Instance::new_async` | Copy Wasmtime | Wasm has no async start function, and sync entry already works |
-| Host futures are polled on the executor stack | Poll them on the guest's stack, as Wasmtime does | A deep future cannot overflow the fixed coroutine stack |
+| Host futures are polled on the executor stack | Poll them on the guest's stack, as Wasmtime does | A deep future cannot overflow the guest's fixed Wasm stack |
 | JavaScript gets a private guest guard | Rely on the borrow | JSPI resumes guests with no `poll` on the stack |
 | A call derives its store from `as_store_mut` once | Derive it for each slice | `AsStoreMut` is public, and can return another store |
 | V8 allows lexical nesting and fails out-of-order resumes | Reject shared stores on V8 | V8 can nest calls but cannot switch stacks |
@@ -400,8 +504,9 @@ awaiting a call under a lock guard, and keep an env handle past its call.
 Wasmtime makes `call_async` safe the same way: its future borrows the store
 until it completes or is dropped, `Caller` and `Accessor::with` keep borrows
 inside their capability, and per-call state moves at one switch point. This
-design differs in polling host futures on the executor's stack, in having one
-host function shape, and in `&mut self` on `AsyncEnv`. The comparison was made
+design differs in polling host futures on the executor's stack, in installing
+per-call state around each resumption instead, in having one host function
+shape, and in `&mut self` on `AsyncEnv`. The comparison was made
 against [Wasmtime at
 `fb792bf`](https://github.com/bytecodealliance/wasmtime/tree/fb792bf7a143801c22c0ba5b16fe2c6085a8598b/crates/wasmtime/src/runtime).
 

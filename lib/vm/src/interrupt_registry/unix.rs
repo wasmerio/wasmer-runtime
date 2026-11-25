@@ -8,6 +8,7 @@ use std::{
 };
 
 use dashmap::{DashMap, Entry};
+use smallvec::SmallVec;
 use wasmer_types::StoreId;
 
 use super::*;
@@ -53,12 +54,18 @@ impl Drop for ThreadTarget {
     }
 }
 
+/// The stores a thread, or one activation, has entered, innermost last, each
+/// with the flag an interrupt of it sets. The usual few are inline: an
+/// activation starts with an empty list, and entering its store must not
+/// allocate.
+type Stores = SmallVec<[(StoreId, Arc<AtomicBool>); 2]>;
+
 /// Thread-related state; only **PARTS** of this struct are safe to access
 /// from within the interrupt handler.
 struct ThreadInterruptState {
     /// We need to maintain a stack of active stores per thread, hence the vec.
     /// This should not be touched by the interrupt handler.
-    active_stores: Vec<(StoreId, Arc<AtomicBool>)>,
+    active_stores: Stores,
 
     /// Always stores the top entry from `active_stores`. Needed since a vec is not
     /// safe to access from signal handlers.
@@ -98,7 +105,7 @@ thread_local! {
     ///   * junk results shouldn't matter if we're not running WASM code
     static THREAD_INTERRUPT_STATE: UnsafeCell<ThreadInterruptState> =
         UnsafeCell::new(ThreadInterruptState {
-            active_stores: vec![],
+            active_stores: Stores::new_const(),
             current_active_store: AtomicUsize::new(0),
             current_signal_target_store: Arc::new(AtomicUsize::new(0)),
             target: ThreadTarget(Arc::new(InterruptTarget {
@@ -170,9 +177,12 @@ pub(super) fn uninstall(store_id: StoreId) {
     THREAD_INTERRUPT_STATE.with(|t| {
         // Safety: See comments on THREAD_INTERRUPT_STATE.
         let borrow = unsafe { t.get().as_mut().unwrap() };
-        match borrow.active_stores.pop_if(|(id, _)| *id == store_id) {
-            Some(_) => borrow.publish_active_store(),
-            None => panic!("InterruptInstallGuard dropped out of order"),
+        match borrow.active_stores.last() {
+            Some((id, _)) if *id == store_id => {
+                borrow.active_stores.pop();
+                borrow.publish_active_store();
+            }
+            _ => panic!("InterruptInstallGuard dropped out of order"),
         }
     });
 
@@ -215,11 +225,11 @@ pub(crate) fn thread_is_usable() -> bool {
 /// [`crate::ActivationState`], which swaps it with the thread's at every
 /// switch so that the signal handler compares an interrupt's target against
 /// the store that is actually running.
-pub(crate) struct ActiveStores(Vec<(StoreId, Arc<AtomicBool>)>);
+pub(crate) struct ActiveStores(Stores);
 
 impl ActiveStores {
     pub(crate) const fn new() -> Self {
-        Self(Vec::new())
+        Self(Stores::new_const())
     }
 
     pub(crate) fn is_empty(&self) -> bool {

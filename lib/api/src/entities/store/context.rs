@@ -14,118 +14,140 @@
 //! a nested entry's borrows are children of the borrow its caller still
 //! holds. Only the top entry is ever used.
 //!
-//! A suspended `call_async` takes its entries with it: the switch to its
-//! coroutine puts them back, and the switch away takes them off, so a call
-//! never finds another call's entries, whichever order they resume in. See
-//! `sys::async_runtime`.
+//! The entries live on the frames of the calls that install them, linked
+//! from the top one, which is all the thread-local holds: it has no
+//! destructor and no `RefCell`, and a borrow of an entry is given back through
+//! the entry itself. An entry is installed for no longer than the frame that
+//! holds it, and the entries above it are always taken off first, so the
+//! links never point at a frame that is gone. A JavaScript exception, which
+//! skips frames without running their destructors, is the one exception: the
+//! boundary it is caught at puts the top back (see [`StoreContext::checkpoint`]).
+//!
+//! A `call_async` installs its entry for as long as its guest runs, and takes
+//! it off when the guest waits or returns, so a call never finds another
+//! call's entries, whichever order they resume in. See `sys::async_runtime`.
 
-use std::cell::RefCell;
+use std::cell::Cell;
+use std::ptr::{self, NonNull};
 
 use super::{StoreInner, StoreMut, StoreRef};
 
 use wasmer_types::StoreId;
 
+/// An entry of the store context: a store executing on this thread, and the
+/// borrow its pointer was derived from. It is made on the frame of the call
+/// that installs it, and stays there while it is installed: the guard that
+/// [`Self::install`] returns borrows it.
 pub(crate) struct StoreContext {
     id: StoreId,
     /// How many borrows of this entry are live. A host function trampoline
-    /// holds one while it runs. A guest call it makes pushes an entry of its
-    /// own, so that the host function's borrow stays valid underneath.
-    borrow_count: u32,
+    /// holds one while it runs. A guest call it makes installs an entry of
+    /// its own, so that the host function's borrow stays valid underneath.
+    borrow_count: Cell<u32>,
     ptr: *mut StoreInner,
+    /// The entry beneath this one while it is installed.
+    prev: Cell<*const StoreContext>,
 }
 
 pub(crate) struct StorePtrWrapper {
     store_ptr: *mut StoreInner,
+    /// The entry the borrow was taken from, which it is given back to. An
+    /// entry stays installed, in place, until the call that installed it
+    /// returns, and a borrow is given back within that call.
+    entry: NonNull<StoreContext>,
     /// The store's id, so that giving the borrow back does not use `store_ptr`.
+    #[cfg_attr(not(feature = "experimental-async"), allow(dead_code))]
     id: StoreId,
 }
 
-pub(crate) struct StoreInstallGuard {
-    store_id: StoreId,
+pub(crate) struct StoreInstallGuard<'a> {
+    entry: &'a StoreContext,
+}
+
+/// The top of the stack, as [`StoreContext::checkpoint`] found it.
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+pub(crate) struct StoreContextCheckpoint {
+    top: *const StoreContext,
+    borrow_count: u32,
 }
 
 thread_local! {
-    static STORE_CONTEXT_STACK: RefCell<Vec<StoreContext>> = const { RefCell::new(Vec::new()) };
+    /// The top entry of this thread's stack of entries, or null.
+    static TOP: Cell<*const StoreContext> = const { Cell::new(ptr::null()) };
+}
+
+/// Runs `f` on the top of the thread's stack of entries.
+///
+/// This is `LocalKey::with`, written with `try_with`, which is `#[inline]`
+/// where `with` is not: an instance of `with` is compiled apart from the
+/// function that calls it, and is inlined into it or not depending on how the
+/// crate happens to be split into codegen units. A host function looks its
+/// store up here on every call.
+#[inline]
+fn with_top<R>(f: impl FnOnce(&Cell<*const StoreContext>) -> R) -> R {
+    TOP.try_with(f)
+        .expect("the store context of a thread was used during or after its destruction")
+}
+
+/// The top entry. The reference is valid for as long as the entry stays
+/// installed, which outlasts any use the callers make of it.
+#[inline]
+fn top_entry<'a>(top: &Cell<*const StoreContext>) -> Option<&'a StoreContext> {
+    // Safety: an installed entry lives, in place, on the frame of the call
+    // that installed it, until that call takes it off.
+    unsafe { top.get().as_ref() }
+}
+
+/// The panic of a lookup that finds another store's entry on top. Out of
+/// line, and given the ids by value, so that a host function does not keep
+/// them in memory on every call to have their addresses ready.
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn mismatched(found: StoreId, expected: StoreId) -> ! {
+    panic!("Mismatched store context access: found {found:?}, expected {expected:?}")
 }
 
 impl StoreContext {
-    /// The depth of the stack, and the borrows of its top entry: for a
-    /// backend whose host can unwind through Rust frames without running
-    /// them.
+    /// An entry for `store_ptr`, to be installed with [`Self::install`].
+    ///
+    /// # Safety
+    /// `store_ptr` must point to a live store.
+    #[inline]
+    pub(crate) unsafe fn new(store_ptr: *mut StoreInner) -> Self {
+        Self {
+            id: unsafe { (*store_ptr).objects.id() },
+            borrow_count: Cell::new(0),
+            ptr: store_ptr,
+            prev: Cell::new(ptr::null()),
+        }
+    }
+
+    /// The top of the stack, and the borrows of its top entry: for a backend
+    /// whose host can unwind through Rust frames without running them.
     #[allow(dead_code)]
-    pub(crate) fn checkpoint() -> (usize, u32) {
-        STORE_CONTEXT_STACK.with(|cell| {
-            let stack = cell.borrow();
-            (stack.len(), stack.last().map_or(0, |top| top.borrow_count))
+    pub(crate) fn checkpoint() -> StoreContextCheckpoint {
+        with_top(|top| StoreContextCheckpoint {
+            top: top.get(),
+            borrow_count: top_entry(top).map_or(0, |entry| entry.borrow_count.get()),
         })
     }
 
     /// Puts the stack back as [`Self::checkpoint`] found it, after an unwind
-    /// skipped the frames that held its entries.
+    /// skipped the frames that held its entries: those entries are gone, and
+    /// nothing may point at them any more.
     #[allow(dead_code)]
-    pub(crate) fn restore_checkpoint((depth, borrow_count): (usize, u32)) {
-        STORE_CONTEXT_STACK.with(|cell| {
-            let mut stack = cell.borrow_mut();
-            stack.truncate(depth);
-            if let Some(top) = stack.last_mut() {
-                top.borrow_count = borrow_count;
+    pub(crate) fn restore_checkpoint(checkpoint: StoreContextCheckpoint) {
+        with_top(|top| {
+            top.set(checkpoint.top);
+            if let Some(entry) = top_entry(top) {
+                entry.borrow_count.set(checkpoint.borrow_count);
             }
         });
     }
 
-    /// Whether the thread still has what unwinding a call suspended in Wasm
-    /// needs of it: false once its thread locals are being destroyed, as it
-    /// exits. A call suspended then is forgotten rather than unwound.
-    #[cfg(all(feature = "sys", feature = "experimental-async"))]
-    pub(crate) fn thread_can_unwind() -> bool {
-        STORE_CONTEXT_STACK.try_with(|_| ()).is_ok()
-            && wasmer_vm::ActivationState::thread_is_usable()
-    }
-
-    /// Puts the entries of a suspended call back on the thread, on top of
-    /// whatever runs there, and returns where they start.
-    ///
-    /// `store` is the pointer the call holds for this slice. It replaces the
-    /// entries' own, which were derived before other code last used the
-    /// store. It is `None` when the coroutine is being discarded: that never
-    /// touches the store, so the old pointers are only compared.
-    #[cfg(all(feature = "sys", feature = "experimental-async"))]
-    pub(crate) fn resume_entries(entries: &mut Vec<Self>, store: Option<*mut StoreInner>) -> usize {
-        STORE_CONTEXT_STACK.with(|cell| {
-            let mut stack = cell.borrow_mut();
-            let base = stack.len();
-            stack.extend(entries.drain(..).map(|mut entry| {
-                if let Some(store) = store {
-                    entry.ptr = store;
-                }
-                entry
-            }));
-            base
-        })
-    }
-
-    /// Takes the entries of a call off the thread again: everything above
-    /// `base`. Never panics, because it runs while a panic may be unwinding.
-    #[cfg(all(feature = "sys", feature = "experimental-async"))]
-    pub(crate) fn suspend_entries(entries: &mut Vec<Self>, base: usize) {
-        let _ = STORE_CONTEXT_STACK.try_with(|cell| {
-            if let Ok(mut stack) = cell.try_borrow_mut()
-                && base <= stack.len()
-            {
-                entries.extend(stack.drain(base..));
-            }
-        });
-    }
-
-    /// Whether a coroutine whose entries start at `base` can suspend: it has
-    /// its own call's entry and nothing above it. Another entry belongs to a
-    /// synchronous call made by a host frame, which must not be parked.
-    #[cfg(all(feature = "sys", feature = "experimental-async"))]
-    pub(crate) fn can_suspend(base: usize) -> bool {
-        STORE_CONTEXT_STACK.with(|cell| cell.borrow().len() == base + 1)
-    }
-
-    /// Install `store_ptr` as this thread's executing store until the returned
+    /// Install this entry as this thread's executing store until the returned
     /// guard is dropped.
     ///
     /// A store already executing here gets a *second* entry rather than
@@ -142,28 +164,35 @@ impl StoreContext {
     /// outer entry.
     ///
     /// # Safety
-    /// `store_ptr` must be derived from a mutable borrow of the store that
-    /// stays alive, and unreachable to every frame on this thread, until the
-    /// guard is dropped.
-    pub(crate) unsafe fn install(store_ptr: *mut StoreInner) -> StoreInstallGuard {
-        let store_id = unsafe { store_ptr.as_ref().unwrap().objects.id() };
-        STORE_CONTEXT_STACK.with(|cell| {
-            let mut stack = cell.borrow_mut();
+    /// The entry's pointer must be derived from a mutable borrow of the store
+    /// that stays alive, and unreachable to every frame on this thread, until
+    /// the guard is dropped.
+    #[inline]
+    pub(crate) unsafe fn install(&self) -> StoreInstallGuard<'_> {
+        with_top(|top| {
+            let prev = top.get();
             // Nesting changes a pointer's provenance, never which store it
             // addresses, so the same store must arrive at the same address.
             debug_assert!(
-                stack
-                    .last()
-                    .is_none_or(|top| top.id != store_id || top.ptr == store_ptr),
+                top_entry(top).is_none_or(|prev| prev.id != self.id || prev.ptr == self.ptr),
                 "Store context pointer mismatch"
             );
-            stack.push(Self {
-                id: store_id,
-                borrow_count: 0,
-                ptr: store_ptr,
-            });
+            debug_assert!(!ptr::eq(prev, self), "Store context entry installed twice");
+            self.prev.set(prev);
+            top.set(self);
         });
-        StoreInstallGuard { store_id }
+        StoreInstallGuard { entry: self }
+    }
+
+    /// A borrow of the top entry, counted in it.
+    #[inline]
+    fn borrow(&self) -> StorePtrWrapper {
+        self.borrow_count.set(self.borrow_count.get() + 1);
+        StorePtrWrapper {
+            store_ptr: self.ptr,
+            entry: NonNull::from(self),
+            id: self.id,
+        }
     }
 
     /// The active entry's store, if no frame on this thread's stack is holding
@@ -176,30 +205,35 @@ impl StoreContext {
     /// zero until somebody takes it — which is how an imported function lends
     /// its store to code it calls into.
     pub(crate) fn try_get_current_unborrowed() -> Option<StorePtrWrapper> {
-        STORE_CONTEXT_STACK.with(|cell| {
-            let mut stack = cell.borrow_mut();
-            let top = stack.last_mut()?;
-            if top.borrow_count != 0 {
-                return None;
-            }
-            top.borrow_count += 1;
-            Some(StorePtrWrapper {
-                store_ptr: top.ptr,
-                id: top.id,
-            })
+        with_top(|top| {
+            let entry = top_entry(top)?;
+            (entry.borrow_count.get() == 0).then(|| entry.borrow())
         })
     }
 
     /// [`Self::try_get_current_unborrowed`], if the active entry is `id`'s.
     #[cfg(feature = "experimental-async")]
     pub(crate) fn try_get_lent(id: StoreId) -> Option<StorePtrWrapper> {
-        let is_top =
-            STORE_CONTEXT_STACK.with(|cell| cell.borrow().last().is_some_and(|top| top.id == id));
-        if is_top {
-            Self::try_get_current_unborrowed()
-        } else {
-            None
-        }
+        with_top(|top| {
+            let entry = top_entry(top)?;
+            (entry.id == id && entry.borrow_count.get() == 0).then(|| entry.borrow())
+        })
+    }
+
+    /// Whether no borrow of the active entry is live, or none is installed.
+    ///
+    /// An async import asks before it has its guest wait: the frames the
+    /// guest waits on are reset, not unwound, if its call is dropped, so a
+    /// borrow they held would never be given back.
+    #[cfg(all(feature = "sys", feature = "experimental-async"))]
+    pub(crate) fn top_is_unborrowed() -> bool {
+        with_top(|top| top_entry(top).is_none_or(|entry| entry.borrow_count.get() == 0))
+    }
+
+    /// Whether `entry` is the active entry of this thread.
+    #[cfg(all(feature = "sys", feature = "experimental-async"))]
+    pub(crate) fn is_active(entry: *const Self) -> bool {
+        with_top(|top| ptr::eq(top.get(), entry))
     }
 
     /// Safety: This method lets you borrow multiple mutable references
@@ -210,18 +244,14 @@ impl StoreContext {
     ///
     /// The intended, valid use-case for this method is from within
     /// imported function trampolines.
+    #[inline]
     pub(crate) unsafe fn get_current(id: StoreId) -> StorePtrWrapper {
-        STORE_CONTEXT_STACK.with(|cell| {
-            let mut stack = cell.borrow_mut();
-            let top = stack
-                .last_mut()
-                .expect("No store context installed on this thread");
-            assert_eq!(top.id, id, "Mismatched store context access");
-            top.borrow_count += 1;
-            StorePtrWrapper {
-                store_ptr: top.ptr,
-                id,
+        with_top(|top| {
+            let entry = top_entry(top).expect("No store context installed on this thread");
+            if entry.id != id {
+                mismatched(entry.id, id);
             }
+            entry.borrow()
         })
     }
 
@@ -232,13 +262,12 @@ impl StoreContext {
     /// remains unchanged as long as the pointer is being accessed.
     #[cfg(feature = "sys")]
     pub(crate) unsafe fn get_current_transient(id: StoreId) -> *mut StoreInner {
-        STORE_CONTEXT_STACK.with(|cell| {
-            let stack = cell.borrow();
-            let top = stack
-                .last()
-                .expect("No store context installed on this thread");
-            assert_eq!(top.id, id, "Mismatched store context access");
-            top.ptr
+        with_top(|top| {
+            let entry = top_entry(top).expect("No store context installed on this thread");
+            if entry.id != id {
+                mismatched(entry.id, id);
+            }
+            entry.ptr
         })
     }
 }
@@ -255,70 +284,56 @@ impl StorePtrWrapper {
         unsafe { StoreMut::from_raw(self.store_ptr) }
     }
 
-    #[cfg(feature = "experimental-async")]
+    /// The pointer the borrow was taken through, for a trampoline to use the
+    /// store on the Wasm stack once the borrow is given back.
+    #[cfg(feature = "sys")]
     pub(crate) fn as_ptr(&self) -> *mut StoreInner {
         self.store_ptr
+    }
+
+    #[cfg(feature = "experimental-async")]
+    pub(crate) fn id(&self) -> StoreId {
+        self.id
     }
 }
 
 impl Drop for StorePtrWrapper {
+    #[inline]
     fn drop(&mut self) {
-        if std::thread::panicking() {
-            // The borrow is given back while unwinding too, if its entry is
-            // still the active one: a host frame further up that catches the
-            // panic must find the count of its own borrow. An entry that is
-            // no longer active is removed by its install guard, whatever its
-            // count. Never panics: a destructor that panics while unwinding
-            // aborts the process.
-            let _ = STORE_CONTEXT_STACK.try_with(|cell| {
-                if let Ok(mut stack) = cell.try_borrow_mut()
-                    && let Some(top) = stack.last_mut()
-                    && top.ptr == self.store_ptr
-                {
-                    top.borrow_count = top.borrow_count.saturating_sub(1);
-                }
-            });
-            return;
-        }
-        let id = self.id;
-        STORE_CONTEXT_STACK.with(|cell| {
-            let mut stack = cell.borrow_mut();
-            let top = stack
-                .last_mut()
-                .expect("No store context installed on this thread");
-            assert_eq!(top.id, id, "Mismatched store context reinstall");
-            top.borrow_count -= 1;
-        })
+        // Safety: the entry outlives the borrow (see the field). The borrow is
+        // given back while unwinding too: a host frame further up that catches
+        // the panic must find the count of its own borrow.
+        let entry = unsafe { self.entry.as_ref() };
+        entry.borrow_count.set(entry.borrow_count.get() - 1);
+        debug_assert!(
+            std::thread::panicking() || with_top(|top| ptr::eq(top.get(), entry)),
+            "Mismatched store context reinstall"
+        );
     }
 }
 
-impl Drop for StoreInstallGuard {
+impl Drop for StoreInstallGuard<'_> {
+    // Inlined into the call that installed the entry, which then looks the
+    // thread-local up once for both.
+    #[inline]
     fn drop(&mut self) {
-        STORE_CONTEXT_STACK.with(|cell| {
-            let mut stack = cell.borrow_mut();
-            match (stack.pop(), std::thread::panicking()) {
-                (Some(top), false) => {
-                    assert_eq!(top.id, self.store_id, "Mismatched store context uninstall");
-                    assert_eq!(
-                        top.borrow_count, 0,
-                        "Cannot uninstall store context while it is still borrowed"
-                    );
-                }
-                (Some(top), true) => {
-                    // If we're panicking and there's a store ID mismatch, just
-                    // put the store back in the hope that its own install guard
-                    // take care of uninstalling it later.
-                    if top.id != self.store_id {
-                        stack.push(top);
-                    }
-                }
-                (None, false) => panic!("Store context stack underflow"),
-                (None, true) => {
-                    // Nothing to do if we're panicking; panics can put the context
-                    // in an invalid state, and we don't want to cause another panic here.
-                }
-            }
-        })
+        let entry = self.entry;
+        // Taken off before anything is checked, so that the thread never keeps
+        // an entry whose frame is about to go. Entries still above it were
+        // left by frames an unwind skipped: they go with it.
+        let was_top = with_top(|top| {
+            let was_top = ptr::eq(top.get(), entry);
+            top.set(entry.prev.get());
+            was_top
+        });
+        if !std::thread::panicking() {
+            assert!(was_top, "Mismatched store context uninstall");
+            assert_eq!(
+                entry.borrow_count.get(),
+                0,
+                "Cannot uninstall store context while it is still borrowed"
+            );
+        }
     }
 }
 
@@ -362,7 +377,8 @@ mod borrow_provenance {
 
         // --- the embedder's Function::call(&mut store)
         let mut caller = store.as_store_mut();
-        let install = unsafe { StoreContext::install(caller.as_store_mut().inner as *mut _) };
+        let entry = unsafe { StoreContext::new(caller.as_store_mut().inner as *mut _) };
+        let install = unsafe { entry.install() };
 
         // --- the import trampoline, handing the shim its store
         let mut wrapper = unsafe { StoreContext::get_current(id) };
@@ -371,8 +387,8 @@ mod borrow_provenance {
 
         {
             // --- the shim calls back into the guest
-            let inner_install =
-                unsafe { StoreContext::install(shim.as_store_mut().inner as *mut _) };
+            let inner_entry = unsafe { StoreContext::new(shim.as_store_mut().inner as *mut _) };
+            let inner_install = unsafe { inner_entry.install() };
 
             // --- the inner import trampoline
             let mut inner_wrapper = unsafe { StoreContext::get_current(id) };
@@ -400,7 +416,8 @@ mod borrow_provenance {
         let id = store.id();
 
         let mut caller = store.as_store_mut();
-        let install = unsafe { StoreContext::install(caller.as_store_mut().inner as *mut _) };
+        let entry = unsafe { StoreContext::new(caller.as_store_mut().inner as *mut _) };
+        let install = unsafe { entry.install() };
 
         let mut wrapper = unsafe { StoreContext::get_current(id) };
         let mut shim = wrapper.as_mut();
@@ -430,15 +447,16 @@ mod borrow_provenance {
         let id = store.id();
 
         let mut caller = store.as_store_mut();
-        let install = unsafe { StoreContext::install(caller.as_store_mut().inner as *mut _) };
+        let entry = unsafe { StoreContext::new(caller.as_store_mut().inner as *mut _) };
+        let install = unsafe { entry.install() };
 
         let mut wrapper = unsafe { StoreContext::get_current(id) };
         let mut shim = wrapper.as_mut();
         let _ = shim.objects_mut().id();
 
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _inner_install =
-                unsafe { StoreContext::install(shim.as_store_mut().inner as *mut _) };
+            let inner_entry = unsafe { StoreContext::new(shim.as_store_mut().inner as *mut _) };
+            let _inner_install = unsafe { inner_entry.install() };
             let mut inner_wrapper = unsafe { StoreContext::get_current(id) };
             let _ = inner_wrapper.as_mut().objects_mut().id();
             panic!("host function panicked");
@@ -458,7 +476,26 @@ mod unwinding {
     use crate::{AsStoreMut, Store};
 
     fn active_borrows() -> u32 {
-        STORE_CONTEXT_STACK.with(|cell| cell.borrow().last().unwrap().borrow_count)
+        with_top(|top| top_entry(top).unwrap().borrow_count.get())
+    }
+
+    /// What an async import checks before its guest waits: a borrow of the
+    /// active entry that is still held shows.
+    #[cfg(all(feature = "sys", feature = "experimental-async"))]
+    #[test]
+    fn a_live_borrow_of_the_active_entry_shows() {
+        assert!(StoreContext::top_is_unborrowed());
+        let mut store = Store::default();
+        let id = store.id();
+        let mut caller = store.as_store_mut();
+        let entry = unsafe { StoreContext::new(caller.as_store_mut().inner as *mut _) };
+        let install = unsafe { entry.install() };
+        assert!(StoreContext::top_is_unborrowed());
+        let wrapper = unsafe { StoreContext::get_current(id) };
+        assert!(!StoreContext::top_is_unborrowed());
+        drop(wrapper);
+        assert!(StoreContext::top_is_unborrowed());
+        drop(install);
     }
 
     /// A host function that catches a panic from a guest it called finds the
@@ -468,13 +505,15 @@ mod unwinding {
         let mut store = Store::default();
         let id = store.id();
         let mut caller = store.as_store_mut();
-        let install = unsafe { StoreContext::install(caller.as_store_mut().inner as *mut _) };
+        let entry = unsafe { StoreContext::new(caller.as_store_mut().inner as *mut _) };
+        let install = unsafe { entry.install() };
         let mut wrapper = unsafe { StoreContext::get_current(id) };
         assert_eq!(active_borrows(), 1);
         let mut shim = wrapper.as_mut();
 
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _inner = unsafe { StoreContext::install(shim.as_store_mut().inner as *mut _) };
+            let inner_entry = unsafe { StoreContext::new(shim.as_store_mut().inner as *mut _) };
+            let _inner = unsafe { inner_entry.install() };
             let _inner_wrapper = unsafe { StoreContext::get_current(id) };
             assert_eq!(active_borrows(), 1);
             panic!("host function panicked");
@@ -485,6 +524,36 @@ mod unwinding {
         drop(wrapper);
         assert_eq!(active_borrows(), 0);
         drop(install);
+    }
+
+    /// Frames that an unwind skips without running their destructors, as a
+    /// JavaScript exception does, leave their entries installed and their
+    /// borrows counted. The checkpoint taken before them puts the top back,
+    /// so nothing points at those entries once their frames are gone.
+    #[test]
+    fn a_checkpoint_drops_the_entries_of_skipped_frames() {
+        let mut store = Store::default();
+        let id = store.id();
+        let mut caller = store.as_store_mut();
+        let entry = unsafe { StoreContext::new(caller.as_store_mut().inner as *mut _) };
+        let install = unsafe { entry.install() };
+        let checkpoint = StoreContext::checkpoint();
+        {
+            // A host function that calls back into the guest, skipped.
+            let mut wrapper = unsafe { StoreContext::get_current(id) };
+            let mut shim = wrapper.as_mut();
+            let inner_entry = unsafe { StoreContext::new(shim.as_store_mut().inner as *mut _) };
+            std::mem::forget(unsafe { inner_entry.install() });
+            std::mem::forget(unsafe { StoreContext::get_current(id) });
+            std::mem::forget(wrapper);
+        }
+        StoreContext::restore_checkpoint(checkpoint);
+        assert_eq!(active_borrows(), 0);
+        let lent = StoreContext::try_get_current_unborrowed().expect("the outer entry is on top");
+        assert_eq!(active_borrows(), 1);
+        drop(lent);
+        drop(install);
+        assert!(StoreContext::try_get_current_unborrowed().is_none());
     }
 
     /// A store lent with `parked` is given out once.
@@ -500,58 +569,5 @@ mod unwinding {
             assert!(StoreContext::try_get_lent(id).is_some());
         });
         assert!(StoreContext::try_get_lent(id).is_none());
-    }
-}
-
-/// What a `call_async` switch does with the entries of its coroutine.
-#[cfg(all(test, feature = "sys", feature = "experimental-async"))]
-mod suspended {
-    use super::*;
-    use crate::{AsStoreMut, Store};
-
-    fn depth() -> usize {
-        STORE_CONTEXT_STACK.with(|cell| cell.borrow().len())
-    }
-
-    #[test]
-    fn a_suspended_call_takes_its_entry_with_it() {
-        let mut store = Store::default();
-        let id = store.id();
-        let ptr: *mut StoreInner = store.as_store_mut().inner;
-        let mut saved = Vec::new();
-
-        let base = StoreContext::resume_entries(&mut saved, Some(ptr));
-        assert!(!StoreContext::can_suspend(base), "nothing entered yet");
-        let guard = unsafe { StoreContext::install(ptr) };
-        assert!(StoreContext::can_suspend(base));
-        StoreContext::suspend_entries(&mut saved, base);
-        assert_eq!((depth(), saved.len()), (base, 1));
-
-        // Another store runs meanwhile, and the call resumes on top of it.
-        let mut other = Store::default();
-        let other_ptr: *mut StoreInner = other.as_store_mut().inner;
-        let other_guard = unsafe { StoreContext::install(other_ptr) };
-        let base = StoreContext::resume_entries(&mut saved, Some(ptr));
-        assert_eq!(depth(), base + 1);
-        assert_eq!(unsafe { StoreContext::get_current_transient(id) }, ptr);
-        drop(guard);
-        StoreContext::suspend_entries(&mut saved, base);
-        assert!(saved.is_empty());
-        drop(other_guard);
-    }
-
-    /// A synchronous call made by a host frame cannot be suspended.
-    #[test]
-    fn only_the_calls_own_entry_can_suspend() {
-        let mut store = Store::default();
-        let ptr: *mut StoreInner = store.as_store_mut().inner;
-        let base = StoreContext::resume_entries(&mut Vec::new(), None);
-        let outer = unsafe { StoreContext::install(ptr) };
-        assert!(StoreContext::can_suspend(base));
-        let nested = unsafe { StoreContext::install(ptr) };
-        assert!(!StoreContext::can_suspend(base));
-        drop(nested);
-        assert!(StoreContext::can_suspend(base));
-        drop(outer);
     }
 }

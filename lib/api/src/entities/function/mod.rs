@@ -17,13 +17,19 @@ pub use call_wrapper::{CallWrapper, WasmCall};
 pub(crate) mod async_call;
 #[cfg(feature = "experimental-async")]
 pub(crate) mod async_host;
+#[cfg(feature = "experimental-async")]
+pub(crate) mod deferred;
 #[doc(hidden)]
 #[cfg(feature = "experimental-async")]
 pub use async_call::AsyncCallRequest;
 #[cfg(feature = "experimental-async")]
 pub use async_call::{AsyncCall, AsyncCallStore};
 #[cfg(feature = "experimental-async")]
-pub use async_host::{AsyncEnv, AsyncHostFunction};
+pub use async_host::{
+    AsyncDynamicHostFunction, AsyncEnv, AsyncHostFunction, ReturnsDeferred, ReturnsFuture,
+};
+#[cfg(feature = "experimental-async")]
+pub use deferred::Deferred;
 
 use wasmer_types::{FunctionType, RawValue};
 
@@ -168,12 +174,20 @@ impl Function {
     /// If you know the signature of the host function at compile time,
     /// consider using [`Self::new_typed_async`] for less runtime overhead.
     ///
+    /// The function takes `&mut AsyncEnv<T>` and the arguments of a call as
+    /// [`Value`]s, and is one of two kinds:
+    ///
+    /// - an `async` function that returns `Result<Vec<Value>, RuntimeError>`;
+    /// - a function that returns a [`Deferred`] of that: the results at once,
+    ///   or a future for them. See [`Self::new_typed_async`]; a dynamic
+    ///   function is called through a future either way.
+    ///
     /// The function reaches the store with [`AsyncEnv::with`]. Called through
     /// [`Function::call_async`], it may wait. Called synchronously, it must be
     /// ready at once, or the guest traps with `YieldOutsideAsyncContext`; on
     /// `js` it traps there either way.
     #[cfg(feature = "experimental-async")]
-    pub fn new_async<T, FT, F>(
+    pub fn new_async<T, FT, F, Kind>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
         ty: FT,
@@ -182,39 +196,50 @@ impl Function {
     where
         T: Send + 'static,
         FT: Into<FunctionType>,
-        F: for<'e> AsyncFn(&'e mut AsyncEnv<T>, &'e [Value]) -> Result<Vec<Value>, RuntimeError>
-            + 'static,
+        F: AsyncDynamicHostFunction<T, Kind>,
     {
         let func = std::rc::Rc::new(func);
-        let body = move |mut cx: AsyncEnv<T>, values: Vec<Value>| -> async_host::HostFuture {
+        let body = move |mut cx: AsyncEnv<T>, values: Vec<Value>| {
             let func = std::rc::Rc::clone(&func);
-            Box::pin(async move {
-                let func: &F = &func;
-                func(&mut cx, &values).await
-            })
+            async move { func.invoke(&mut cx, &values).await }
         };
         Self(BackendFunction::new_async(store, env, ty, body))
     }
 
-    /// Creates a new async host `Function` from a typed async function.
+    /// Creates a new async host `Function` from a typed function.
     ///
-    /// The function takes `&mut AsyncEnv<T>` and its Wasm arguments, and
-    /// returns the results, or any type that implements
-    /// [`IntoResult`](crate::IntoResult) for them, such as `Result<Rets, E>`.
+    /// The function takes `&mut AsyncEnv<T>` and its Wasm arguments, and is
+    /// one of two kinds:
+    ///
+    /// - an `async` function, whose call is the future it returns. It returns
+    ///   the results, or any type that implements
+    ///   [`IntoResult`](crate::IntoResult) for them, such as
+    ///   `Result<Rets, E>`.
+    /// - a function that returns a [`Deferred`] of those: the results at
+    ///   once ([`Deferred::ready`]), or a future for them
+    ///   ([`Deferred::pending`]).
+    ///
+    /// Either reaches the store with [`AsyncEnv::with`], and holds none of it
+    /// in between.
+    ///
+    /// An `async` function pays for being able to wait on every call. On
+    /// `sys`, a call of the other kind that returns [`Deferred::ready`] makes
+    /// no future, and costs what a call of a sync host function costs. On
+    /// the other backends that function is called as an `async` one, whose
+    /// future is ready at once.
     #[cfg(feature = "experimental-async")]
-    pub fn new_typed_async<T, Args, Rets>(
+    pub fn new_typed_async<T, Args, Rets, Kind>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
-        func: impl AsyncHostFunction<T, Args, Rets>,
+        func: impl AsyncHostFunction<T, Args, Rets, Kind>,
     ) -> Self
     where
         T: Send + 'static,
         Args: WasmTypeList + 'static,
         Rets: WasmTypeList + 'static,
+        Kind: 'static,
     {
-        let ty = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
-        let body = async_host::typed_host_body::<T, _, Args, Rets>(func, ty.clone());
-        Self(BackendFunction::new_async(store, env, ty, body))
+        Self(BackendFunction::new_typed_async(store, env, func))
     }
 
     /// Returns the [`FunctionType`] of the `Function`.
@@ -387,9 +412,9 @@ impl Function {
     /// host code, and leaves the instance usable with partial guest state, as
     /// a trap does.
     ///
-    /// On `sys`, the coroutine has a fixed stack of 1 MiB, on which the host
-    /// functions the guest calls run. Host futures are polled on the
-    /// executor's stack. On `js`, the engine suspends the guest's stack
+    /// On `sys`, the guest runs on a Wasm stack of its own, which an async
+    /// import suspends. Host functions and host futures run on the stack of
+    /// whoever polls the call. On `js`, the engine suspends the guest's stack
     /// (JSPI) and runs the call: after its first poll it makes progress
     /// whether or not it is polled again, host futures run on the microtask
     /// queue, an async import never works for a guest that was entered
@@ -526,6 +551,62 @@ impl Function {
     /// Checks whether this `Function` can be used with the given store.
     pub fn is_from_store(&self, store: &impl AsStoreRef) -> bool {
         self.0.is_from_store(store)
+    }
+
+    /// With `false`, lets calls from Wasm to this host function run on the
+    /// Wasm stack they come from; with `true`, makes every call run on the
+    /// native stack again, as it does by default.
+    ///
+    /// On the `sys` backend a call from Wasm switches from the Wasm stack to
+    /// the native stack to run its host function, and back. A typed
+    /// synchronous host function (made with [`Self::new_typed`] or
+    /// [`Self::new_typed_with_env`]) set to `false` here instead runs on the
+    /// Wasm stack when enough of that stack is left
+    /// (`wasmer::sys::vm::HOST_CALL_RESERVE`, 256 KiB), which saves switching
+    /// stacks, and switches otherwise. The reserve is all the stack it is sure
+    /// to have there: a host function that may need more must stay on the
+    /// native stack, since one that overflows the Wasm stack aborts the
+    /// process. The setting applies from the next call on, including calls
+    /// through instances that already import the function.
+    ///
+    /// Two more kinds of host function must stay on the native stack, however
+    /// little stack they use:
+    ///
+    /// - One that runs code which compares the stack pointer with the bounds
+    ///   of the thread's stack: the stack guard and the conservative stack
+    ///   scanning of a JavaScript engine such as V8, Go called through cgo,
+    ///   or the `stacker` and `psm` crates. The Wasm stack is a mapping of
+    ///   its own, far from the thread's stack, so such code finds the stack
+    ///   pointer outside the bounds it knows.
+    /// - One that calls C or C++ built without stack probes
+    ///   (`-fstack-clash-protection`). The Wasm stack has a single guard
+    ///   page, which a frame larger than a page can step over without
+    ///   touching, into the mapping beneath it, instead of faulting.
+    ///
+    /// Dynamic and asynchronous host functions always run on the native
+    /// stack, and other backends always run host functions on their own
+    /// stack: there, and for a function defined in Wasm, this does nothing.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use wasmer::{Function, Store};
+    /// # let mut store = Store::default();
+    /// #
+    /// let light = Function::new_typed(&mut store, |x: i32| x + 1);
+    /// light.set_calls_on_native_stack(&mut store, false);
+    /// ```
+    pub fn set_calls_on_native_stack(&self, store: &mut impl AsStoreMut, always: bool) {
+        self.0.set_calls_on_native_stack(store, always)
+    }
+
+    /// Whether every call from Wasm to this host function runs on the native
+    /// stack: unless it is a typed synchronous host function that was set not
+    /// to with [`Self::set_calls_on_native_stack`]. Always `false` on backends
+    /// that have no Wasm stacks of their own, and for a function defined in
+    /// Wasm.
+    pub fn calls_on_native_stack(&self, store: &impl AsStoreRef) -> bool {
+        self.0.calls_on_native_stack(store)
     }
 
     pub(crate) fn to_vm_extern(&self) -> VMExtern {

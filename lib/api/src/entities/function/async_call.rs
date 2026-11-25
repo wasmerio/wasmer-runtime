@@ -7,9 +7,11 @@ use std::{
     task::{Context, Poll},
 };
 
+use wasmer_types::RawValue;
+
 use crate::{
     AsStoreMut, AsyncEnv, BackendFunction, CallStore, Function, RuntimeError, SharedStore,
-    StoreInner, StoreMut, Value, WasmTypeList,
+    StoreInner, StoreMut, Value, WasmTypeList, WithSlice,
 };
 
 /// The future of every async call.
@@ -19,13 +21,32 @@ use crate::{
 /// without running guest or host code.
 #[must_use = "an async call does nothing until it is polled"]
 pub struct AsyncCall<'a, R> {
-    inner: Pin<Box<dyn Future<Output = R> + 'a>>,
+    inner: Inner<'a, R>,
+}
+
+// The larger variant is the one that is there not to be boxed.
+#[allow(clippy::large_enum_variant)]
+enum Inner<'a, R> {
+    Boxed(Pin<Box<dyn Future<Output = R> + 'a>>),
+    /// A typed call on the native backend, which keeps nothing on the heap.
+    #[cfg(feature = "sys")]
+    Typed(sys::TypedCall<'a, R>),
+}
+
+#[cfg(feature = "sys")]
+mod sys {
+    pub(super) use crate::backend::sys::{
+        async_runtime::{AsyncCallFuture, Converted, Typed},
+        entities::function::{Function, RawValues},
+    };
+
+    pub(super) type TypedCall<'a, R> = AsyncCallFuture<'a, Typed<R>>;
 }
 
 impl<'a, R> AsyncCall<'a, R> {
     pub(crate) fn new(future: impl Future<Output = R> + 'a) -> Self {
         Self {
-            inner: Box::pin(future),
+            inner: Inner::Boxed(Box::pin(future)),
         }
     }
 }
@@ -33,8 +54,13 @@ impl<'a, R> AsyncCall<'a, R> {
 impl<R> Future for AsyncCall<'_, R> {
     type Output = R;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
-        self.inner.as_mut().poll(cx)
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
+        // Safety: the call is not moved out of its variant.
+        match unsafe { &mut self.get_unchecked_mut().inner } {
+            Inner::Boxed(call) => call.as_mut().poll(cx),
+            #[cfg(feature = "sys")]
+            Inner::Typed(call) => unsafe { Pin::new_unchecked(call) }.poll(cx),
+        }
     }
 }
 
@@ -44,8 +70,9 @@ impl<R> std::fmt::Debug for AsyncCall<'_, R> {
     }
 }
 
-type CallParams = Box<dyn FnOnce(&mut StoreMut<'_>) -> Result<Vec<Value>, RuntimeError>>;
-type CallFinish<X> = Box<dyn FnOnce(&mut StoreMut<'_>, &[Value]) -> Result<X, RuntimeError>>;
+pub(crate) type CallParams = Box<dyn FnOnce(&mut StoreMut<'_>) -> Result<Vec<Value>, RuntimeError>>;
+pub(crate) type CallFinish<X> =
+    Box<dyn FnOnce(&mut StoreMut<'_>, &[Value]) -> Result<X, RuntimeError>>;
 
 /// What a typed or dynamic call needs its backend to run.
 ///
@@ -70,19 +97,30 @@ impl AsyncCallRequest<Box<[Value]>> {
 }
 
 impl<X> AsyncCallRequest<X> {
-    pub(crate) fn typed(
+    /// A typed call, whose arguments `args` makes as raw values.
+    pub(crate) fn typed<A: AsRef<[RawValue]>>(
         function: Function,
-        params: impl FnOnce(&mut StoreMut<'_>) -> Vec<Value> + 'static,
+        args: impl FnOnce(&mut StoreMut<'_>) -> Result<A, RuntimeError> + 'static,
     ) -> Self
     where
         X: WasmTypeList,
     {
-        let ty_source = function.clone();
+        let params_source = function.clone();
+        let results_source = function.clone();
         Self {
             function,
-            params: Box::new(move |store| Ok(params(store))),
+            params: Box::new(move |store| {
+                let args = args(store)?;
+                let ty = params_source.ty(store);
+                let params = args.as_ref().iter().zip(ty.params());
+                // Safety: each raw value was made from an argument of this
+                // function's parameter type.
+                Ok(params
+                    .map(|(raw, ty)| unsafe { Value::from_raw(store, *ty, *raw) })
+                    .collect())
+            }),
             finish: Box::new(move |store, results| {
-                let ty = ty_source.ty(store);
+                let ty = results_source.ty(store);
                 convert_results::<X>(store, ty.results(), results)
             }),
         }
@@ -139,6 +177,21 @@ pub trait AsyncCallStore: sealed::Sealed {
         &'a mut self,
         request: AsyncCallRequest<X>,
     ) -> Self::Call<'a, Result<X, RuntimeError>>;
+
+    /// Starts a typed call of `function`, whose arguments `args` makes as raw
+    /// values. A store that can be reached now makes them now.
+    #[doc(hidden)]
+    fn start_typed_call<'a, A, Rets>(
+        &'a mut self,
+        function: &Function,
+        args: impl FnOnce(&mut StoreMut<'_>) -> Result<A, RuntimeError> + 'static,
+    ) -> Self::Call<'a, Result<Rets, RuntimeError>>
+    where
+        A: AsRef<[RawValue]>,
+        Rets: WasmTypeList + 'static,
+    {
+        self.start_call(AsyncCallRequest::typed(function.clone(), args))
+    }
 }
 
 impl<S: AsStoreMut> AsyncCallStore for S {
@@ -151,20 +204,42 @@ impl<S: AsStoreMut> AsyncCallStore for S {
         &'a mut self,
         request: AsyncCallRequest<X>,
     ) -> AsyncCall<'a, Result<X, RuntimeError>> {
-        // `AsStoreMut` is a public trait, and a later call could return
-        // another store: the pointer is derived here, once, and `'a` keeps
-        // the borrow it comes from alive and unreachable.
-        let store: StoreMut<'a> = self.as_store_mut();
-        let id = store.inner.objects.id();
-        let ptr: *mut StoreInner = store.inner;
-        start(
-            CallStore::Exclusive {
-                id,
-                ptr,
-                _borrow: PhantomData,
-            },
-            request,
-        )
+        start(exclusive(self.as_store_mut()), request)
+    }
+
+    fn start_typed_call<'a, A, Rets>(
+        &'a mut self,
+        function: &Function,
+        args: impl FnOnce(&mut StoreMut<'_>) -> Result<A, RuntimeError> + 'static,
+    ) -> AsyncCall<'a, Result<Rets, RuntimeError>>
+    where
+        A: AsRef<[RawValue]>,
+        Rets: WasmTypeList + 'static,
+    {
+        match &function.0 {
+            #[cfg(feature = "sys")]
+            BackendFunction::Sys(sys) => {
+                let mut store: StoreMut<'a> = self.as_store_mut();
+                let args = args(&mut store);
+                typed(exclusive(store), sys, args)
+            }
+            #[allow(unreachable_patterns)]
+            _ => self.start_call(AsyncCallRequest::typed(function.clone(), args)),
+        }
+    }
+}
+
+/// The store of a call that holds `&'a mut` of it.
+fn exclusive<'a>(store: StoreMut<'a>) -> CallStore<'a> {
+    // `AsStoreMut` is a public trait, and a later call could return another
+    // store: the pointer is derived here, once, and `'a` keeps the borrow it
+    // comes from alive and unreachable.
+    let id = store.inner.objects.id();
+    let ptr: *mut StoreInner = store.inner;
+    CallStore::Exclusive {
+        id,
+        ptr,
+        _borrow: PhantomData,
     }
 }
 
@@ -185,6 +260,35 @@ impl<T> AsyncCallStore for AsyncEnv<T> {
             },
             request,
         )
+    }
+
+    fn start_typed_call<'a, A, Rets>(
+        &'a mut self,
+        function: &Function,
+        args: impl FnOnce(&mut StoreMut<'_>) -> Result<A, RuntimeError> + 'static,
+    ) -> AsyncCall<'a, Result<Rets, RuntimeError>>
+    where
+        A: AsRef<[RawValue]>,
+        Rets: WasmTypeList + 'static,
+    {
+        // Where the store is in reach, the arguments are made now: the host
+        // function that makes the call is being polled, and holds no slice.
+        // Elsewhere, in a destructor or inside a slice, they are left for
+        // the first poll of the call, as those of a dynamic call are.
+        #[cfg(feature = "sys")]
+        if let BackendFunction::Sys(sys) = &function.0
+            && let Some(slice) = WithSlice::enter_if_in_reach(self.store_id())
+        {
+            // Safety: the slice is the only holder of the store.
+            let args = args(&mut unsafe { StoreMut::from_raw(slice.ptr()) });
+            drop(slice);
+            let store = CallStore::Env {
+                id: self.store_id(),
+                _borrow: PhantomData,
+            };
+            return typed(store, sys, args);
+        }
+        self.start_call(AsyncCallRequest::typed(function.clone(), args))
     }
 }
 
@@ -208,9 +312,11 @@ fn start<'a, X: 'static>(
 ) -> AsyncCall<'a, Result<X, RuntimeError>> {
     match &request.function.0 {
         #[cfg(feature = "sys")]
-        BackendFunction::Sys(_) => AsyncCall::new(
-            crate::backend::sys::async_runtime::AsyncCallFuture::new(store, request),
-        ),
+        BackendFunction::Sys(_) => AsyncCall::new(sys::AsyncCallFuture::new(
+            store,
+            sys::Converted::new(request),
+            sys::RawValues::new(),
+        )),
         #[cfg(feature = "v8")]
         BackendFunction::V8(_) => {
             AsyncCall::new(crate::backend::v8::async_call::call(store, request))
@@ -218,6 +324,45 @@ fn start<'a, X: 'static>(
         #[cfg(feature = "js")]
         BackendFunction::Js(_) => AsyncCall::new(crate::backend::js::jspi::call(store, request)),
     }
+}
+
+/// A typed call of a native function, whose arguments are raw values already:
+/// its future is the call itself, with nothing on the heap.
+#[cfg(feature = "sys")]
+fn typed<'a, A: AsRef<[RawValue]>, Rets: WasmTypeList + 'static>(
+    store: CallStore<'a>,
+    function: &sys::Function,
+    args: Result<A, RuntimeError>,
+) -> AsyncCall<'a, Result<Rets, RuntimeError>> {
+    let (values, refused) = match args {
+        Ok(args) => {
+            // With room for the results, which the trampoline writes over them.
+            let args = args.as_ref();
+            let mut values = sys::RawValues::from_slice(args);
+            values.resize(args.len().max(Rets::size() as usize), RawValue { i32: 0 });
+            (values, None)
+        }
+        Err(refused) => (sys::RawValues::new(), Some(refused)),
+    };
+    let entry = sys::Typed::new(function.clone(), refused, typed_results::<Rets>);
+    AsyncCall {
+        inner: Inner::Typed(sys::AsyncCallFuture::new(store, entry, values)),
+    }
+}
+
+/// Reads the typed results of a guest that returned from its values, of which
+/// they are the first.
+#[cfg(feature = "sys")]
+fn typed_results<Rets: WasmTypeList>(
+    outcome: Result<(&mut StoreMut<'_>, &[RawValue]), RuntimeError>,
+) -> Result<Rets, RuntimeError> {
+    let (store, values) = outcome?;
+    let mut array = Rets::empty_array();
+    let results = array.as_mut();
+    results.copy_from_slice(&values[..results.len()]);
+    // Safety: the function has the results of its `TypedFunction`, which the
+    // trampoline wrote over the first values.
+    Ok(unsafe { Rets::from_array(store, array) })
 }
 
 /// The misuses the type contract rejects at compile time.

@@ -11,6 +11,7 @@ use std::{
     cell::Cell,
     marker::PhantomData,
     mem::ManuallyDrop,
+    ptr,
     rc::{Rc, Weak},
 };
 
@@ -61,12 +62,27 @@ thread_local! {
     static POLL_STORE: Cell<Option<PollStore>> = const { Cell::new(None) };
 }
 
-/// What a slice panics with when its shared store is already in one.
-const ALREADY_IN_A_SLICE: &str = "the shared store is already running a slice on this thread";
+/// Where this thread's store is published, for a guard that takes it and
+/// puts it back to look it up once.
+///
+/// The pointer is valid for as long as the thread runs: the thread-local has
+/// no destructor. A guard that keeps it holds a pointer to its store as well,
+/// so it is not `Send`, and it is dropped before the poll it was made in
+/// returns: it never leaves the thread.
+///
+/// This is `LocalKey::with`, written with `try_with`, which is `#[inline]`
+/// where `with` is not (see `with_top` in `context.rs`).
+#[inline]
+fn published() -> *const Cell<Option<PollStore>> {
+    POLL_STORE
+        .try_with(ptr::from_ref)
+        .expect("the published store of a thread was used during or after its destruction")
+}
 
 impl PollStore {
     /// The store for a poll made by a synchronous entry, whose host frame
     /// holds `ptr` for as long as the poll runs.
+    #[inline]
     pub(crate) fn exclusive(id: StoreId, ptr: *mut StoreInner) -> Self {
         Self {
             id,
@@ -78,12 +94,17 @@ impl PollStore {
     ///
     /// # Panics
     /// Panics if a shared store is already in a slice.
+    #[inline]
     pub(crate) fn enter_slice(self) -> StoreSlice {
-        self.try_enter_slice().expect(ALREADY_IN_A_SLICE)
+        match self.try_enter_slice() {
+            Some(slice) => slice,
+            None => slice_is_running(),
+        }
     }
 
     /// [`Self::enter_slice`], or `None` if a shared store is already in a
     /// slice. That slice goes on holding the store.
+    #[inline]
     pub(crate) fn try_enter_slice(self) -> Option<StoreSlice> {
         match self.access {
             StoreAccess::Exclusive(ptr) => Some(StoreSlice { ptr, shared: None }),
@@ -168,6 +189,7 @@ impl StoreSlice {
 }
 
 impl Drop for StoreSlice {
+    #[inline]
     fn drop(&mut self) {
         if let Some(state) = self.shared {
             // Safety: see `PollStore::enter_slice`.
@@ -180,19 +202,27 @@ impl Drop for StoreSlice {
 /// its host future.
 pub(crate) struct PollScope {
     previous: Option<PollStore>,
+    /// See [`published`].
+    published: *const Cell<Option<PollStore>>,
 }
 
 impl PollScope {
+    #[inline]
     pub(crate) fn enter(store: Option<PollStore>) -> Self {
+        let published = published();
         Self {
-            previous: POLL_STORE.replace(store),
+            // Safety: see `published`.
+            previous: unsafe { &*published }.replace(store),
+            published,
         }
     }
 }
 
 impl Drop for PollScope {
+    #[inline]
     fn drop(&mut self) {
-        POLL_STORE.set(self.previous);
+        // Safety: see `published`.
+        unsafe { &*self.published }.set(self.previous);
     }
 }
 
@@ -201,14 +231,55 @@ impl Drop for PollScope {
 pub(crate) struct WithSlice {
     slice: ManuallyDrop<StoreSlice>,
     poll: PollStore,
+    /// See [`published`].
+    published: *const Cell<Option<PollStore>>,
+}
+
+/// The panics of a slice. Out of line, so that the slice of an
+/// `AsyncEnv::with`, which is all that most host futures do with the store,
+/// is small enough to be inlined into it.
+#[cold]
+#[inline(never)]
+fn not_published() -> ! {
+    panic!(
+        "AsyncEnv::with can only be used while its host function is being polled, \
+         and not inside another `with`"
+    )
+}
+
+#[cold]
+#[inline(never)]
+fn published_for_another_store() -> ! {
+    panic!("AsyncEnv::with was used during a poll of another store's call")
+}
+
+#[cold]
+#[inline(never)]
+fn slice_is_running() -> ! {
+    panic!("the shared store is already running a slice on this thread")
+}
+
+/// The panic of a task of a shared store that is polled where a slice holds
+/// its store, and the store is not published for that poll.
+#[cold]
+#[inline(never)]
+fn polled_in_a_slice() -> ! {
+    panic!(
+        "a task of a shared store was polled from inside a slice of that store; an \
+         executor whose waker polls inline must defer that poll"
+    )
 }
 
 impl WithSlice {
     /// # Panics
     /// Panics unless the call being polled is on the store `id`, and if that
     /// store is a shared one that is already in a slice.
+    #[inline]
     pub(crate) fn enter(id: StoreId) -> Self {
-        Self::try_enter(id).expect(ALREADY_IN_A_SLICE)
+        match Self::try_enter(id) {
+            Some(slice) => slice,
+            None => slice_is_running(),
+        }
     }
 
     /// [`Self::enter`], or `None` if the store is a shared one that is
@@ -216,37 +287,69 @@ impl WithSlice {
     ///
     /// # Panics
     /// Panics unless the call being polled is on the store `id`.
+    #[inline]
     pub(crate) fn try_enter(id: StoreId) -> Option<Self> {
-        let Some(poll) = POLL_STORE.take() else {
-            panic!(
-                "AsyncEnv::with can only be used while its host function is being polled, \
-                 and not inside another `with`"
-            );
+        let published = published();
+        // Safety: see `published`.
+        let cell = unsafe { &*published };
+        let Some(poll) = cell.take() else {
+            not_published()
         };
+        // The published store is put back before a panic: it is not this
+        // slice's to keep.
         if poll.id != id {
-            POLL_STORE.set(Some(poll));
-            panic!("AsyncEnv::with was used during a poll of another store's call");
+            cell.set(Some(poll));
+            published_for_another_store()
         }
         let Some(slice) = poll.try_enter_slice() else {
-            POLL_STORE.set(Some(poll));
+            cell.set(Some(poll));
             return None;
         };
         Some(Self {
             slice: ManuallyDrop::new(slice),
             poll,
+            published,
         })
     }
 
+    /// [`Self::try_enter`], or `None` where that panics as well: unless the
+    /// call being polled is on the store `id`. What is published stays as it
+    /// was.
+    #[inline]
+    pub(crate) fn enter_if_in_reach(id: StoreId) -> Option<Self> {
+        let published = published();
+        // Safety: see `published`.
+        let cell = unsafe { &*published };
+        let poll = cell.take()?;
+        let slice = if poll.id == id {
+            poll.try_enter_slice()
+        } else {
+            None
+        };
+        let Some(slice) = slice else {
+            cell.set(Some(poll));
+            return None;
+        };
+        Some(Self {
+            slice: ManuallyDrop::new(slice),
+            poll,
+            published,
+        })
+    }
+
+    #[inline]
     pub(crate) fn ptr(&self) -> *mut StoreInner {
         self.slice.ptr()
     }
 }
 
 impl Drop for WithSlice {
+    #[inline]
     fn drop(&mut self) {
         // Safety: dropped once, here.
         unsafe { ManuallyDrop::drop(&mut self.slice) };
-        POLL_STORE.set(Some(self.poll));
+        // Safety: see `published`.
+        unsafe { &*self.published }.set(Some(self.poll));
     }
 }
 
@@ -285,11 +388,9 @@ impl CallStore<'_> {
     pub(crate) fn resolve(&self) -> PollStore {
         match self {
             Self::Shared(store) => {
-                assert!(
-                    !store.0.busy.get(),
-                    "a task of a shared store was polled from inside a slice of that \
-                     store; an executor whose waker polls inline must defer that poll"
-                );
+                if store.0.busy.get() {
+                    polled_in_a_slice()
+                }
                 store.poll_store()
             }
             _ => self.try_resolve().unwrap_or_else(|| {
@@ -301,6 +402,27 @@ impl CallStore<'_> {
         }
     }
 
+    /// [`Self::resolve`], for a backend that asks at every poll and keeps the
+    /// answer no longer than that poll.
+    ///
+    /// A task of a shared store that is polled where its store is lent (see
+    /// [`lent_under_a_guest`]) runs with the store that is published there,
+    /// as a call made with an `AsyncEnv` does. The task is polled by the host
+    /// function the store is published for, so the two do not overlap.
+    ///
+    /// # Panics
+    /// As [`Self::resolve`], unless the store is lent to the poll this one is
+    /// made in.
+    #[cfg(feature = "sys")]
+    pub(crate) fn resolve_in_reach(&self) -> PollStore {
+        match self {
+            Self::Shared(store) if store.0.busy.get() => {
+                lent_under_a_guest(store.0.id).unwrap_or_else(|| polled_in_a_slice())
+            }
+            _ => self.resolve(),
+        }
+    }
+
     /// The store for dropping a host future, if it can still be reached.
     pub(crate) fn try_resolve(&self) -> Option<PollStore> {
         match self {
@@ -309,6 +431,27 @@ impl CallStore<'_> {
             Self::Shared(store) => Some(store.poll_store()),
         }
     }
+}
+
+/// The store `id` as it is published for an async host function that is being
+/// polled under its own guest, if that guest is the one of a `call_async`.
+///
+/// On `sys` an async host function is polled for the first time where its
+/// guest called it, while the guest still has its slice of the store, and the
+/// store is published for the host function alone. The store is busy there,
+/// though the host function would find it free in every later poll, which its
+/// call makes with no slice held. So a handle of a shared store is let in
+/// where the `AsyncEnv` of the host function is: through what is published,
+/// which has one holder at a time.
+///
+/// A guest that was entered synchronously lends nothing: the host frame that
+/// entered it holds the store, as it does for a synchronous host function.
+#[cfg(feature = "sys")]
+fn lent_under_a_guest(id: StoreId) -> Option<PollStore> {
+    POLL_STORE
+        .get()
+        .filter(|poll| poll.id == id && poll.is_exclusive())
+        .filter(|_| crate::backend::sys::async_runtime::guest_can_wait_here())
 }
 
 /// The state behind every handle of a [`SharedStore`].
@@ -361,15 +504,19 @@ impl Drop for SharedState {
 ///   callback of an embedded engine, uses a handle inside
 ///   [`FunctionEnvMut::release`](crate::FunctionEnvMut::release). A guest
 ///   entered from a synchronous host function cannot wait. An async one
-///   passes its [`AsyncEnv`](crate::AsyncEnv) to `call_async`.
+///   passes its [`AsyncEnv`](crate::AsyncEnv) to `call_async`, and holds no
+///   store between its slices: code it reaches through such frames asks for
+///   the store with
+///   [`AsyncEnv::with_if_in_reach`](crate::AsyncEnv::with_if_in_reach).
 /// - **A guest can end while calls are still on the native stack.** Until
 ///   they return, the frames below hold the store: `try_with` fails with
 ///   [`StoreBusy`], and [`into_store`](Self::into_store) gives the handle
 ///   back. The error that ended the guest unwinds the calls innermost first,
 ///   and each host function goes on with its own borrow. A task that waits
-///   has no host frame on its stack, so it can be dropped at any point, also
-///   from inside one of those calls: its host future is dropped first, and
-///   its guest is then discarded without running. A destructor that needs
+///   has no frame of a host function on its stack, so it can be dropped at
+///   any point, also from inside one of those calls: its host future is
+///   dropped first, and its guest is then discarded without running. A
+///   destructor that needs
 ///   the store uses a handle and `try_with`, because
 ///   [`AsyncEnv::with`](crate::AsyncEnv::with) panics in another slice of the
 ///   store. On `StoreBusy` it leaves its work for the owning thread to run
@@ -378,14 +525,15 @@ impl Drop for SharedState {
 ///   is dropped, and a [`WeakSharedStore`] no longer upgrades once the store
 ///   is dropped.
 ///
-/// Host code always runs on the owning thread, but not always on that
-/// thread's own stack. A guest entered with `call` runs its host functions on
-/// the stack that entered it, and one entered with `call_async` runs them on
-/// the stack of that call, a 1 MiB mapping. Bindings that need the thread's
-/// own stack are entered through `try_with`.
+/// Host code always runs on the owning thread, and on the stack of whoever
+/// entered the guest: the caller of `call`, or whoever polls the future of a
+/// `call_async`. The exception is a typed host function set to run on the
+/// Wasm stack with
+/// [`Function::set_calls_on_native_stack`](crate::Function::set_calls_on_native_stack),
+/// which bindings that need the thread's own stack must not be.
 ///
-/// The owning thread drops its tasks before it exits. A task dropped while
-/// the thread's locals are destroyed is forgotten, with its stack.
+/// A task that still waits when the owning thread exits is dropped like any
+/// other: its host future is dropped, and its guest's stack is reset.
 ///
 /// The thread that owns the store, serving a request of another thread:
 ///
@@ -476,8 +624,25 @@ impl SharedStore {
     ///
     /// Fails at once if the store is busy, because there is nothing to wait
     /// for. Inside [`FunctionEnvMut::release`](crate::FunctionEnvMut::release)
-    /// the store is lent to this call.
+    /// the store is lent to this call. On `sys` it is lent as well where an
+    /// async host function is polled under its own guest, if a
+    /// [`call_async`](crate::Function::call_async) runs that guest: this
+    /// takes the store there as [`AsyncEnv::with`](crate::AsyncEnv::with)
+    /// does, one holder at a time.
     pub fn try_with<R>(&self, f: impl FnOnce(StoreMut<'_>) -> R) -> Result<R, StoreBusy> {
+        #[cfg(feature = "sys")]
+        if self.0.busy.get()
+            && lent_under_a_guest(self.0.id).is_some()
+            && let Some(slice) = WithSlice::enter_if_in_reach(self.0.id)
+        {
+            // Safety: the slice is the only holder of the store until it
+            // drops: it took what was published, as the slice of an
+            // `AsyncEnv` does.
+            return Ok(self
+                .0
+                .keeper
+                .holding(slice, |slice| f(unsafe { StoreMut::from_raw(slice.ptr()) })));
+        }
         if self.is_held() {
             let lent = StoreContext::try_get_lent(self.0.id).ok_or(StoreBusy)?;
             return Ok(self.0.keeper.holding(lent, |lent| f(lent.as_mut())));
@@ -653,6 +818,49 @@ mod tests {
         drop(slice);
         assert!(is_published());
         assert_eq!(shared.try_with(|store| *env.as_ref(&store)), Ok(4));
+    }
+
+    /// A slice asked for where the store may be out of reach, as
+    /// `AsyncEnv::with_if_in_reach` asks: there is none unless the store is
+    /// published and free, and asking changes nothing.
+    #[test]
+    fn a_slice_is_only_in_reach_of_a_poll_of_its_store() {
+        let mut store = sys_store();
+        let env = FunctionEnv::new(&mut store, 1i32);
+        let shared = store.into_shared();
+        let id = shared.0.id;
+        let other = sys_store().into_shared();
+
+        // No call is being polled.
+        assert!(WithSlice::enter_if_in_reach(id).is_none());
+        assert!(!is_published());
+
+        // A call of another store is.
+        {
+            let _scope = PollScope::enter(Some(other.poll_store()));
+            assert!(WithSlice::enter_if_in_reach(id).is_none());
+            assert!(WithSlice::enter_if_in_reach(other.0.id).is_some());
+            assert!(is_published());
+        }
+
+        let _scope = PollScope::enter(Some(shared.poll_store()));
+        // The store is in a slice already.
+        shared
+            .try_with(|mut outer| {
+                assert!(WithSlice::enter_if_in_reach(id).is_none());
+                assert!(is_published());
+                *env.as_mut(&mut outer) += 1;
+            })
+            .unwrap();
+
+        let slice = WithSlice::enter_if_in_reach(id).expect("the store is in reach");
+        // This slice hides the store, and a running guest does as well.
+        assert!(WithSlice::enter_if_in_reach(id).is_none());
+        let mut inner = unsafe { StoreMut::from_raw(slice.ptr()) };
+        *env.as_mut(&mut inner) += 1;
+        drop(slice);
+        assert!(is_published());
+        assert_eq!(shared.try_with(|store| *env.as_ref(&store)), Ok(3));
     }
 
     /// A slice is given back when its closure panics.
