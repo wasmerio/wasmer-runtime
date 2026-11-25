@@ -315,6 +315,7 @@ fn start<'a, X: 'static>(
         BackendFunction::Sys(_) => AsyncCall::new(sys::AsyncCallFuture::new(
             store,
             sys::Converted::new(request),
+            sys::RawValues::new(),
         )),
         #[cfg(feature = "v8")]
         BackendFunction::V8(_) => {
@@ -333,16 +334,19 @@ fn typed<'a, A: AsRef<[RawValue]>, Rets: WasmTypeList + 'static>(
     function: &sys::Function,
     args: Result<A, RuntimeError>,
 ) -> AsyncCall<'a, Result<Rets, RuntimeError>> {
-    let values = args.map(|args| {
-        // With room for the results, which the trampoline writes over them.
-        let args = args.as_ref();
-        let mut values = sys::RawValues::from_slice(args);
-        values.resize(args.len().max(Rets::size() as usize), RawValue { i32: 0 });
-        values
-    });
-    let entry = sys::Typed::new(function.clone(), values, typed_results::<Rets>);
+    let (values, refused) = match args {
+        Ok(args) => {
+            // With room for the results, which the trampoline writes over them.
+            let args = args.as_ref();
+            let mut values = sys::RawValues::from_slice(args);
+            values.resize(args.len().max(Rets::size() as usize), RawValue { i32: 0 });
+            (values, None)
+        }
+        Err(refused) => (sys::RawValues::new(), Some(refused)),
+    };
+    let entry = sys::Typed::new(function.clone(), refused, typed_results::<Rets>);
     AsyncCall {
-        inner: Inner::Typed(sys::AsyncCallFuture::new(store, entry)),
+        inner: Inner::Typed(sys::AsyncCallFuture::new(store, entry, values)),
     }
 }
 
