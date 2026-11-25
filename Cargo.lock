@@ -639,7 +639,7 @@ dependencies = [
 [[package]]
 name = "cranelift-assembler-x64"
 version = "0.139.0-dev"
-source = "git+https://github.com/marxin/wasmtime?rev=8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2#8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2"
+source = "git+https://github.com/marxin/wasmtime?rev=ee0b427c78fed451026e8c7b137522027fcd0c18#ee0b427c78fed451026e8c7b137522027fcd0c18"
 dependencies = [
  "cranelift-assembler-x64-meta 0.139.0-dev",
 ]
@@ -656,7 +656,7 @@ dependencies = [
 [[package]]
 name = "cranelift-assembler-x64-meta"
 version = "0.139.0-dev"
-source = "git+https://github.com/marxin/wasmtime?rev=8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2#8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2"
+source = "git+https://github.com/marxin/wasmtime?rev=ee0b427c78fed451026e8c7b137522027fcd0c18#ee0b427c78fed451026e8c7b137522027fcd0c18"
 dependencies = [
  "cranelift-srcgen 0.139.0-dev",
 ]
@@ -674,7 +674,7 @@ dependencies = [
 [[package]]
 name = "cranelift-bforest"
 version = "0.139.0-dev"
-source = "git+https://github.com/marxin/wasmtime?rev=8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2#8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2"
+source = "git+https://github.com/marxin/wasmtime?rev=ee0b427c78fed451026e8c7b137522027fcd0c18#ee0b427c78fed451026e8c7b137522027fcd0c18"
 dependencies = [
  "cranelift-entity 0.139.0-dev",
  "wasmtime-internal-core 52.0.0-dev",
@@ -694,7 +694,7 @@ dependencies = [
 [[package]]
 name = "cranelift-bitset"
 version = "0.139.0-dev"
-source = "git+https://github.com/marxin/wasmtime?rev=8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2#8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2"
+source = "git+https://github.com/marxin/wasmtime?rev=ee0b427c78fed451026e8c7b137522027fcd0c18#ee0b427c78fed451026e8c7b137522027fcd0c18"
 dependencies = [
  "serde",
  "serde_derive",
@@ -735,7 +735,7 @@ dependencies = [
 [[package]]
 name = "cranelift-codegen"
 version = "0.139.0-dev"
-source = "git+https://github.com/marxin/wasmtime?rev=8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2#8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2"
+source = "git+https://github.com/marxin/wasmtime?rev=ee0b427c78fed451026e8c7b137522027fcd0c18#ee0b427c78fed451026e8c7b137522027fcd0c18"
 dependencies = [
  "bumpalo",
  "cranelift-assembler-x64 0.139.0-dev",
@@ -776,7 +776,7 @@ dependencies = [
 [[package]]
 name = "cranelift-codegen-meta"
 version = "0.139.0-dev"
-source = "git+https://github.com/marxin/wasmtime?rev=8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2#8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2"
+source = "git+https://github.com/marxin/wasmtime?rev=ee0b427c78fed451026e8c7b137522027fcd0c18#ee0b427c78fed451026e8c7b137522027fcd0c18"
 dependencies = [
  "cranelift-assembler-x64-meta 0.139.0-dev",
  "cranelift-codegen-shared 0.139.0-dev",
@@ -794,7 +794,7 @@ checksum = "6116ab06dc15034ee1b4e3124371acb6742c189b438040837aeb0cfcf790e356"
 [[package]]
 name = "cranelift-codegen-shared"
 version = "0.139.0-dev"
-source = "git+https://github.com/marxin/wasmtime?rev=8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2#8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2"
+source = "git+https://github.com/marxin/wasmtime?rev=ee0b427c78fed451026e8c7b137522027fcd0c18#ee0b427c78fed451026e8c7b137522027fcd0c18"
 
 [[package]]
 name = "cranelift-control"
@@ -808,7 +808,7 @@ dependencies = [
 [[package]]
 name = "cranelift-control"
 version = "0.139.0-dev"
-source = "git+https://github.com/marxin/wasmtime?rev=8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2#8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2"
+source = "git+https://github.com/marxin/wasmtime?rev=ee0b427c78fed451026e8c7b137522027fcd0c18#ee0b427c78fed451026e8c7b137522027fcd0c18"
 dependencies = [
  "arbitrary",
 ]
@@ -828,7 +828,7 @@ dependencies = [
 [[package]]
 name = "cranelift-entity"
 version = "0.139.0-dev"
-source = "git+https://github.com/marxin/wasmtime?rev=8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2#8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2"
+source = "git+https://github.com/marxin/wasmtime?rev=ee0b427c78fed451026e8c7b137522027fcd0c18#ee0b427c78fed451026e8c7b137522027fcd0c18"
 dependencies = [
  "cranelift-bitset 0.139.0-dev",
  "serde",
@@ -852,7 +852,7 @@ dependencies = [
 [[package]]
 name = "cranelift-frontend"
 version = "0.139.0-dev"
-source = "git+https://github.com/marxin/wasmtime?rev=8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2#8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2"
+source = "git+https://github.com/marxin/wasmtime?rev=ee0b427c78fed451026e8c7b137522027fcd0c18#ee0b427c78fed451026e8c7b137522027fcd0c18"
 dependencies = [
  "cranelift-codegen 0.139.0-dev",
  "hashbrown 0.17.2",
@@ -869,7 +869,7 @@ checksum = "ff643d297ee16c7a8a6aba6bf526b610879635275ec14e7ee75b94f0b46e9514"
 [[package]]
 name = "cranelift-isle"
 version = "0.139.0-dev"
-source = "git+https://github.com/marxin/wasmtime?rev=8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2#8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2"
+source = "git+https://github.com/marxin/wasmtime?rev=ee0b427c78fed451026e8c7b137522027fcd0c18#ee0b427c78fed451026e8c7b137522027fcd0c18"
 
 [[package]]
 name = "cranelift-native"
@@ -892,7 +892,7 @@ checksum = "e30dff68753c0933cb30eb445d75d6b3cdcc0f7f0121b9c5aaabbe4a8315617d"
 [[package]]
 name = "cranelift-srcgen"
 version = "0.139.0-dev"
-source = "git+https://github.com/marxin/wasmtime?rev=8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2#8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2"
+source = "git+https://github.com/marxin/wasmtime?rev=ee0b427c78fed451026e8c7b137522027fcd0c18#ee0b427c78fed451026e8c7b137522027fcd0c18"
 
 [[package]]
 name = "crc32fast"
@@ -2974,7 +2974,7 @@ dependencies = [
 [[package]]
 name = "pulley-interpreter"
 version = "52.0.0-dev"
-source = "git+https://github.com/marxin/wasmtime?rev=8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2#8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2"
+source = "git+https://github.com/marxin/wasmtime?rev=ee0b427c78fed451026e8c7b137522027fcd0c18#ee0b427c78fed451026e8c7b137522027fcd0c18"
 dependencies = [
  "cranelift-bitset 0.139.0-dev",
 ]
@@ -5156,7 +5156,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-core"
 version = "52.0.0-dev"
-source = "git+https://github.com/marxin/wasmtime?rev=8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2#8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2"
+source = "git+https://github.com/marxin/wasmtime?rev=ee0b427c78fed451026e8c7b137522027fcd0c18#ee0b427c78fed451026e8c7b137522027fcd0c18"
 dependencies = [
  "hashbrown 0.17.2",
  "libm",
