@@ -7,11 +7,15 @@ fn build_v8() {
         sync::{LazyLock, Mutex},
     };
 
-    const WEE8_RELEASE_VERSION: &str = "11.9.7";
+    const WEE8_RELEASE_VERSION: &str = "15.9.111.2";
     const V8_ARTIFACT_DIR: &str = "WASMER_V8_ARTIFACT_DIR";
 
+    // `cfg!(target_os)` is the host in a build script, so the target comes
+    // from Cargo's environment.
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+
     let (asset_name, platform_name) = match (
-        env::var("CARGO_CFG_TARGET_OS").unwrap().as_str(),
+        target_os.as_str(),
         env::var("CARGO_CFG_TARGET_ARCH").unwrap().as_str(),
         env::var("CARGO_CFG_TARGET_ENV")
             .unwrap_or_default()
@@ -19,7 +23,6 @@ fn build_v8() {
     ) {
         ("macos", "aarch64", _) => ("v8-darwin-aarch64.tar.xz", "darwin-aarch64"),
         ("linux", "x86_64", "gnu") => ("v8-linux-amd64.tar.xz", "linux-amd64"),
-        ("linux", "x86_64", "musl") => ("v8-linux-musl.tar.xz", "linux-musl"),
         ("windows", "x86_64", _) => ("v8-windows-amd64.tar.xz", "windows-amd64"),
         ("android", "aarch64", _) => ("v8-android-arm64.tar.xz", "android-arm64"),
         (os, arch, _) => panic!("target os + arch combination not supported: {os}, {arch}"),
@@ -34,7 +37,7 @@ fn build_v8() {
         .join(WEE8_RELEASE_VERSION)
         .join(platform_name);
     let archive_path = cache_dir.join(asset_name);
-    let library_name = if cfg!(target_os = "windows") {
+    let library_name = if target_os == "windows" {
         "v8.lib"
     } else {
         "libv8.a"
@@ -73,7 +76,7 @@ fn build_v8() {
 
         if !archive_path.exists() {
             let url = format!(
-                "https://github.com/wasmerio/wee8-custom-builds/releases/download/{WEE8_RELEASE_VERSION}/{asset_name}"
+                "https://github.com/wasmerio/v8-custom-builds/releases/download/{WEE8_RELEASE_VERSION}/{asset_name}"
             );
             let tar_data = ureq::get(&url)
                 .call()
@@ -151,7 +154,7 @@ fn build_v8() {
 
     let header_path = v8_header_path.join("wasm.h");
     let mut args = vec![];
-    if cfg!(target_os = "macos") {
+    if target_os == "macos" {
         args.push("-I/usr/local/include");
         args.push("-I/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include/c++/v1");
         args.push("-I/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include");
@@ -197,9 +200,8 @@ fn build_v8() {
         .expect("cannot lock WEE8_RENAMED")
         .iter()
         .map(|(old, new)| {
-            // A bit hacky: we need a way to figure out if we're going to target a Mach-O
-            // library or an ELF one to take care of the "_" in front of symbols.
-            if cfg!(any(target_os = "macos", target_os = "ios")) {
+            // Mach-O symbols have a "_" in front; ELF and COFF x86_64 ones do not.
+            if matches!(target_os.as_str(), "macos" | "ios") {
                 format!("--redefine-sym=_{old}={new}")
             } else {
                 format!("--redefine-sym={old}={new}")
@@ -225,9 +227,9 @@ fn build_v8() {
     println!("cargo:rustc-link-lib=static=v8prefixed");
 
     // Static link dependencies must follow the archive that references them.
-    if cfg!(any(target_os = "linux",)) {
+    if target_os == "linux" {
         println!("cargo:rustc-link-lib=stdc++");
-    } else if cfg!(target_os = "windows") {
+    } else if target_os == "windows" {
         println!("cargo:rustc-link-lib=winmm");
         println!("cargo:rustc-link-lib=dbghelp");
         println!("cargo:rustc-link-lib=shlwapi");
