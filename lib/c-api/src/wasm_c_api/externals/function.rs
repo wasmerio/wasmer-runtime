@@ -56,26 +56,13 @@ fn callback_args_to_wasm(args: &[Value], store: &StoreRef) -> Result<wasm_val_ve
     Ok(vals.into())
 }
 
-/// Convert the C `wasm_val_t`s produced by a host callback of `store` back
-/// into [`Value`]s.
-fn callback_results_to_values(
-    results: Vec<wasm_val_t>,
-    store: &StoreRef,
-) -> Result<Vec<Value>, RuntimeError> {
-    let values = results
+/// Convert the C `wasm_val_t`s produced by a host callback back into [`Value`]s.
+fn callback_results_to_values(results: Vec<wasm_val_t>) -> Result<Vec<Value>, RuntimeError> {
+    results
         .into_iter()
         .map(Value::try_from)
         .collect::<Result<Vec<Value>, &'static str>>()
-        .map_err(RuntimeError::new)?;
-    // The Rust API hands a host function's results to the guest unchecked, so
-    // a reference of another store has to be refused here.
-    let own = store
-        .with(|store| values.iter().all(|value| value.is_from_store(&store)))
-        .map_err(|busy| RuntimeError::new(busy.to_string()))?;
-    if !own {
-        return Err(RuntimeError::new("cross-`Store` values are not supported"));
-    }
-    Ok(values)
+        .map_err(RuntimeError::new)
 }
 
 /// Runs the C callback of a host function.
@@ -110,7 +97,7 @@ fn call_host_callback(
             return Err(trap.inner);
         }
 
-        callback_results_to_values(results.take(), &store)
+        callback_results_to_values(results.take())
     })
 }
 
@@ -589,6 +576,80 @@ mod tests {
                 wasm_func_delete(leak);
                 wasm_functype_delete(leak_type);
                 wasm_foreign_delete(foreign);
+                wasm_store_delete(other_store);
+                wasm_store_delete(store);
+                wasm_engine_delete(engine);
+
+                return 0;
+            }
+        })
+        .success();
+    }
+
+    #[allow(
+        unexpected_cfgs,
+        reason = "tools like cargo-llvm-coverage pass --cfg coverage"
+    )]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    #[test]
+    fn test_host_function_returning_a_function_of_another_store_traps() {
+        (assert_c! {
+            #include "tests/wasmer.h"
+
+            static wasm_func_t* foreign;
+
+            wasm_trap_t* nothing(const wasm_val_vec_t* arguments, wasm_val_vec_t* results) {
+                (void) arguments;
+                (void) results;
+
+                return NULL;
+            }
+
+            // Returns a function that is not of the store this one is in.
+            wasm_trap_t* leak_callback(
+                const wasm_val_vec_t* arguments,
+                wasm_val_vec_t* results
+            ) {
+                (void) arguments;
+
+                wasm_val_t value = {.kind = WASM_FUNCREF, .of = {.ref = wasm_func_as_ref(foreign)}};
+                results->data[0] = value;
+
+                return NULL;
+            }
+
+            int main() {
+                wasm_engine_t* engine = wasm_engine_new();
+                wasm_store_t* store = wasm_store_new(engine);
+                wasm_store_t* other_store = wasm_store_new(engine);
+
+                wasm_functype_t* nothing_type = wasm_functype_new_0_0();
+                foreign = wasm_func_new(other_store, nothing_type, nothing);
+                assert(foreign);
+
+                wasm_functype_t* leak_type = wasm_functype_new_0_1(wasm_valtype_new_funcref());
+                wasm_func_t* leak = wasm_func_new(store, leak_type, leak_callback);
+                assert(leak);
+
+                wasm_val_t results[1] = { WASM_INIT_VAL };
+                wasm_val_vec_t arguments_as_array = WASM_EMPTY_VEC;
+                wasm_val_vec_t results_as_array = WASM_ARRAY_VEC(results);
+
+                wasm_trap_t* trap = wasm_func_call(leak, &arguments_as_array, &results_as_array);
+
+                assert(trap != NULL);
+                assert(results[0].of.ref == NULL);
+
+                wasm_message_t message;
+                wasm_trap_message(trap, &message);
+                assert(strstr(message.data, "values are not supported") != NULL);
+
+                wasm_byte_vec_delete(&message);
+                wasm_trap_delete(trap);
+                wasm_func_delete(leak);
+                wasm_functype_delete(leak_type);
+                wasm_func_delete(foreign);
+                wasm_functype_delete(nothing_type);
                 wasm_store_delete(other_store);
                 wasm_store_delete(store);
                 wasm_engine_delete(engine);

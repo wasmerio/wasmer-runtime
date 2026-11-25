@@ -41,13 +41,15 @@ fn instantiate(
     #[allow(unused_variables)] imports: &[Option<Box<wasm_extern_t>>],
     externs: &[Extern],
 ) -> Result<Instance, Box<InstantiationError>> {
-    // The Rust API refuses an import of another store as well, but only after
-    // the import origins would have been handed one.
-    if externs.iter().any(|value| !value.is_from_store(store)) {
-        return Err(Box::new(InstantiationError::DifferentStores));
-    }
+    // The Rust API refuses an import of another store below, but that is
+    // after the import origins would have been handed its memory.
     #[cfg(feature = "extensions")]
-    prebind_memory(store, imports, externs);
+    {
+        if externs.iter().any(|value| !value.is_from_store(store)) {
+            return Err(Box::new(InstantiationError::DifferentStores));
+        }
+        prebind_memory(store, imports, externs);
+    }
     Instance::new_by_index(store, module, externs).map_err(Box::new)
 }
 
@@ -340,6 +342,81 @@ mod tests {
             wasm_store_delete(Some(store));
             wasm_engine_delete(Some(engine));
         }
+    }
+
+    #[cfg(feature = "extensions")]
+    #[test]
+    fn import_origin_is_not_given_a_memory_of_another_store() {
+        use super::wasm_instance_new;
+        use crate::error::take_last_error;
+        use crate::wasm_c_api::{
+            engine::wasm_engine_new,
+            externals::{ExternOrigin, wasm_extern_t, wasm_extern_vec_t},
+            module::wasm_module_t,
+            store::wasm_store_new,
+        };
+        use std::{
+            rc::Rc,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+        };
+        use wasmer_api::{
+            Extern, Function, InstantiationError, Memory, MemoryType, Module, StoreMut,
+        };
+
+        struct Origin(Arc<AtomicBool>);
+        impl ExternOrigin for Origin {
+            fn prebind_memory(&self, _: &mut StoreMut<'_>, _: &Memory) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let engine = wasm_engine_new();
+        let mut store = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "env" "function" (func))
+                (import "env" "memory" (memory 1)))"#,
+        )
+        .unwrap();
+        let (module, function) = store
+            .inner
+            .with_mut(|mut raw| {
+                let module = Module::new(&raw, wasm).unwrap();
+                (module, Function::new_typed(&mut raw, || {}))
+            })
+            .unwrap();
+        let module = wasm_module_t { inner: module };
+        let other_store = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
+        let other_memory = other_store
+            .inner
+            .with_mut(|mut raw| Memory::new(&mut raw, MemoryType::new(1, None, false)))
+            .unwrap()
+            .unwrap();
+
+        let given = Arc::new(AtomicBool::new(false));
+        let mut import = wasm_extern_t::new(store.inner.clone(), Extern::Function(function));
+        import.origin = Some(Rc::new(Origin(given.clone())));
+        let imports: wasm_extern_vec_t = vec![
+            Some(Box::new(import)),
+            Some(Box::new(wasm_extern_t::new(
+                other_store.inner.clone(),
+                Extern::Memory(other_memory),
+            ))),
+        ]
+        .into();
+
+        let instance =
+            unsafe { wasm_instance_new(Some(&mut store), Some(&module), Some(&imports), None) };
+
+        assert!(instance.is_none());
+        assert_eq!(
+            take_last_error(),
+            Some(InstantiationError::DifferentStores.to_string())
+        );
+        assert!(!given.load(Ordering::SeqCst));
     }
 
     #[allow(
