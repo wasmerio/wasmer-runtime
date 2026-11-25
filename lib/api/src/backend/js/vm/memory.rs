@@ -132,6 +132,12 @@ impl TryFrom<VMMemory> for VMSharedMemory {
     }
 }
 impl VMSharedMemory {
+    /// The memory on the current worker, or `None` if it was never delivered
+    /// there.
+    pub fn local_memory(&self) -> Option<JsMemory> {
+        self.memory.get()
+    }
+
     /// Fails if the memory was never delivered to the current worker.
     pub fn try_attach(self) -> Result<VMMemory, MemoryError> {
         let memory = self.memory.get().ok_or_else(|| {
@@ -150,6 +156,7 @@ impl VMSharedMemory {
 #[cfg(test)]
 mod tests {
     use super::{VMMemory, VMSharedMemory};
+    use crate::js::JsSharedMemoryExt;
     use crate::{Memory, MemoryError, MemoryType, Pages, Store};
     use wasm_bindgen_test::wasm_bindgen_test;
 
@@ -182,7 +189,9 @@ mod tests {
         let mut store = Store::default();
         let source = Memory::new(&mut store, MemoryType::new(1, Some(4), true)).unwrap();
         let shared = source.as_shared(&store).unwrap();
+        assert!(shared.local_js_memory().is_some());
         crate::js::utils::shared_handle::forget_local_objects();
+        assert!(shared.local_js_memory().is_none());
         assert!(matches!(
             shared.try_attach(&mut store),
             Err(MemoryError::Generic(_))

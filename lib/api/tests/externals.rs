@@ -122,6 +122,154 @@ fn table_get() -> Result<(), String> {
     Ok(())
 }
 
+/// The message of the error `result` is.
+fn error_message<T>(result: Result<T, RuntimeError>) -> String {
+    result.err().expect("an error").message()
+}
+
+#[engine_test]
+fn table_get_typed_function() -> Result<(), String> {
+    let mut store = Store::default();
+    let wat = r#"(module
+  (table (export "table") 3 funcref)
+  (func $nullary)
+  (func $double (param i32) (result i32) (i32.mul (local.get 0) (i32.const 2)))
+  (elem (i32.const 0) $nullary $double))"#;
+    let module = Module::new(&store, wat).map_err(|e| format!("{e:?}"))?;
+    let instance =
+        Instance::new(&mut store, &module, &imports! {}).map_err(|e| format!("{e:?}"))?;
+    let table = instance
+        .exports
+        .get_table("table")
+        .map_err(|e| format!("{e:?}"))?;
+
+    // A function that takes and returns nothing.
+    let nullary: TypedFunction<(), ()> = table
+        .get_typed_function(&mut store, 0)
+        .map_err(|e| format!("{e:?}"))?;
+    nullary.call(&mut store).map_err(|e| format!("{e:?}"))?;
+
+    // A function of another signature.
+    let double: TypedFunction<i32, i32> = table
+        .get_typed_function(&mut store, 1)
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(double.call(&mut store, 21).unwrap(), 42);
+
+    // Neither is given with a signature that is not its own.
+    let mismatch = "don't match the actual types";
+    let arguments = error_message(table.get_typed_function::<i32, i32>(&mut store, 0));
+    assert!(arguments.contains(mismatch), "{arguments}");
+    let arguments = error_message(table.get_typed_function::<(), i32>(&mut store, 1));
+    assert!(arguments.contains(mismatch), "{arguments}");
+    let results = error_message(table.get_typed_function::<i32, ()>(&mut store, 1));
+    assert!(results.contains(mismatch), "{results}");
+    let both = error_message(table.get_typed_function::<(), ()>(&mut store, 1));
+    assert!(both.contains(mismatch), "{both}");
+
+    // A null element, and indices past the end of the table.
+    let null = error_message(table.get_typed_function::<(), ()>(&mut store, 2));
+    assert!(null.contains("is null"), "{null}");
+    for index in [3, u32::MAX] {
+        let outside = error_message(table.get_typed_function::<(), ()>(&mut store, index));
+        assert!(outside.contains("out of bounds"), "{outside}");
+    }
+
+    Ok(())
+}
+
+#[engine_test]
+#[cfg_attr(
+    feature = "v8-default",
+    ignore = "extern refs are not supported by the default v8 backend"
+)]
+fn table_get_typed_function_needs_a_table_of_functions() -> Result<(), String> {
+    let mut store = Store::default();
+    let ty = TableType::new(Type::ExternRef, 1, None);
+    let table = Table::new(&mut store, ty, Value::ExternRef(None)).map_err(|e| format!("{e:?}"))?;
+
+    let message = error_message(table.get_typed_function::<(), ()>(&mut store, 0));
+    assert!(message.contains("does not hold functions"), "{message}");
+
+    Ok(())
+}
+
+/// JavaScript does not tell the signature of a WebAssembly function. Wasmer
+/// knows the ones of a module's element segments, and not the ones of what a
+/// guest stores in a table as it runs.
+#[cfg(feature = "js")]
+#[wasm_bindgen_test]
+fn js_table_get_typed_function_does_not_guess_a_signature() {
+    let mut store = Store::default();
+    let wat = r#"(module
+  (table (export "table") 4 funcref)
+  (func $nullary)
+  (func $double (param i32) (result i32) (i32.mul (local.get 0) (i32.const 2)))
+  (func $late_nullary)
+  (func $late_double (param i32) (result i32) (i32.mul (local.get 0) (i32.const 2)))
+  (elem (i32.const 0) $nullary $double)
+  (elem declare func $late_nullary $late_double)
+  (func (export "store_late")
+    (table.set 0 (i32.const 2) (ref.func $late_nullary))
+    (table.set 0 (i32.const 3) (ref.func $late_double))))"#;
+    let module = Module::new(&store, wat).unwrap();
+    let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
+    let table = instance.exports.get_table("table").unwrap();
+    let store_late = instance.exports.get_function("store_late").unwrap();
+    store_late.call(&mut store, &[]).unwrap();
+
+    let unknown = "is unknown";
+    for index in [2, 3] {
+        // Not even with the signature the function has.
+        let message = error_message(table.get_typed_function::<(), ()>(&mut store, index));
+        assert!(message.contains(unknown), "{message}");
+        let message = error_message(table.get_typed_function::<i32, i32>(&mut store, index));
+        assert!(message.contains(unknown), "{message}");
+
+        // `get` gives the function as a `() -> ()` one, whatever it is, which
+        // `typed` then takes its word for...
+        let Some(Value::FuncRef(Some(guessed))) = table.get(&mut store, index) else {
+            panic!("the table has no function at {index}");
+        };
+        assert_eq!(guessed.ty(&store), FunctionType::new([], []));
+        assert!(guessed.typed::<(), ()>(&store).is_ok());
+        // ... and that guess does not become the signature of the function.
+        let message = error_message(table.get_typed_function::<(), ()>(&mut store, index));
+        assert!(message.contains(unknown), "{message}");
+    }
+
+    // A function known to be a `() -> ()` one is told from those.
+    let nullary: TypedFunction<(), ()> = table.get_typed_function(&mut store, 0).unwrap();
+    nullary.call(&mut store).unwrap();
+    let double: TypedFunction<i32, i32> = table.get_typed_function(&mut store, 1).unwrap();
+    assert_eq!(double.call(&mut store, 21).unwrap(), 42);
+}
+
+/// A table of functions never holds a plain JavaScript function: the engine
+/// refuses one. In a table of references it is a value, not a function.
+#[cfg(feature = "js")]
+#[wasm_bindgen_test]
+fn js_table_get_typed_function_gives_no_plain_javascript_function() {
+    use wasm_bindgen::JsCast;
+    use wasmer::js::AsJs;
+
+    let mut store = Store::default();
+    let plain: js_sys::Function = js_sys::Object::new().constructor();
+
+    let ty = TableType::new(Type::FuncRef, 1, None);
+    let functions = Table::new(&mut store, ty, Value::FuncRef(None)).unwrap();
+    let js_functions: js_sys::WebAssembly::Table = functions.as_jsvalue(&store).unchecked_into();
+    assert!(js_functions.set(0, &plain).is_err());
+    let message = error_message(functions.get_typed_function::<(), ()>(&mut store, 0));
+    assert!(message.contains("is null"), "{message}");
+
+    let ty = TableType::new(Type::ExternRef, 1, None);
+    let references = Table::new(&mut store, ty, Value::ExternRef(None)).unwrap();
+    let js_references: js_sys::WebAssembly::Table = references.as_jsvalue(&store).unchecked_into();
+    js_references.set_raw(0, &plain).unwrap();
+    let message = error_message(references.get_typed_function::<(), ()>(&mut store, 0));
+    assert!(message.contains("does not hold functions"), "{message}");
+}
+
 #[engine_test]
 #[cfg_attr(
     feature = "v8-default",
