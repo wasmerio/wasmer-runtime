@@ -1059,6 +1059,37 @@ impl WasmStack {
     }
 }
 
+/// Says on the standard error that host code running in place overflowed
+/// its Wasm stack, if `fault_address` is in the guard page of `stack`.
+///
+/// The fault is then left to the next signal handler, which does not know the
+/// stack of a coroutine: Rust's reports an overflow of the thread's own stack
+/// only, so the process would die of a bare `SIGSEGV` or `SIGBUS`. A frame
+/// that was not probed may fault further down than the guard page, which goes
+/// unreported.
+///
+/// Called from the signal handler: it only reads the stack's limit and makes
+/// one `write`.
+///
+/// # Safety
+///
+/// `stack` must be the Wasm stack that host code runs in place on.
+#[cfg(unix)]
+#[cold]
+unsafe fn report_host_stack_overflow(stack: NonNull<WasmStack>, fault_address: usize) {
+    const MESSAGE: &[u8] = b"\nwasmer: a host function set to run on the Wasm stack has \
+        overflowed that stack. Only `HOST_CALL_RESERVE` (256 KiB) of it is sure to be left for \
+        such a function: one that may need more must run on the native stack, as host functions \
+        do unless `Function::set_calls_on_native_stack(.., false)` is called on them.\n";
+    // Safety: the stack of the coroutine that is running.
+    let limit = unsafe { stack.as_ref() }.limit;
+    let guard_page = limit - region::page::size()..limit;
+    if guard_page.contains(&fault_address) {
+        // Safety: a valid buffer. Nothing can be done if the write fails.
+        unsafe { libc::write(libc::STDERR_FILENO, MESSAGE.as_ptr().cast(), MESSAGE.len()) };
+    }
+}
+
 /// The yielder of a Wasm stack: that of an entry coroutine (see
 /// [`EntrySlots`]) or of a [`SuspendedCall`].
 ///
@@ -1284,7 +1315,13 @@ impl TrapHandlerContext {
             // resetting the coroutine would skip its destructors. Host code
             // anywhere else runs on the native stack, which the context of
             // the coroutine tells from its own below.
-            if thread.stacks.in_place.get().is_some() {
+            if let Some(in_place) = thread.stacks.in_place.get() {
+                #[cfg(unix)]
+                if let Some(fault_address) = maybe_fault_address {
+                    report_host_stack_overflow(in_place, fault_address);
+                }
+                #[cfg(not(unix))]
+                let _ = in_place;
                 return false;
             }
 

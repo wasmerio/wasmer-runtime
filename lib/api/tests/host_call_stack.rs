@@ -419,6 +419,94 @@ fn a_call_async_from_a_host_function_in_place_starts_from_the_native_stack()
     Ok(())
 }
 
+/// Uses a stack frame of 1.5 MiB: more than the whole Wasm stack, and far
+/// less than the stack of the thread that runs the guest.
+#[inline(never)]
+fn use_1536_kib_of_stack() {
+    let mut frame = MaybeUninit::<[u8; 1536 * 1024]>::uninit();
+    black_box(frame.as_mut_ptr());
+}
+
+const OVERFLOW_ENV: &str = "WASMER_HOST_OVERFLOW_ON_NATIVE_STACK";
+const OVERFLOW_SURVIVED: &str = "the host function returned";
+
+/// The child of the test below, which does nothing unless that test started
+/// it: a shallow guest calls a host function that needs 1.5 MiB of stack, on
+/// a thread with 8 MiB.
+#[test]
+fn overflow_child() {
+    let Ok(on_native_stack) = std::env::var(OVERFLOW_ENV) else {
+        return;
+    };
+    let on_native_stack = on_native_stack == "true";
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let mut store = Store::default();
+            let module = Module::new(
+                &store,
+                r#"(module
+                    (import "host" "deep" (func $deep))
+                    (func (export "run") call $deep))"#,
+            )
+            .unwrap();
+            let deep = Function::new_typed(&mut store, use_1536_kib_of_stack);
+            deep.set_calls_on_native_stack(&mut store, on_native_stack);
+            let imports = imports! { "host" => { "deep" => deep } };
+            let instance = Instance::new(&mut store, &module, &imports).unwrap();
+            let run: TypedFunction<(), ()> =
+                instance.exports.get_typed_function(&store, "run").unwrap();
+            run.call(&mut store).unwrap();
+            println!("{OVERFLOW_SURVIVED}");
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+/// A host function set to run on the Wasm stack that needs more of it than
+/// is left kills the process, as one that overflows the native stack does.
+/// The next signal handler does not know the stack, so ours says what
+/// happened before the process dies of the fault. The process is this test
+/// binary, run again.
+#[cfg(unix)]
+#[test]
+fn a_host_function_that_overflows_the_wasm_stack_says_so() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let run = |on_native_stack: bool| {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "overflow_child",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(OVERFLOW_ENV, on_native_stack.to_string())
+            .output()
+            .unwrap()
+    };
+
+    // On the native stack the function has the room it needs.
+    let output = run(true);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{}", output.status);
+    assert!(stdout.contains(OVERFLOW_SURVIVED), "{stdout}");
+
+    let output = run(false);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.signal().is_some(),
+        "{}: {stderr}",
+        output.status
+    );
+    assert!(stderr.contains("set_calls_on_native_stack"), "{stderr}");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains(OVERFLOW_SURVIVED),
+        "the host function did not overflow the Wasm stack"
+    );
+}
+
 /// A host function's setting is read and changed without running Wasm, so
 /// that Miri can check it (`cargo +nightly miri test -p wasmer --test
 /// host_call_stack -- the_stack_setting`): the setting lives inside the
