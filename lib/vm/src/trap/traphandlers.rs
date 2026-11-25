@@ -98,6 +98,13 @@ pub fn get_stack_size() -> usize {
 /// overflows the Wasm stack aborts the process, as overflowing the native
 /// stack does.
 ///
+/// Having enough stack is not all it takes to run there. The Wasm stack is a
+/// mapping of its own with a single guard page, so a host function must also
+/// stay on the native stack if it runs code that checks the stack pointer
+/// against the bounds of the thread's stack (a JavaScript engine, Go through
+/// cgo, `stacker`), or code built without stack probes, whose frames can step
+/// over the guard page.
+///
 /// The space is measured from the lowest address of the Wasm stack, above its
 /// guard page.
 pub const HOST_CALL_RESERVE: usize = ByteSize::kib(256).as_u64() as usize;

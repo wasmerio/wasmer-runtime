@@ -569,6 +569,20 @@ impl Function {
     /// process. The setting applies from the next call on, including calls
     /// through instances that already import the function.
     ///
+    /// Two more kinds of host function must stay on the native stack, however
+    /// little stack they use:
+    ///
+    /// - One that runs code which compares the stack pointer with the bounds
+    ///   of the thread's stack: the stack guard and the conservative stack
+    ///   scanning of a JavaScript engine such as V8, Go called through cgo,
+    ///   or the `stacker` and `psm` crates. The Wasm stack is a mapping of
+    ///   its own, far from the thread's stack, so such code finds the stack
+    ///   pointer outside the bounds it knows.
+    /// - One that calls C or C++ built without stack probes
+    ///   (`-fstack-clash-protection`). The Wasm stack has a single guard
+    ///   page, which a frame larger than a page can step over without
+    ///   touching, into the mapping beneath it, instead of faulting.
+    ///
     /// Dynamic and asynchronous host functions always run on the native
     /// stack, and other backends always run host functions on their own
     /// stack: there, and for a function defined in Wasm, this does nothing.
