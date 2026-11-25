@@ -1,6 +1,5 @@
 //! Support for compiling with Cranelift.
 
-use crate::elf::UnwindKind;
 use crate::{
     address_map::get_function_address_map,
     config::{Cranelift, CraneliftOptLevel},
@@ -87,7 +86,6 @@ impl CraneliftCompiler {
             .isa(target)
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
         let frontend_config = isa.frontend_config();
-        let unwind = UnwindKind::for_isa(&*isa);
         let memory_styles = &compile_info.memory_styles;
         let table_styles = &compile_info.table_styles;
         let module = &compile_info.module;
@@ -243,7 +241,6 @@ impl CraneliftCompiler {
                 function_symbol,
                 func_relocs,
                 &source_map,
-                unwind,
                 &context,
             )?;
             Ok(CompileOutput {
@@ -333,9 +330,7 @@ impl CraneliftCompiler {
                     progress.notify_steps(WASM_TRAMPOLINE_ESTIMATED_BODY_SIZE)?;
                 }
                 Ok(CompileOutput {
-                    object: crate::elf::emit_dynamic_trampoline(
-                        &*isa, target, &kind, unwind, &context,
-                    )?,
+                    object: crate::elf::emit_dynamic_trampoline(&*isa, target, &kind, &context)?,
                     maximum_stack_usage: None,
                 })
             })

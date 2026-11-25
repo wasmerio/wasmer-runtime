@@ -4839,7 +4839,6 @@ dependencies = [
  "more-asserts",
  "object 0.41.0",
  "rayon",
- "regalloc2",
  "serde",
  "serde_derive",
  "smallvec",

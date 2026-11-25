@@ -4,18 +4,13 @@
 //! Wasm exception handling so that Wasmer's libunwind personalities can parse
 //! the tables without any runtime changes.
 
-use cranelift_codegen::{
-    ExceptionContextLoc, MachCallSiteItem, MachExceptionHandler, isa::unwind::UnwindInst,
-};
+use cranelift_codegen::{ExceptionContextLoc, MachCallSiteItem, MachExceptionHandler};
 use cranelift_entity::EntityRef;
 use itertools::Itertools;
+use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::io::{Cursor, Write};
-
-use object::write::{Relocation, SymbolId};
-use object::{RelocationEncoding, RelocationFlags, RelocationKind};
 
 /// Relocation information for an LSDA entry that references a tag constant.
 #[derive(Debug, Clone)]
@@ -218,183 +213,6 @@ pub fn build_function_lsda<'a>(
         bytes: writer.into_inner(),
         relocations,
     })
-}
-
-#[derive(Debug, Clone)]
-pub struct CompactUnwindEntryData {
-    pub function_length: u32,
-    pub compact_encoding: u32,
-    pub lsda_offset: Option<u32>,
-}
-
-/// Build the 64-bit Mach-O `__compact_unwind` section consumed by the
-/// runtime compact-unwind publisher.
-pub fn build_compact_unwind_section(
-    entries: impl IntoIterator<Item = CompactUnwindEntryData>,
-    function_symbol: SymbolId,
-    personality_symbol: Option<SymbolId>,
-    lsda_symbol: Option<SymbolId>,
-) -> Option<(Vec<u8>, Vec<Relocation>)> {
-    const ENTRY_SIZE: usize = 32;
-    const FUNCTION_ADDR_OFFSET: u32 = 0;
-    const PERSONALITY_ADDR_OFFSET: u32 = 16;
-    const LSDA_ADDR_OFFSET: u32 = 24;
-
-    let entries = entries.into_iter().collect::<Vec<_>>();
-    if entries.is_empty() {
-        return None;
-    }
-
-    let mut bytes = Vec::with_capacity(entries.len() * ENTRY_SIZE);
-    let mut relocations = Vec::new();
-    let flags = RelocationFlags::Generic {
-        kind: RelocationKind::Absolute,
-        encoding: RelocationEncoding::Generic,
-        size: 64,
-    };
-
-    for entry in entries {
-        let base = bytes.len() as u32;
-
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&entry.function_length.to_le_bytes());
-        bytes.extend_from_slice(&entry.compact_encoding.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-        bytes.extend_from_slice(&0u64.to_le_bytes());
-
-        relocations.push(Relocation {
-            flags,
-            symbol: function_symbol,
-            offset: u64::from(base + FUNCTION_ADDR_OFFSET),
-            addend: 0,
-        });
-        if let Some(symbol) = personality_symbol {
-            relocations.push(Relocation {
-                flags,
-                symbol,
-                offset: u64::from(base + PERSONALITY_ADDR_OFFSET),
-                addend: 0,
-            });
-        }
-
-        if let Some(lsda_offset) = entry.lsda_offset {
-            relocations.push(Relocation {
-                flags,
-                symbol: lsda_symbol.expect("LSDA symbol required for LSDA relocation"),
-                offset: u64::from(base + LSDA_ADDR_OFFSET),
-                addend: lsda_offset as i64,
-            });
-        }
-    }
-
-    Some((bytes, relocations))
-}
-
-// Constants are defined in compact_unwind_encoding.h file.
-const UNWIND_ARM64_MODE_FRAMELESS: u32 = 0x02000000;
-const UNWIND_ARM64_MODE_FRAME: u32 = 0x04000000;
-
-const UNWIND_ARM64_FRAMELESS_STACK_SIZE_SHIFT: u32 = 12;
-const UNWIND_ARM64_FRAME_X19_X20_PAIR: u32 = 0x00000001;
-const UNWIND_ARM64_FRAME_X21_X22_PAIR: u32 = 0x00000002;
-const UNWIND_ARM64_FRAME_X23_X24_PAIR: u32 = 0x00000004;
-const UNWIND_ARM64_FRAME_X25_X26_PAIR: u32 = 0x00000008;
-const UNWIND_ARM64_FRAME_X27_X28_PAIR: u32 = 0x00000010;
-const UNWIND_ARM64_FRAME_D8_D9_PAIR: u32 = 0x00000100;
-const UNWIND_ARM64_FRAME_D10_D11_PAIR: u32 = 0x00000200;
-const UNWIND_ARM64_FRAME_D12_D13_PAIR: u32 = 0x00000400;
-const UNWIND_ARM64_FRAME_D14_D15_PAIR: u32 = 0x00000800;
-
-const STACK_SIZE_UNIT: u32 = 16;
-
-pub fn compact_unwind_encoding_aarch64(unwind_info: &[(u32, UnwindInst)]) -> Result<u32, String> {
-    let mut has_frame = false;
-    let mut stack_size = 0u32;
-    let mut saved_int = HashSet::new();
-    let mut saved_float = HashSet::new();
-
-    for (_, inst) in unwind_info {
-        match inst {
-            UnwindInst::PushFrameRegs { .. } | UnwindInst::DefineNewFrame { .. } => {
-                has_frame = true;
-            }
-            UnwindInst::StackAlloc { size } => {
-                stack_size = stack_size
-                    .checked_add(*size)
-                    .ok_or_else(|| "aarch64 compact-unwind stack size overflow".to_string())?;
-            }
-            UnwindInst::SaveReg { reg, .. } => match reg.class() {
-                regalloc2::RegClass::Int => {
-                    saved_int.insert(reg.hw_enc());
-                }
-                regalloc2::RegClass::Float => {
-                    saved_float.insert(reg.hw_enc());
-                }
-                regalloc2::RegClass::Vector => {
-                    return Err(
-                        "aarch64 compact-unwind cannot encode vector register saves".to_owned()
-                    );
-                }
-            },
-            UnwindInst::RegStackOffset { .. } => {
-                return Err("aarch64 compact-unwind cannot encode RegStackOffset".to_owned());
-            }
-            UnwindInst::Aarch64SetPointerAuth { .. } => {}
-            UnwindInst::FrameRecordMoved { .. } => todo!(),
-        }
-    }
-
-    if !has_frame {
-        if !saved_int.is_empty() || !saved_float.is_empty() {
-            return Err("aarch64 frameless compact-unwind cannot encode saved registers".into());
-        }
-        if !stack_size.is_multiple_of(STACK_SIZE_UNIT) {
-            return Err("aarch64 compact-unwind stack size must be 16-byte aligned".into());
-        }
-        let stack_units = stack_size / STACK_SIZE_UNIT;
-        if stack_units > 0x0fff {
-            return Err("aarch64 compact-unwind stack size is too large".into());
-        }
-        return Ok(
-            UNWIND_ARM64_MODE_FRAMELESS | (stack_units << UNWIND_ARM64_FRAMELESS_STACK_SIZE_SHIFT)
-        );
-    }
-
-    let encode_saved_pair = |saved: &mut HashSet<_>, lo, hi, bit, class_name| match (
-        saved.remove(&lo),
-        saved.remove(&hi),
-    ) {
-        (false, false) => Ok(0),
-        (true, true) => Ok(bit),
-        _ => Err(format!(
-            "aarch64 compact-unwind cannot encode unpaired {class_name}{lo}/{class_name}{hi} save"
-        )),
-    };
-
-    let mut encoding = UNWIND_ARM64_MODE_FRAME;
-    for (lo, hi, bit) in [
-        (19, 20, UNWIND_ARM64_FRAME_X19_X20_PAIR),
-        (21, 22, UNWIND_ARM64_FRAME_X21_X22_PAIR),
-        (23, 24, UNWIND_ARM64_FRAME_X23_X24_PAIR),
-        (25, 26, UNWIND_ARM64_FRAME_X25_X26_PAIR),
-        (27, 28, UNWIND_ARM64_FRAME_X27_X28_PAIR),
-    ] {
-        encoding |= encode_saved_pair(&mut saved_int, lo, hi, bit, "x")?;
-    }
-    for (lo, hi, bit) in [
-        (8, 9, UNWIND_ARM64_FRAME_D8_D9_PAIR),
-        (10, 11, UNWIND_ARM64_FRAME_D10_D11_PAIR),
-        (12, 13, UNWIND_ARM64_FRAME_D12_D13_PAIR),
-        (14, 15, UNWIND_ARM64_FRAME_D14_D15_PAIR),
-    ] {
-        encoding |= encode_saved_pair(&mut saved_float, lo, hi, bit, "d")?;
-    }
-
-    if !saved_int.is_empty() || !saved_float.is_empty() {
-        return Err("aarch64 compact-unwind encountered unsupported saved register".to_owned());
-    }
-
-    Ok(encoding)
 }
 
 #[derive(Debug)]

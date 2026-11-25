@@ -11,7 +11,7 @@ use crate::elf::CompileOutput;
 use crate::misc::{CompiledFunctionExt, CompiledKind};
 use crate::progress::ProgressContext;
 use crate::types::{function::Compilation, module::CompileModuleInfo};
-use crate::{EH_FRAME_SECTION_NAME, get_object_for_target};
+use crate::{ELF_EH_FRAME_SECTION_NAME, get_object_for_target};
 use crate::{
     FunctionBodyData, ModuleTranslationState, WASMER_FUNCTION_OFFSETS_SECTION_NAME,
     WASMER_TRAP_FUNCTION_OFFSETS_SECTION_NAME, translator::ModuleMiddleware,
@@ -464,13 +464,16 @@ fn emit_wasmer_meta_object(
         };
     }
 
-    // Emit zero sentinel for the .eh_frame section.
-    let section_id = obj.add_section(
-        obj.segment_name(StandardSegment::Debug).to_vec(),
-        EH_FRAME_SECTION_NAME.to_vec(),
-        SectionKind::Other,
-    );
-    obj.append_section_data(section_id, &0u64.to_ne_bytes(), 4);
+    // ELF/libgcc registration requires a zero sentinel. Mach-O/libunwind
+    // registers individual FDEs from __TEXT,__eh_frame instead.
+    if obj.format() == object::BinaryFormat::Elf {
+        let section_id = obj.add_section(
+            obj.segment_name(StandardSegment::Debug).to_vec(),
+            ELF_EH_FRAME_SECTION_NAME.to_vec(),
+            SectionKind::Other,
+        );
+        obj.append_section_data(section_id, &0u64.to_ne_bytes(), 4);
+    }
 
     // Emit offsets of the functions
     let section_id = obj.add_section(
