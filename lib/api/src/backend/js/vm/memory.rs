@@ -156,6 +156,7 @@ impl VMSharedMemory {
 #[cfg(test)]
 mod tests {
     use super::{VMMemory, VMSharedMemory};
+    use crate::js::JsSharedMemoryExt;
     use crate::{Memory, MemoryError, MemoryType, Pages, Store};
     use wasm_bindgen_test::wasm_bindgen_test;
 

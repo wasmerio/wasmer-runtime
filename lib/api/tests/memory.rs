@@ -9,7 +9,10 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_test::*;
 use wasmer::{Instance, Memory, MemoryLocation, MemoryType, Module, Store, imports};
 #[cfg(feature = "js")]
-use wasmer::{MemoryAccessError, Value, js::AsJs};
+use wasmer::{
+    MemoryAccessError, Value,
+    js::{AsJs, JsSharedMemoryExt},
+};
 
 #[test]
 #[allow(unused_attributes)]

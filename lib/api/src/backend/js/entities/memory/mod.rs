@@ -251,7 +251,9 @@ impl From<crate::Memory> for Memory {
     }
 }
 
-impl crate::SharedMemory {
+/// The custom trait to access to all the `js` functions in the common
+/// `SharedMemory`.
+pub trait JsSharedMemoryExt {
     /// The `WebAssembly.Memory` behind this shared memory on the calling
     /// worker, without attaching it to a store.
     ///
@@ -264,6 +266,8 @@ impl crate::SharedMemory {
     ///
     /// ```ignore
     /// # use wasmer::{Memory, MemoryType, Store};
+    /// use wasmer::js::JsSharedMemoryExt;
+    ///
     /// # let mut store = Store::default();
     /// let memory = Memory::new(&mut store, MemoryType::new(1, Some(2), true)).unwrap();
     /// let shared = memory.as_shared(&store).unwrap();
@@ -271,7 +275,11 @@ impl crate::SharedMemory {
     /// // The same memory JavaScript sees: hand it to code that is not Wasmer's.
     /// let js_memory: js_sys::WebAssembly::Memory = shared.local_js_memory().unwrap();
     /// ```
-    pub fn local_js_memory(&self) -> Option<js_sys::WebAssembly::Memory> {
+    fn local_js_memory(&self) -> Option<js_sys::WebAssembly::Memory>;
+}
+
+impl JsSharedMemoryExt for SharedMemory {
+    fn local_js_memory(&self) -> Option<js_sys::WebAssembly::Memory> {
         match &self.memory {
             crate::vm::VMSharedMemory::Js(memory) => memory.local_memory(),
             #[allow(unreachable_patterns)]
