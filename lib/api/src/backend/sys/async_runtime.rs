@@ -2,12 +2,14 @@
 //! of its own, which an async import suspends.
 //!
 //! The stack is the one the VM runs every Wasm call on (see
-//! [`wasmer_vm::SuspendableCall`]). Host functions run on the stack of whoever
-//! polls the call, as in a synchronous call. When the guest calls an async
-//! import, the import polls its host future there once. If the future is not
-//! ready, the import suspends the guest's stack, which then holds guest frames
-//! only, and the future of the call polls the host future until it is ready,
-//! and resumes the guest with what it returned.
+//! [`wasmer_vm::wasmer_call_trampoline_suspendable`], and
+//! [`wasmer_vm::SuspendedCall`], which keeps it while the guest waits). Host
+//! functions run on the stack of whoever polls the call, as in a synchronous
+//! call. When the guest calls an async import, the import polls its host
+//! future there once. If the future is not ready, the import suspends the
+//! guest's stack, which then holds guest frames only, and the future of the
+//! call polls the host future until it is ready, and resumes the guest with
+//! what it returned.
 //!
 //! Nothing of a call stays on the thread while its guest waits: each
 //! resumption installs the store and the trap handler, and takes them off

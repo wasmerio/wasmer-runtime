@@ -280,8 +280,8 @@ view, and V8's C API cannot switch stacks.
 
 ### `sys`
 
-Each `call_async` runs its guest on a Wasm stack of its own, a
-`wasmer_vm::SuspendableCall`
+Each `call_async` runs its guest on a Wasm stack of its own, which a
+`wasmer_vm::SuspendedCall` keeps while the guest waits
 ([`async_runtime.rs`](../lib/api/src/backend/sys/async_runtime.rs)). An async
 import polls its host future once where it is called, on the stack of whoever
 polls the call. If the future is pending, the import suspends the guest, with
