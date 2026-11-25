@@ -230,6 +230,12 @@ impl StoreContext {
         with_top(|top| top_entry(top).is_none_or(|entry| entry.borrow_count.get() == 0))
     }
 
+    /// Whether `entry` is the active entry of this thread.
+    #[cfg(all(feature = "sys", feature = "experimental-async"))]
+    pub(crate) fn is_active(entry: *const Self) -> bool {
+        with_top(|top| ptr::eq(top.get(), entry))
+    }
+
     /// Safety: This method lets you borrow multiple mutable references
     /// to the currently active store context. The caller must ensure that:
     ///   * there is only one mutable reference alive, or

@@ -286,7 +286,9 @@ Checks that stay dynamic, and fail safely:
 
 - Using a handle with the wrong store panics.
 - Polling a task from inside a slice of its own store panics. An executor
-  whose `wake` polls inline must defer that poll.
+  whose `wake` polls inline must defer that poll. On `sys`, the first poll of
+  an async host function under a `call_async` is not such a slice, though its
+  guest still has the store (see [`sys`](#sys)).
 - `with` panics if a task is dropped inside another slice of its shared store
   and its host future's destructor asks for the store. A destructor that needs
   the store asks with `try_with`, which fails with `StoreBusy` there.
@@ -317,6 +319,16 @@ A deep host future therefore cannot overflow the guest's Wasm stack, and an
 import whose future is ready at once switches no stack. A typed async host
 function also keeps the heap block of a future that was ready at once, and
 makes its next future there, so such a call does not allocate either.
+
+In that first poll the guest still has the store, which is published for the
+host function alone. On a shared store, under a guest that a `call_async`
+runs, a handle reaches it there as the `AsyncEnv` of the host function does:
+`SharedStore::try_with` takes it, one holder at a time, and a task of the
+store that the host function polls runs with it. So a host function finds its
+store the same in its first poll as in the later ones, which the call makes
+with no slice held. A guest that was entered synchronously lends nothing: its
+caller holds the store, `try_with` fails with `StoreBusy`, and a task polled
+there panics.
 
 A typed function that returns `Deferred` has a trampoline of its own. It
 calls the function as the trampoline of a sync host function does, with the

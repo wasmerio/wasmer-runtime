@@ -259,6 +259,17 @@ fn slice_is_running() -> ! {
     panic!("the shared store is already running a slice on this thread")
 }
 
+/// The panic of a task of a shared store that is polled where a slice holds
+/// its store, and the store is not published for that poll.
+#[cold]
+#[inline(never)]
+fn polled_in_a_slice() -> ! {
+    panic!(
+        "a task of a shared store was polled from inside a slice of that store; an \
+         executor whose waker polls inline must defer that poll"
+    )
+}
+
 impl WithSlice {
     /// # Panics
     /// Panics unless the call being polled is on the store `id`, and if that
@@ -377,11 +388,9 @@ impl CallStore<'_> {
     pub(crate) fn resolve(&self) -> PollStore {
         match self {
             Self::Shared(store) => {
-                assert!(
-                    !store.0.busy.get(),
-                    "a task of a shared store was polled from inside a slice of that \
-                     store; an executor whose waker polls inline must defer that poll"
-                );
+                if store.0.busy.get() {
+                    polled_in_a_slice()
+                }
                 store.poll_store()
             }
             _ => self.try_resolve().unwrap_or_else(|| {
@@ -393,6 +402,27 @@ impl CallStore<'_> {
         }
     }
 
+    /// [`Self::resolve`], for a backend that asks at every poll and keeps the
+    /// answer no longer than that poll.
+    ///
+    /// A task of a shared store that is polled where its store is lent (see
+    /// [`lent_under_a_guest`]) runs with the store that is published there,
+    /// as a call made with an `AsyncEnv` does. The task is polled by the host
+    /// function the store is published for, so the two do not overlap.
+    ///
+    /// # Panics
+    /// As [`Self::resolve`], unless the store is lent to the poll this one is
+    /// made in.
+    #[cfg(feature = "sys")]
+    pub(crate) fn resolve_in_reach(&self) -> PollStore {
+        match self {
+            Self::Shared(store) if store.0.busy.get() => {
+                lent_under_a_guest(store.0.id).unwrap_or_else(|| polled_in_a_slice())
+            }
+            _ => self.resolve(),
+        }
+    }
+
     /// The store for dropping a host future, if it can still be reached.
     pub(crate) fn try_resolve(&self) -> Option<PollStore> {
         match self {
@@ -401,6 +431,27 @@ impl CallStore<'_> {
             Self::Shared(store) => Some(store.poll_store()),
         }
     }
+}
+
+/// The store `id` as it is published for an async host function that is being
+/// polled under its own guest, if that guest is the one of a `call_async`.
+///
+/// On `sys` an async host function is polled for the first time where its
+/// guest called it, while the guest still has its slice of the store, and the
+/// store is published for the host function alone. The store is busy there,
+/// though the host function would find it free in every later poll, which its
+/// call makes with no slice held. So a handle of a shared store is let in
+/// where the `AsyncEnv` of the host function is: through what is published,
+/// which has one holder at a time.
+///
+/// A guest that was entered synchronously lends nothing: the host frame that
+/// entered it holds the store, as it does for a synchronous host function.
+#[cfg(feature = "sys")]
+fn lent_under_a_guest(id: StoreId) -> Option<PollStore> {
+    POLL_STORE
+        .get()
+        .filter(|poll| poll.id == id && poll.is_exclusive())
+        .filter(|_| crate::backend::sys::async_runtime::guest_can_wait_here())
 }
 
 /// The state behind every handle of a [`SharedStore`].
@@ -573,8 +624,25 @@ impl SharedStore {
     ///
     /// Fails at once if the store is busy, because there is nothing to wait
     /// for. Inside [`FunctionEnvMut::release`](crate::FunctionEnvMut::release)
-    /// the store is lent to this call.
+    /// the store is lent to this call. On `sys` it is lent as well where an
+    /// async host function is polled under its own guest, if a
+    /// [`call_async`](crate::Function::call_async) runs that guest: this
+    /// takes the store there as [`AsyncEnv::with`](crate::AsyncEnv::with)
+    /// does, one holder at a time.
     pub fn try_with<R>(&self, f: impl FnOnce(StoreMut<'_>) -> R) -> Result<R, StoreBusy> {
+        #[cfg(feature = "sys")]
+        if self.0.busy.get()
+            && lent_under_a_guest(self.0.id).is_some()
+            && let Some(slice) = WithSlice::enter_if_in_reach(self.0.id)
+        {
+            // Safety: the slice is the only holder of the store until it
+            // drops: it took what was published, as the slice of an
+            // `AsyncEnv` does.
+            return Ok(self
+                .0
+                .keeper
+                .holding(slice, |slice| f(unsafe { StoreMut::from_raw(slice.ptr()) })));
+        }
         if self.is_held() {
             let lent = StoreContext::try_get_lent(self.0.id).ok_or(StoreBusy)?;
             return Ok(self.0.keeper.holding(lent, |lent| f(lent.as_mut())));

@@ -888,6 +888,135 @@ fn polling_a_task_inside_a_slice_of_its_store_panics() {
     assert!(poll(&mut task).is_pending(), "the task is not harmed");
 }
 
+thread_local! {
+    /// A task for the `join` import to wait for.
+    static TO_JOIN: RefCell<Option<Task>> = const { RefCell::new(None) };
+}
+
+/// What a handle of the store of `cx` gets from `SharedStore::try_with`: 1 if
+/// it has the store, which then adds 1000 to the host state, and a second
+/// `try_with` inside it is refused.
+fn takes_the_store(cx: &mut AsyncEnv<Counter>) -> i32 {
+    let (shared, env) = cx.with(|env| (env.shared().expect("a shared store"), env.as_ref()));
+    let taken = shared.try_with(|mut store| {
+        env.as_mut(&mut store).value += 1000;
+        shared.try_with(|_| ()).is_err()
+    });
+    i32::from(taken == Ok(true))
+}
+
+/// A guest on a shared store, whose exports are each one import:
+///
+/// - `run` is the `wait` of [`guest`];
+/// - `joins` waits for the task in `TO_JOIN`, which its future polls itself;
+/// - `asks` and `asks_deferred` return [`takes_the_store`], from an `async`
+///   function and from one that returns `Deferred`.
+fn joining_guest() -> (SharedStore, Instance, Rc<Cell<bool>>, FunctionEnv<Counter>) {
+    let (mut store, instance, gate, env) = instantiate(GUEST);
+    let wait = instance.exports.get_function("run").unwrap().clone();
+    drop(instance);
+    let module = Module::new(
+        &store,
+        r#"(module
+          (import "h" "run" (func $run (param i32) (result i32)))
+          (import "h" "join" (func $join (result i32)))
+          (import "h" "ask" (func $ask (result i32)))
+          (import "h" "ask_deferred" (func $ask_deferred (result i32)))
+          (func (export "run") (param i32) (result i32) (call $run (local.get 0)))
+          (func (export "joins") (result i32) (call $join))
+          (func (export "asks") (result i32) (call $ask))
+          (func (export "asks_deferred") (result i32) (call $ask_deferred)))"#,
+    )
+    .unwrap();
+    let join =
+        Function::new_typed_async(&mut store, &env, async |_: &mut AsyncEnv<Counter>| -> i32 {
+            let task = TO_JOIN.take().expect("a task to join");
+            task.await.unwrap()[0].unwrap_i32()
+        });
+    let ask = Function::new_typed_async(
+        &mut store,
+        &env,
+        async |cx: &mut AsyncEnv<Counter>| -> i32 { takes_the_store(cx) },
+    );
+    let ask_deferred = Function::new_typed_async(&mut store, &env, |cx: &mut AsyncEnv<Counter>| {
+        Deferred::ready(takes_the_store(cx))
+    });
+    let imports = imports! { "h" => {
+        "run" => wait,
+        "join" => join,
+        "ask" => ask,
+        "ask_deferred" => ask_deferred,
+    } };
+    let instance = Instance::new(&mut store, &module, &imports).unwrap();
+    (store.into_shared(), instance, gate, env)
+}
+
+/// An async import polls its future for the first time while its guest still
+/// has the store. Under a `call_async`, a task of that store polled there
+/// runs with the store the import was given, as a call made with the import's
+/// `AsyncEnv` does.
+#[test]
+fn a_task_is_polled_in_the_first_poll_of_an_import_of_its_store() {
+    let (shared, instance, gate, env) = joining_guest();
+    let (run, joins) = (export(&instance, "run"), export(&instance, "joins"));
+    let task = |x: i32| -> Task { Box::pin(run.call_async(&mut shared.clone(), &[Value::I32(x)])) };
+    let joined = |joiner: &mut Task| -> i32 {
+        let Poll::Ready(results) = poll(joiner) else {
+            panic!("the import did not finish");
+        };
+        results.unwrap()[0].unwrap_i32()
+    };
+
+    // A task that never waits starts and ends inside that poll.
+    gate.set(true);
+    TO_JOIN.set(Some(task(1)));
+    let mut joiner: Task = Box::pin(joins.call_async(&mut shared.clone(), &[]));
+    assert_eq!(joined(&mut joiner), 3);
+
+    // One that waits has the import wait, and the guest of the import with it.
+    gate.set(false);
+    TO_JOIN.set(Some(task(2)));
+    let mut joiner: Task = Box::pin(joins.call_async(&mut shared.clone(), &[]));
+    assert!(poll(&mut joiner).is_pending());
+    assert!(shared.try_with(|_| ()).is_ok(), "no task holds the store");
+    gate.set(true);
+    assert_eq!(joined(&mut joiner), 5);
+
+    // One that waited before is resumed inside that poll.
+    gate.set(false);
+    let mut waiting = task(3);
+    assert!(poll(&mut waiting).is_pending());
+    gate.set(true);
+    TO_JOIN.set(Some(waiting));
+    let mut joiner: Task = Box::pin(joins.call_async(&mut shared.clone(), &[]));
+    assert_eq!(joined(&mut joiner), 7);
+
+    let value = shared.try_with(|store| env.as_ref(&store).value).unwrap();
+    assert_eq!(value, 33);
+}
+
+/// In the first poll of an async import, and in a function that returns
+/// `Deferred`, a handle of the import's shared store takes the store with
+/// `try_with`, as the import's `AsyncEnv` does with `with`: one holder at a
+/// time. Not under a guest that was entered synchronously, whose caller
+/// holds the store.
+#[test]
+fn a_handle_takes_its_shared_store_in_the_first_poll_of_an_import() {
+    let (shared, instance, _gate, env) = joining_guest();
+    for asks in ["asks", "asks_deferred"].map(|name| export(&instance, name)) {
+        let mut task: Task = Box::pin(asks.call_async(&mut shared.clone(), &[]));
+        let Poll::Ready(results) = poll(&mut task) else {
+            panic!("the import did not finish");
+        };
+        assert_eq!(results.unwrap()[0].unwrap_i32(), 1);
+
+        let results = shared.try_with(|mut store| asks.call(&mut store, &[]));
+        assert_eq!(results.unwrap().unwrap()[0].unwrap_i32(), 0);
+    }
+    let value = shared.try_with(|store| env.as_ref(&store).value).unwrap();
+    assert_eq!(value, 2000);
+}
+
 /// A host future's destructor runs when its task is dropped. If that happens
 /// inside another slice of the shared store, `with` fails safely instead of
 /// aliasing the store.

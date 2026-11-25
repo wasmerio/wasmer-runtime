@@ -92,6 +92,9 @@ struct Waiting {
     /// What that future returned, for the import to take when the guest is
     /// resumed.
     ready: Option<Result<RawResults, RuntimeError>>,
+    /// The entry of the store that the guest runs under, while it runs: see
+    /// [`guest_can_wait_here`].
+    entry: *const StoreContext,
 }
 
 thread_local! {
@@ -341,7 +344,7 @@ impl<E: Entry> Future for AsyncCallFuture<'_, E> {
             && let Some(future) = suspended.waiting.pending.as_mut()
         {
             let polled = {
-                let _scope = PollScope::enter(Some(this.store.resolve()));
+                let _scope = PollScope::enter(Some(this.store.resolve_in_reach()));
                 let polled = future.as_mut().poll(cx);
                 if polled.is_ready() {
                     // Its destructors run with the store in reach too.
@@ -357,7 +360,7 @@ impl<E: Entry> Future for AsyncCallFuture<'_, E> {
 
         // The store is taken for as long as the guest runs, and given up as
         // soon as it waits or returns.
-        let slice = this.store.resolve().enter_slice();
+        let slice = this.store.resolve_in_reach().enter_slice();
         // Safety: the slice is the only holder of the store; the handles are
         // gone before the guest runs.
         let trap_handler = unsafe { StoreMut::from_raw(slice.ptr()) }
@@ -371,6 +374,7 @@ impl<E: Entry> Future for AsyncCallFuture<'_, E> {
             cx: ptr::null_mut(),
             pending: None,
             ready: None,
+            entry: ptr::null(),
         };
         let (values, returned) = match this.suspended.as_deref_mut() {
             Some(suspended) => {
@@ -471,11 +475,28 @@ fn running<T>(
         // Safety: the entry is taken off before the slice ends.
         let entry = unsafe { StoreContext::new(store) };
         let _entered = unsafe { entry.install() };
+        waiting.entry = ptr::from_ref(&entry);
         let _waiting = Resuming::enter(waiting);
         guest()
     };
     waiting.cx = ptr::null_mut();
     returned
+}
+
+/// Whether the store that is active on this thread is the one a `call_async`
+/// entered to run its guest: whether host code that the guest called runs
+/// under a guest that can wait, and not under one that was entered
+/// synchronously, by a host frame that holds the store.
+///
+/// An async host function of such a guest is polled for the first time while
+/// the guest still has its slice of the store. A handle of a shared store is
+/// let in there, where it would find the store free in every later poll (see
+/// `SharedStore::try_with`).
+pub(crate) fn guest_can_wait_here() -> bool {
+    let waiting = WAITING.get();
+    // Safety: published by the call that is being resumed, whose poll is
+    // beneath on this stack. The entry is only compared.
+    !waiting.is_null() && StoreContext::is_active(unsafe { (*waiting).entry })
 }
 
 impl<E: Entry> Drop for AsyncCallFuture<'_, E> {
