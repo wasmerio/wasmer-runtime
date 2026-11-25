@@ -61,6 +61,9 @@ thread_local! {
     static POLL_STORE: Cell<Option<PollStore>> = const { Cell::new(None) };
 }
 
+/// What a slice panics with when its shared store is already in one.
+const ALREADY_IN_A_SLICE: &str = "the shared store is already running a slice on this thread";
+
 impl PollStore {
     /// The store for a poll made by a synchronous entry, whose host frame
     /// holds `ptr` for as long as the poll runs.
@@ -76,20 +79,25 @@ impl PollStore {
     /// # Panics
     /// Panics if a shared store is already in a slice.
     pub(crate) fn enter_slice(self) -> StoreSlice {
+        self.try_enter_slice().expect(ALREADY_IN_A_SLICE)
+    }
+
+    /// [`Self::enter_slice`], or `None` if a shared store is already in a
+    /// slice. That slice goes on holding the store.
+    pub(crate) fn try_enter_slice(self) -> Option<StoreSlice> {
         match self.access {
-            StoreAccess::Exclusive(ptr) => StoreSlice { ptr, shared: None },
+            StoreAccess::Exclusive(ptr) => Some(StoreSlice { ptr, shared: None }),
             StoreAccess::Shared(state) => {
                 // Safety: whoever published this access holds a handle to the
                 // state for at least as long as the poll.
                 let state_ref = unsafe { &*state };
-                assert!(
-                    !state_ref.busy.replace(true),
-                    "the shared store is already running a slice on this thread"
-                );
-                StoreSlice {
+                if state_ref.busy.replace(true) {
+                    return None;
+                }
+                Some(StoreSlice {
                     ptr: state_ref.ptr,
                     shared: Some(state),
-                }
+                })
             }
         }
     }
@@ -145,17 +153,6 @@ impl PollStore {
             unsafe { &*state }.busy.set(busy);
         }
     }
-
-    /// [`Self::enter_slice`], or `None` if the store is in a slice.
-    pub(crate) fn try_enter_slice(self) -> Option<StoreSlice> {
-        if let StoreAccess::Shared(state) = self.access
-            // Safety: as for `keeper`.
-            && unsafe { &*state }.busy.get()
-        {
-            return None;
-        }
-        Some(self.enter_slice())
-    }
 }
 
 /// One synchronous slice of a store. Ends when dropped.
@@ -208,8 +205,18 @@ pub(crate) struct WithSlice {
 
 impl WithSlice {
     /// # Panics
-    /// Panics unless the call being polled is on the store `id`.
+    /// Panics unless the call being polled is on the store `id`, and if that
+    /// store is a shared one that is already in a slice.
     pub(crate) fn enter(id: StoreId) -> Self {
+        Self::try_enter(id).expect(ALREADY_IN_A_SLICE)
+    }
+
+    /// [`Self::enter`], or `None` if the store is a shared one that is
+    /// already in a slice: the store stays published, and that slice goes on.
+    ///
+    /// # Panics
+    /// Panics unless the call being polled is on the store `id`.
+    pub(crate) fn try_enter(id: StoreId) -> Option<Self> {
         let Some(poll) = POLL_STORE.take() else {
             panic!(
                 "AsyncEnv::with can only be used while its host function is being polled, \
@@ -220,20 +227,14 @@ impl WithSlice {
             POLL_STORE.set(Some(poll));
             panic!("AsyncEnv::with was used during a poll of another store's call");
         }
-        // Restores the published store if the slice cannot be taken.
-        struct Restore(PollStore);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                POLL_STORE.set(Some(self.0));
-            }
-        }
-        let restore = Restore(poll);
-        let slice = poll.enter_slice();
-        std::mem::forget(restore);
-        Self {
+        let Some(slice) = poll.try_enter_slice() else {
+            POLL_STORE.set(Some(poll));
+            return None;
+        };
+        Some(Self {
             slice: ManuallyDrop::new(slice),
             poll,
-        }
+        })
     }
 
     pub(crate) fn ptr(&self) -> *mut StoreInner {
@@ -623,6 +624,35 @@ mod tests {
         assert_eq!(value, 4);
         let store = shared.into_store().expect("the last handle");
         assert_eq!(*env.as_ref(&store), 4);
+    }
+
+    /// A slice that is refused, as `AsyncEnv::try_with` is in a destructor run
+    /// inside another slice, leaves the store to the slice that runs and
+    /// published for the next, and the holder goes on with its borrow.
+    #[test]
+    fn a_refused_slice_leaves_the_running_one_in_place() {
+        let mut store = sys_store();
+        let env = FunctionEnv::new(&mut store, 1i32);
+        let shared = store.into_shared();
+        let id = shared.0.id;
+        let _scope = PollScope::enter(Some(shared.poll_store()));
+        shared
+            .try_with(|mut outer| {
+                *env.as_mut(&mut outer) += 1;
+                assert!(WithSlice::try_enter(id).is_none());
+                assert!(is_published());
+                assert_eq!(shared.try_with(|_| ()).err(), Some(StoreBusy));
+                *env.as_mut(&mut outer) += 1;
+            })
+            .unwrap();
+
+        let slice = WithSlice::try_enter(id).expect("the store is free");
+        assert!(!is_published(), "a slice hides the store it holds");
+        let mut inner = unsafe { StoreMut::from_raw(slice.ptr()) };
+        *env.as_mut(&mut inner) += 1;
+        drop(slice);
+        assert!(is_published());
+        assert_eq!(shared.try_with(|store| *env.as_ref(&store)), Ok(4));
     }
 
     /// A slice is given back when its closure panics.

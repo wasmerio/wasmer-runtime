@@ -24,7 +24,7 @@ use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_test::wasm_bindgen_test;
 use wasmer::{
     AsStoreMut, AsStoreRef, AsyncEnv, Function, FunctionEnv, FunctionEnvMut, FunctionType,
-    Instance, Module, RuntimeError, SharedStore, Store, Type, Value, imports, js::AsJs,
+    Instance, Module, RuntimeError, SharedStore, Store, StoreBusy, Type, Value, imports, js::AsJs,
 };
 use wasmer_types::{StoreId, TrapCode};
 
@@ -880,6 +880,103 @@ async fn a_dropped_call_retains_no_waker() {
     );
     settle().await;
     guest.into_store();
+}
+
+thread_local! {
+    /// What each destructor of a [`TriesStore`] got from `try_with`.
+    static TRIED: RefCell<Vec<Result<i32, StoreBusy>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// What a host future holds while it waits. Its destructor asks for the store
+/// with `try_with`, adds 100 to the host state if it gets it, and notes the
+/// outcome.
+struct TriesStore<'a>(&'a mut AsyncEnv<i32>);
+impl Drop for TriesStore<'_> {
+    fn drop(&mut self) {
+        let tried = self.0.try_with(|mut env| {
+            *env.data_mut() += 100;
+            *env.data()
+        });
+        // Where `try_with` has the store, `with` has it too.
+        if let Ok(value) = tried {
+            assert_eq!(self.0.with(|env| *env.data()), value);
+        }
+        TRIED.with_borrow_mut(|tried_so_far| tried_so_far.push(tried));
+    }
+}
+
+/// A shared store whose `waits` function waits for good in a host future
+/// that holds a [`TriesStore`], and its host state.
+fn store_with_a_destructor() -> (SharedStore, FunctionEnv<i32>, Function) {
+    TRIED.take();
+    let mut store = Store::default();
+    let module = Module::new(
+        &store,
+        r#"(module
+          (import "h" "wait" (func $wait))
+          (func (export "waits") (call $wait)))"#,
+    )
+    .unwrap();
+    let env = FunctionEnv::new(&mut store, 0);
+    let wait = Function::new_typed_async(&mut store, &env, async |cx: &mut AsyncEnv<i32>| {
+        let _tries = TriesStore(cx);
+        std::future::pending::<()>().await;
+    });
+    let imports = imports! { "h" => { "wait" => wait } };
+    let instance = Instance::new(&mut store, &module, &imports).unwrap();
+    let waits = instance.exports.get_function("waits").unwrap().clone();
+    (store.into_shared(), env, waits)
+}
+
+/// A task of `shared` whose guest waits in `waits`, with its host future
+/// started: the engine runs it once it has suspended the guest.
+async fn waiting_task(shared: &SharedStore, waits: &Function) -> Call {
+    let mut task: Call = Box::pin(waits.call_async(&mut shared.clone(), &[]));
+    assert!(poll_once(&mut task).is_pending());
+    settle().await;
+    task
+}
+
+/// A task dropped inside another slice of its shared store drops its host
+/// future there. A destructor that asks with `try_with` finds the store busy
+/// and goes on. `with` panics there, which is a trap on this target: the
+/// rest of the destructor would not run, and the dropped call would swallow
+/// the trap.
+#[wasm_bindgen_test]
+async fn try_with_fails_in_a_destructor_run_inside_another_slice() {
+    let (shared, env, waits) = store_with_a_destructor();
+    let task = waiting_task(&shared, &waits).await;
+    shared.try_with(|_| drop(task)).unwrap();
+    assert_eq!(TRIED.take(), [Err(StoreBusy)]);
+    settle().await;
+    let value = shared.try_with(|mut store| *env.as_mut(&mut store));
+    assert_eq!(value, Ok(0), "the store is free, and was not reached");
+}
+
+/// Dropped outside every slice, the task drops its host future with the
+/// store in reach, as it polls it: `try_with` has the store where `with` has.
+#[wasm_bindgen_test]
+async fn try_with_takes_the_store_where_with_does() {
+    let (shared, env, waits) = store_with_a_destructor();
+    drop(waiting_task(&shared, &waits).await);
+    assert_eq!(TRIED.take(), [Ok(100)]);
+    settle().await;
+
+    // Inside a poll of its own call.
+    let add = async |cx: &mut AsyncEnv<i32>, x: i32| -> i32 {
+        let tried = cx.try_with(|mut env| {
+            *env.data_mut() += x;
+            *env.data()
+        });
+        let with = cx.with(|env| *env.data());
+        assert_eq!(tried, Ok(with));
+        with
+    };
+    let add = shared
+        .try_with(|mut store| Function::new_typed_async(&mut store, &env, add))
+        .unwrap();
+    let results = add.call_async(&mut shared.clone(), &[Value::I32(1)]).await;
+    assert_eq!(results.unwrap()[0].unwrap_i32(), 101);
 }
 
 // --- host errors -------------------------------------------------------------
