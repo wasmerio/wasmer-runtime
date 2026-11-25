@@ -385,6 +385,10 @@ impl std::fmt::Debug for Engine {
 /// has its length in front and each string its length in bytes, both as a
 /// little-endian `u64`, which also keeps two different lists from giving the
 /// same bytes.
+///
+/// The features are a set: they are hashed sorted by name, so the order they
+/// are given in does not matter. The middlewares are hashed in the order of
+/// their chain, which changes what they do to a module.
 #[cfg(any(test, feature = "compiler"))]
 fn configuration_hash<'a>(
     features: impl IntoIterator<Item = &'a str>,
@@ -401,8 +405,12 @@ fn configuration_hash<'a>(
         }
     }
 
+    let mut features: Vec<_> = features.into_iter().collect();
+    features.sort_unstable();
+    features.dedup();
+
     let mut bytes = Vec::new();
-    push_list(&mut bytes, &features.into_iter().collect::<Vec<_>>());
+    push_list(&mut bytes, &features);
     push_list(&mut bytes, &middlewares.into_iter().collect::<Vec<_>>());
 
     wasmer_types::ModuleHash::sha256(bytes).as_bytes()[..8]
@@ -681,6 +689,17 @@ impl Default for EngineId {
 mod tests {
     use super::configuration_hash;
 
+    /// The names of `Features::default()`, in the order of `WasmFeature`.
+    const DEFAULT_FEATURES: [&str; 7] = [
+        "threads",
+        "reference_types",
+        "simd",
+        "bulk_memory",
+        "multi_value",
+        "multi_memory",
+        "extended_const",
+    ];
+
     fn hash(features: &[&str], middlewares: &[&str]) -> String {
         configuration_hash(
             features.iter().copied(),
@@ -694,17 +713,7 @@ mod tests {
     #[test]
     fn the_configuration_hash_is_the_same_on_every_host() {
         assert_eq!(hash(&[], &[]), "374708fff7719dd5");
-        // The names of `Features::default()`, in the order of `WasmFeature`.
-        let default = [
-            "threads",
-            "reference_types",
-            "simd",
-            "bulk_memory",
-            "multi_value",
-            "multi_memory",
-            "extended_const",
-        ];
-        assert_eq!(hash(&default, &[]), "fa8a0375f8ae814d");
+        assert_eq!(hash(&DEFAULT_FEATURES, &[]), "8a6ee7ac7c82e49d");
         assert_eq!(
             hash(&["simd"], &["metering-100-fn(&Operator) -> u64"]),
             "67896330fd0ddac9"
@@ -719,6 +728,32 @@ mod tests {
         assert_eq!(hash(&["a", "b"], &[]), "92e76ce1a328984a");
         assert_eq!(hash(&["a"], &[]), "8f782512f782c6b1");
         assert_eq!(hash(&[], &["a"]), "7235add669dcd775");
+    }
+
+    /// The features are a set, so their order does not change the hash, and
+    /// neither does naming one twice.
+    #[test]
+    fn the_configuration_hash_ignores_the_order_of_the_features() {
+        let shuffled = [
+            "threads",
+            "multi_value",
+            "multi_memory",
+            "extended_const",
+            "reference_types",
+            "simd",
+            "bulk_memory",
+        ];
+        assert_eq!(hash(&shuffled, &[]), "8a6ee7ac7c82e49d");
+        assert_eq!(hash(&shuffled, &[]), hash(&DEFAULT_FEATURES, &[]));
+        assert_eq!(hash(&["b", "a"], &[]), hash(&["a", "b"], &[]));
+        assert_eq!(hash(&["a", "b", "a"], &[]), hash(&["a", "b"], &[]));
+    }
+
+    /// The order of a middleware chain changes what it does to a module.
+    #[test]
+    fn the_configuration_hash_keeps_the_order_of_the_middlewares() {
+        assert_eq!(hash(&[], &["a", "b"]), "27291775452cf10d");
+        assert_eq!(hash(&[], &["b", "a"]), "5c5ee0d4b31dddfc");
     }
 
     #[test]
