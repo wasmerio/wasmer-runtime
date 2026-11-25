@@ -193,6 +193,23 @@ impl Artifact {
         self.allocated.is_some()
     }
 
+    /// The size in bytes of this artifact's native image: the length of what
+    /// [`ArtifactCreate::serialize`] returns, without making that copy.
+    ///
+    /// For an artifact that was loaded from a file, this is the length of the
+    /// file.
+    pub fn size(&self) -> Result<usize, SerializeError> {
+        if let Some(module_file) = &self.module_file {
+            let length = std::fs::metadata(module_file)
+                .map_err(|e| {
+                    SerializeError::Generic(format!("Failed to read Artifact file size: {e}"))
+                })?
+                .len();
+            return usize::try_from(length).map_err(|e| SerializeError::Generic(e.to_string()));
+        }
+        self.artifact.size()
+    }
+
     /// A unique identifier for this object.
     ///
     /// This exists to allow us to compare two Artifacts for equality. Otherwise,
