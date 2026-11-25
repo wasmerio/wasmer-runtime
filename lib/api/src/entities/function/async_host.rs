@@ -184,7 +184,7 @@ where
             let args = cx.with(|mut env| args_from_values::<Args>(&mut env, &ty, &values))?;
             let (mut cx, result) = func.invoke(cx, args).await;
             let rets = result?;
-            Ok(cx.with(|mut env| results_to_values::<Rets>(&mut env, &ty, rets)))
+            cx.with(|mut env| results_to_values::<Rets>(&mut env, &ty, rets))
         })
     }
 }
@@ -216,11 +216,16 @@ fn results_to_values<Rets: WasmTypeList>(
     store: &mut impl AsStoreMut,
     ty: &FunctionType,
     rets: Rets,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, RuntimeError> {
+    // The raw form of a reference does not say which store it is of, so one
+    // of another store would be read back below as one of this store.
+    if !rets.is_from_store(store) {
+        return Err(RuntimeError::new("cross-`Store` values are not supported"));
+    }
     // Safety: the raw values are read back as the result types of `Rets`.
     let mut raw_array = unsafe { rets.into_array(store) };
     let results = raw_array.as_mut().iter().zip(ty.results());
-    results
+    Ok(results
         .map(|(raw, ty)| unsafe { Value::from_raw(store, *ty, *raw) })
-        .collect()
+        .collect())
 }
