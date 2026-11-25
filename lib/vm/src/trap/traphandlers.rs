@@ -1431,6 +1431,11 @@ fn on_wasm_stack<F: FnOnce() -> T + 'static, T: 'static>(
     unsafe fn run<F: FnOnce() -> T, T>(f: *const u8, result: *mut u8) {
         unsafe { result.cast::<T>().write(ptr::read(f.cast::<F>())()) }
     }
+    let thread = VmThread::get();
+    // Once the thread exits, its slots keep nothing: a call from a later
+    // destructor runs on a coroutine of its own. A thread that cannot be
+    // set up runs nothing, and the closure is dropped as it is.
+    let keeps = thread.prepare().map_err(UnwindReason::LibTrap)?;
     // `run` moves the closure out. It is never dropped here: if the call
     // traps, it is abandoned with the rest of the Wasm stack.
     let f = ManuallyDrop::new(f);
@@ -1440,10 +1445,6 @@ fn on_wasm_stack<F: FnOnce() -> T + 'static, T: 'static>(
         f: ptr::from_ref(&*f).cast(),
         result: result.as_mut_ptr().cast(),
     };
-    let thread = VmThread::get();
-    // Once the thread exits, its slots keep nothing: a call from a later
-    // destructor runs on a coroutine of its own.
-    let keeps = thread.prepare().map_err(UnwindReason::LibTrap)?;
     // The first coroutine of the thread that no running call uses, or one
     // made for this call if they are all in use.
     let slots = &thread.entries;
