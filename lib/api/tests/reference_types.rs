@@ -58,7 +58,7 @@ pub mod reference_types {
         let call_set_value: &Function = instance.exports.get_function("call_set_value")?;
         let results: Box<[Value]> =
             call_set_value.call(&mut store, &[Value::FuncRef(Some(func_to_call))])?;
-        assert!(env.as_ref(&store.as_store_ref()).0.load(Ordering::SeqCst));
+        assert!(env.as_ref(&store).0.load(Ordering::SeqCst));
         assert_eq!(&*results, &[Value::I32(343)]);
 
         Ok(())
@@ -694,6 +694,452 @@ pub mod reference_types {
                 assert_eq!(*value, 11)
             }
         }
+
+        Ok(())
+    }
+
+    // The tests below return a reference from a host function: one of the
+    // store the function is in, which the guest and the caller get, and one of
+    // another store, which ends the call as passing it in does.
+
+    /// The error of a call that a value of another store is used in.
+    const CROSS_STORE: &str = "cross-`Store` values are not supported";
+
+    /// A function and an extern object of `store`. The function returns
+    /// `number` and the object is `name`, which tells them from the ones
+    /// another store has at the same place.
+    fn references(store: &mut Store, name: &'static str, number: i32) -> (Function, ExternRef) {
+        let function = Function::new_typed(store, move || number);
+        (function, ExternRef::new(store, name))
+    }
+
+    /// What `value` is when it is used with `store`.
+    fn resolve(store: &mut Store, value: &Value) -> String {
+        match value {
+            Value::FuncRef(Some(function)) => {
+                format!("a function returning {:?}", function.call(store, &[]))
+            }
+            Value::ExternRef(Some(object)) => {
+                format!("the object {:?}", object.downcast::<&str>(store))
+            }
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// Asserts that a call ended with the error of a value of another store.
+    /// If it returned instead, the panic says what the caller got.
+    fn assert_refused(store: &mut Store, what: &str, result: Result<Box<[Value]>, RuntimeError>) {
+        match result {
+            Err(error) => assert_eq!(error.message(), CROSS_STORE, "{what}"),
+            Ok(values) => {
+                let values: Vec<String> = values.iter().map(|v| resolve(store, v)).collect();
+                panic!("{what}: the call returned {}", values.join(" and "));
+            }
+        }
+    }
+
+    /// A guest function that calls `host` and returns what it returned.
+    fn guest_caller(store: &mut Store, host: &Function) -> Result<Function> {
+        let results: Vec<&str> = host
+            .ty(store)
+            .results()
+            .iter()
+            .map(|ty| match ty {
+                Type::I32 => "i32",
+                Type::FuncRef => "funcref",
+                Type::ExternRef => "externref",
+                other => unimplemented!("a result of type {other}"),
+            })
+            .collect();
+        let results = match results.as_slice() {
+            [] => String::new(),
+            results => format!("(result {})", results.join(" ")),
+        };
+        let wat = format!(
+            r#"(module
+    (import "env" "host" (func $host {results}))
+    (func (export "call") {results} (call $host)))"#
+        );
+        let module = Module::new(store, wat)?;
+        let imports = imports! { "env" => { "host" => host.clone() } };
+        let instance = Instance::new(store, &module, &imports)?;
+        Ok(instance.exports.get_function("call")?.clone())
+    }
+
+    /// The results of `host`, called by the embedder and by a guest.
+    fn call_both_ways(
+        store: &mut Store,
+        host: &Function,
+    ) -> Result<[Result<Box<[Value]>, RuntimeError>; 2]> {
+        let guest = guest_caller(store, host)?;
+        Ok([host.call(store, &[]), guest.call(store, &[])])
+    }
+
+    /// Asserts that `host` is refused its result, however it is called.
+    fn assert_result_refused(store: &mut Store, what: &str, host: &Function) -> Result<()> {
+        for result in call_both_ways(store, host)? {
+            assert_refused(store, what, result);
+        }
+        Ok(())
+    }
+
+    /// Asserts that `host` returns the function and the object that
+    /// [`references`] made for `(name, number)`, or no reference for `None`.
+    fn assert_result_returned(
+        store: &mut Store,
+        results: impl IntoIterator<Item = Result<Box<[Value]>, RuntimeError>>,
+        expected: Option<(&'static str, i32)>,
+    ) -> Result<()> {
+        for result in results {
+            for value in result?.iter() {
+                match (value, expected) {
+                    (Value::FuncRef(None) | Value::ExternRef(None), None) => {}
+                    (Value::FuncRef(Some(function)), Some((_, number))) => {
+                        assert_eq!(&*function.call(store, &[])?, &[Value::I32(number)]);
+                    }
+                    (Value::ExternRef(Some(object)), Some((name, _))) => {
+                        assert_eq!(object.downcast::<&str>(store), Some(&name));
+                    }
+                    (Value::I32(_), _) => {}
+                    (other, _) => panic!("{other:?} where {expected:?} is expected"),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A dynamic host function of `store` that returns `value`.
+    fn dynamic(store: &mut Store, with_env: bool, value: Value) -> Function {
+        let ty = FunctionType::new([], [value.ty()]);
+        if with_env {
+            let env = FunctionEnv::new(store, ());
+            let body = move |_: FunctionEnvMut<()>, _: &[Value]| Ok(vec![value.clone()]);
+            Function::new_with_env(store, &env, ty, body)
+        } else {
+            Function::new(store, ty, move |_: &[Value]| Ok(vec![value.clone()]))
+        }
+    }
+
+    /// The typed host functions of `store` that return `function`, with and
+    /// without an environment.
+    fn typed_returning_function(store: &mut Store, function: Option<Function>) -> [Function; 2] {
+        let env = FunctionEnv::new(store, ());
+        let (plain, with_env) = (function.clone(), function);
+        [
+            Function::new_typed(store, move || -> Option<Function> { plain.clone() }),
+            Function::new_typed_with_env(
+                store,
+                &env,
+                move |_: FunctionEnvMut<()>| -> Option<Function> { with_env.clone() },
+            ),
+        ]
+    }
+
+    /// The typed host functions of `store` that return `object`: with and
+    /// without an environment, and after another result.
+    fn typed_returning_object(store: &mut Store, object: Option<ExternRef>) -> [Function; 3] {
+        let env = FunctionEnv::new(store, ());
+        let (plain, with_env, second) = (object.clone(), object.clone(), object);
+        [
+            Function::new_typed(store, move || -> Option<ExternRef> { plain.clone() }),
+            Function::new_typed_with_env(
+                store,
+                &env,
+                move |_: FunctionEnvMut<()>| -> Option<ExternRef> { with_env.clone() },
+            ),
+            Function::new_typed(store, move || -> (i32, Option<ExternRef>) {
+                (7, second.clone())
+            }),
+        ]
+    }
+
+    #[engine_test]
+    #[cfg_attr(
+        feature = "v8-default",
+        ignore = "function refs are not supported by the default v8 backend"
+    )]
+    fn func_ref_of_another_store_returned_by_dynamic_host_function() -> Result<()> {
+        let (mut store, mut other) = (Store::default(), Store::default());
+        let _mine = references(&mut store, "mine", 1);
+        let (theirs, _) = references(&mut other, "theirs", 2);
+
+        for with_env in [false, true] {
+            let host = dynamic(&mut store, with_env, Value::FuncRef(Some(theirs.clone())));
+            assert_result_refused(&mut store, "a function of another store", &host)?;
+        }
+
+        Ok(())
+    }
+
+    #[engine_test]
+    #[cfg_attr(
+        feature = "v8-default",
+        ignore = "extern refs are not supported by the default v8 backend"
+    )]
+    fn extern_ref_of_another_store_returned_by_dynamic_host_function() -> Result<()> {
+        let (mut store, mut other) = (Store::default(), Store::default());
+        // Unchecked, the object of the other store is handed out as the one
+        // this store has at the same place.
+        let _mine = references(&mut store, "mine", 1);
+        let (_, theirs) = references(&mut other, "theirs", 2);
+
+        for with_env in [false, true] {
+            let host = dynamic(&mut store, with_env, Value::ExternRef(Some(theirs.clone())));
+            assert_result_refused(&mut store, "an object of another store", &host)?;
+        }
+
+        // The object is still usable where it belongs.
+        let host = dynamic(&mut other, false, Value::ExternRef(Some(theirs)));
+        let results = call_both_ways(&mut other, &host)?;
+        assert_result_returned(&mut other, results, Some(("theirs", 2)))
+    }
+
+    #[engine_test]
+    #[cfg_attr(
+        feature = "v8-default",
+        ignore = "extern refs are not supported by the default v8 backend"
+    )]
+    fn refs_of_own_store_returned_by_dynamic_host_function() -> Result<()> {
+        let mut store = Store::default();
+        let (function, object) = references(&mut store, "mine", 1);
+
+        for with_env in [false, true] {
+            for (value, expected) in [
+                (Value::FuncRef(Some(function.clone())), Some(("mine", 1))),
+                (Value::ExternRef(Some(object.clone())), Some(("mine", 1))),
+                (Value::FuncRef(None), None),
+                (Value::ExternRef(None), None),
+            ] {
+                let host = dynamic(&mut store, with_env, value);
+                let results = call_both_ways(&mut store, &host)?;
+                assert_result_returned(&mut store, results, expected)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[engine_test]
+    #[cfg_attr(
+        feature = "v8-default",
+        ignore = "function refs are not supported by the default v8 backend"
+    )]
+    fn func_ref_of_another_store_returned_by_typed_host_function() -> Result<()> {
+        let (mut store, mut other) = (Store::default(), Store::default());
+        let _mine = references(&mut store, "mine", 1);
+        let (theirs, _) = references(&mut other, "theirs", 2);
+
+        for host in typed_returning_function(&mut store, Some(theirs)) {
+            assert_result_refused(&mut store, "a function of another store", &host)?;
+
+            let typed: TypedFunction<(), Option<Function>> = host.typed(&store)?;
+            let error = typed.call(&mut store).unwrap_err();
+            assert_eq!(error.message(), CROSS_STORE);
+        }
+
+        Ok(())
+    }
+
+    #[engine_test]
+    #[cfg_attr(
+        feature = "v8-default",
+        ignore = "extern refs are not supported by the default v8 backend"
+    )]
+    fn extern_ref_of_another_store_returned_by_typed_host_function() -> Result<()> {
+        let (mut store, mut other) = (Store::default(), Store::default());
+        let _mine = references(&mut store, "mine", 1);
+        let (_, theirs) = references(&mut other, "theirs", 2);
+
+        for host in typed_returning_object(&mut store, Some(theirs)) {
+            assert_result_refused(&mut store, "an object of another store", &host)?;
+        }
+
+        Ok(())
+    }
+
+    #[engine_test]
+    #[cfg_attr(
+        feature = "v8-default",
+        ignore = "extern refs are not supported by the default v8 backend"
+    )]
+    fn refs_of_own_store_returned_by_typed_host_function() -> Result<()> {
+        let mut store = Store::default();
+        let (function, object) = references(&mut store, "mine", 1);
+
+        for (function, object, expected) in [
+            (Some(function), Some(object), Some(("mine", 1))),
+            (None, None, None),
+        ] {
+            let hosts = typed_returning_function(&mut store, function)
+                .into_iter()
+                .chain(typed_returning_object(&mut store, object));
+            for host in hosts.collect::<Vec<_>>() {
+                let results = call_both_ways(&mut store, &host)?;
+                assert_result_returned(&mut store, results, expected)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The async host functions of `store` that return `value`: a dynamic one
+    /// and a typed one.
+    #[cfg(feature = "experimental-async")]
+    fn async_returning(store: &mut Store, value: Value) -> [Function; 2] {
+        let env = FunctionEnv::new(store, ());
+        let ty = FunctionType::new([], [value.ty()]);
+        let dynamic = value.clone();
+        let typed = match value {
+            Value::FuncRef(function) => Function::new_typed_async(
+                store,
+                &env,
+                async move |_: &mut AsyncEnv<()>| -> Option<Function> { function.clone() },
+            ),
+            Value::ExternRef(object) => Function::new_typed_async(
+                store,
+                &env,
+                async move |_: &mut AsyncEnv<()>| -> Option<ExternRef> { object.clone() },
+            ),
+            other => unimplemented!("an async host function returning {other:?}"),
+        };
+        [
+            Function::new_async(
+                store,
+                &env,
+                ty,
+                async move |_: &mut AsyncEnv<()>, _: &[Value]| Ok(vec![dynamic.clone()]),
+            ),
+            typed,
+        ]
+    }
+
+    /// The results of `host`, called by the embedder and by a guest: in place,
+    /// and on a coroutine.
+    #[cfg(feature = "experimental-async")]
+    fn call_every_way(
+        store: &mut Store,
+        host: &Function,
+    ) -> Result<Vec<Result<Box<[Value]>, RuntimeError>>> {
+        let guest = guest_caller(store, host)?;
+        let mut results = vec![host.call(store, &[]), guest.call(store, &[])];
+        for function in [host, &guest] {
+            results.push(futures::executor::block_on(function.call_async(store, &[])));
+        }
+        Ok(results)
+    }
+
+    #[cfg(feature = "experimental-async")]
+    #[engine_test]
+    #[cfg_attr(
+        feature = "v8-default",
+        ignore = "function refs are not supported by the default v8 backend"
+    )]
+    fn func_ref_of_another_store_returned_by_async_host_function() -> Result<()> {
+        let (mut store, mut other) = (Store::default(), Store::default());
+        let _mine = references(&mut store, "mine", 1);
+        let (theirs, _) = references(&mut other, "theirs", 2);
+
+        for host in async_returning(&mut store, Value::FuncRef(Some(theirs))) {
+            for result in call_every_way(&mut store, &host)? {
+                assert_refused(&mut store, "a function of another store", result);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "experimental-async")]
+    #[engine_test]
+    #[cfg_attr(
+        feature = "v8-default",
+        ignore = "extern refs are not supported by the default v8 backend"
+    )]
+    fn extern_ref_of_another_store_returned_by_async_host_function() -> Result<()> {
+        let (mut store, mut other) = (Store::default(), Store::default());
+        let _mine = references(&mut store, "mine", 1);
+        let (_, theirs) = references(&mut other, "theirs", 2);
+
+        for host in async_returning(&mut store, Value::ExternRef(Some(theirs))) {
+            for result in call_every_way(&mut store, &host)? {
+                assert_refused(&mut store, "an object of another store", result);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "experimental-async")]
+    #[engine_test]
+    #[cfg_attr(
+        feature = "v8-default",
+        ignore = "extern refs are not supported by the default v8 backend"
+    )]
+    fn refs_of_own_store_returned_by_async_host_function() -> Result<()> {
+        let mut store = Store::default();
+        let (function, object) = references(&mut store, "mine", 1);
+
+        for (value, expected) in [
+            (Value::FuncRef(Some(function)), Some(("mine", 1))),
+            (Value::ExternRef(Some(object)), Some(("mine", 1))),
+            (Value::FuncRef(None), None),
+            (Value::ExternRef(None), None),
+        ] {
+            for host in async_returning(&mut store, value) {
+                let results = call_every_way(&mut store, &host)?;
+                assert_result_returned(&mut store, results, expected)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// A host function of `store` that ends with `error`.
+    fn failing(store: &mut Store, error: RuntimeError) -> Function {
+        Function::new(store, FunctionType::new([], []), move |_: &[Value]| {
+            Err(error.clone())
+        })
+    }
+
+    #[engine_test]
+    #[cfg_attr(
+        feature = "v8-default",
+        ignore = "exceptions are not supported by the default v8 backend"
+    )]
+    fn exception_of_another_store_thrown_by_host_function() -> Result<()> {
+        let (mut store, mut other) = (Store::default(), Store::default());
+        let no_payload = Vec::<Type>::new();
+        let mine = Tag::new(&mut store, no_payload.clone());
+        let mine = Exception::new(&mut store, &mine, &[]);
+        let theirs = Tag::new(&mut other, no_payload);
+        let theirs = Exception::new(&mut other, &theirs, &[]);
+
+        // A guest that catches what `host` throws, and returns whether it
+        // threw.
+        let wat = r#"(module
+    (import "env" "host" (func $host))
+    (func (export "catch") (result i32)
+          (block $caught
+            (try_table (catch_all $caught)
+              (call $host)
+              (return (i32.const 0))))
+          (i32.const 1)))"#;
+        let module = Module::new(&store, wat)?;
+        let catch = |store: &mut Store, error: RuntimeError| -> Result<_> {
+            let host = failing(store, error);
+            let imports = imports! { "env" => { "host" => host } };
+            let instance = Instance::new(store, &module, &imports)?;
+            Ok(instance.exports.get_function("catch")?.call(store, &[]))
+        };
+
+        let error = RuntimeError::exception(&store, mine);
+        assert_eq!(&*catch(&mut store, error)??, &[Value::I32(1)]);
+
+        // Thrown into this store, the exception of the other one would be the
+        // one this store has at the same place. The guest does not get to
+        // catch it.
+        let error = RuntimeError::exception(&other, theirs);
+        let caught = catch(&mut store, error)?;
+        assert_refused(&mut store, "an exception of another store", caught);
 
         Ok(())
     }

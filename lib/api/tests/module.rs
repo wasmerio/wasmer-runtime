@@ -104,7 +104,7 @@ fn imported_table_elements_preserve_function_types() {
         Value::FuncRef(None),
     )
     .unwrap();
-    let table_base = Global::new(&mut store, Value::I32(3));
+    let table_base = Global::new(&mut store, Value::I32(3)).unwrap();
     let imports = imports! {
         "env" => {
             "table" => table.clone(),

@@ -64,6 +64,11 @@ toolchain. CI uses this backend for Windows tests.
 cargo build --locked -p wasmer --no-default-features --features v8-default
 ```
 
+To build without network access, set `WASMER_V8_ARTIFACT_DIR` to the absolute
+path of an unpacked V8 archive: a directory that has `lib/libv8.a`
+(`lib/v8.lib` on Windows). The build script then downloads nothing and writes
+nothing to that directory.
+
 ### JavaScript host backend
 
 Build the Rust API for a JavaScript host such as a browser or Node.js. This is

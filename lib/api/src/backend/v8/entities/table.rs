@@ -1,8 +1,9 @@
 //! Data types, functions and traits for `v8` runtime's `Table` implementation.
-use wasmer_types::TableType;
+use wasmer_types::{TableType, StoreId};
 
 use crate::{
-    AsStoreMut, AsStoreRef, BackendTable, RuntimeError, Value,
+    AsStoreMut, AsStoreRef, BackendTable, RuntimeError, TypedFunction, Value, WasmTypeList,
+    entities::table::typed_element,
     v8::{
         bindings::{self, *},
         utils::convert::{IntoCApiType, IntoCApiValue, IntoWasmerType, IntoWasmerValue},
@@ -11,12 +12,14 @@ use crate::{
     vm::{VMExtern, VMExternTable},
 };
 
-use super::check_isolate;
+use super::{check_isolate, check_owner};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A WebAssembly `table` in the `v8` runtime.
 pub struct Table {
     pub(crate) handle: VMTable,
+    /// The store it belongs to: V8 does not know.
+    pub(crate) store_id: StoreId,
 }
 
 unsafe impl Send for Table {}
@@ -41,6 +44,9 @@ impl Table {
         init: Value,
     ) -> Result<Self, RuntimeError> {
         check_isolate(store);
+        if !init.is_from_store(store) {
+            return Err(RuntimeError::new("cross-`Store` values are not supported"));
+        }
         let store_mut = store.as_store_mut();
         let v8_store = store_mut.inner.store.as_v8();
 
@@ -51,6 +57,7 @@ impl Table {
 
         Ok(Self {
             handle: unsafe { wasm_table_new(v8_store.inner, wasm_tablety, init.of.ref_) },
+            store_id: store_mut.inner.objects.id(),
         })
     }
 
@@ -59,7 +66,7 @@ impl Table {
     }
 
     pub fn ty(&self, store: &impl AsStoreRef) -> TableType {
-        check_isolate(store);
+        check_owner(store, self.store_id);
 
         let store = store.as_store_ref();
 
@@ -82,7 +89,7 @@ impl Table {
     }
 
     pub fn get(&self, store: &mut impl AsStoreMut, index: u32) -> Option<Value> {
-        check_isolate(store);
+        check_owner(store, self.store_id);
         let store_mut = store.as_store_mut();
 
         if index >= self.size(store) {
@@ -111,8 +118,21 @@ impl Table {
                 of: bindings::wasm_val_t__bindgen_ty_1 { ref_ },
             };
 
-            Some(value.into_wv())
+            Some(value.into_wv(self.store_id))
         }
+    }
+
+    pub fn get_typed_function<Args, Rets>(
+        &self,
+        store: &mut impl AsStoreMut,
+        index: u32,
+    ) -> Result<TypedFunction<Args, Rets>, RuntimeError>
+    where
+        Args: WasmTypeList,
+        Rets: WasmTypeList,
+    {
+        let element = self.get(store, index);
+        typed_element(store, index, element)
     }
 
     pub fn set(
@@ -121,7 +141,10 @@ impl Table {
         index: u32,
         val: Value,
     ) -> Result<(), RuntimeError> {
-        check_isolate(store);
+        check_owner(store, self.store_id);
+        if !val.is_from_store(store) {
+            return Err(RuntimeError::new("cross-`Store` values are not supported"));
+        }
         let store_mut = store.as_store_mut();
 
         unsafe {
@@ -146,7 +169,7 @@ impl Table {
     }
 
     pub fn size(&self, store: &impl AsStoreRef) -> u32 {
-        check_isolate(store);
+        check_owner(store, self.store_id);
         let store = store.as_store_ref();
         unsafe { wasm_table_size(self.handle) }
     }
@@ -157,7 +180,10 @@ impl Table {
         delta: u32,
         init: Value,
     ) -> Result<u32, RuntimeError> {
-        check_isolate(store);
+        check_owner(store, self.store_id);
+        if !init.is_from_store(store) {
+            return Err(RuntimeError::new("cross-`Store` values are not supported"));
+        }
         let store_mut = store.as_store_mut();
 
         unsafe {
@@ -198,12 +224,13 @@ impl Table {
 
         Self {
             handle: vm_extern.unwrap_v_8(),
+            store_id: store_mut.inner.objects.id(),
         }
     }
 
     pub fn is_from_store(&self, store: &impl AsStoreRef) -> bool {
         check_isolate(store);
-        true
+        self.store_id == store.as_store_ref().objects().id()
     }
 }
 

@@ -39,8 +39,15 @@ macro_rules! impl_native_traits {
             pub(crate) fn call_wrapped_v8(&self, mut store: &mut impl AsStoreMut, wrapper: Option<&mut dyn CallWrapper>, $( $x: $x, )* ) -> Result<Rets, RuntimeError> where
             $( $x: FromToNativeWasmType, )*
             {
+                 let store_id = self.func.as_v8().store_id;
+                 crate::backend::v8::entities::check_owner(store, store_id);
+                 // V8 takes a reference of another store for one of its own.
+                 if $(!FromToNativeWasmType::is_from_store(&$x, store) ||)* false {
+                     return Err(RuntimeError::new(
+                         "cross-`Store` values are not supported",
+                     ));
+                 }
 
-                 // // let store_ptr = Value::I64(store.as_store_mut().as_raw() as _).as_jsvalue(store);
                  #[allow(unused_unsafe)]
                  let params_list: Vec<_> = unsafe {
                      vec![ $( {
@@ -61,13 +68,13 @@ macro_rules! impl_native_traits {
 
                  let func = unsafe { wasm_extern_as_func(self.func.to_vm_extern().unwrap_v_8()) };
 
-                 call_wrapped(store, wrapper, |_| {
+                 call_wrapped(store, wrapper, |store| {
                     // `wasm_func_call` takes the arguments, so every entry gets its own.
                     let mut params = unsafe { std::mem::zeroed() };
-                    let trap = unsafe {
+                    let trap = crate::backend::v8::guest_entry(store, || unsafe {
                         wasm_val_vec_new(&mut params, params_list.len(), params_list.as_ptr());
                         wasm_func_call(func, &params, &mut results)
-                    };
+                    });
                     if trap.is_null() {
                         Ok(())
                     } else {
@@ -83,13 +90,13 @@ macro_rules! impl_native_traits {
                         0 => {},
                         1 => {
                             let val = (*results.data.wrapping_add(0)).clone();
-                            let val = val.into_wv();
+                            let val = val.into_wv(store_id);
                             *mut_rets = val.as_raw(store);
                         }
                         _n => {
                             for (i, ret_type) in Rets::wasm_types().iter().enumerate() {
                                     let val = (*results.data.wrapping_add(i)).clone();
-                                    let val = val.into_wv();
+                                    let val = val.into_wv(store_id);
                                     let slot = mut_rets.add(i);
                                     *slot = val.as_raw(store);
                             }

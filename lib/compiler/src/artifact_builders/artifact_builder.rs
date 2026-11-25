@@ -106,6 +106,21 @@ impl ArtifactBuild {
     ) -> Option<&PrimaryMap<LocalFunctionIndex, Option<usize>>> {
         Some(&self.compile_info.function_max_stack_usage)
     }
+
+    /// The size in bytes of the native image: the length of what
+    /// [`ArtifactCreate::serialize`] returns, without making that copy.
+    pub fn size(&self) -> Result<usize, SerializeError> {
+        self.image().map(<[u8]>::len)
+    }
+
+    fn image(&self) -> Result<&[u8], SerializeError> {
+        if self.compilation.is_empty() {
+            return Err(SerializeError::Generic(
+                "No in-memory compilation bytes to serialize".to_string(),
+            ));
+        }
+        Ok(&self.compilation)
+    }
 }
 
 impl<'a> ArtifactCreate<'a> for ArtifactBuild {
@@ -141,11 +156,6 @@ impl<'a> ArtifactCreate<'a> for ArtifactBuild {
     }
 
     fn serialize(&self) -> Result<Vec<u8>, SerializeError> {
-        if self.compilation.is_empty() {
-            return Err(SerializeError::Generic(
-                "No in-memory compilation bytes to serialize".to_string(),
-            ));
-        }
-        Ok(self.compilation.clone())
+        self.image().map(<[u8]>::to_vec)
     }
 }

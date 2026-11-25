@@ -1,8 +1,9 @@
 //! Data types, functions and traits for `sys` runtime's `Table` implementation.
 use crate::{
-    BackendTable, ExternRef, Function, Value,
+    BackendTable, ExternRef, Function, TypedFunction, Value, WasmTypeList,
     backend::sys::entities::engine::NativeEngineExt,
     entities::store::{AsStoreMut, AsStoreRef},
+    entities::table::typed_element,
     error::RuntimeError,
     vm::{VMExtern, VMExternTable},
 };
@@ -111,6 +112,19 @@ impl Table {
             .get(store.as_store_ref().objects().as_sys())
             .get(index)?;
         Some(value_from_table_element(store, item))
+    }
+
+    pub(crate) fn get_typed_function<Args, Rets>(
+        &self,
+        store: &mut impl AsStoreMut,
+        index: u32,
+    ) -> Result<TypedFunction<Args, Rets>, RuntimeError>
+    where
+        Args: WasmTypeList,
+        Rets: WasmTypeList,
+    {
+        let element = self.get(store, index);
+        typed_element(store, index, element)
     }
 
     pub(crate) fn set(

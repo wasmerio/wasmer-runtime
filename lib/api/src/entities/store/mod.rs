@@ -1,11 +1,18 @@
 //! Defines the [`Store`] data type and various useful traits and data types to interact with a
 //! store.
 
-/// Defines the [`AsStoreAsync`] trait and its supporting types.
+/// Defines [`SharedStore`] and how async calls reach their store.
 #[cfg(feature = "experimental-async")]
 mod async_;
+#[cfg(all(test, feature = "experimental-async", feature = "sys"))]
+pub(crate) use async_::is_published;
 #[cfg(feature = "experimental-async")]
-pub use async_::*;
+pub(crate) use async_::{CallStore, PollScope, PollStore, SharedState, StoreSlice, WithSlice};
+#[cfg(feature = "experimental-async")]
+pub use async_::{SharedStore, StoreBusy, WeakSharedStore};
+#[cfg(feature = "experimental-async")]
+#[allow(unused_imports)]
+pub(crate) use async_::{publish_store, published_store};
 
 /// Defines the [`StoreContext`] type.
 mod context;
@@ -16,14 +23,9 @@ mod inner;
 /// Create temporary handles to engines.
 mod store_ref;
 
-/// Single-threaded async-aware RwLock.
-#[cfg(feature = "experimental-async")]
-mod local_rwlock;
-#[cfg(feature = "experimental-async")]
-pub(crate) use local_rwlock::*;
-
 use std::{
     boxed::Box,
+    mem::ManuallyDrop,
     ops::{Deref, DerefMut},
 };
 
@@ -33,8 +35,6 @@ mod obj;
 pub use obj::*;
 
 use crate::{AsEngineRef, BackendEngine, Engine, EngineRef};
-#[cfg(feature = "unsafe-cothread")]
-pub use context::CoroutineStoreGuard;
 pub(crate) use context::*;
 pub(crate) use inner::*;
 use wasmer_types::StoreId;
@@ -53,7 +53,63 @@ use wasmer_vm::TrapHandlerFn;
 /// For more information, check out the [related WebAssembly specification]
 /// [related WebAssembly specification]: <https://webassembly.github.io/spec/core/exec/runtime.html#store>
 pub struct Store {
-    pub(crate) inner: Box<StoreInner>,
+    pub(crate) inner: StoreBox,
+}
+
+/// What owns a store's allocation, with what the store's backend keeps
+/// beside it. The keeper is asked before the allocation is reached, and is
+/// given the allocation when its owner is gone: on a backend where a call
+/// can outlive its borrow, host code may still be using the store.
+pub(crate) struct StoreBox {
+    inner: ManuallyDrop<Box<StoreInner>>,
+    keeper: BackendStoreKeeper,
+}
+
+impl StoreBox {
+    pub(crate) fn new(inner: Box<StoreInner>) -> Self {
+        let keeper = inner.store.keeper();
+        Self {
+            inner: ManuallyDrop::new(inner),
+            keeper,
+        }
+    }
+
+    /// Gives the allocation up to another owner.
+    pub(crate) fn into_box(self) -> Box<StoreInner> {
+        self.keeper.check_owner();
+        let mut this = ManuallyDrop::new(self);
+        // Safety: `this` is never dropped, so each field is taken once.
+        unsafe {
+            std::ptr::drop_in_place(&mut this.keeper);
+            ManuallyDrop::take(&mut this.inner)
+        }
+    }
+}
+
+impl Deref for StoreBox {
+    type Target = StoreInner;
+
+    #[inline]
+    fn deref(&self) -> &StoreInner {
+        self.keeper.check_owner();
+        &self.inner
+    }
+}
+
+impl DerefMut for StoreBox {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut StoreInner {
+        self.keeper.check_owner();
+        &mut self.inner
+    }
+}
+
+impl Drop for StoreBox {
+    fn drop(&mut self) {
+        // Safety: dropped once, here.
+        let inner = unsafe { ManuallyDrop::take(&mut self.inner) };
+        self.keeper.dispose(inner);
+    }
 }
 
 impl Store {
@@ -76,11 +132,27 @@ impl Store {
             }
         };
 
+        let objects = StoreObjects::from_store_ref(&store);
+        #[cfg(all(
+            feature = "sys",
+            feature = "experimental-async",
+            feature = "experimental-host-interrupt"
+        ))]
+        let _teardown = crate::backend::sys::async_runtime::StoreTeardown(objects.id());
+        let inner = Box::new(StoreInner {
+            objects,
+            store,
+            #[cfg(all(
+                feature = "sys",
+                feature = "experimental-async",
+                feature = "experimental-host-interrupt"
+            ))]
+            _teardown,
+            #[cfg(feature = "experimental-async")]
+            shared: std::rc::Weak::new(),
+        });
         Self {
-            inner: Box::new(StoreInner {
-                objects: StoreObjects::from_store_ref(&store),
-                store,
-            }),
+            inner: StoreBox::new(inner),
         }
     }
 
@@ -152,22 +224,6 @@ impl Store {
         Some(f(&mut store.as_mut()))
     }
 
-    /// Installs this store's context for the duration of a coroutine resume.
-    /// The guard removes the context when dropped; hold it for exactly the
-    /// duration of the resume() call.
-    ///
-    /// # Panics
-    /// Panics if the store is anywhere on the current thread's context stack
-    /// (active or suspended).
-    ///
-    /// # Safety
-    /// Exactly one `StorePtrWrapper` derived from this store must be alive on
-    /// the suspended coroutine's stack for the duration of the guard.
-    #[cfg(feature = "unsafe-cothread")]
-    pub unsafe fn coroutine_store_guard(&mut self) -> CoroutineStoreGuard<'_> {
-        unsafe { CoroutineStoreGuard::new(self.inner.as_mut()) }
-    }
-
     /// Builds an [`Interrupter`] for this store. Calling [`Interrupter::interrupt`]
     /// will cause running WASM code to terminate immediately with a
     /// [`HostInterrupt`](crate::backend::sys::vm::TrapCode::HostInterrupt) trap.
@@ -194,14 +250,16 @@ impl Store {
         self.inner.objects.interrupter()
     }
 
+    /// Makes this store shareable by several guest stacks.
+    ///
+    /// Most embedders do not need this: [`Function::call_async`](crate::Function::call_async)
+    /// on a plain store already suspends and resumes. A [`SharedStore`] is for
+    /// a guest that runs several stacks at once. Two stacks on one instance
+    /// share its globals and memory, so this is only correct for guests built
+    /// for it.
     #[cfg(feature = "experimental-async")]
-    /// Transforms this store into a [`StoreAsync`] which can be used
-    /// to invoke [`Function::call_async`](crate::Function::call_async).
-    pub fn into_async(self) -> StoreAsync {
-        StoreAsync {
-            id: self.id(),
-            inner: LocalRwLock::new(self.inner),
-        }
+    pub fn into_shared(self) -> SharedStore {
+        SharedStore::new(self.inner.into_box())
     }
 }
 
@@ -235,14 +293,12 @@ impl AsEngineRef for Store {
 
 impl AsStoreRef for Store {
     fn as_store_ref(&self) -> StoreRef<'_> {
-        StoreRef { inner: &self.inner }
+        StoreRef::new(&self.inner)
     }
 }
 impl AsStoreMut for Store {
     fn as_store_mut(&mut self) -> StoreMut<'_> {
-        StoreMut {
-            inner: &mut self.inner,
-        }
+        StoreMut::new(&mut self.inner)
     }
 
     fn objects_mut(&mut self) -> &mut StoreObjects {

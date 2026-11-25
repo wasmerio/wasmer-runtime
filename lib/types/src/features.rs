@@ -1,8 +1,72 @@
+use enumset::{EnumSet, EnumSetType};
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 #[cfg(feature = "enable-serde")]
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "detect-wasm-features")]
 use wasmparser::{Parser, Payload, Validator, WasmFeatures};
+
+/// A WebAssembly feature that [`Features`] can enable.
+/// Features usually have a corresponding [WebAssembly proposal].
+///
+/// [WebAssembly proposal]: https://github.com/WebAssembly/proposals
+#[allow(clippy::derived_hash_with_manual_eq)]
+#[derive(EnumSetType, Debug, Hash)]
+pub enum WasmFeature {
+    /// Threads proposal
+    Threads,
+    /// Reference Types proposal
+    ReferenceTypes,
+    /// SIMD proposal
+    Simd,
+    /// Bulk Memory proposal
+    BulkMemory,
+    /// Multi-value proposal
+    MultiValue,
+    /// Tail call proposal
+    TailCall,
+    /// Module Linking proposal
+    ModuleLinking,
+    /// Multi Memory proposal
+    MultiMemory,
+    /// 64-bit Memory proposal (unsupported now)
+    Memory64,
+    /// Wasm exceptions proposal
+    Exceptions,
+    /// Relaxed SIMD proposal
+    RelaxedSimd,
+    /// Extended constant expressions proposal
+    ExtendedConst,
+    /// Wide Arithmetic proposal
+    WideArithmetic,
+}
+
+impl WasmFeature {
+    /// The name of this feature, which only has ASCII lowercase letters,
+    /// digits and `_`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Threads => "threads",
+            Self::ReferenceTypes => "reference_types",
+            Self::Simd => "simd",
+            Self::BulkMemory => "bulk_memory",
+            Self::MultiValue => "multi_value",
+            Self::TailCall => "tail_call",
+            Self::ModuleLinking => "module_linking",
+            Self::MultiMemory => "multi_memory",
+            Self::Memory64 => "memory64",
+            Self::Exceptions => "exceptions",
+            Self::RelaxedSimd => "relaxed_simd",
+            Self::ExtendedConst => "extended_const",
+            Self::WideArithmetic => "wide_arithmetic",
+        }
+    }
+}
+
+impl std::fmt::Display for WasmFeature {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.name())
+    }
+}
 
 /// Controls which experimental features will be enabled.
 /// Features usually have a corresponding [WebAssembly proposal].
@@ -322,6 +386,45 @@ impl Features {
         self
     }
 
+    /// The set of features that are enabled.
+    pub fn enabled(&self) -> EnumSet<WasmFeature> {
+        // Written this way to cause compile errors when new features are added.
+        let Self {
+            threads,
+            reference_types,
+            simd,
+            bulk_memory,
+            multi_value,
+            tail_call,
+            module_linking,
+            multi_memory,
+            _memory64,
+            exceptions,
+            relaxed_simd,
+            extended_const,
+            wide_arithmetic,
+        } = *self;
+
+        [
+            (threads, WasmFeature::Threads),
+            (reference_types, WasmFeature::ReferenceTypes),
+            (simd, WasmFeature::Simd),
+            (bulk_memory, WasmFeature::BulkMemory),
+            (multi_value, WasmFeature::MultiValue),
+            (tail_call, WasmFeature::TailCall),
+            (module_linking, WasmFeature::ModuleLinking),
+            (multi_memory, WasmFeature::MultiMemory),
+            (_memory64, WasmFeature::Memory64),
+            (exceptions, WasmFeature::Exceptions),
+            (relaxed_simd, WasmFeature::RelaxedSimd),
+            (extended_const, WasmFeature::ExtendedConst),
+            (wide_arithmetic, WasmFeature::WideArithmetic),
+        ]
+        .into_iter()
+        .filter_map(|(enabled, feature)| enabled.then_some(feature))
+        .collect()
+    }
+
     /// Checks if this features set contains all the features required by another set
     pub fn contains_features(&self, required: &Self) -> bool {
         // Check all required features
@@ -592,6 +695,37 @@ mod test_features {
             .bulk_memory(false);
         assert!(!features.bulk_memory);
         assert!(!features.reference_types);
+    }
+
+    #[test]
+    fn enabled_features() {
+        assert!(Features::none().enabled().is_empty());
+        assert_eq!(Features::all().enabled().len(), 12);
+        assert!(!Features::all().enabled().contains(WasmFeature::Memory64));
+
+        let mut features = Features::none();
+        features.tail_call(true).exceptions(true);
+        assert_eq!(
+            features.enabled(),
+            WasmFeature::TailCall | WasmFeature::Exceptions
+        );
+        let names: Vec<_> = Features::default()
+            .enabled()
+            .into_iter()
+            .map(|feature| feature.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "threads",
+                "reference_types",
+                "simd",
+                "bulk_memory",
+                "multi_value",
+                "multi_memory",
+                "extended_const"
+            ]
+        );
     }
 
     #[test]

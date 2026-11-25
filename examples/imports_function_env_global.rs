@@ -56,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let module = Module::new(&store, wasm_bytes)?;
 
     // Create the global
-    let g_counter = Global::new_mut(&mut store, Value::I32(5));
+    let g_counter = Global::new_mut(&mut store, Value::I32(5))?;
 
     // We create some shared data here, `Arc` is required because we may
     // move our WebAssembly instance to another thread to run it. Mutex
@@ -83,14 +83,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         *env.data().counter.lock().unwrap()
     }
     fn add_to_counter(mut env: FunctionEnvMut<Env>, add: i32) -> i32 {
-        let (data, mut storemut) = env.data_and_store_mut();
-        let mut counter_ref = data.counter.lock().unwrap();
-
-        let global_count = data.g_counter.get(&mut storemut).unwrap_i32();
-        data.g_counter
-            .set(&mut storemut, Value::I32(global_count + add))
+        let global = env.data().g_counter.clone();
+        let global_count = global.get(&mut env).unwrap_i32();
+        global
+            .set(&mut env, Value::I32(global_count + add))
             .unwrap();
 
+        let mut counter_ref = env.data().counter.lock().unwrap();
         *counter_ref += add;
         *counter_ref
     }

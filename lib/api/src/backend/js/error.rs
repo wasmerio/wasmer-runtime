@@ -92,12 +92,16 @@ impl std::fmt::Display for Trap {
 
 impl From<JsValue> for RuntimeError {
     fn from(value: JsValue) -> Self {
-        // We try to downcast the error and see if it's an instance of Trap
-        // instead, so we don't need to re-wrap it.
-        if let Some(obj) = value.dyn_ref()
-            && let Some(trap) = downcast_from_ptr(obj)
-        {
+        // A host function's error comes back under the trap that carried it
+        // past the guest. Otherwise we try to downcast the error and see if
+        // it's an instance of Trap instead, so we don't need to re-wrap it.
+        let carried = downcast_from_ptr(&shim_carried(&value));
+        if let Some(trap) = carried.or_else(|| downcast_from_ptr(&value)) {
             return trap.into();
+        }
+        #[cfg(feature = "experimental-async")]
+        if let Some(refusal) = crate::js::jspi::refusal(&value) {
+            return refusal;
         }
 
         Self::from(Trap {
@@ -116,8 +120,10 @@ fn downcast_from_ptr(value: &JsValue) -> Option<Trap> {
         return None;
     }
 
-    let prototype = &Reflect::get_prototype_of(value).ok()?;
-    let class = prototype.constructor();
+    // Every step can run JavaScript, a `Proxy` trap or a getter, which may
+    // throw: what throws is not a `Trap`.
+    let prototype = Reflect::get_prototype_of(value).ok()?;
+    let class = Reflect::get(&prototype, &JsValue::from_str("constructor")).ok()?;
     let key = JsValue::from_str("__wbg_wasmer_trap");
 
     let marker_func: Option<js_sys::Function> = Reflect::get(&class, &key)
@@ -151,8 +157,10 @@ fn downcast_from_ptr(value: &JsValue) -> Option<Trap> {
 /// JavaScript exposes a WebAssembly `i32` result as a signed number, while
 /// newer glue may explicitly coerce pointer results to an unsigned number.
 /// Accept both representations and preserve the original wasm32 bit pattern.
+/// Zero is no pointer: it is what a wrapper that was already taken apart
+/// gives, as one JavaScript threw again after it was converted once.
 fn wasm32_pointer_from_js_number(value: f64) -> Option<u32> {
-    if !value.is_finite() || value.fract() != 0.0 {
+    if !value.is_finite() || value.fract() != 0.0 || value == 0.0 {
         return None;
     }
 
@@ -188,6 +196,7 @@ mod tests {
 
     #[test]
     fn rejects_numbers_that_cannot_be_wasm32_pointers() {
+        assert_eq!(wasm32_pointer_from_js_number(0.0), None);
         assert_eq!(wasm32_pointer_from_js_number(f64::NAN), None);
         assert_eq!(wasm32_pointer_from_js_number(1.5), None);
         assert_eq!(wasm32_pointer_from_js_number(i32::MIN as f64 - 1.0), None);
@@ -204,15 +213,29 @@ enum JsTrap {
     Unknown,
 }
 
+// `String(value)`, or nothing if that throws.
+#[wasm_bindgen(inline_js = r#"
+export function describe(value) {
+  try { return String(value); } catch { return undefined; }
+}
+"#)]
+extern "C" {
+    fn describe(value: &JsValue) -> Option<String>;
+}
+
+/// The string `value` has as `key`, if reading it does not throw.
+fn string_property(value: &JsValue, key: &str) -> Option<String> {
+    Reflect::get(value, &JsValue::from_str(key)).ok()?.as_string()
+}
+
+/// Whatever JavaScript threw: nothing it does when it is looked at, a getter
+/// or a `Proxy` trap that throws, gets out of here.
 impl From<JsValue> for JsTrap {
     fn from(value: JsValue) -> Self {
         // Let's try some easy special cases first
-        if let Some(error) = value.dyn_ref::<js_sys::Error>() {
-            let message = String::from(error.message());
-            let stack = Reflect::get(&value, &JsValue::from_str("stack"))
-                .ok()
-                .and_then(|value| value.as_string())
-                .unwrap_or_default();
+        if value.dyn_ref::<js_sys::Error>().is_some() {
+            let message = string_property(&value, "message").unwrap_or_default();
+            let stack = string_property(&value, "stack").unwrap_or_default();
             return Self::Message(if stack.is_empty() || stack == message {
                 message
             } else {
@@ -225,8 +248,10 @@ impl From<JsValue> for JsTrap {
         }
 
         // Otherwise, we'll try to stringify the error and hope for the best
-        if let Some(obj) = value.dyn_ref::<js_sys::Object>() {
-            return Self::Message(obj.to_string().into());
+        if (value.is_object() || value.is_function())
+            && let Some(message) = describe(&value)
+        {
+            return Self::Message(message);
         }
 
         Self::Unknown
@@ -277,13 +302,74 @@ impl From<RuntimeError> for wasm_bindgen::JsValue {
     }
 }
 
+// The error of a trap: the one thing a guest's exception handlers do not
+// catch, also when JavaScript throws it. It is made by trapping in
+// `(module (func (export "trap") unreachable))`. A host that refuses to
+// compile that gives its own error instead, which a guest may catch.
+//
+// `trapCarrying` makes a new one for each error it carries, so that each
+// thrown value stands for one error only, wherever it is caught. It is
+// static JavaScript, not made from a string: some hosts forbid that.
+#[wasm_bindgen(inline_js = r#"
+const carried = new WeakMap();
+let trap, trapError;
+function trapped() {
+  try {
+    if (trap === undefined) {
+      const bytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 4, 1, 96, 0, 0, 3, 2, 1, 0,
+        7, 8, 1, 4, 116, 114, 97, 112, 0, 0, 10, 5, 1, 3, 0, 0, 11]);
+      trap = new WebAssembly.Instance(new WebAssembly.Module(bytes)).exports.trap;
+    }
+    trap();
+  } catch (error) {
+    return error;
+  }
+}
+export function jsTrapError() {
+  if (trapError === undefined) {
+    trapError = trapped();
+  }
+  return trapError;
+}
+export function jsTrapCarrying(payload) {
+  const error = trapped();
+  try {
+    carried.set(error, payload);
+  } catch {
+    // Not an object: the payload goes as it is, which a guest may catch.
+    return payload;
+  }
+  return error;
+}
+export function jsTrapCarried(error) {
+  return carried.get(error);
+}
+"#)]
+extern "C" {
+    #[wasm_bindgen(js_name = jsTrapError)]
+    fn shim_trap_error() -> JsValue;
+    #[wasm_bindgen(js_name = jsTrapCarrying)]
+    fn shim_carrying(payload: JsValue) -> JsValue;
+    #[wasm_bindgen(js_name = jsTrapCarried)]
+    fn shim_carried(error: &JsValue) -> JsValue;
+}
+
+/// The error of a trap, which stands for no error of the host: what a guest
+/// that is only to be unwound is woken with.
+#[cfg(feature = "experimental-async")]
+pub(crate) fn trap_error() -> JsValue {
+    shim_trap_error()
+}
+
 pub(crate) fn raise(error: Box<dyn Error + Send + Sync>) -> ! {
     wasm_bindgen::throw_val(trap_value(error))
 }
 
-/// The value a host function's error is thrown or rejected with: a [`Trap`],
-/// which `RuntimeError::from(JsValue)` turns back into the same error, so
-/// the caller can still downcast it (to a WASIX exit, say).
+/// The value a host function's error is thrown or rejected with: the error
+/// of a trap, so that no exception handler of the guest catches it, as none
+/// catches a host function's error on the other backends. It carries a
+/// [`Trap`], which `RuntimeError::from(JsValue)` turns back into the same
+/// error, so the caller can still downcast it (to a WASIX exit, say).
 pub(crate) fn trap_value(error: impl Into<Box<dyn Error + Send + Sync>>) -> JsValue {
-    Trap::user(error.into()).into()
+    shim_carrying(Trap::user(error.into()).into())
 }

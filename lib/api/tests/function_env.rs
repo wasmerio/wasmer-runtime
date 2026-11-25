@@ -5,9 +5,9 @@ use wasm_bindgen_test::wasm_bindgen_test;
 use wasmer::*;
 
 #[engine_test]
-fn data_and_store_mut() -> Result<(), String> {
+fn data_and_store() -> Result<(), String> {
     let mut store = Store::default();
-    let global_mut = Global::new_mut(&mut store, Value::I32(10));
+    let global_mut = Global::new_mut(&mut store, Value::I32(10)).unwrap();
     struct Env {
         value: i32,
         global: Global,
@@ -21,23 +21,25 @@ fn data_and_store_mut() -> Result<(), String> {
     );
     let mut envmut = env.into_mut(&mut store);
 
-    let (data, mut storemut) = envmut.data_and_store_mut();
+    let global = envmut.data().global.clone();
+    {
+        let (data, store) = envmut.data_and_store();
+        assert_eq!(
+            data.global.ty(&store),
+            GlobalType {
+                ty: Type::I32,
+                mutability: Mutability::Var
+            }
+        );
+        data.value = 10;
+    }
+    assert_eq!(global.get(&mut envmut), Value::I32(10));
+    let value = global.get(&mut envmut).unwrap_i32() + envmut.data().value;
+    envmut.data_mut().value = value;
 
-    assert_eq!(
-        data.global.ty(&storemut),
-        GlobalType {
-            ty: Type::I32,
-            mutability: Mutability::Var
-        }
-    );
-    assert_eq!(data.global.get(&mut storemut), Value::I32(10));
-    data.value = data.global.get(&mut storemut).unwrap_i32() + 10;
+    global.set(&mut envmut, Value::I32(value)).unwrap();
 
-    data.global
-        .set(&mut storemut, Value::I32(data.value))
-        .unwrap();
-
-    assert_eq!(data.global.get(&mut storemut), Value::I32(data.value));
+    assert_eq!(global.get(&mut envmut), Value::I32(value));
 
     Ok(())
 }

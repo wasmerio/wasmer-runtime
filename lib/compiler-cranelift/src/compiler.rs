@@ -1,8 +1,6 @@
 //! Support for compiling with Cranelift.
 
-use crate::eh::{FunctionLsdaData, build_function_lsda, compact_unwind_encoding_aarch64};
-
-use crate::translator::{CraneliftUnwindInfo, compiled_function_unwind_info};
+use crate::elf::UnwindKind;
 use crate::{
     address_map::get_function_address_map,
     config::{Cranelift, CraneliftOptLevel},
@@ -20,14 +18,11 @@ use cranelift_codegen::{
     ir::{self, ExternalName, UserFuncName},
 };
 
-use cranelift_codegen::gimli::write::{Address, FrameDescriptionEntry};
-
 use itertools::Itertools;
 use object::write::{Object, Relocation, SymbolId};
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use std::sync::Arc;
 use wasmer_compiler::WASM_TRAMPOLINE_ESTIMATED_BODY_SIZE;
-use wasmer_compiler::dwarf::WriterRelocate;
 use wasmer_compiler::elf::CompileOutput;
 use wasmer_compiler::elf::{add_libcall_symbol, add_undefined_symbol};
 use wasmer_compiler::misc::{CompiledFunctionExt, CompiledKind};
@@ -40,9 +35,7 @@ use wasmer_compiler::{
     types::function::CompiledFunctionFrameInfo,
 };
 use wasmer_compiler::{build_function_buckets, translate_function_buckets};
-use wasmer_types::entity::EntityRef;
 use wasmer_types::entity::PrimaryMap;
-use wasmer_types::target::CallingConvention;
 use wasmer_types::target::Target;
 use wasmer_types::{
     CompilationProgressCallback, CompileError, FunctionIndex, LocalFunctionIndex, ModuleInfo,
@@ -52,9 +45,6 @@ use wasmer_types::{
 pub struct CraneliftCompiledFunction {
     body: Compilation,
     frame_info: CompiledFunctionFrameInfo,
-    fde: Option<FrameDescriptionEntry>,
-    function_lsda: Option<FunctionLsdaData>,
-    compact_unwind_encoding: Option<u32>,
 }
 
 impl wasmer_compiler::CompiledFunction for CraneliftCompiledFunction {}
@@ -97,16 +87,7 @@ impl CraneliftCompiler {
             .isa(target)
             .map_err(|error| CompileError::Codegen(error.to_string()))?;
         let frontend_config = isa.frontend_config();
-        let pointer_bytes = frontend_config.pointer_bytes();
-        let emit_macho_compact_unwind = matches!(
-            target.triple(),
-            target_lexicon::Triple {
-                binary_format: target_lexicon::BinaryFormat::Macho,
-                operating_system: target_lexicon::OperatingSystem::Darwin(_),
-                architecture: target_lexicon::Architecture::Aarch64(_),
-                ..
-            }
-        );
+        let unwind = UnwindKind::for_isa(&*isa);
         let memory_styles = &compile_info.memory_styles;
         let table_styles = &compile_info.table_styles;
         let module = &compile_info.module;
@@ -135,13 +116,6 @@ impl CraneliftCompiler {
         let progress = progress_callback
             .cloned()
             .map(|cb| ProgressContext::new(cb, total_steps, "cranelift::functions"));
-
-        let emit_dwarf_unwind = !function_body_inputs.is_empty()
-            && matches!(
-                target.triple().default_calling_convention(),
-                Ok(CallingConvention::SystemV)
-            )
-            && isa.create_systemv_cie().is_some();
 
         // The `compile_function` closure is used for both the sequential and
         // parallel compilation paths to avoid code duplication.
@@ -249,62 +223,12 @@ impl CraneliftCompiler {
                 .map(mach_trap_to_trap)
                 .collect::<Vec<_>>();
 
-            let emit_lsda = emit_dwarf_unwind || emit_macho_compact_unwind;
-
-            let compact_unwind_encoding = if emit_macho_compact_unwind {
-                Some(
-                    compact_unwind_encoding_aarch64(result.buffer.unwind_info()).map_err(|error| {
-                        CompileError::Codegen(format!(
-                            "failed to encode aarch64 Mach-O compact unwind for function {}: {error}",
-                            i.index()
-                        ))
-                    })?,
-                )
-            } else {
-                None
-            };
-
-            let function_lsda = if emit_lsda {
-                build_function_lsda(
-                    result.buffer.call_sites(),
-                    result.buffer.data().len(),
-                    pointer_bytes,
-                    true,
-                )
-            } else {
-                None
-            };
-
-            let fde = match compiled_function_unwind_info(&*isa, &context)? {
-                CraneliftUnwindInfo::Fde(fde) => {
-                    if emit_dwarf_unwind {
-                        // For the ELF artifact format each function's
-                        // `.eh_frame` relocates against its own text symbol,
-                        // so the FDE's initial location must not be shifted.
-                        let fde = fde.to_fde(Address::Symbol {
-                            // The symbol is the kind of relocation.
-                            // "0" is used for functions
-                            symbol: WriterRelocate::FUNCTION_SYMBOL,
-                            addend: 0,
-                        });
-                        // The unwind information is inserted into the dwarf section
-                        Some(fde)
-                    } else {
-                        None
-                    }
-                }
-                CraneliftUnwindInfo::None => None,
-            };
-
             let range = reader.range();
             let address_map = get_function_address_map(&context, range, code_buf.len());
 
             let compiled = CraneliftCompiledFunction {
                 body: code_buf,
                 frame_info: CompiledFunctionFrameInfo { address_map, traps },
-                fde,
-                function_lsda,
-                compact_unwind_encoding,
             };
 
             let object = crate::elf::emit_local_function(
@@ -319,9 +243,8 @@ impl CraneliftCompiler {
                 function_symbol,
                 func_relocs,
                 &source_map,
-                compiled.fde,
-                compiled.function_lsda,
-                compiled.compact_unwind_encoding,
+                unwind,
+                &context,
             )?;
             Ok(CompileOutput {
                 object,
@@ -396,7 +319,7 @@ impl CraneliftCompiler {
                     FunctionIndex::from_u32(*index as u32),
                     func_type.clone(),
                 );
-                let trampoline = make_trampoline_dynamic_function(
+                let context = make_trampoline_dynamic_function(
                     &self.config().callbacks,
                     &*isa,
                     target.triple().architecture,
@@ -410,7 +333,9 @@ impl CraneliftCompiler {
                     progress.notify_steps(WASM_TRAMPOLINE_ESTIMATED_BODY_SIZE)?;
                 }
                 Ok(CompileOutput {
-                    object: wasmer_compiler::elf::emit_function_body(target, &kind, &trampoline)?,
+                    object: crate::elf::emit_dynamic_trampoline(
+                        &*isa, target, &kind, unwind, &context,
+                    )?,
                     maximum_stack_usage: None,
                 })
             })

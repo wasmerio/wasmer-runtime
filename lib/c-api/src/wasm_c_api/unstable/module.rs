@@ -73,6 +73,69 @@ pub unsafe extern "C" fn wasmer_module_name(
     out.set_buffer(name.as_bytes().to_vec());
 }
 
+/// Unstable non-standard Wasmer-specific API that used to set the
+/// module's name.
+///
+/// A module's name can no longer be changed once the module is
+/// compiled, so this function never updates it and always returns
+/// `false`, which is its result for "the name was not updated". It is
+/// kept so that code calling it still links. The name is not consumed.
+///
+/// # Example
+///
+/// ```rust
+/// # use inline_c::assert_c;
+/// # fn main() {
+/// #    (assert_c! {
+/// # #include "tests/wasmer.h"
+/// #
+/// int main() {
+///     // Create the engine and the store.
+///     wasm_engine_t* engine = wasm_engine_new();
+///     wasm_store_t* store = wasm_store_new(engine);
+///
+///     // Create a WebAssembly module from a WAT definition.
+///     wasm_byte_vec_t wat;
+///     wasmer_byte_vec_new_from_string(&wat, "(module $moduleName)");
+///     wasm_byte_vec_t wasm;
+///     wat2wasm(&wat, &wasm);
+///
+///     // Create the module.
+///     wasm_module_t* module = wasm_module_new(store, &wasm);
+///
+///     // The name is not updated.
+///     wasm_name_t new_name;
+///     wasmer_byte_vec_new_from_string(&new_name, "hello");
+///     assert(!wasmer_module_set_name(module, &new_name));
+///
+///     // The module keeps its name.
+///     wasm_name_t name;
+///     wasmer_module_name(module, &name);
+///     wasmer_assert_name(&name, "moduleName");
+///
+///     // Free everything.
+///     wasm_byte_vec_delete(&name);
+///     wasm_byte_vec_delete(&new_name);
+///     wasm_module_delete(module);
+///     wasm_byte_vec_delete(&wasm);
+///     wasm_byte_vec_delete(&wat);
+///     wasm_store_delete(store);
+///     wasm_engine_delete(engine);
+///
+///     return 0;
+/// }
+/// #    })
+/// #    .success();
+/// # }
+/// ```
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn wasmer_module_set_name(
+    _module: &mut wasm_module_t,
+    _name: &wasm_name_t,
+) -> bool {
+    false
+}
+
 /// A WebAssembly module contains stateless WebAssembly code that has
 /// already been compiled and can be instantiated multiple times.
 ///

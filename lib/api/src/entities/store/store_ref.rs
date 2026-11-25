@@ -2,22 +2,73 @@ use std::ops::{Deref, DerefMut};
 
 use super::{StoreObjects, inner::StoreInner};
 use crate::entities::engine::{AsEngineRef, Engine, EngineRef};
-#[cfg(feature = "experimental-async")]
-use crate::{AsStoreAsync, StoreAsync};
 use wasmer_types::ExternType;
 //use wasmer_vm::{StoreObjects, TrapHandlerFn};
 
 #[cfg(feature = "sys")]
 use wasmer_vm::TrapHandlerFn;
 
+/// How a handle reached its store.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct HandleOrigin {
+    /// Lent for one synchronous slice of a call, rather than taken from the
+    /// store's owner. A slice's handle cannot outlive that slice.
+    from_slice: bool,
+    /// From [`FunctionEnvMut::data_and_store`](crate::FunctionEnvMut::data_and_store),
+    /// whose `&mut T` is live: it must not reach host state.
+    view_only: bool,
+}
+
 /// A temporary handle to a [`crate::Store`].
 #[derive(Debug)]
 pub struct StoreRef<'a> {
     pub(crate) inner: &'a StoreInner,
+    origin: HandleOrigin,
 }
 
 impl<'a> StoreRef<'a> {
+    pub(crate) fn new(inner: &'a StoreInner) -> Self {
+        Self {
+            inner,
+            origin: HandleOrigin::default(),
+        }
+    }
+
+    /// A handle lent for one slice of a call.
+    pub(crate) fn from_slice(inner: &'a StoreInner) -> Self {
+        Self {
+            inner,
+            origin: HandleOrigin {
+                from_slice: true,
+                view_only: false,
+            },
+        }
+    }
+
+    /// This handle, without access to host state.
+    pub(crate) fn view_only(mut self) -> Self {
+        self.origin.view_only = true;
+        self
+    }
+
     pub(crate) fn objects(&self) -> &'a StoreObjects {
+        &self.inner.objects
+    }
+
+    /// The objects, for reading a `FunctionEnv`.
+    ///
+    /// `AsStoreMut` is a public trait, so a wrapper can forward the view of
+    /// [`FunctionEnvMut::data_and_store`](crate::FunctionEnvMut::data_and_store)
+    /// through it. The origin travels with the handle, so that view still
+    /// cannot reach the `T` whose `&mut` is live.
+    ///
+    /// # Panics
+    /// Panics on a handle from `data_and_store`.
+    pub(crate) fn host_state_objects(&self) -> &'a StoreObjects {
+        assert!(
+            !self.origin.view_only,
+            "the store view of `FunctionEnvMut::data_and_store` cannot read host state"
+        );
         &self.inner.objects
     }
 
@@ -44,6 +95,16 @@ impl<'a> StoreRef<'a> {
 /// A temporary handle to a [`crate::Store`].
 pub struct StoreMut<'a> {
     pub(crate) inner: &'a mut StoreInner,
+    origin: HandleOrigin,
+}
+
+impl<'a> StoreMut<'a> {
+    pub(crate) fn new(inner: &'a mut StoreInner) -> Self {
+        Self {
+            inner,
+            origin: HandleOrigin::default(),
+        }
+    }
 }
 
 impl StoreMut<'_> {
@@ -63,10 +124,18 @@ impl StoreMut<'_> {
         self.inner as *const StoreInner as *mut StoreInner
     }
 
+    /// A handle lent for one slice of a call.
+    ///
+    /// # Safety
+    /// The caller holds the store exclusively for as long as this handle.
     #[allow(unused)]
     pub(crate) unsafe fn from_raw(raw: *mut StoreInner) -> Self {
         Self {
             inner: unsafe { &mut *raw },
+            origin: HandleOrigin {
+                from_slice: true,
+                view_only: false,
+            },
         }
     }
 
@@ -114,12 +183,13 @@ impl StoreMut<'_> {
         // through a reference it was handed — picks up a borrow derived from
         // *this* one. The new entry starts unborrowed, which is what makes the
         // store lendable for as long as it is on top.
+        let keeper = self.inner.store.keeper();
         let ptr: *mut StoreInner = &mut *self.inner;
         // SAFETY: `ptr` comes from `&mut *self.inner`, which `&mut self` keeps
         // alive and unreachable for every frame on this thread until `f`
         // returns and the guard is dropped.
-        let _guard = unsafe { super::StoreContext::install(ptr) };
-        f()
+        let guard = unsafe { super::StoreContext::install(ptr) };
+        keeper.holding(guard, |_| f())
     }
 }
 
@@ -127,17 +197,6 @@ impl StoreMut<'_> {
 pub trait AsStoreRef {
     /// Returns a `StoreRef` pointing to the underlying context.
     fn as_store_ref(&self) -> StoreRef<'_>;
-
-    /// Returns a [`StoreAsync`] if the current
-    /// context is asynchronous. The store will be locked since
-    /// it's already active in the current context, but can be used
-    /// to spawn new coroutines via
-    /// [`Function::call_async`](crate::Function::call_async).
-    #[cfg(feature = "experimental-async")]
-    fn as_store_async(&self) -> Option<impl AsStoreAsync + 'static> {
-        let id = self.as_store_ref().inner.objects.id();
-        StoreAsync::from_context(id)
-    }
 }
 
 /// Helper trait for a value that is convertible to a [`StoreMut`].
@@ -149,9 +208,24 @@ pub trait AsStoreMut: AsStoreRef {
     fn objects_mut(&mut self) -> &mut StoreObjects;
 }
 
+/// A handle from the store's owner asks the store's backend before it
+/// reaches the store: on a backend where a call can outlive its borrow, the
+/// owner must wait for it. A handle lent to a slice of a call does not ask,
+/// and cannot outlive the slice.
+#[inline]
+fn check_guest_guard(inner: &StoreInner, origin: HandleOrigin) {
+    if !origin.from_slice {
+        inner.store.check_owner();
+    }
+}
+
 impl AsStoreRef for StoreRef<'_> {
     fn as_store_ref(&self) -> StoreRef<'_> {
-        StoreRef { inner: self.inner }
+        check_guest_guard(self.inner, self.origin);
+        StoreRef {
+            inner: self.inner,
+            origin: self.origin,
+        }
     }
 }
 
@@ -163,15 +237,24 @@ impl AsEngineRef for StoreRef<'_> {
 
 impl AsStoreRef for StoreMut<'_> {
     fn as_store_ref(&self) -> StoreRef<'_> {
-        StoreRef { inner: self.inner }
+        check_guest_guard(self.inner, self.origin);
+        StoreRef {
+            inner: self.inner,
+            origin: self.origin,
+        }
     }
 }
 impl AsStoreMut for StoreMut<'_> {
     fn as_store_mut(&mut self) -> StoreMut<'_> {
-        StoreMut { inner: self.inner }
+        check_guest_guard(self.inner, self.origin);
+        StoreMut {
+            inner: self.inner,
+            origin: self.origin,
+        }
     }
 
     fn objects_mut(&mut self) -> &mut StoreObjects {
+        check_guest_guard(self.inner, self.origin);
         &mut self.inner.objects
     }
 }

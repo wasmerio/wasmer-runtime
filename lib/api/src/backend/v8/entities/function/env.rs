@@ -31,12 +31,15 @@ impl<T> FunctionEnv<T> {
     }
 
     /// Get the data as reference
-    pub fn as_ref<'a>(&self, store: &'a impl AsStoreRef) -> &'a T
+    ///
+    /// This needs a mutable store view, because a [`StoreRef`] can coexist with
+    /// the `&mut T` returned by [`FunctionEnvMut::data_and_store`].
+    pub fn as_ref<'a>(&self, store: &'a impl AsStoreMut) -> &'a T
     where
         T: Any + Send + 'static + Sized,
     {
         self.handle
-            .get(store.as_store_ref().objects().as_v8())
+            .get(store.as_store_ref().host_state_objects().as_v8())
             .as_ref()
             .downcast_ref::<T>()
             .unwrap()
@@ -136,31 +139,26 @@ impl<T: Send + 'static> FunctionEnvMut<'_, T> {
         }
     }
 
-    /// Borrows a new mutable reference of both the attached Store and host state
-    pub fn data_and_store_mut<'a>(&'a mut self) -> (&'a mut T, StoreMut<'a>) {
+    /// Borrows the host state mutably and the rest of the store immutably.
+    pub fn data_and_store(&mut self) -> (&mut T, StoreRef<'_>) {
         let data = self.func_env.as_mut(&mut self.store_mut) as *mut T;
-        // telling the borrow check to close his eyes here
-        // this is still relatively safe to do as func_env are
-        // stored in a specific vec of Store, separate from the other objects
-        // and not really directly accessible with the StoreMut
+        // SAFETY: the host state lives in its own heap allocation in the
+        // store. A `StoreRef` cannot reach it, because `FunctionEnv::as_ref`
+        // requires a mutable store view.
         let data = unsafe { &mut *data };
-        (data, self.store_mut.as_store_mut())
+        (data, self.store_mut.as_store_ref().view_only())
     }
 }
 
 impl<T> AsStoreRef for FunctionEnvMut<'_, T> {
     fn as_store_ref(&self) -> StoreRef<'_> {
-        StoreRef {
-            inner: self.store_mut.inner,
-        }
+        self.store_mut.as_store_ref()
     }
 }
 
 impl<T> AsStoreMut for FunctionEnvMut<'_, T> {
     fn as_store_mut(&mut self) -> StoreMut<'_> {
-        StoreMut {
-            inner: self.store_mut.inner,
-        }
+        self.store_mut.as_store_mut()
     }
 
     fn objects_mut(&mut self) -> &mut crate::StoreObjects {

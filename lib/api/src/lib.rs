@@ -100,6 +100,12 @@
 //!   compilers available, it's the one available in the JavaScript
 //!   environment that will be used.
 //!
+//!   The `js` feature ships small static JavaScript helpers as
+//!   `wasm-bindgen` snippets, rather than making functions from strings
+//!   at run time, which a Content Security Policy may forbid. It works
+//!   with every `wasm-bindgen` target but `--target no-modules`, which
+//!   takes no snippets.
+//!
 //! Wasmer ships by default with the Cranelift compiler as its great for
 //! development purposes.  However, we strongly encourage to use the LLVM
 //! compiler in production as it performs about 50% faster, achieving
@@ -434,6 +440,14 @@ compile_error!(
 ))]
 compile_error!(
     "the `sys` feature requires enabling at least one compiler backend: `singlepass`, `cranelift`, `llvm`, or `headless`."
+);
+
+// A `baremetal` trap leaves through the embedder's unwinder, which cannot
+// stop at the coroutine of a `call_async`, and a call dropped while suspended
+// cannot be unwound either: it would be forgotten, stack and all.
+#[cfg(all(feature = "sys", feature = "experimental-async", feature = "baremetal"))]
+compile_error!(
+    "the `experimental-async` feature is not supported with `baremetal`: traps and cancelled calls cannot unwind a `call_async` coroutine there."
 );
 
 cfg_compiler! {

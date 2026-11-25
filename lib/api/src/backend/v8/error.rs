@@ -1,6 +1,9 @@
 use std::{
+    any::Any,
+    cell::Cell,
     error::Error,
-    ffi::{CStr, c_char},
+    ffi::{CStr, c_void},
+    panic::resume_unwind,
 };
 
 use crate::{
@@ -66,55 +69,78 @@ impl Trap {
         None
     }
 
-    #[allow(clippy::unnecessary_mut_passed)]
+    /// The trap V8 is given for this one: the trap itself if it came from
+    /// V8, and for the error of a host function a trap that carries it.
     pub unsafe fn into_wasm_trap(self, store: &mut impl AsStoreMut) -> *mut wasm_trap_t {
         match self.inner {
             InnerTrap::CApi(t) => t,
-            InnerTrap::User(err) => {
-                let err_ptr = Box::leak(Box::new(err));
-                // UNSAFE: The boxed error is propagated by passing the string
-                // with the pointer to the struct instance, later on decoded.
-                let mut data = unsafe { std::mem::zeroed() };
-                let error_message = format!("🐛{err_ptr:p}");
-                unsafe {
-                    wasm_byte_vec_new(&mut data, error_message.len(), error_message.as_ptr() as _)
-                };
-                let store = store.as_store_mut();
-                let trap = unsafe { wasm_trap_new(store.inner.store.as_v8().inner, &mut data) };
-                unsafe { wasm_byte_vec_delete(&mut data) };
-                trap
-            }
+            InnerTrap::User(error) => unsafe {
+                trap_carrying(store, "a host function failed", Payload::Error(error))
+            },
         }
+    }
+
+    /// The trap V8 is given for a host function that panicked. A C callback
+    /// cannot unwind, so the trap carries the panic past V8's frames, to the
+    /// Rust caller of the guest: [`Trap::from`] resumes it there.
+    pub(crate) unsafe fn from_panic(
+        store: &mut impl AsStoreMut,
+        panic: Box<dyn Any + Send>,
+    ) -> *mut wasm_trap_t {
+        unsafe { trap_carrying(store, "a host function panicked", Payload::Panic(panic)) }
+    }
+}
+
+/// What the trap of a host function carries past V8's frames, as the host
+/// info of the trap. A guest cannot catch a trap that a host function
+/// returns, so it reaches the Rust caller of the guest, which takes it.
+enum Payload {
+    /// The error the host function returned.
+    Error(Box<dyn Error + Send + Sync>),
+    /// The panic of the host function.
+    Panic(Box<dyn Any + Send>),
+}
+
+/// The host info of such a trap: its payload, until it is taken.
+type Carried = Cell<Option<Payload>>;
+
+/// Frees the host info of a trap, when V8 collects the trap.
+unsafe extern "C" fn drop_carried(info: *mut c_void) {
+    drop(unsafe { Box::from_raw(info.cast::<Carried>()) });
+}
+
+/// A trap of `store` that carries `payload`.
+unsafe fn trap_carrying(
+    store: &mut impl AsStoreMut,
+    message: &str,
+    payload: Payload,
+) -> *mut wasm_trap_t {
+    let store = store.as_store_mut();
+    unsafe {
+        let mut data = std::mem::zeroed();
+        wasm_byte_vec_new(&mut data, message.len(), message.as_ptr() as _);
+        let trap = wasm_trap_new(store.inner.store.as_v8().inner, &data);
+        wasm_byte_vec_delete(&mut data);
+        let carried: *mut Carried = Box::into_raw(Box::new(Cell::new(Some(payload))));
+        wasm_trap_set_host_info_with_finalizer(trap, carried.cast(), Some(drop_carried));
+        trap
     }
 }
 
 impl From<*mut wasm_trap_t> for Trap {
+    /// The trap of a guest, as V8 returned it to the Rust caller. Only a
+    /// trap that a host function made has host info: what it carries is taken
+    /// here, and its panic resumes, now that V8's frames are gone.
     fn from(value: *mut wasm_trap_t) -> Self {
-        let message = unsafe {
-            let mut message = unsafe { std::mem::zeroed() };
-            unsafe { wasm_trap_message(value, &mut message) };
-
-            CStr::from_ptr(message.data as *const c_char)
-                .to_str()
-                .unwrap()
-        };
-
-        // User traps are encoded by `into_wasm_trap` as a leaked `Box` pointer
-        // prefixed with this marker.
-        if let Some((_, ptr_str)) = message.split_once("🐛") {
-            let ptr: Box<dyn Error + Send + Sync + 'static> = unsafe {
-                let r = ptr_str.trim_start_matches("0x");
-                std::ptr::read(usize::from_str_radix(r, 16).unwrap()
-                    as *const Box<dyn Error + Send + Sync + 'static>)
-            };
-
-            Self {
-                inner: InnerTrap::User(ptr),
-            }
-        } else {
-            Self {
+        let carried = unsafe { wasm_trap_get_host_info(value) }.cast::<Carried>();
+        match unsafe { carried.as_ref() }.and_then(Cell::take) {
+            Some(Payload::Error(error)) => Self {
+                inner: InnerTrap::User(error),
+            },
+            Some(Payload::Panic(panic)) => resume_unwind(panic),
+            None => Self {
                 inner: InnerTrap::CApi(value),
-            }
+            },
         }
     }
 }

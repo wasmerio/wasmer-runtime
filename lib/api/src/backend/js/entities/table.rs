@@ -1,5 +1,6 @@
 use crate::{
-    AsStoreMut, AsStoreRef, BackendTable, RuntimeError, Value,
+    AsStoreMut, AsStoreRef, BackendTable, RuntimeError, TypedFunction, Value, WasmTypeList,
+    entities::table::typed_element,
     js::vm::{VMFunction, VMTable},
     vm::{VMExtern, VMExternTable},
 };
@@ -38,6 +39,23 @@ fn get_table_item(store: &mut impl AsStoreMut, val: Value) -> Result<JsValue, Ru
         },
         _ => unimplemented!("The {val:?} is not yet supported"),
     }
+}
+
+/// A function the engine gave no signature for, as `() -> ()`: what
+/// [`Table::get`] always said of one. The signature is not written on the
+/// JavaScript function, which every handle to it shares: a guess there would
+/// read as the function's real signature from then on.
+fn untyped_function(function: js_sys::Function) -> VMFunction {
+    VMFunction {
+        function: crate::js::utils::js_handle::JsHandle::new(function),
+        ty: FunctionType::new(vec![], vec![]),
+    }
+}
+
+/// Whether Wasmer knows the signature of `function`, which came out of a
+/// table: it is written on its JavaScript function.
+fn has_known_signature(function: &crate::Function) -> bool {
+    VMFunction::type_from_js(&function.as_js().handle.function).is_some()
 }
 
 impl Table {
@@ -90,9 +108,10 @@ impl Table {
         match self.handle.ty.ty {
             Type::FuncRef => {
                 let func = value.dyn_into::<js_sys::Function>().ok()?;
-                let ty = VMFunction::type_from_js(&func)
-                    .unwrap_or_else(|| FunctionType::new(vec![], vec![]));
-                let vm_function = VMFunction::new(func, ty);
+                let vm_function = match VMFunction::type_from_js(&func) {
+                    Some(ty) => VMFunction::new(func, ty),
+                    None => untyped_function(func),
+                };
                 let function = crate::Function::from_vm_extern(
                     store,
                     crate::vm::VMExternFunction::Js(vm_function),
@@ -106,6 +125,29 @@ impl Table {
             )))),
             _ => None,
         }
+    }
+
+    /// Fails for a function that carries no signature, which [`Table::get`]
+    /// gives as a `() -> ()` one: that guess is not checked against `Args`
+    /// and `Rets`, or a function of any signature would pass as `() -> ()`.
+    pub fn get_typed_function<Args, Rets>(
+        &self,
+        store: &mut impl AsStoreMut,
+        index: u32,
+    ) -> Result<TypedFunction<Args, Rets>, RuntimeError>
+    where
+        Args: WasmTypeList,
+        Rets: WasmTypeList,
+    {
+        let element = self.get(store, index);
+        if let Some(Value::FuncRef(Some(function))) = &element
+            && !has_known_signature(function)
+        {
+            return Err(RuntimeError::new(format!(
+                "the signature of the function at table index {index} is unknown"
+            )));
+        }
+        typed_element(store, index, element)
     }
 
     pub fn set(

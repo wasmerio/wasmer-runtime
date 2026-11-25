@@ -59,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     println!("Creating the imported global...");
-    let host_global = Global::new(&mut store, Value::I32(42));
+    let host_global = Global::new(&mut store, Value::I32(42))?;
 
     // Create an import object.
     //

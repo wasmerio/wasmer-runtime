@@ -1,5 +1,5 @@
 //! Data types, functions and traits for `v8` runtime's `Global` implementation.
-use wasmer_types::{GlobalType, Mutability};
+use wasmer_types::{GlobalType, Mutability, StoreId, Type};
 
 use crate::{
     AsStoreMut, AsStoreRef, RuntimeError, Value,
@@ -15,12 +15,14 @@ use crate::{
     vm::{VMExtern, VMExternGlobal},
 };
 
-use super::check_isolate;
+use super::{check_isolate, check_owner};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A WebAssembly `global` in the `v8` runtime.
 pub struct Global {
     pub(crate) handle: VMGlobal,
+    /// The store it belongs to: V8 does not know.
+    pub(crate) store_id: StoreId,
 }
 
 unsafe impl Send for Global {}
@@ -47,6 +49,16 @@ impl Global {
         mutability: Mutability,
     ) -> Result<Self, RuntimeError> {
         check_isolate(store);
+        if !val.is_from_store(store) {
+            return Err(RuntimeError::new("cross-`Store` values are not supported"));
+        }
+        // Converting either to a V8 value panics.
+        if matches!(val.ty(), Type::ExternRef | Type::ExceptionRef) {
+            return Err(RuntimeError::new(format!(
+                "A global of type {} is not supported in V8",
+                val.ty()
+            )));
+        }
         let store = store.as_store_mut();
         let v8_store = store.inner.store.as_v8();
         let v8_type = val.ty().into_ct();
@@ -62,11 +74,12 @@ impl Global {
 
         Ok(Self {
             handle: unsafe { wasm_global_new(v8_store.inner, v8_global_type, &v8_value) },
+            store_id: store.inner.objects.id(),
         })
     }
 
     pub fn ty(&self, store: &impl AsStoreRef) -> GlobalType {
-        check_isolate(store);
+        check_owner(store, self.store_id);
         let store = store.as_store_ref();
         let r#type = unsafe { wasm_global_type(self.handle) };
         let mutability = unsafe { wasm_globaltype_mutability(&*r#type) };
@@ -84,15 +97,18 @@ impl Global {
     }
 
     pub fn get(&self, store: &mut impl AsStoreMut) -> Value {
-        check_isolate(store);
+        check_owner(store, self.store_id);
         let store = store.as_store_ref();
         let mut out = unsafe { std::mem::zeroed() };
         unsafe { wasm_global_get(self.handle, &mut out) };
-        out.into_wv()
+        out.into_wv(self.store_id)
     }
 
     pub fn set(&self, store: &mut impl AsStoreMut, val: Value) -> Result<(), RuntimeError> {
-        check_isolate(store);
+        check_owner(store, self.store_id);
+        if !val.is_from_store(store) {
+            return Err(RuntimeError::new("cross-`Store` values are not supported"));
+        }
 
         if val.ty() != self.ty(store).ty {
             return Err(RuntimeError::new(format!(
@@ -117,11 +133,12 @@ impl Global {
         check_isolate(store);
         Self {
             handle: vm_global.unwrap_v_8(),
+            store_id: store.objects_mut().id(),
         }
     }
 
     pub fn is_from_store(&self, store: &impl AsStoreRef) -> bool {
         check_isolate(store);
-        true
+        self.store_id == store.as_store_ref().objects().id()
     }
 }

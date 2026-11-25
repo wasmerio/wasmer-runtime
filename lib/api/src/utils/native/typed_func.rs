@@ -8,12 +8,11 @@
 //! let add_one_native: TypedFunction<i32, i32> = add_one.native().unwrap();
 //! ```
 #[cfg(feature = "experimental-async")]
-use crate::AsStoreAsync;
+use crate::{AsyncCallRequest, AsyncCallStore, StoreMut, Value};
 use crate::{
     AsStoreMut, BackendStore, CallWrapper, FromToNativeWasmType, Function, NativeWasmTypeInto,
     RuntimeError, WasmTypeList, store::AsStoreRef,
 };
-use std::future::Future;
 use std::marker::PhantomData;
 use wasmer_types::RawValue;
 
@@ -94,39 +93,35 @@ macro_rules! impl_native_traits {
             }
 
             /// Call the typed func asynchronously.
+            ///
+            /// See [`Function::call_async`] for what `store` can be.
             #[cfg(feature = "experimental-async")]
-            #[allow(unused_mut)]
             #[allow(clippy::too_many_arguments)]
-            pub fn call_async(
-                &self,
-                store: &impl AsStoreAsync,
+            pub fn call_async<'a, S: AsyncCallStore>(
+                &'a self,
+                store: &'a mut S,
                 $( $x: $x, )*
-            ) -> impl Future<Output = Result<Rets, RuntimeError>> + Sized + 'static
+            ) -> S::Call<'a, Result<Rets, RuntimeError>>
             where
                 $( $x: FromToNativeWasmType + 'static, )*
+                Rets: 'static,
             {
                 $(
                     let [<p_ $x>] = $x;
                 )*
-                let store = store.store();
-                let func = self.func.clone();
-                async move {
-                    let read_lock = store.read_lock().await;
-                    match read_lock.as_store_ref().inner.store {
-                        #[cfg(feature = "sys")]
-                        BackendStore::Sys(_) => {
-                            drop(read_lock);
-                            Self::call_async_sys(func, store, $([<p_ $x>]),*).await
-                        }
-                        #[cfg(feature = "v8")]
-                        BackendStore::V8(_) => async_backend_error(),
-                        #[cfg(feature = "js")]
-                        BackendStore::Js(_) => {
-                            drop(read_lock);
-                            Self::call_async_js(func, store, $([<p_ $x>]),*).await
-                        }
+                let function = self.func.clone();
+                let ty_source = function.clone();
+                store.start_call(AsyncCallRequest::<Rets>::typed(function, move |store: &mut StoreMut<'_>| {
+                    let ty = ty_source.ty(store);
+                    let raw = [ $( [<p_ $x>].to_native().into_raw(store) ),* ];
+                    let mut values: Vec<Value> = Vec::with_capacity(raw.len());
+                    for (raw, ty) in raw.iter().zip(ty.params()) {
+                        // Safety: each raw value was made from an argument of
+                        // this function's parameter type.
+                        values.push(unsafe { Value::from_raw(store, *ty, *raw) });
                     }
-                }
+                    values
+                }))
             }
 
             #[doc(hidden)]
@@ -181,9 +176,3 @@ impl_native_traits!(
 impl_native_traits!(
     A1, A2, A3, A4, A5, A6, A7, A8, A9, A10, A11, A12, A13, A14, A15, A16, A17, A18, A19, A20
 );
-
-fn async_backend_error<Rets>() -> Result<Rets, RuntimeError> {
-    Err(RuntimeError::new(
-        "async calls are not supported with the `v8` backend",
-    ))
-}

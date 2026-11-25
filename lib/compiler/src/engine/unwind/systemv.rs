@@ -4,13 +4,14 @@
 //! Module for System V ABI unwind registry.
 
 use core::sync::atomic::{AtomicBool, Ordering};
+use gimli::{BaseAddresses, CieOrFde, EhFrame, NativeEndian, UnwindSection};
 use std::sync::Once;
 
 /// Represents a registry of function unwind information for System V ABI.
 pub struct UnwindRegistry {
     published: bool,
     eh_frames_published: bool,
-    registrations: Vec<usize>,
+    registrations: Vec<*const u8>,
     #[cfg(target_os = "macos")]
     compact_unwind_mgr: compact_unwind::CompactUnwindManager,
 }
@@ -30,8 +31,8 @@ mod compact_unwind;
 ///
 /// Unfortunately their interface to `__register_frame` is different. The
 /// libunwind library takes a pointer to an individual FDE while libgcc takes a
-/// null-terminated list of FDEs. This means we need to know what unwinder
-/// is being used at runtime.
+/// null-terminated `.eh_frame` section. This means we need to know what
+/// unwinder is being used at runtime.
 ///
 /// This detection is done currently by looking for a libunwind-specific symbol.
 /// This specific symbol was somewhat recommended by LLVM's
@@ -84,7 +85,7 @@ impl UnwindRegistry {
 
         unsafe {
             if let Some(eh_frame) = eh_frame {
-                self.register_eh_frames(eh_frame);
+                self.register_eh_frames(eh_frame)?;
             }
         }
 
@@ -93,68 +94,49 @@ impl UnwindRegistry {
         Ok(())
     }
 
-    #[allow(clippy::cast_ptr_alignment)]
-    unsafe fn register_eh_frames(&mut self, eh_frame: &[u8]) {
-        {
-            // Validate that the `.eh_frame` is well-formed before registering it.
-            // See https://refspecs.linuxfoundation.org/LSB_3.0.0/LSB-Core-generic/LSB-Core-generic/ehframechpt.html for more details.
-            // We put the frame records into a vector before registering them, because
-            // calling `__register_frame` with invalid data can cause segfaults.
+    unsafe fn register_eh_frames(&mut self, eh_frame: &[u8]) -> Result<(), String> {
+        let start = eh_frame.as_ptr() as usize;
 
-            // Pointers to the registrations that will be registered with `__register_frame`.
-            // For libgcc based systems, these are CIEs.
-            // For libunwind based systems, these are FDEs.
-            let mut records_to_register = Vec::new();
+        // We're going to make a validation even for libgcc where we generally pass the entire
+        // input slice.
+        let section = EhFrame::new(eh_frame, NativeEndian);
+        let bases = BaseAddresses::default().set_eh_frame(start as u64);
+        let mut entries = section.entries(&bases);
+        let mut records = Vec::new();
 
-            let mut current = 0;
-            let mut last_len = 0;
-            let using_libunwind = using_libunwind();
-            while current <= (eh_frame.len() - size_of::<u32>()) {
-                // If a CFI or a FDE starts with 0u32 it is a terminator.
-                let len = u32::from_ne_bytes(eh_frame[current..(current + 4)].try_into().unwrap());
-                if len == 0 {
-                    current += size_of::<u32>();
-                    last_len = 0;
-                    continue;
-                }
-                // The first record after a terminator is always a CIE.
-                let is_cie = last_len == 0;
-                last_len = len;
-                let record = eh_frame.as_ptr() as usize + current;
-                current = current + len as usize + 4;
-
-                if using_libunwind {
-                    // For libunwind based systems, `__register_frame` takes a pointer to an FDE.
-                    if !is_cie {
-                        // Every record that's not a CIE is an FDE.
-                        records_to_register.push(record);
-                    }
-                } else {
-                    // For libgcc based systems, `__register_frame` takes a pointer to a CIE.
-                    if is_cie {
-                        records_to_register.push(record);
-                    }
+        if using_libunwind() {
+            while let Some(entry) = entries
+                .next()
+                .map_err(|err| format!("invalid `.eh_frame` entry: {err}"))?
+            {
+                if let CieOrFde::Fde(fde) = entry {
+                    records.push((start + fde.offset()) as *const u8);
                 }
             }
 
-            assert_eq!(
-                last_len, 0,
-                "The last record in the `.eh_frame` must be a terminator (but it actually has length {last_len})"
-            );
-            assert_eq!(
-                current,
-                eh_frame.len(),
-                "The `.eh_frame` must be finished after the last record",
-            );
-
-            for record in records_to_register {
-                // Register the CFI with libgcc
-                unsafe {
-                    __register_frame(record as *const u8);
-                }
+            for record in records {
+                unsafe { __register_frame(record) };
                 self.registrations.push(record);
             }
+        } else {
+            while entries
+                .next()
+                .map_err(|err| format!("invalid `.eh_frame` entry: {err}"))?
+                .is_some()
+            {}
+
+            if !eh_frame.ends_with(&[0u8; 4]) {
+                return Err(
+                    "The `.eh_frame` section must end with a four-byte zero terminator".to_string(),
+                );
+            }
+
+            let start = start as *const u8;
+            unsafe { __register_frame(start) };
+            self.registrations.push(start);
         }
+
+        Ok(())
     }
 
     #[cfg(target_os = "macos")]

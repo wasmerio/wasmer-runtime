@@ -40,8 +40,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let module = Module::new(&store, wasm_bytes)?;
 
     // Create the globals
-    let some = Global::new(&mut store, Value::F32(1.0));
-    let other = Global::new_mut(&mut store, Value::F32(2.0));
+    let some = Global::new(&mut store, Value::F32(1.0))?;
+    let other = Global::new_mut(&mut store, Value::F32(2.0))?;
 
     // Create an import object.
     // We add the two required globals in the `env` namespace.

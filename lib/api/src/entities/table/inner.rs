@@ -1,7 +1,8 @@
 use wasmer_types::TableType;
 
 use crate::{
-    AsStoreMut, AsStoreRef, ExportError, Exportable, Extern, StoreMut, StoreRef, Value,
+    AsStoreMut, AsStoreRef, ExportError, Exportable, Extern, StoreMut, StoreRef, TypedFunction,
+    Value, WasmTypeList,
     error::RuntimeError,
     macros::backend::{gen_rt_ty, match_rt},
     store::BackendStore,
@@ -20,6 +21,30 @@ gen_rt_ty! {
     #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
     #[derive(Debug, Clone, PartialEq, Eq, derive_more::From)]
     pub BackendTable(entities::table::Table);
+}
+
+/// The typed form of `element`, which a table gave for `index`: what every
+/// backend's `get_typed_function` ends with. The signature is checked by
+/// [`crate::Function::typed`].
+pub(crate) fn typed_element<Args, Rets>(
+    store: &impl AsStoreRef,
+    index: u32,
+    element: Option<Value>,
+) -> Result<TypedFunction<Args, Rets>, RuntimeError>
+where
+    Args: WasmTypeList,
+    Rets: WasmTypeList,
+{
+    match element {
+        Some(Value::FuncRef(Some(function))) => function.typed(store),
+        Some(Value::FuncRef(None)) => Err(RuntimeError::new(format!(
+            "the table element at index {index} is null"
+        ))),
+        Some(_) => Err(RuntimeError::new("the table does not hold functions")),
+        None => Err(RuntimeError::new(format!(
+            "the table index {index} is out of bounds"
+        ))),
+    }
 }
 
 impl BackendTable {
@@ -63,6 +88,22 @@ impl BackendTable {
     pub fn get(&self, store: &mut impl AsStoreMut, index: u32) -> Option<Value> {
         match_rt!(on self => s {
             s.get(store, index)
+        })
+    }
+
+    /// Retrieves the function at the provided `index` as a [`TypedFunction`].
+    #[inline]
+    pub fn get_typed_function<Args, Rets>(
+        &self,
+        store: &mut impl AsStoreMut,
+        index: u32,
+    ) -> Result<TypedFunction<Args, Rets>, RuntimeError>
+    where
+        Args: WasmTypeList,
+        Rets: WasmTypeList,
+    {
+        match_rt!(on self => s {
+            s.get_typed_function(store, index)
         })
     }
 
