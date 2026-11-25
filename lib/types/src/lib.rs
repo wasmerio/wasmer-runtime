@@ -47,7 +47,7 @@ pub use error::{
 
 /// The entity module, with common helpers for Rust structures
 pub mod entity;
-pub use crate::features::Features;
+pub use crate::features::{Features, WasmFeature};
 pub use crate::indexes::{
     CustomSectionIndex, DataIndex, ElemIndex, ExportIndex, FunctionIndex, GlobalIndex, ImportIndex,
     LocalFunctionIndex, LocalGlobalIndex, LocalMemoryIndex, LocalTableIndex, LocalTagIndex,

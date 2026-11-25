@@ -486,6 +486,13 @@ impl SharedStore {
     pub fn downgrade(&self) -> WeakSharedStore {
         WeakSharedStore(Rc::downgrade(&self.0))
     }
+
+    /// Whether both handles are of the same store.
+    ///
+    /// It does not borrow the store, so it also answers inside a slice.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 impl std::fmt::Debug for SharedStore {
@@ -500,6 +507,11 @@ impl WeakSharedStore {
     /// The store, if a handle to it is still alive.
     pub fn upgrade(&self) -> Option<SharedStore> {
         self.0.upgrade().map(SharedStore)
+    }
+
+    /// Whether both handles are of the same store, alive or not.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Weak::ptr_eq(&self.0, &other.0)
     }
 }
 

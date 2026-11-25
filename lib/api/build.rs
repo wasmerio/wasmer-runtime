@@ -8,6 +8,7 @@ fn build_v8() {
     };
 
     const WEE8_RELEASE_VERSION: &str = "11.9.7";
+    const V8_ARTIFACT_DIR: &str = "WASMER_V8_ARTIFACT_DIR";
 
     let (asset_name, platform_name) = match (
         env::var("CARGO_CFG_TARGET_OS").unwrap().as_str(),
@@ -33,14 +34,36 @@ fn build_v8() {
         .join(WEE8_RELEASE_VERSION)
         .join(platform_name);
     let archive_path = cache_dir.join(asset_name);
-    let v8_lib_dir = cache_dir.join("lib");
-    let v8_lib_path = v8_lib_dir.join(if cfg!(target_os = "windows") {
+    let library_name = if cfg!(target_os = "windows") {
         "v8.lib"
     } else {
         "libv8.a"
-    });
+    };
 
-    if !v8_lib_path.exists() {
+    // A build without network access names an unpacked artifact, which is
+    // then used as it is: nothing is downloaded, and nothing is written to it.
+    println!("cargo:rerun-if-env-changed={V8_ARTIFACT_DIR}");
+    let prebuilt_lib_dir = env::var_os(V8_ARTIFACT_DIR).map(|dir| {
+        let dir = PathBuf::from(dir);
+        assert!(
+            dir.is_absolute(),
+            "{V8_ARTIFACT_DIR} must be an absolute path: {}",
+            dir.display()
+        );
+        let library = dir.join("lib").join(library_name);
+        assert!(
+            library.is_file(),
+            "{V8_ARTIFACT_DIR} must contain lib/{library_name}: {}",
+            dir.display()
+        );
+        println!("cargo:rerun-if-changed={}", library.display());
+        dir.join("lib")
+    });
+    let is_prebuilt = prebuilt_lib_dir.is_some();
+    let v8_lib_dir = prebuilt_lib_dir.unwrap_or_else(|| cache_dir.join("lib"));
+    let v8_lib_path = v8_lib_dir.join(library_name);
+
+    if !is_prebuilt && !v8_lib_path.exists() {
         fs::create_dir_all(&cache_dir).unwrap_or_else(|err| {
             panic!(
                 "failed to create v8 cache dir {}: {err}",
@@ -87,7 +110,17 @@ fn build_v8() {
         });
     }
 
-    println!("cargo:rustc-link-search=native={}", v8_lib_dir.display());
+    // The library with its symbols renamed goes next to the one it is made
+    // from, except for a prebuilt artifact, which may be read-only.
+    let prefixed_lib_dir = if is_prebuilt {
+        out_path.clone()
+    } else {
+        v8_lib_dir.clone()
+    };
+    println!(
+        "cargo:rustc-link-search=native={}",
+        prefixed_lib_dir.display()
+    );
 
     // Rename the wasm-c-api symbols from V8 so they do not collide with
     // Wasmer's own wasm-c-api exports when this crate is linked into tests.
@@ -173,7 +206,7 @@ fn build_v8() {
             }
         })
         .collect();
-    let prefixed_v8_lib_path = v8_lib_dir.join("libv8prefixed.a");
+    let prefixed_v8_lib_path = prefixed_lib_dir.join("libv8prefixed.a");
     let output = std::process::Command::new(objcopy)
         .args(syms)
         .arg(v8_lib_path.display().to_string())

@@ -342,15 +342,11 @@ fn nested_async_in_sync() -> Result<()> {
     Ok(())
 }
 
-/// An async import that returns the exception of a guest it called throws it
-/// back into its caller, which was suspended and resumed in between, and
-/// whose `try_table` catches it.
-#[test]
-#[cfg_attr(
-    feature = "v8-default",
-    ignore = "async functions are not supported by the default v8 backend"
-)]
-fn an_async_import_rethrows_a_guest_exception() -> Result<()> {
+/// Runs a guest whose `try_table` calls the import that `relay` makes, with
+/// the guest's `thrower` export in the import's environment.
+fn catch_what_the_relay_returns(
+    relay: impl FnOnce(&mut Store, &FunctionEnv<Option<Function>>) -> Function,
+) -> Result<()> {
     const WAT: &str = r#"
     (module
         (import "env" "relay" (func $relay))
@@ -370,15 +366,7 @@ fn an_async_import_rethrows_a_guest_exception() -> Result<()> {
     let module = Module::new(&store, wasm)?;
 
     let env = FunctionEnv::new(&mut store, None::<Function>);
-    let relay = Function::new_typed_async(
-        &mut store,
-        &env,
-        async |cx: &mut AsyncEnv<Option<Function>>| -> Result<(), RuntimeError> {
-            let thrower = cx.with(|env| env.data().clone().expect("thrower to be set"));
-            tokio::task::yield_now().await;
-            thrower.call_async(cx, &[]).await.map(drop)
-        },
-    );
+    let relay = relay(&mut store, &env);
 
     let instance = Instance::new(
         &mut store,
@@ -396,4 +384,53 @@ fn an_async_import_rethrows_a_guest_exception() -> Result<()> {
     assert_eq!(results.as_ref(), [Value::I32(7)]);
 
     Ok(())
+}
+
+/// An async import that returns the exception of a guest it called throws it
+/// back into its caller, which was suspended and resumed in between, and
+/// whose `try_table` catches it.
+#[test]
+#[cfg_attr(
+    feature = "v8-default",
+    ignore = "async functions are not supported by the default v8 backend"
+)]
+fn an_async_import_rethrows_a_guest_exception() -> Result<()> {
+    catch_what_the_relay_returns(|store, env| {
+        Function::new_typed_async(
+            store,
+            env,
+            async |cx: &mut AsyncEnv<Option<Function>>| -> Result<(), RuntimeError> {
+                let thrower = cx.with(|env| env.data().clone().expect("thrower to be set"));
+                tokio::task::yield_now().await;
+                thrower.call_async(cx, &[]).await.map(drop)
+            },
+        )
+    })
+}
+
+/// The same through a dynamic async import, whose signature is only known at
+/// run time.
+#[test]
+#[cfg_attr(
+    feature = "v8-default",
+    ignore = "async functions are not supported by the default v8 backend"
+)]
+fn a_dynamic_async_import_rethrows_a_guest_exception() -> Result<()> {
+    catch_what_the_relay_returns(|store, env| {
+        Function::new_async(
+            store,
+            env,
+            FunctionType::new(vec![], vec![]),
+            async |cx: &mut AsyncEnv<Option<Function>>,
+                   _args: &[Value]|
+                   -> Result<Vec<Value>, RuntimeError> {
+                let thrower = cx.with(|env| env.data().clone().expect("thrower to be set"));
+                tokio::task::yield_now().await;
+                thrower
+                    .call_async(cx, &[])
+                    .await
+                    .map(|results| results.to_vec())
+            },
+        )
+    })
 }

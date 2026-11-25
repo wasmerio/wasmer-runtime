@@ -27,6 +27,23 @@ pub trait ModuleMiddleware: Debug + Send + Sync {
     fn transform_module_info(&self, _: &mut ModuleInfo) -> Result<(), MiddlewareError> {
         Ok(())
     }
+
+    /// Returns the deterministic id of this middleware, which goes into the
+    /// hash in the deterministic id of an engine that uses it. It can be any
+    /// string, of any length.
+    ///
+    /// Two middlewares that can transform the same module differently must
+    /// have different ids. The default is the name of the middleware's type,
+    /// so a middleware whose transformation depends on its configuration
+    /// should include that configuration.
+    ///
+    /// The id should be the same on every host, or the engine's id is not:
+    /// leave out addresses, paths and anything else of the machine it runs
+    /// on. Rust does not promise that the name of a type stays the same
+    /// between compiler versions, so the default can change with one.
+    fn deterministic_id(&self) -> String {
+        std::any::type_name::<Self>().to_string()
+    }
 }
 
 /// A function middleware specialized for a single function.
