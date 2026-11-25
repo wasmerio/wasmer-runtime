@@ -310,6 +310,39 @@ poll and the entry of a `call_async` made from a sync host function.
 [`interrupt_registry/unix.rs`](../lib/vm/src/interrupt_registry/unix.rs) record
 it, and are ignored until it is fixed.
 
+## Owning-thread execution
+
+**On `sys`, an embedder that runs its guest on a thread it owns uses
+`SharedStore` as it is.** Its bindings stay on that thread, other threads ask
+it for work, and the guest can end while calls are still on the native stack.
+The `next` line had `NativeInvocationScope`, the `NativeCleanup*` family,
+`WeakNativeInvocation` and `NativeAncestrySettlement` for this. Each served a
+need that the contract already meets, so none of them is ported:
+
+| Need | On `next` | Here |
+| --- | --- | --- |
+| Bind a store to a thread | `NativeInvocationScope::bind` records the owner | `Store`, `SharedStore`, `WeakSharedStore` and call futures are `!Send`, so the thread that makes a store owns it |
+| Enter the store from that thread | Calls with a local owner, and store loans | `try_with`, a `call_async` polled there, and `release` for code reached through frames that carry no reference |
+| Take work from other threads | Outside these APIs | The embedder's: a channel to the owning thread, and wakers that only ask it to poll |
+| Refuse work once the guest ended | `NativeInvocationScope::close` | The embedder drops its tasks and its handles, and a `WeakSharedStore` stops upgrading |
+| Know when the calls on the native stack are over | `close_and_wait`, `NativeAncestrySettlement` | Calls nest, so they are over when the owning thread's outermost entry returns. Until then `try_with` fails with `StoreBusy` and `into_store` gives the handle back |
+| Keep a suspended call from resuming under a foreign frame | `WeakNativeInvocation`, `NativeFrameGuard`, `NativeCleanupGuard` | Nothing to keep: a suspended stack holds no host frame (invariant 3), and a guest under one traps instead of waiting |
+| Run clean-up that needs the store once those calls are over | `NativeCleanupOwner`, with its fences, seals and exit boundaries | A destructor asks a handle. On `StoreBusy` the embedder queues the work, and runs it when its outermost entry returns |
+
+A task that waits can be dropped from inside a call of its store, for example
+by the import that ends the guest: its host future is dropped first, and its
+guest is discarded without running. `AsyncEnv::with` panics in such a
+destructor, which is why one that needs the store asks a handle.
+
+Host code stays on the owning thread, but not always on that thread's own
+stack: under a `call_async`, a synchronous host function runs on the coroutine
+stack of the call. Bindings that need the thread's own stack are entered
+through `try_with`.
+
+[`async_owning_thread.rs`](../lib/api/tests/async_owning_thread.rs) runs all
+of it on an embedder thread, and the documentation of `SharedStore` tells an
+embedder how.
+
 ## Limitations and porting notes
 
 - **Futures are `!Send`.** `Store` is `!Send`, so embedders use `spawn_local`
@@ -340,6 +373,7 @@ it, and are ignored until it is fixed.
 | One `call_async`, with the difference in a sealed trait | `AsyncEnv::call` and `SharedStore::call` | One way to call, and `cx` reborrows like a store |
 | `SharedStore` owns the store behind `Rc` | A scoped `run_concurrent` that borrows the store | A forgotten scope would end the borrow while handles still reach the store |
 | `try_with` fails instead of waiting | Async acquisition | On one thread, a busy store means the holder is below you on the stack |
+| Owning-thread execution adds no API | Port `NativeInvocationScope` and the `NativeCleanup*` family | A store is bound to its thread by its type, calls nest, and a suspended stack holds no host frame, so there is nothing to settle that the embedder cannot see |
 | `data_and_store` returns `StoreRef` | A new view type | No new types, and WASIX compiles after sequencing a few borrows |
 | No `Instance::new_async` | Copy Wasmtime | Wasm has no async start function, and sync entry already works |
 | Host futures are polled on the executor stack | Poll them on the guest's stack, as Wasmtime does | A deep future cannot overflow the fixed coroutine stack |
