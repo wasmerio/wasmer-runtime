@@ -245,7 +245,7 @@ fn exit(mut env: FunctionEnvMut<Host>, code: i32) -> Result<(), RuntimeError> {
     Err(RuntimeError::user(Box::new(Exit(code))))
 }
 
-/// Drops the tasks that wait, oldest first, which unwinds their guests
+/// Drops the tasks that wait, oldest first, which discards their guests
 /// without running them, and tells who asked.
 fn cancel_suspended(log: &Log) {
     let suspended = OWNED.with_borrow_mut(|owned| std::mem::take(&mut owned.suspended));
@@ -508,8 +508,8 @@ impl Owner {
 }
 
 impl Drop for Owner {
-    /// A thread drops its tasks before it exits, while it can still unwind
-    /// them.
+    /// The embedder drops its tasks with its guest, so that a test leaves
+    /// none to the next one on its thread.
     fn drop(&mut self) {
         drop(OWNED.take());
     }
@@ -634,8 +634,8 @@ fn an_embedder_thread_owns_a_shared_store() {
     );
 }
 
-/// The guest ends on the stack of a task: its sibling is unwound from that
-/// stack, and the task ends with the guest's error.
+/// The guest ends in a host function of a task: its sibling is dropped from
+/// there, and the task ends with the guest's error.
 #[test]
 fn a_guest_that_ends_under_a_task_unwinds_the_same_way() {
     let log = Log::default();

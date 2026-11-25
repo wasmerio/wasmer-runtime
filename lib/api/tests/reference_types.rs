@@ -1275,4 +1275,216 @@ pub mod reference_types {
 
         Ok(())
     }
+
+    // The async host functions below take the paths of this backend that the
+    // tests above do not: a future the guest waits for gives its results raw,
+    // and a function that returns `Deferred` has a trampoline of its own.
+
+    /// Pending once, then ready: the guest of an import that awaits it waits.
+    #[cfg(feature = "experimental-async")]
+    struct Once(bool);
+
+    #[cfg(feature = "experimental-async")]
+    impl std::future::Future for Once {
+        type Output = ();
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<()> {
+            if std::mem::replace(&mut self.0, true) {
+                return std::task::Poll::Ready(());
+            }
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    }
+
+    /// A kind of async host function, whether its guest waits for it, and
+    /// one that returns a given value.
+    #[cfg(feature = "experimental-async")]
+    type AsyncKind = (&'static str, bool, Function);
+
+    /// The typed async host functions of a store that return `$value`, of the
+    /// type `$ty`: an `async` one that waits, and those that return each
+    /// form of `Deferred`.
+    #[cfg(feature = "experimental-async")]
+    macro_rules! typed_async_kinds {
+        ($store:expr, $env:expr, $value:expr, $ty:ty) => {{
+            let value: $ty = $value;
+            let (waits, ready, polled, pending) =
+                (value.clone(), value.clone(), value.clone(), value);
+            let kinds: Vec<AsyncKind> = vec![
+                (
+                    "an async function that waits",
+                    true,
+                    Function::new_typed_async(
+                        $store,
+                        $env,
+                        async move |_: &mut AsyncEnv<()>| -> $ty {
+                            Once(false).await;
+                            waits.clone()
+                        },
+                    ),
+                ),
+                (
+                    "a function that returns `Deferred::ready`",
+                    false,
+                    Function::new_typed_async(
+                        $store,
+                        $env,
+                        move |_: &mut AsyncEnv<()>| -> Deferred<$ty> {
+                            Deferred::ready(ready.clone())
+                        },
+                    ),
+                ),
+                (
+                    "a function that returns a `Deferred` that is ready when polled",
+                    false,
+                    Function::new_typed_async(
+                        $store,
+                        $env,
+                        move |_: &mut AsyncEnv<()>| -> Deferred<$ty> {
+                            let polled = polled.clone();
+                            Deferred::pending(async move { polled })
+                        },
+                    ),
+                ),
+                (
+                    "a function that returns a `Deferred` that waits",
+                    true,
+                    Function::new_typed_async(
+                        $store,
+                        $env,
+                        move |_: &mut AsyncEnv<()>| -> Deferred<$ty> {
+                            let pending = pending.clone();
+                            Deferred::pending(async move {
+                                Once(false).await;
+                                pending
+                            })
+                        },
+                    ),
+                ),
+            ];
+            kinds
+        }};
+    }
+
+    /// The dynamic async host functions of `store` that return `value`: an
+    /// `async` one that waits, and one that returns `Deferred`.
+    #[cfg(feature = "experimental-async")]
+    fn dynamic_async_kinds(
+        store: &mut Store,
+        env: &FunctionEnv<()>,
+        value: Value,
+    ) -> Vec<AsyncKind> {
+        let ty = FunctionType::new([], [value.ty()]);
+        let (waits, ready) = (value.clone(), value);
+        vec![
+            (
+                "a dynamic async function that waits",
+                true,
+                Function::new_async(
+                    store,
+                    env,
+                    ty.clone(),
+                    async move |_: &mut AsyncEnv<()>, _: &[Value]| {
+                        Once(false).await;
+                        Ok(vec![waits.clone()])
+                    },
+                ),
+            ),
+            (
+                "a dynamic function that returns `Deferred::ready`",
+                false,
+                Function::new_async(store, env, ty, move |_: &mut AsyncEnv<()>, _: &[Value]| {
+                    Deferred::ready(Ok(vec![ready.clone()]))
+                }),
+            ),
+        ]
+    }
+
+    /// Every kind of async host function of `store` that returns `function`,
+    /// and every kind that returns `object`.
+    #[cfg(feature = "experimental-async")]
+    fn async_kinds(
+        store: &mut Store,
+        function: Option<Function>,
+        object: Option<ExternRef>,
+    ) -> Vec<AsyncKind> {
+        let env = FunctionEnv::new(store, ());
+        let mut kinds = typed_async_kinds!(&mut *store, &env, function.clone(), Option<Function>);
+        kinds.extend(typed_async_kinds!(
+            &mut *store,
+            &env,
+            object.clone(),
+            Option<ExternRef>
+        ));
+        kinds.extend(dynamic_async_kinds(store, &env, Value::FuncRef(function)));
+        kinds.extend(dynamic_async_kinds(store, &env, Value::ExternRef(object)));
+        kinds
+    }
+
+    /// The results of `host`, called by the embedder and by a guest: on a
+    /// coroutine, and in place too unless its guest has to wait, which it
+    /// cannot do there.
+    #[cfg(feature = "experimental-async")]
+    fn call_where_it_can_wait(
+        store: &mut Store,
+        host: &Function,
+        waits: bool,
+    ) -> Result<Vec<Result<Box<[Value]>, RuntimeError>>> {
+        let guest = guest_caller(store, host)?;
+        let mut results = Vec::new();
+        for function in [host, &guest] {
+            results.push(futures::executor::block_on(function.call_async(store, &[])));
+            if !waits {
+                results.push(function.call(store, &[]));
+            }
+        }
+        Ok(results)
+    }
+
+    #[cfg(feature = "experimental-async")]
+    #[engine_test]
+    #[cfg_attr(
+        feature = "v8-default",
+        ignore = "function and extern refs are not supported by the default v8 backend"
+    )]
+    fn refs_of_another_store_returned_by_every_kind_of_async_host_function() -> Result<()> {
+        let (mut store, mut other) = (Store::default(), Store::default());
+        let _mine = references(&mut store, "mine", 1);
+        let (function, object) = references(&mut other, "theirs", 2);
+
+        for (kind, waits, host) in async_kinds(&mut store, Some(function), Some(object)) {
+            for result in call_where_it_can_wait(&mut store, &host, waits)? {
+                assert_refused(&mut store, kind, result);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "experimental-async")]
+    #[engine_test]
+    #[cfg_attr(
+        feature = "v8-default",
+        ignore = "function and extern refs are not supported by the default v8 backend"
+    )]
+    fn refs_of_own_store_returned_by_every_kind_of_async_host_function() -> Result<()> {
+        let mut store = Store::default();
+        let (function, object) = references(&mut store, "mine", 1);
+
+        for (function, object, expected) in [
+            (Some(function), Some(object), Some(("mine", 1))),
+            (None, None, None),
+        ] {
+            for (_kind, waits, host) in async_kinds(&mut store, function, object) {
+                let results = call_where_it_can_wait(&mut store, &host, waits)?;
+                assert_result_returned(&mut store, results, expected)?;
+            }
+        }
+
+        Ok(())
+    }
 }
