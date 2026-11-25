@@ -311,3 +311,39 @@ fn middleware_locals_info_multiple_functions(mut config: crate::Config) -> Resul
     );
     Ok(())
 }
+
+#[compiler_test(middlewares)]
+fn deterministic_id_covers_features_and_middlewares(mut config: crate::Config) -> Result<()> {
+    let mut features = Features::default();
+    config.set_features(features.clone());
+    let plain = config.engine().deterministic_id();
+    assert!(
+        plain
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+        "{plain}"
+    );
+    assert_eq!(plain, config.engine().deterministic_id());
+
+    features.tail_call = !features.tail_call;
+    config.set_features(features);
+    let other_features = config.engine().deterministic_id();
+    assert_ne!(plain, other_features);
+
+    config.set_features(Features::default());
+    config.set_middlewares(vec![
+        Arc::new(Add2MulGen { value_off: 0 }) as Arc<dyn ModuleMiddleware>
+    ]);
+    let with_middleware = config.engine().deterministic_id();
+    assert_ne!(plain, with_middleware);
+    assert!(
+        with_middleware
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+        "{with_middleware}"
+    );
+
+    config.set_middlewares(vec![Arc::new(FusionGen) as Arc<dyn ModuleMiddleware>]);
+    assert_ne!(with_middleware, config.engine().deterministic_id());
+    Ok(())
+}

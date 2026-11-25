@@ -85,13 +85,35 @@ impl Engine {
         self.name.as_str()
     }
 
-    /// Returns the deterministic id of this engine
+    /// Returns the deterministic id of this engine.
+    ///
+    /// Engines that can compile the same module to different code have
+    /// different ids: the id covers the compiler and its configuration, the
+    /// WebAssembly features of the engine and the compiler's middlewares. It
+    /// does not cover the target.
+    ///
+    /// The id only has ASCII letters, digits, `_` and `-`.
     pub fn deterministic_id(&self) -> String {
         #[cfg(feature = "compiler")]
         {
             let i = self.inner();
             if let Some(ref c) = i.compiler {
-                return c.deterministic_id();
+                let features = crate::DeterministicIdComponent::of_features(&i.features)
+                    .into_iter()
+                    .map(|component| component.to_string());
+                let middlewares = c.get_middlewares().iter().map(|middleware| {
+                    let id: String = middleware
+                        .deterministic_id()
+                        .chars()
+                        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                        .collect();
+                    format!("mw_{id}")
+                });
+                return std::iter::once(c.deterministic_id())
+                    .chain(features)
+                    .chain(middlewares)
+                    .collect::<Vec<_>>()
+                    .join("-");
             } else {
                 return self.name.clone();
             }
