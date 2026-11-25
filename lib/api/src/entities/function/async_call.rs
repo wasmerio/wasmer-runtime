@@ -402,6 +402,36 @@ fn typed_results<Rets: WasmTypeList>(
 /// # }
 /// ```
 ///
+/// Moving a store to another thread than the one that made it:
+///
+/// ```compile_fail,E0277
+/// # use wasmer::*;
+/// # fn f(store: Store) {
+/// fn send<T: Send>(_: T) {}
+/// send(store);
+/// # }
+/// ```
+///
+/// Moving a handle of a shared store to another thread:
+///
+/// ```compile_fail,E0277
+/// # use wasmer::*;
+/// # fn f(shared: SharedStore) {
+/// fn send<T: Send>(_: T) {}
+/// send(shared);
+/// # }
+/// ```
+///
+/// Moving a weak handle of a shared store to another thread:
+///
+/// ```compile_fail,E0277
+/// # use wasmer::*;
+/// # fn f(weak: WeakSharedStore) {
+/// fn send<T: Send>(_: T) {}
+/// send(weak);
+/// # }
+/// ```
+///
 /// Holding a store borrow across an `.await` in a host function:
 ///
 /// ```compile_fail,E0728

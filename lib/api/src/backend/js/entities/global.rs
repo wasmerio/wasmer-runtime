@@ -30,9 +30,7 @@ impl Global {
         mutability: Mutability,
     ) -> Result<Self, RuntimeError> {
         if !val.is_from_store(store) {
-            return Err(RuntimeError::new(
-                "cross-`WasmerEnv` values are not supported",
-            ));
+            return Err(RuntimeError::new("cross-`Store` values are not supported"));
         }
         let global_ty = GlobalType {
             mutability,
@@ -44,7 +42,11 @@ impl Global {
             Value::I64(i) => ("i64", JsValue::from_f64(i as _)),
             Value::F32(f) => ("f32", JsValue::from_f64(f as _)),
             Value::F64(f) => ("f64", JsValue::from_f64(f)),
-            _ => unimplemented!("The type is not yet supported in the JS Global API"),
+            _ => {
+                return Err(RuntimeError::new(
+                    "The type is not yet supported in the JS Global API",
+                ));
+            }
         };
         // This is the value type as string, even though is incorrectly called "value"
         // in the JS API.
@@ -55,7 +57,7 @@ impl Global {
             &mutability.is_mutable().into(),
         )?;
 
-        let js_global = WebAssembly::Global::new(&descriptor, &value).unwrap();
+        let js_global = WebAssembly::Global::new(&descriptor, &value)?;
         let vm_global = VMGlobal::new(js_global, global_ty);
 
         Ok(Self::from_vm_extern(store, VMExternGlobal::Js(vm_global)))

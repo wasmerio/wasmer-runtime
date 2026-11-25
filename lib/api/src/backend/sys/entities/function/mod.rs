@@ -201,7 +201,8 @@ impl Function {
                 let slice = WithSlice::enter(store_id);
                 // Safety: the slice is the only holder of the store.
                 let store = unsafe { StoreMut::from_raw(slice.ptr()) };
-                Ok(values.iter().map(|value| value.as_raw(&store)).collect())
+                let raw = values.iter().map(|value| dynamic_result_as_raw(value, &store));
+                raw.collect()
             });
             HostCallOutcome::Future { future, store }
         };
@@ -684,17 +685,28 @@ impl Function {
 // throwing exceptions won't work since libunwind requires
 // considerable stack space to do its magic, but everything else
 // should work.
-enum InvocationResult<T, E> {
+enum InvocationResult<T> {
     Success(T),
     Exception(crate::Exception),
-    Trap(Box<E>),
+    Trap(Box<dyn Error + Send + Sync>),
     YieldOutsideAsyncContext,
 }
 
+/// The error of a host function that gives the guest a reference of another
+/// store, which is what `call` reports for such an argument.
+///
+/// The guest gets a reference in its raw form, which only says where the
+/// object is in a store. One of another store would be taken for whatever
+/// this store has there.
+fn cross_store_error() -> RuntimeError {
+    RuntimeError::new("cross-`Store` values are not supported")
+}
+
+/// What the host function of the store `store_id` ended with.
 #[inline(always)]
-fn to_invocation_result<T, E>(result: Result<T, E>) -> InvocationResult<T, E>
+fn to_invocation_result<T, E>(result: Result<T, E>, store_id: StoreId) -> InvocationResult<T>
 where
-    E: Error + 'static,
+    E: Error + Send + Sync + 'static,
 {
     match result {
         Ok(value) => InvocationResult::Success(value),
@@ -703,10 +715,37 @@ where
             if let Some(runtime_error) = dyn_err_ref.downcast_ref::<RuntimeError>()
                 && let Some(exception) = runtime_error.to_exception()
             {
+                // An exception is thrown into the guest by its raw form too.
+                if exception.vm_exceptionref().unwrap_sys_ref().0.store_id() != store_id {
+                    return InvocationResult::Trap(Box::new(cross_store_error()));
+                }
                 return InvocationResult::Exception(exception);
             }
             InvocationResult::Trap(Box::new(trap))
         }
+    }
+}
+
+/// What a typed host function of the store `store_id` ended with: its
+/// results come with `store_ptr`, the pointer of the store's active entry,
+/// which the Wasm stack converts them with. They are refused if one of them
+/// is a reference of another store.
+#[inline(always)]
+fn typed_invocation_result<Rets, E>(
+    result: Result<Rets, E>,
+    store: &impl AsStoreRef,
+    store_ptr: *mut StoreInner,
+    store_id: StoreId,
+) -> InvocationResult<(Rets, *mut StoreInner)>
+where
+    Rets: WasmTypeList,
+    E: Error + Send + Sync + 'static,
+{
+    match result {
+        Ok(rets) if !rets.is_from_store(store) => {
+            InvocationResult::Trap(Box::new(cross_store_error()))
+        }
+        result => to_invocation_result(result.map(|rets| (rets, store_ptr)), store_id),
     }
 }
 
@@ -751,11 +790,42 @@ fn write_dynamic_results(
     let store = store_wrapper.as_mut();
     check_dynamic_results(func_ty, returns)?;
     for (i, ret) in returns.iter().enumerate() {
-        unsafe {
-            values_vec.add(i).write_unaligned(ret.as_raw(&store));
-        }
+        // What was written before a refused result is never read: the call
+        // ends with the error.
+        let raw = dynamic_result_as_raw(ret, &store)?;
+        unsafe { values_vec.add(i).write_unaligned(raw) };
     }
     Ok(())
+}
+
+/// A result of a dynamic host function as the guest takes it, which is
+/// refused if it is a reference of another store.
+#[inline]
+fn dynamic_result_as_raw(
+    value: &Value,
+    store: &impl AsStoreRef,
+) -> Result<RawValue, RuntimeError> {
+    if !value.is_from_store(store) {
+        return Err(cross_store_error());
+    }
+    Ok(value.as_raw(store))
+}
+
+/// The results of a typed async import as its call keeps them while its
+/// guest waits: raw, for the trampoline to read back as `Rets`. They are
+/// refused if one of them is a reference of another store, which its raw form
+/// would no longer tell.
+#[cfg(feature = "experimental-async")]
+fn typed_results_into_raw<Rets: WasmTypeList>(
+    rets: Rets,
+    store: &mut StoreMut<'_>,
+) -> Result<RawResults, RuntimeError> {
+    if !rets.is_from_store(store) {
+        return Err(cross_store_error());
+    }
+    // Safety: the trampoline reads the raw values back as `Rets`.
+    let mut array = unsafe { rets.into_array(store) };
+    Ok(RawResults::from_slice(array.as_mut()))
 }
 
 /// Gives the trampoline the results of an async import.
@@ -813,19 +883,20 @@ where
                 Box::pin(async move {
                     let rets: Rets = future.await?;
                     let slice = WithSlice::enter(store_id);
-                    // Safety: the slice is the only holder of the store, and
-                    // the trampoline reads the raw values back as `Rets`.
-                    let mut array = unsafe {
-                        let mut store = StoreMut::from_raw(slice.ptr());
-                        rets.into_array(&mut store)
-                    };
-                    Ok(RawResults::from_slice(array.as_mut()))
+                    // Safety: the slice is the only holder of the store.
+                    let mut store = unsafe { StoreMut::from_raw(slice.ptr()) };
+                    typed_results_into_raw(rets, &mut store)
                 })
             };
             match wait_for_host_future(store, future, suspendable, into_pending) {
-                HostWait::Ready(result) => {
-                    Some(to_invocation_result(result.map(|rets| (rets, store_ptr))))
-                }
+                // Safety: the pointer of the active entry, whose borrow the
+                // poll gave back.
+                HostWait::Ready(result) => Some(typed_invocation_result(
+                    result,
+                    unsafe { &*store_ptr },
+                    store_ptr,
+                    store_id,
+                )),
                 HostWait::Suspend => None,
                 HostWait::CannotSuspend => Some(InvocationResult::YieldOutsideAsyncContext),
             }
@@ -840,9 +911,7 @@ where
 /// stack: `None` if the guest is to wait for the future, which its call then
 /// has.
 #[cfg(feature = "experimental-async")]
-type FirstPoll<Rets> = std::thread::Result<
-    Option<InvocationResult<(Rets, *mut StoreInner), RuntimeError>>,
->;
+type FirstPoll<Rets> = std::thread::Result<Option<InvocationResult<(Rets, *mut StoreInner)>>>;
 
 /// The end of the trampoline of a typed host function that may have its
 /// guest wait, back on the Wasm stack: suspends the guest if it is to wait,
@@ -867,14 +936,17 @@ unsafe fn finish_typed_async_call<Rets: WasmTypeList + 'static>(
         unsafe { wasmer_vm::suspend_wasm_call() };
         result = on_host_stack(|| {
             panic::catch_unwind(AssertUnwindSafe(|| {
-                Some(to_invocation_result(take_host_result().map(|results| {
+                // The future refused a reference of another store before it
+                // made its results raw (see `typed_results_into_raw`).
+                let results = take_host_result().map(|results| {
                     // Safety: the trampoline of an import again, on the entry
                     // that the call installed to resume the guest.
                     let mut store = unsafe { StoreContext::get_current(store_id) };
                     let rets = unsafe { Rets::from_slice(&mut store.as_mut(), &results) };
                     let rets = rets.expect("the future of a call returns one value per result");
                     (rets, store.as_ptr())
-                })))
+                });
+                Some(to_invocation_result(results, store_id))
             }))
         });
     }
@@ -926,7 +998,7 @@ where
 {
     /// What the function made of its call.
     enum Called<Rets, R> {
-        Over(InvocationResult<(Rets, *mut StoreInner), RuntimeError>),
+        Over(InvocationResult<(Rets, *mut StoreInner)>),
         Waits(Pin<Box<dyn Future<Output = R>>>),
     }
 
@@ -946,8 +1018,11 @@ where
                 call(&env.func, &mut cx, args)
             };
             match deferred.0 {
-                DeferredState::Ready(results) => Called::Over(to_invocation_result(
-                    typed_results(results).map(|rets| (rets, store_ptr)),
+                DeferredState::Ready(results) => Called::Over(typed_invocation_result(
+                    typed_results(results),
+                    &store.as_ref(),
+                    store_ptr,
+                    store_id,
                 )),
                 DeferredState::Pending(future) => Called::Waits(future),
             }
@@ -974,18 +1049,19 @@ where
                             let rets: Rets = typed_results(future.await)?;
                             let slice = WithSlice::enter(store_id);
                             // Safety: the slice is the only holder of the
-                            // store, and the trampoline reads the raw values
-                            // back as `Rets`.
-                            let mut array = unsafe {
-                                let mut store = StoreMut::from_raw(slice.ptr());
-                                rets.into_array(&mut store)
-                            };
-                            Ok(RawResults::from_slice(array.as_mut()))
+                            // store.
+                            let mut store = unsafe { StoreMut::from_raw(slice.ptr()) };
+                            typed_results_into_raw(rets, &mut store)
                         })
                     };
                     match wait_for_host_future(store, future, suspendable, into_pending) {
-                        HostWait::Ready(results) => Some(to_invocation_result(
-                            typed_results(results).map(|rets| (rets, store_ptr)),
+                        // Safety: the pointer of the active entry, whose
+                        // borrow the poll gave back.
+                        HostWait::Ready(results) => Some(typed_invocation_result(
+                            typed_results(results),
+                            unsafe { &*store_ptr },
+                            store_ptr,
+                            store_id,
                         )),
                         HostWait::Suspend => None,
                         HostWait::CannotSuspend => Some(InvocationResult::YieldOutsideAsyncContext),
@@ -1003,8 +1079,8 @@ where
 /// What the host function of a typed trampoline gave it: its results, with the
 /// pointer of the store's active entry to convert them with, or the exception
 /// or trap it returned, or the panic it unwound with.
-type TypedHostResult<Rets, E> =
-    Result<InvocationResult<(Rets, *mut StoreInner), E>, Box<dyn Any + Send>>;
+type TypedHostResult<Rets> =
+    Result<InvocationResult<(Rets, *mut StoreInner)>, Box<dyn Any + Send>>;
 
 /// What the trampoline of a typed host function does with what the host
 /// function returned, back on the Wasm stack: gives its results to Wasm, or
@@ -1019,9 +1095,9 @@ type TypedHostResult<Rets, E> =
 /// `store_id`, with what that host function returned and the pointer of the
 /// store's active entry it was called with.
 #[inline(always)]
-unsafe fn finish_typed_host_call<Rets: WasmTypeList, E: Error + Send + Sync + 'static>(
+unsafe fn finish_typed_host_call<Rets: WasmTypeList>(
     store_id: StoreId,
-    result: TypedHostResult<Rets, E>,
+    result: TypedHostResult<Rets>,
 ) -> Rets::CStruct {
     // IMPORTANT: DO NOT ALLOCATE ON THE STACK,
     // AS WE ARE IN THE WASM STACK, NOT ON THE HOST ONE.
@@ -1109,16 +1185,22 @@ where
         let mut result = on_host_stack(|| {
             panic::catch_unwind(AssertUnwindSafe(|| match (this.ctx.func)(values_vec) {
                 HostCallOutcome::Ready(result, mut store) => {
-                    Some(to_invocation_result(result.and_then(|values| {
+                    let written = result.and_then(|values| {
                         write_dynamic_results(&mut store, &this.ctx.func_ty, &values, values_vec)
-                    })))
+                    });
+                    Some(to_invocation_result(written, this.ctx.store_id))
                 }
+                // Its future refused a reference of another store where it
+                // made its results raw.
                 #[cfg(feature = "experimental-async")]
                 HostCallOutcome::Future { future, store } => {
                     match wait_for_host_future(store, future, suspendable, |future| future) {
-                        HostWait::Ready(result) => Some(to_invocation_result(result.map(
-                            |results: RawResults| unsafe { write_raw_results(&results, values_vec) },
-                        ))),
+                        HostWait::Ready(result) => {
+                            let written = result.map(|results: RawResults| unsafe {
+                                write_raw_results(&results, values_vec)
+                            });
+                            Some(to_invocation_result(written, this.ctx.store_id))
+                        }
                         HostWait::Suspend => None,
                         HostWait::CannotSuspend => Some(InvocationResult::YieldOutsideAsyncContext),
                     }
@@ -1133,9 +1215,10 @@ where
             unsafe { wasmer_vm::suspend_wasm_call() };
             result = on_host_stack(|| {
                 panic::catch_unwind(AssertUnwindSafe(|| {
-                    Some(to_invocation_result(take_host_result().map(
-                        |results: RawResults| unsafe { write_raw_results(&results, values_vec) },
-                    )))
+                    let written = take_host_result().map(|results: RawResults| unsafe {
+                        write_raw_results(&results, values_vec)
+                    });
+                    Some(to_invocation_result(written, this.ctx.store_id))
                 }))
             });
         }
@@ -1342,7 +1425,7 @@ macro_rules! impl_host_function {
                             };
                         )*
                         let result = (env.func)($($x),* ).into_result();
-                        to_invocation_result(result.map(|rets| (rets, store_ptr)))
+                        typed_invocation_result(result, &store, store_ptr, env.store_id)
                     }))
                 };
                 let result = if IN_PLACE {
@@ -1451,7 +1534,14 @@ macro_rules! impl_host_function {
                             func_env: env.env.as_sys().clone(),
                         }.into();
                         let result = (env.func)(f_env, $($x),* ).into_result();
-                        to_invocation_result(result.map(|rets| (rets, store_ptr)))
+                        // The host function was given the store with its
+                        // environment, and has given it back by now.
+                        typed_invocation_result(
+                            result,
+                            &store_wrapper.as_ref(),
+                            store_ptr,
+                            env.store_id,
+                        )
                     }))
                 };
                 let result = if IN_PLACE {

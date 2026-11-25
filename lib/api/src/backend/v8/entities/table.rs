@@ -2,7 +2,8 @@
 use wasmer_types::{TableType, StoreId};
 
 use crate::{
-    AsStoreMut, AsStoreRef, BackendTable, RuntimeError, Value,
+    AsStoreMut, AsStoreRef, BackendTable, RuntimeError, TypedFunction, Value, WasmTypeList,
+    entities::table::typed_element,
     v8::{
         bindings::{self, *},
         utils::convert::{IntoCApiType, IntoCApiValue, IntoWasmerType, IntoWasmerValue},
@@ -119,6 +120,19 @@ impl Table {
 
             Some(value.into_wv(self.store_id))
         }
+    }
+
+    pub fn get_typed_function<Args, Rets>(
+        &self,
+        store: &mut impl AsStoreMut,
+        index: u32,
+    ) -> Result<TypedFunction<Args, Rets>, RuntimeError>
+    where
+        Args: WasmTypeList,
+        Rets: WasmTypeList,
+    {
+        let element = self.get(store, index);
+        typed_element(store, index, element)
     }
 
     pub fn set(

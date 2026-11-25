@@ -35,7 +35,7 @@ impl Instance {
     /// let module = Module::new(&store, "(module)")?;
     /// let imports = imports!{
     ///   "host" => {
-    ///     "var" => Global::new(&mut store, Value::I32(2))
+    ///     "var" => Global::new(&mut store, Value::I32(2))?
     ///   }
     /// };
     /// let instance = Instance::new(&mut store, &module, &imports)?;

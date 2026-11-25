@@ -535,6 +535,15 @@ where
     /// Get the Wasm types for the tuple (list) of currently
     /// represented values.
     fn wasm_types() -> &'static [Type];
+
+    /// Returns whether all the values are from the given store.
+    ///
+    /// This is always true of a tuple (list) without references, whose values
+    /// can be used with any store.
+    #[inline]
+    fn is_from_store(&self, _store: &impl AsStoreRef) -> bool {
+        true
+    }
 }
 
 /// The `IntoResult` trait turns a `WasmTypeList` into a
@@ -794,6 +803,15 @@ macro_rules! impl_wasmtypelist {
                         $x::Native::WASM_TYPE
                     ),*
                 ]
+            }
+
+            #[inline]
+            #[allow(non_snake_case)]
+            fn is_from_store(&self, _store: &impl AsStoreRef) -> bool {
+                // Unpack items of the tuple.
+                let ( $( $x ),* ) = self;
+
+                $( FromToNativeWasmType::is_from_store($x, _store) && )* true
             }
         }
 

@@ -18,8 +18,8 @@ use std::{
 
 use wasmer::{
     AsStoreMut, AsStoreRef, AsyncEnv, Deferred, ExternRef, Function, FunctionEnv, FunctionEnvMut,
-    FunctionType, Instance, Module, RuntimeError, SharedStore, Store, StoreMut, StoreObjects,
-    StoreRef, Type, TypedFunction, Value, imports,
+    FunctionType, Instance, Module, RuntimeError, SharedStore, Store, StoreBusy, StoreMut,
+    StoreObjects, StoreRef, Type, TypedFunction, Value, imports,
 };
 use wasmer_vm::TrapCode;
 
@@ -922,6 +922,189 @@ fn with_panics_in_a_destructor_run_inside_another_slice() {
     shared.try_with(|_| drop(task)).unwrap();
     assert_eq!(PANICKED.get(), Some(true));
     assert!(shared.try_with(|_| ()).is_ok(), "the store is free again");
+}
+
+type Task = Pin<Box<dyn Future<Output = Result<Box<[Value]>, RuntimeError>>>>;
+
+thread_local! {
+    /// What each destructor of a [`TriesStore`] got from `try_with`.
+    static TRIED: RefCell<Vec<Result<i32, StoreBusy>>> = const { RefCell::new(Vec::new()) };
+    /// A task for the `drop_task` import to drop.
+    static TO_DROP: RefCell<Option<Task>> = const { RefCell::new(None) };
+}
+
+/// What a host future holds while it waits. Its destructor asks for the store
+/// with `try_with`, adds 100 to the host state if it gets it, and notes the
+/// outcome.
+struct TriesStore<'a>(&'a mut AsyncEnv<i32>);
+impl Drop for TriesStore<'_> {
+    fn drop(&mut self) {
+        let tried = self.0.try_with(|mut env| {
+            *env.data_mut() += 100;
+            *env.data()
+        });
+        // Where `try_with` has the store, `with` has it too.
+        if let Ok(value) = tried {
+            assert_eq!(self.0.with(|env| *env.data()), value);
+        }
+        TRIED.with_borrow_mut(|tried_so_far| tried_so_far.push(tried));
+    }
+}
+
+/// A guest on a shared store, whose exports are each one import:
+///
+/// - `waits` waits for good, in a host future that holds a [`TriesStore`];
+/// - `relays` waits for `waits`, which it calls with its `AsyncEnv`;
+/// - `drops` drops the task in `TO_DROP`, in a synchronous host function;
+/// - `drops_in_slice` drops it in a `with` slice of an async one.
+fn dropping_guest() -> (SharedStore, FunctionEnv<i32>, Instance) {
+    TRIED.take();
+    let mut store = Store::default();
+    let module = Module::new(
+        &store,
+        r#"(module
+          (import "h" "wait" (func $wait))
+          (import "h" "relay" (func $relay))
+          (import "h" "drop" (func $drop))
+          (import "h" "drop_in_slice" (func $drop_in_slice))
+          (func (export "waits") (call $wait))
+          (func (export "relays") (call $relay))
+          (func (export "drops") (call $drop))
+          (func (export "drops_in_slice") (call $drop_in_slice)))"#,
+    )
+    .unwrap();
+    let env = FunctionEnv::new(&mut store, 0);
+    let wait = Function::new_typed_async(&mut store, &env, async |cx: &mut AsyncEnv<i32>| {
+        let _tries = TriesStore(cx);
+        std::future::pending::<()>().await;
+    });
+    let relay = Function::new_typed_async(&mut store, &env, {
+        let wait = wait.clone();
+        async move |cx: &mut AsyncEnv<i32>| {
+            let _ = wait.call_async(cx, &[]).await;
+        }
+    });
+    let drop_task = Function::new_typed(&mut store, || drop(TO_DROP.take()));
+    let drop_in_slice =
+        Function::new_typed_async(&mut store, &env, async |cx: &mut AsyncEnv<i32>| {
+            cx.with(|_| drop(TO_DROP.take()));
+        });
+    let imports = imports! { "h" => {
+        "wait" => wait,
+        "relay" => relay,
+        "drop" => drop_task,
+        "drop_in_slice" => drop_in_slice,
+    } };
+    let instance = Instance::new(&mut store, &module, &imports).unwrap();
+    (store.into_shared(), env, instance)
+}
+
+fn export(instance: &Instance, name: &str) -> Function {
+    instance.exports.get_function(name).unwrap().clone()
+}
+
+/// A task of `shared` whose guest waits in `waits`.
+fn waiting_task(shared: &SharedStore, waits: &Function) -> Task {
+    let mut task: Task = Box::pin(waits.call_async(&mut shared.clone(), &[]));
+    assert!(poll(&mut task).is_pending());
+    task
+}
+
+/// The destructor of `with_panics_in_a_destructor_run_inside_another_slice`,
+/// asking with `try_with`: the store is busy, whoever holds it and however
+/// deep the host future is, and nothing panics.
+#[test]
+fn try_with_fails_in_a_destructor_run_inside_another_slice() {
+    let (shared, env, instance) = dropping_guest();
+    let drops = export(&instance, "drops");
+    for waits in ["waits", "relays"].map(|name| export(&instance, name)) {
+        // Dropped by the holder of a slice.
+        let task = waiting_task(&shared, &waits);
+        shared.try_with(|_| drop(task)).unwrap();
+        assert_eq!(TRIED.take(), [Err(StoreBusy)]);
+
+        // Dropped by an import of a guest that a synchronous call runs.
+        TO_DROP.set(Some(waiting_task(&shared, &waits)));
+        let dropped = shared.try_with(|mut store| drops.call(&mut store, &[]));
+        assert!(dropped.unwrap().is_ok());
+        assert_eq!(TRIED.take(), [Err(StoreBusy)]);
+
+        // Dropped by an import of another task: by a synchronous host
+        // function, and in a slice of an async one.
+        for drops in ["drops", "drops_in_slice"].map(|name| export(&instance, name)) {
+            TO_DROP.set(Some(waiting_task(&shared, &waits)));
+            let mut dropper: Task = Box::pin(drops.call_async(&mut shared.clone(), &[]));
+            assert!(matches!(poll(&mut dropper), Poll::Ready(Ok(_))));
+            assert_eq!(TRIED.take(), [Err(StoreBusy)]);
+        }
+    }
+
+    // No destructor reached the store, which is free again.
+    let value = shared.try_with(|mut store| *env.as_mut(&mut store));
+    assert_eq!(value, Ok(0));
+}
+
+/// A call drops its host future with the store in reach, so a destructor
+/// gets the store from `try_with` wherever it gets it from `with`: when a
+/// task is dropped outside every slice, when a synchronous entry drops a
+/// future that cannot wait, and when a call that borrows the store is
+/// dropped.
+#[test]
+fn try_with_takes_the_store_in_a_destructor_run_with_the_store_in_reach() {
+    let (shared, env, instance) = dropping_guest();
+    let (waits, relays) = (export(&instance, "waits"), export(&instance, "relays"));
+
+    drop(waiting_task(&shared, &waits));
+    assert_eq!(TRIED.take(), [Ok(100)]);
+    drop(waiting_task(&shared, &relays));
+    assert_eq!(TRIED.take(), [Ok(200)]);
+
+    let waited = shared.try_with(|mut store| waits.call(&mut store, &[]));
+    assert!(waited.unwrap().is_err(), "the import cannot wait");
+    assert_eq!(TRIED.take(), [Ok(300)]);
+
+    let mut store = shared.into_store().expect("the last handle");
+    let mut call = Box::pin(waits.call_async(&mut store, &[]));
+    assert!(poll(&mut call).is_pending());
+    drop(call);
+    assert_eq!(TRIED.take(), [Ok(400)]);
+    assert_eq!(*env.as_ref(&store), 400);
+}
+
+/// Inside a poll of its own call, `try_with` is `with`.
+#[test]
+fn try_with_takes_the_store_in_a_poll_as_with_does() {
+    let mut store = Store::default();
+    let env = FunctionEnv::new(&mut store, 0);
+    let add = Function::new_typed_async(
+        &mut store,
+        &env,
+        async |cx: &mut AsyncEnv<i32>, x: i32| -> i32 {
+            let tried = cx.try_with(|mut env| {
+                *env.data_mut() += x;
+                *env.data()
+            });
+            let with = cx.with(|env| *env.data());
+            assert_eq!(tried, Ok(with));
+            with
+        },
+    );
+    let results = add.call(&mut store, &[Value::I32(1)]).unwrap();
+    assert_eq!(results[0].unwrap_i32(), 1);
+
+    let mut call = Box::pin(add.call_async(&mut store, &[Value::I32(2)]));
+    let Poll::Ready(results) = poll(&mut call) else {
+        panic!("the call did not finish");
+    };
+    assert_eq!(results.unwrap()[0].unwrap_i32(), 3);
+    drop(call);
+
+    let mut shared = store.into_shared();
+    let mut task = Box::pin(add.call_async(&mut shared, &[Value::I32(4)]));
+    let Poll::Ready(results) = poll(&mut task) else {
+        panic!("the task did not finish");
+    };
+    assert_eq!(results.unwrap()[0].unwrap_i32(), 7);
 }
 
 /// Keeps the helper types above honest: `SharedStore` is `Clone`.

@@ -55,6 +55,9 @@ engine = ["compiler"]
 # Rust-only hooks for crates that extend this C API, such as a WASI
 # implementation. Not covered by semver.
 extensions = []
+# The `extensions` hooks that are built on the async API: a store shared with
+# the extension, which can take over `wasm_func_call`. Not covered by semver.
+extensions-async = ["extensions", "wasmer-api/experimental-async"]
 
 # Enable the `sys` backend.
 sys = ["wasmer-api/sys", "wasmer-compiler", "wasmer-c-api-imports/sys"]

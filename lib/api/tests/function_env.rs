@@ -7,7 +7,7 @@ use wasmer::*;
 #[engine_test]
 fn data_and_store() -> Result<(), String> {
     let mut store = Store::default();
-    let global_mut = Global::new_mut(&mut store, Value::I32(10));
+    let global_mut = Global::new_mut(&mut store, Value::I32(10)).unwrap();
     struct Env {
         value: i32,
         global: Global,

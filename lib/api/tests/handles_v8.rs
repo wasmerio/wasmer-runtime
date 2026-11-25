@@ -60,7 +60,7 @@ fn a_handle_belongs_to_its_store() {
         assert!(!function.is_from_store(&second));
     }
     for global in [
-        &Global::new(&mut first, Value::I32(1)),
+        &Global::new(&mut first, Value::I32(1)).unwrap(),
         exports.get_global("global").unwrap(),
     ] {
         assert!(global.is_from_store(&first));
@@ -106,7 +106,7 @@ fn an_import_of_another_store_is_refused() {
     let mut first = Store::default();
     let mut second = Store::default();
     let function = Function::new_typed(&mut first, || {});
-    let global = Global::new(&mut first, Value::I32(1));
+    let global = Global::new(&mut first, Value::I32(1)).unwrap();
     let memory = Memory::new(&mut first, MemoryType::new(1, None, false)).unwrap();
     let cases = [
         (
@@ -179,9 +179,11 @@ fn a_function_of_another_store_is_not_given_to_a_guest() {
     let table = instance.exports.get_table("table").unwrap();
 
     assert_cross_store("an argument", pass.call(&mut second, &[foreign()]));
-    // `Global::new` has no error to return.
-    let message = panic_of(|| Global::new(&mut second, foreign()));
-    assert!(message.contains("cross-`Store`"), "a new global: {message}");
+    assert_cross_store("a new global", Global::new(&mut second, foreign()));
+    assert_cross_store(
+        "a new mutable global",
+        Global::new_mut(&mut second, foreign()),
+    );
     let table_type = TableType::new(Type::FuncRef, 1, None);
     assert_cross_store(
         "a new table",
@@ -197,4 +199,21 @@ fn a_function_of_another_store_is_not_given_to_a_guest() {
         move |_| Ok(vec![returned.clone()]),
     );
     assert_cross_store("a host result", returns.call(&mut second, &[]));
+}
+
+/// V8 has no global of an `externref` or of an exception reference: making
+/// one is an error.
+#[test]
+fn a_global_v8_cannot_hold_is_refused() {
+    let mut store = Store::default();
+    for value in [Value::ExternRef(None), Value::ExceptionRef(None)] {
+        let results = [
+            Global::new(&mut store, value.clone()),
+            Global::new_mut(&mut store, value.clone()),
+        ];
+        for result in results {
+            let message = result.unwrap_err().message();
+            assert!(message.contains("not supported in V8"), "{message}");
+        }
+    }
 }
