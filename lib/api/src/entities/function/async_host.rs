@@ -5,8 +5,8 @@ use std::{future::Future, marker::PhantomData, pin::Pin, rc::Rc};
 use wasmer_types::{FunctionType, StoreId};
 
 use crate::{
-    AsStoreMut, FunctionEnv, FunctionEnvMut, RuntimeError, StoreMut, Value, WasmTypeList,
-    WithSlice,
+    AsStoreMut, FunctionEnv, FunctionEnvMut, RuntimeError, StoreBusy, StoreMut, Value,
+    WasmTypeList, WithSlice,
     utils::{FromToNativeWasmType, IntoResult},
 };
 
@@ -57,9 +57,65 @@ impl<T> AsyncEnv<T> {
     /// # Panics
     /// Panics outside a poll of the call this host function belongs to: for
     /// example from a destructor that runs after the call was dropped inside
-    /// another slice of a shared store.
+    /// another slice of a shared store. A destructor uses
+    /// [`try_with`](Self::try_with), which fails there instead.
     pub fn with<R>(&mut self, f: impl FnOnce(FunctionEnvMut<'_, T>) -> R) -> R {
-        let slice = WithSlice::enter(self.store_id);
+        self.in_slice(WithSlice::enter(self.store_id), f)
+    }
+
+    /// [`with`](Self::with), for where the store may be busy: it fails with
+    /// [`StoreBusy`] instead of panicking if the store is a shared one that
+    /// is already running a slice on this thread.
+    ///
+    /// That is where the destructor of a host future can find itself. A call
+    /// drops its host future with the store in reach, but a task of a
+    /// [`SharedStore`](crate::SharedStore) can be dropped from inside a call
+    /// of its store, for example by the import that ends the guest. The
+    /// frames below hold the store then, and there is nothing to wait for:
+    /// what still needs the store is left for when they have returned.
+    ///
+    /// ```
+    /// # use std::cell::RefCell;
+    /// # use wasmer::AsyncEnv;
+    /// # struct State;
+    /// # impl State {
+    /// #     fn close(&mut self, _id: u32) {}
+    /// # }
+    /// # thread_local! {
+    /// #     static CLOSE_LATER: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    /// # }
+    /// /// What a host function holds while it waits.
+    /// struct Connection<'a> {
+    ///     cx: &'a mut AsyncEnv<State>,
+    ///     id: u32,
+    /// }
+    ///
+    /// impl Drop for Connection<'_> {
+    ///     fn drop(&mut self) {
+    ///         let id = self.id;
+    ///         if self.cx.try_with(|mut env| env.data_mut().close(id)).is_err() {
+    ///             // For the embedder to close, once its call has returned.
+    ///             CLOSE_LATER.with_borrow_mut(|ids| ids.push(id));
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// # Panics
+    /// Panics, as `with` does, if no call on this host function's store is
+    /// being polled or dropped on this thread. A host function does not get
+    /// there: its future is only polled and dropped by its own call, which
+    /// publishes the store for it.
+    pub fn try_with<R>(
+        &mut self,
+        f: impl FnOnce(FunctionEnvMut<'_, T>) -> R,
+    ) -> Result<R, StoreBusy> {
+        let slice = WithSlice::try_enter(self.store_id).ok_or(StoreBusy)?;
+        Ok(self.in_slice(slice, f))
+    }
+
+    /// Runs `f` with the store, which `slice` holds until `f` has returned.
+    fn in_slice<R>(&self, slice: WithSlice, f: impl FnOnce(FunctionEnvMut<'_, T>) -> R) -> R {
         // Safety: the slice is the only holder of the store until it drops,
         // after `f`, and `f` cannot keep a borrow it was given.
         let store = unsafe { StoreMut::from_raw(slice.ptr()) };
@@ -184,7 +240,7 @@ where
             let args = cx.with(|mut env| args_from_values::<Args>(&mut env, &ty, &values))?;
             let (mut cx, result) = func.invoke(cx, args).await;
             let rets = result?;
-            Ok(cx.with(|mut env| results_to_values::<Rets>(&mut env, &ty, rets)))
+            cx.with(|mut env| results_to_values::<Rets>(&mut env, &ty, rets))
         })
     }
 }
@@ -216,11 +272,16 @@ fn results_to_values<Rets: WasmTypeList>(
     store: &mut impl AsStoreMut,
     ty: &FunctionType,
     rets: Rets,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, RuntimeError> {
+    // The raw form of a reference does not say which store it is of, so one
+    // of another store would be read back below as one of this store.
+    if !rets.is_from_store(store) {
+        return Err(RuntimeError::new("cross-`Store` values are not supported"));
+    }
     // Safety: the raw values are read back as the result types of `Rets`.
     let mut raw_array = unsafe { rets.into_array(store) };
     let results = raw_array.as_mut().iter().zip(ty.results());
-    results
+    Ok(results
         .map(|(raw, ty)| unsafe { Value::from_raw(store, *ty, *raw) })
-        .collect()
+        .collect())
 }

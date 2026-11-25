@@ -107,6 +107,63 @@ impl<'a> MemoryView<'a> {
         }
     }
 
+    /// Atomically replaces the 32-bit word at `offset` with `new` if it equals
+    /// `expected`. Returns the word that was there: the exchange took place if
+    /// that is `expected`.
+    ///
+    /// This is `Atomics.compareExchange`: guests that run on other workers see
+    /// the word change in one step, as with their own atomic instructions. The
+    /// other backends get that from an atomic at the memory's pointer, which
+    /// JavaScript does not have. It also works on a memory that is not shared,
+    /// where nothing races with it.
+    ///
+    /// `offset` has to be a multiple of 4, as for an atomic access of a guest.
+    /// After the memory grows, make a new view.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// # use wasmer::{Memory, MemoryType, Store};
+    /// # let mut store = Store::default();
+    /// let memory = Memory::new(&mut store, MemoryType::new(1, Some(2), true)).unwrap();
+    /// let view = memory.as_js().view(&store);
+    ///
+    /// // The word is 0: it becomes 7.
+    /// assert_eq!(view.compare_exchange_u32(0, 0, 7).unwrap(), 0);
+    /// // The word is not 0 anymore: it stays 7.
+    /// assert_eq!(view.compare_exchange_u32(0, 0, 9).unwrap(), 7);
+    /// ```
+    pub fn compare_exchange_u32(
+        &self,
+        offset: u64,
+        expected: u32,
+        new: u32,
+    ) -> Result<u32, MemoryAccessError> {
+        let offset = self.atomic_word_offset(offset)?;
+        let word =
+            js_sys::Int32Array::new_with_byte_offset_and_length(&self.view.buffer(), offset, 1);
+        // `Atomics` compares and returns the bits of the word, which the
+        // casts keep.
+        js_sys::Atomics::compare_exchange(&word, 0, expected as i32, new as i32)
+            .map(|previous| previous as u32)
+            .map_err(|_| MemoryAccessError::HeapOutOfBounds)
+    }
+
+    /// Checks that an atomic 32-bit access at `offset` is aligned and inside
+    /// the view. A view of a memory that grew since may have lost its buffer:
+    /// its length is 0 then, and every offset is out of bounds.
+    fn atomic_word_offset(&self, offset: u64) -> Result<u32, MemoryAccessError> {
+        if !offset.is_multiple_of(4) {
+            return Err(MemoryAccessError::UnalignedPointerRead);
+        }
+        let offset: u32 = offset.try_into().map_err(|_| MemoryAccessError::Overflow)?;
+        let end = offset.checked_add(4).ok_or(MemoryAccessError::Overflow)?;
+        if end > self.view.length() {
+            return Err(MemoryAccessError::HeapOutOfBounds);
+        }
+        Ok(offset)
+    }
+
     /// Safely reads bytes from the memory at the given offset.
     ///
     /// The full buffer will be filled, otherwise a `MemoryAccessError` is returned

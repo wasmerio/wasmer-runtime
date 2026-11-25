@@ -24,7 +24,7 @@ use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_test::wasm_bindgen_test;
 use wasmer::{
     AsStoreMut, AsStoreRef, AsyncEnv, Function, FunctionEnv, FunctionEnvMut, FunctionType,
-    Instance, Module, RuntimeError, SharedStore, Store, Type, Value, imports, js::AsJs,
+    Instance, Module, RuntimeError, SharedStore, Store, StoreBusy, Type, Value, imports, js::AsJs,
 };
 use wasmer_types::{StoreId, TrapCode};
 
@@ -624,12 +624,14 @@ async fn two_stores_overlap_on_one_thread() {
 
 // --- cancellation ------------------------------------------------------------
 
-/// Guests that wait inside a handler which catches everything a guest can
-/// catch, and say so with `observe(9)`.
+/// Guests that wait, call a synchronous import that fails, and throw inside
+/// a handler which catches everything a guest can catch, and say so with
+/// `observe(9)`.
 const CATCH_ALL_LEGACY: &str = r#"(module
   (import "host" "wait" (func $wait (param i32) (result i32)))
   (import "host" "fail" (func $fail (param i32)))
   (import "host" "observe" (func $observe (param i32)))
+  (tag $own)
   (func (export "once") (param i32) (result i32)
     (call $observe (i32.const 1))
     try
@@ -651,12 +653,27 @@ const CATCH_ALL_LEGACY: &str = r#"(module
     catch_all
       (call $observe (i32.const 9))
     end
+    (call $wait (i32.const 1000)))
+  (func (export "wait_then_fail") (param i32)
+    (drop (call $wait (local.get 0)))
+    try
+      (call $fail (local.get 0))
+    catch_all
+      (call $observe (i32.const 9))
+    end)
+  (func (export "throw_then_wait") (result i32)
+    try
+      (throw $own)
+    catch_all
+      (call $observe (i32.const 9))
+    end
     (call $wait (i32.const 1000))))"#;
 
 const CATCH_ALL_TRY_TABLE: &str = r#"(module
   (import "host" "wait" (func $wait (param i32) (result i32)))
   (import "host" "fail" (func $fail (param i32)))
   (import "host" "observe" (func $observe (param i32)))
+  (tag $own)
   (func (export "once") (param i32) (result i32)
     (call $observe (i32.const 1))
     (block $done
@@ -680,6 +697,19 @@ const CATCH_ALL_TRY_TABLE: &str = r#"(module
           (call $fail (local.get 0)))
         (br $done))
       (call $observe (i32.const 9)))
+    (call $wait (i32.const 1000)))
+  (func (export "wait_then_fail") (param i32)
+    (drop (call $wait (local.get 0)))
+    (block $caught
+      (try_table (catch_all $caught)
+        (call $fail (local.get 0))
+        (return)))
+    (call $observe (i32.const 9)))
+  (func (export "throw_then_wait") (result i32)
+    (block $caught
+      (try_table (catch_all $caught)
+        (throw $own)))
+    (call $observe (i32.const 9))
     (call $wait (i32.const 1000))))"#;
 
 /// The guests of the tests below: without a handler, and with each kind of
@@ -744,8 +774,9 @@ async fn a_guest_cancelled_after_its_wake_runs_no_more_code() {
 }
 
 /// The handlers of the guests above do run: a guest that is not cancelled
-/// goes on, and they catch what a synchronous host function throws. A guest
-/// that caught one can wait in an async import right after.
+/// goes on, and they catch what the guest throws itself. A guest that caught
+/// that can wait in an async import right after. What a host function fails
+/// with is not theirs to catch (see the host errors below).
 #[wasm_bindgen_test]
 async fn the_handlers_catch_what_can_be_caught() {
     for (name, guest) in guests_with_handlers().into_iter().skip(1) {
@@ -753,20 +784,19 @@ async fn the_handlers_catch_what_can_be_caught() {
         guest.until_waiting(&mut call, 7).await;
         guest.gate.release(7);
         assert_eq!(i32_of(call.await), 7, "{name}");
-        guest.call("fail", &[3]).await.unwrap();
+        let waited = guest.call("throw_then_wait", &[]).await;
+        assert_eq!(i32_of(waited), AUTO, "{name}");
         assert_eq!(
             guest.log(),
             [
                 "1: async, locked",
                 "wait7",
                 "2: async, locked",
-                "9: async, locked"
+                "9: async, locked",
+                "wait1000"
             ],
             "{name}"
         );
-        let waited = guest.call("fail_then_wait", &[3]).await;
-        assert_eq!(i32_of(waited), AUTO, "{name}");
-        assert_eq!(guest.log()[4..], ["9: async, locked", "wait1000"], "{name}");
     }
 }
 
@@ -852,6 +882,103 @@ async fn a_dropped_call_retains_no_waker() {
     guest.into_store();
 }
 
+thread_local! {
+    /// What each destructor of a [`TriesStore`] got from `try_with`.
+    static TRIED: RefCell<Vec<Result<i32, StoreBusy>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// What a host future holds while it waits. Its destructor asks for the store
+/// with `try_with`, adds 100 to the host state if it gets it, and notes the
+/// outcome.
+struct TriesStore<'a>(&'a mut AsyncEnv<i32>);
+impl Drop for TriesStore<'_> {
+    fn drop(&mut self) {
+        let tried = self.0.try_with(|mut env| {
+            *env.data_mut() += 100;
+            *env.data()
+        });
+        // Where `try_with` has the store, `with` has it too.
+        if let Ok(value) = tried {
+            assert_eq!(self.0.with(|env| *env.data()), value);
+        }
+        TRIED.with_borrow_mut(|tried_so_far| tried_so_far.push(tried));
+    }
+}
+
+/// A shared store whose `waits` function waits for good in a host future
+/// that holds a [`TriesStore`], and its host state.
+fn store_with_a_destructor() -> (SharedStore, FunctionEnv<i32>, Function) {
+    TRIED.take();
+    let mut store = Store::default();
+    let module = Module::new(
+        &store,
+        r#"(module
+          (import "h" "wait" (func $wait))
+          (func (export "waits") (call $wait)))"#,
+    )
+    .unwrap();
+    let env = FunctionEnv::new(&mut store, 0);
+    let wait = Function::new_typed_async(&mut store, &env, async |cx: &mut AsyncEnv<i32>| {
+        let _tries = TriesStore(cx);
+        std::future::pending::<()>().await;
+    });
+    let imports = imports! { "h" => { "wait" => wait } };
+    let instance = Instance::new(&mut store, &module, &imports).unwrap();
+    let waits = instance.exports.get_function("waits").unwrap().clone();
+    (store.into_shared(), env, waits)
+}
+
+/// A task of `shared` whose guest waits in `waits`, with its host future
+/// started: the engine runs it once it has suspended the guest.
+async fn waiting_task(shared: &SharedStore, waits: &Function) -> Call {
+    let mut task: Call = Box::pin(waits.call_async(&mut shared.clone(), &[]));
+    assert!(poll_once(&mut task).is_pending());
+    settle().await;
+    task
+}
+
+/// A task dropped inside another slice of its shared store drops its host
+/// future there. A destructor that asks with `try_with` finds the store busy
+/// and goes on. `with` panics there, which is a trap on this target: the
+/// rest of the destructor would not run, and the dropped call would swallow
+/// the trap.
+#[wasm_bindgen_test]
+async fn try_with_fails_in_a_destructor_run_inside_another_slice() {
+    let (shared, env, waits) = store_with_a_destructor();
+    let task = waiting_task(&shared, &waits).await;
+    shared.try_with(|_| drop(task)).unwrap();
+    assert_eq!(TRIED.take(), [Err(StoreBusy)]);
+    settle().await;
+    let value = shared.try_with(|mut store| *env.as_mut(&mut store));
+    assert_eq!(value, Ok(0), "the store is free, and was not reached");
+}
+
+/// Dropped outside every slice, the task drops its host future with the
+/// store in reach, as it polls it: `try_with` has the store where `with` has.
+#[wasm_bindgen_test]
+async fn try_with_takes_the_store_where_with_does() {
+    let (shared, env, waits) = store_with_a_destructor();
+    drop(waiting_task(&shared, &waits).await);
+    assert_eq!(TRIED.take(), [Ok(100)]);
+    settle().await;
+
+    // Inside a poll of its own call.
+    let add = async |cx: &mut AsyncEnv<i32>, x: i32| -> i32 {
+        let tried = cx.try_with(|mut env| {
+            *env.data_mut() += x;
+            *env.data()
+        });
+        let with = cx.with(|env| *env.data());
+        assert_eq!(tried, Ok(with));
+        with
+    };
+    let add = shared
+        .try_with(|mut store| Function::new_typed_async(&mut store, &env, add))
+        .unwrap();
+    let results = add.call_async(&mut shared.clone(), &[Value::I32(1)]).await;
+    assert_eq!(results.unwrap()[0].unwrap_i32(), 101);
+}
+
 // --- host errors -------------------------------------------------------------
 
 /// An error from an async host function is a trap: no handler of the guest
@@ -869,6 +996,36 @@ async fn a_host_error_is_a_trap_and_keeps_its_type() {
             "{name}: {error}"
         );
         assert_eq!(guest.log(), ["1: async, locked", "wait7"], "{name}");
+        assert!(!locked(&guest.store), "{name}");
+        guest.into_store();
+    }
+}
+
+/// An error from a synchronous host function is a trap as well, in a guest
+/// entered by `call_async`, before it first waits and once the engine has
+/// resumed it: no handler of the guest sees it, the guest does not go on to
+/// its next import, and the caller gets the error itself back.
+#[wasm_bindgen_test]
+async fn a_sync_host_error_is_a_trap_and_keeps_its_type() {
+    for (name, guest) in guests_with_handlers().into_iter().skip(1) {
+        for export in ["fail", "fail_then_wait"] {
+            let error = guest.call(export, &[3]).await.unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<HostExit>(),
+                Some(&HostExit(3)),
+                "{name}, {export}: {error}"
+            );
+        }
+        let mut call = guest.call("wait_then_fail", &[7]);
+        guest.until_waiting(&mut call, 7).await;
+        guest.gate.release(7);
+        let error = call.await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<HostExit>(),
+            Some(&HostExit(7)),
+            "{name}: {error}"
+        );
+        assert_eq!(guest.log(), ["wait7"], "{name}");
         assert!(!locked(&guest.store), "{name}");
         guest.into_store();
     }

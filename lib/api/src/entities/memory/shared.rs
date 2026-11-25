@@ -12,7 +12,7 @@ use crate::{
 ///
 /// This type never represents non-shared linear memory or an owned byte snapshot.
 pub struct SharedMemory {
-    memory: VMSharedMemory,
+    pub(crate) memory: VMSharedMemory,
     ops: Option<Arc<dyn SharedMemoryOps + Send + Sync>>,
 }
 

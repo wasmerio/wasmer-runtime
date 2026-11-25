@@ -58,7 +58,7 @@ use crate::{
     SharedStore, StoreInner, StoreMut, StoreSlice, Value,
     js::{
         boundary,
-        error::Trap,
+        error::{Trap, trap_error, trap_value},
         function::{enter_async, entered_synchronously, mark_entered},
         guard::GuestGuard,
         lent,
@@ -79,7 +79,6 @@ pub(crate) type ImportFuture = Pin<Box<dyn Future<Output = Result<Vec<Value>, Ru
 const suspendingOf = new WeakMap(), hostOf = new WeakMap();
 const storeOf = new WeakMap(), promisingOf = new WeakMap();
 const noop = () => {};
-let trapError;
 export function jspiHost(start, array, store) {
   const host = array ? (...args) => start(args) : start;
   const suspending = new WebAssembly.Suspending(host);
@@ -126,22 +125,6 @@ export function jspiWait(resumed) {
 export function jspiSettle(promise, done) {
   promise.then((value) => done(false, value), (error) => done(true, error));
 }
-// The error of a trap: the one thing a guest's exception handlers do not
-// catch, also when JavaScript throws it. It is made by trapping in
-// `(module (func (export "trap") unreachable))`. A host that refuses to
-// compile that gives its own error instead, which a guest may catch.
-export function jspiTrapError() {
-  if (trapError === undefined) {
-    try {
-      const bytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 4, 1, 96, 0, 0, 3, 2, 1, 0,
-        7, 8, 1, 4, 116, 114, 97, 112, 0, 0, 10, 5, 1, 3, 0, 0, 11]);
-      new WebAssembly.Instance(new WebAssembly.Module(bytes)).exports.trap();
-    } catch (error) {
-      trapError = error;
-    }
-  }
-  return trapError;
-}
 export function jspiIsSuspendError(value) {
   const SuspendError = WebAssembly.SuspendError;
   try {
@@ -171,8 +154,6 @@ extern "C" {
     fn shim_wait(resumed: &JsValue) -> Array;
     #[wasm_bindgen(js_name = jspiSettle)]
     fn shim_settle(promise: &JsValue, done: &JsValue);
-    #[wasm_bindgen(js_name = jspiTrapError)]
-    fn trap_error() -> JsValue;
     #[wasm_bindgen(js_name = jspiIsSuspendError)]
     fn shim_is_suspend_error(value: &JsValue) -> bool;
 }
@@ -557,9 +538,10 @@ fn cannot_suspend_error() -> RuntimeError {
 }
 
 /// [`cannot_suspend_error`], thrown as host functions throw their errors, so
-/// that the caller gets this very error back.
+/// that no handler of the guest catches it and the caller gets this very
+/// error back.
 fn cannot_suspend() -> JsValue {
-    Trap::user(Box::new(cannot_suspend_error())).into()
+    trap_value(cannot_suspend_error())
 }
 
 /// The error of a guest the engine refused to suspend, if `error` is the

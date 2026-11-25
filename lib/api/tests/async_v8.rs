@@ -197,6 +197,54 @@ fn a_shared_task_runs_a_ready_import_and_refuses_to_wait() {
     });
 }
 
+/// An import's future is driven and dropped on the stack of its guest, whose
+/// caller lends the store, so it is never dropped inside another slice:
+/// `AsyncEnv::try_with` has the store wherever `with` has, in a poll and in
+/// the destructor of a future that could not wait.
+#[test]
+fn try_with_takes_the_store_wherever_with_does() {
+    struct Tries<'a>(&'a mut AsyncEnv<i32>);
+    impl Drop for Tries<'_> {
+        fn drop(&mut self) {
+            let tried = self.0.try_with(|mut env| {
+                *env.data_mut() += 100;
+                *env.data()
+            });
+            assert_eq!(tried, Ok(self.0.with(|env| *env.data())));
+        }
+    }
+
+    finishes(|| {
+        let mut store = Store::default();
+        let module = Module::new(&store, GUEST).unwrap();
+        let env = FunctionEnv::new(&mut store, 0);
+        let wait = Function::new_typed_async(
+            &mut store,
+            &env,
+            async |cx: &mut AsyncEnv<i32>, x: i32| -> i32 {
+                let tried = cx.try_with(|mut env| {
+                    *env.data_mut() += x;
+                    *env.data()
+                });
+                assert_eq!(tried, Ok(cx.with(|env| *env.data())));
+                let _tries = Tries(cx);
+                std::future::pending::<()>().await;
+                0
+            },
+        );
+        let imports = imports! { "h" => { "wait" => wait } };
+        let instance = Instance::new(&mut store, &module, &imports).unwrap();
+        let run = instance.exports.get_function("run").unwrap().clone();
+
+        let mut shared = store.into_shared();
+        let mut call = Box::pin(run.call_async(&mut shared, &[Value::I32(1)]));
+        assert_cannot_wait(&poll_ready(&mut call).unwrap_err());
+        drop(call);
+        let value = shared.try_with(|mut store| *env.as_mut(&mut store));
+        assert_eq!(value, Ok(101));
+    });
+}
+
 #[test]
 fn a_host_future_panic_reaches_the_poller() {
     finishes(|| {
