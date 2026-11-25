@@ -592,6 +592,72 @@ fn a_forgotten_call_from_a_slice_keeps_the_shared_store_busy() {
     assert_eq!(shared.try_with(|_| ()).err(), Some(StoreBusy));
 }
 
+thread_local! {
+    static TASK: RefCell<Option<Call>> = const { RefCell::new(None) };
+    static IN_HOST: Cell<bool> = const { Cell::new(false) };
+    static OVERLAPPED: Cell<bool> = const { Cell::new(false) };
+}
+
+const POKE_GUEST: &str = r#"(module
+  (import "h" "poke" (func $poke))
+  (func (export "run") (call $poke)))"#;
+
+/// A task of a shared store cannot be polled from a host function that holds
+/// the store under a forgotten exclusive call, as `try_with` cannot run there:
+/// the task would enter the store while that host function borrows it.
+#[wasm_bindgen_test]
+async fn a_task_polled_under_a_forgotten_calls_host_function_is_refused() {
+    fn host(mut env: FunctionEnvMut<i32>) {
+        let data: &mut i32 = env.data_mut();
+        *data = 1;
+        IN_HOST.set(true);
+        let mut task = TASK.with(|task| task.borrow_mut().take()).unwrap();
+        // Panics: the store is held, so the task has no slice to take.
+        let _ = poll(task.as_mut());
+        IN_HOST.set(false);
+        OBSERVED.set(Some((true, *data)));
+        TASK.with(|slot| *slot.borrow_mut() = Some(task));
+    }
+    fn poke(mut env: FunctionEnvMut<i32>) {
+        *env.data_mut() = 2;
+        OVERLAPPED.set(IN_HOST.get());
+    }
+
+    let mut store = Store::default();
+    let env = FunctionEnv::new(&mut store, 0i32);
+    let wait = Function::new_typed_async(&mut store, &env, async |_: &mut AsyncEnv<i32>| {});
+    let host = Function::new_typed_with_env(&mut store, &env, host);
+    let module = Module::new(&store, WAIT_THEN_HOST).unwrap();
+    let imports = imports! { "h" => { "wait" => wait, "host" => host } };
+    let instance = Instance::new(&mut store, &module, &imports).unwrap();
+    let run = instance.exports.get_function("run").unwrap().clone();
+
+    let poke = Function::new_typed_with_env(&mut store, &env, poke);
+    let module = Module::new(&store, POKE_GUEST).unwrap();
+    let imports = imports! { "h" => { "poke" => poke } };
+    let instance = Instance::new(&mut store, &module, &imports).unwrap();
+    let poke_run = instance.exports.get_function("run").unwrap().clone();
+
+    let mut shared = store.into_shared();
+    let task: Call = Box::pin(poke_run.call_async(&mut shared, &[]));
+    TASK.with(|slot| *slot.borrow_mut() = Some(task));
+    OBSERVED.set(None);
+    shared
+        .try_with(|mut store| {
+            let mut call = Box::pin(run.call_async(&mut store, &[]));
+            assert!(poll(call.as_mut()).is_pending());
+            std::mem::forget(call);
+        })
+        .unwrap();
+    settle().await;
+    assert!(
+        !OVERLAPPED.get(),
+        "a task entered the store a host function held (it saw {:?})",
+        OBSERVED.get()
+    );
+    assert_eq!(OBSERVED.get(), None, "the host function went on");
+}
+
 /// A waker that polls inline cannot serve a wake from inside its own poll.
 #[wasm_bindgen_test]
 async fn a_wake_during_an_inline_poll_is_not_lost() {
