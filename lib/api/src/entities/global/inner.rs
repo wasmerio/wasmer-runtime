@@ -21,42 +21,6 @@ gen_rt_ty! {
 }
 
 impl BackendGlobal {
-    /// Create a new global with the initial [`Value`].
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use wasmer::{Global, Mutability, Store, Value};
-    /// # let mut store = Store::default();
-    /// #
-    /// let g = Global::new(&mut store, Value::I32(1));
-    ///
-    /// assert_eq!(g.get(&mut store), Value::I32(1));
-    /// assert_eq!(g.ty(&mut store).mutability, Mutability::Const);
-    /// ```
-    #[inline]
-    pub fn new(store: &mut impl AsStoreMut, val: Value) -> Self {
-        Self::from_value(store, val, Mutability::Const).unwrap()
-    }
-
-    /// Create a mutable global with the initial [`Value`].
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use wasmer::{Global, Mutability, Store, Value};
-    /// # let mut store = Store::default();
-    /// #
-    /// let g = Global::new_mut(&mut store, Value::I32(1));
-    ///
-    /// assert_eq!(g.get(&mut store), Value::I32(1));
-    /// assert_eq!(g.ty(&mut store).mutability, Mutability::Var);
-    /// ```
-    #[inline]
-    pub fn new_mut(store: &mut impl AsStoreMut, val: Value) -> Self {
-        Self::from_value(store, val, Mutability::Var).unwrap()
-    }
-
     /// Create a global with the initial [`Value`] and the provided [`Mutability`].
     #[inline]
     pub(crate) fn from_value(

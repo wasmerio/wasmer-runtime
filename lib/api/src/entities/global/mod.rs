@@ -34,8 +34,68 @@ impl Global {
     /// assert_eq!(g.get(&mut store), Value::I32(1));
     /// assert_eq!(g.ty(&mut store).mutability, Mutability::Const);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics when [`Global::try_new`] returns an error, that is when `val`:
+    ///
+    /// - is a reference (a `funcref`, an `externref` or an exception
+    ///   reference) of another store;
+    /// - is of a type the backend of `store` cannot create a global of: an
+    ///   `externref` or an exception reference on `v8`; a reference, a `v128`
+    ///   or an `i64` on `js`.
+    ///
+    /// Use [`Global::try_new`] for a value you do not control.
+    ///
+    /// ```should_panic
+    /// # use wasmer::{Function, Global, Store, Value};
+    /// # let mut store = Store::default();
+    /// # let mut other_store = Store::default();
+    /// #
+    /// let f = Function::new_typed(&mut other_store, || {});
+    ///
+    /// // This panics: `f` is a function of another store.
+    /// Global::new(&mut store, Value::FuncRef(Some(f)));
+    /// ```
     pub fn new(store: &mut impl AsStoreMut, val: Value) -> Self {
-        Self(BackendGlobal::new(store, val))
+        Self::try_new(store, val).unwrap()
+    }
+
+    /// Create a new global with the initial [`Value`], or return an error
+    /// where [`Global::new`] panics.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use wasmer::{Global, Mutability, Store, Value};
+    /// # let mut store = Store::default();
+    /// #
+    /// let g = Global::try_new(&mut store, Value::I32(1)).unwrap();
+    ///
+    /// assert_eq!(g.get(&mut store), Value::I32(1));
+    /// assert_eq!(g.ty(&mut store).mutability, Mutability::Const);
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Trying to create a global with a reference of another store will
+    /// raise an error:
+    ///
+    /// ```
+    /// # use wasmer::{Function, Global, Store, Value};
+    /// # let mut store = Store::default();
+    /// # let mut other_store = Store::default();
+    /// #
+    /// let f = Function::new_typed(&mut other_store, || {});
+    ///
+    /// assert!(Global::try_new(&mut store, Value::FuncRef(Some(f))).is_err());
+    /// ```
+    ///
+    /// So will a value of a type the backend of `store` cannot create a
+    /// global of: an `externref` or an exception reference on `v8`; a
+    /// reference, a `v128` or an `i64` on `js`.
+    pub fn try_new(store: &mut impl AsStoreMut, val: Value) -> Result<Self, RuntimeError> {
+        Self::from_value(store, val, Mutability::Const)
     }
 
     /// Create a mutable global with the initial [`Value`].
@@ -51,8 +111,46 @@ impl Global {
     /// assert_eq!(g.get(&mut store), Value::I32(1));
     /// assert_eq!(g.ty(&mut store).mutability, Mutability::Var);
     /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics when [`Global::try_new_mut`] returns an error, on the same
+    /// values as [`Global::new`]. Use [`Global::try_new_mut`] for a value you
+    /// do not control.
     pub fn new_mut(store: &mut impl AsStoreMut, val: Value) -> Self {
-        Self(BackendGlobal::new_mut(store, val))
+        Self::try_new_mut(store, val).unwrap()
+    }
+
+    /// Create a mutable global with the initial [`Value`], or return an error
+    /// where [`Global::new_mut`] panics.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use wasmer::{Global, Mutability, Store, Value};
+    /// # let mut store = Store::default();
+    /// #
+    /// let g = Global::try_new_mut(&mut store, Value::I32(1)).unwrap();
+    ///
+    /// assert_eq!(g.get(&mut store), Value::I32(1));
+    /// assert_eq!(g.ty(&mut store).mutability, Mutability::Var);
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on the same values as [`Global::try_new`]:
+    ///
+    /// ```
+    /// # use wasmer::{Function, Global, Store, Value};
+    /// # let mut store = Store::default();
+    /// # let mut other_store = Store::default();
+    /// #
+    /// let f = Function::new_typed(&mut other_store, || {});
+    ///
+    /// assert!(Global::try_new_mut(&mut store, Value::FuncRef(Some(f))).is_err());
+    /// ```
+    pub fn try_new_mut(store: &mut impl AsStoreMut, val: Value) -> Result<Self, RuntimeError> {
+        Self::from_value(store, val, Mutability::Var)
     }
 
     /// Create a global with the initial [`Value`] and the provided [`Mutability`].

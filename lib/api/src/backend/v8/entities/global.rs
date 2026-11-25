@@ -1,5 +1,5 @@
 //! Data types, functions and traits for `v8` runtime's `Global` implementation.
-use wasmer_types::{GlobalType, Mutability, StoreId};
+use wasmer_types::{GlobalType, Mutability, StoreId, Type};
 
 use crate::{
     AsStoreMut, AsStoreRef, RuntimeError, Value,
@@ -51,6 +51,13 @@ impl Global {
         check_isolate(store);
         if !val.is_from_store(store) {
             return Err(RuntimeError::new("cross-`Store` values are not supported"));
+        }
+        // Converting either to a V8 value panics.
+        if matches!(val.ty(), Type::ExternRef | Type::ExceptionRef) {
+            return Err(RuntimeError::new(format!(
+                "A global of type {} is not supported in V8",
+                val.ty()
+            )));
         }
         let store = store.as_store_mut();
         let v8_store = store.inner.store.as_v8();
