@@ -40,6 +40,17 @@ fn get_table_item(store: &mut impl AsStoreMut, val: Value) -> Result<JsValue, Ru
     }
 }
 
+/// A function the engine gave no signature for, as `() -> ()`: what
+/// [`Table::get`] always said of one. The signature is not written on the
+/// JavaScript function, which every handle to it shares: a guess there would
+/// read as the function's real signature from then on.
+fn untyped_function(function: js_sys::Function) -> VMFunction {
+    VMFunction {
+        function: crate::js::utils::js_handle::JsHandle::new(function),
+        ty: FunctionType::new(vec![], vec![]),
+    }
+}
+
 impl Table {
     pub fn new(
         store: &mut impl AsStoreMut,
@@ -90,9 +101,10 @@ impl Table {
         match self.handle.ty.ty {
             Type::FuncRef => {
                 let func = value.dyn_into::<js_sys::Function>().ok()?;
-                let ty = VMFunction::type_from_js(&func)
-                    .unwrap_or_else(|| FunctionType::new(vec![], vec![]));
-                let vm_function = VMFunction::new(func, ty);
+                let vm_function = match VMFunction::type_from_js(&func) {
+                    Some(ty) => VMFunction::new(func, ty),
+                    None => untyped_function(func),
+                };
                 let function = crate::Function::from_vm_extern(
                     store,
                     crate::vm::VMExternFunction::Js(vm_function),
@@ -106,6 +118,25 @@ impl Table {
             )))),
             _ => None,
         }
+    }
+
+    /// The function at `index`, if its signature is known: `None` for one
+    /// that carries no signature, where [`Table::get`] says `() -> ()`.
+    pub fn get_typed_function(
+        &self,
+        store: &mut impl AsStoreMut,
+        index: u32,
+    ) -> Option<crate::Function> {
+        if self.handle.ty.ty != Type::FuncRef {
+            return None;
+        }
+        let value = self.handle.table.get_raw(index).ok()?;
+        let function = value.dyn_into::<js_sys::Function>().ok()?;
+        let ty = VMFunction::type_from_js(&function)?;
+        Some(crate::Function::from_vm_extern(
+            store,
+            crate::vm::VMExternFunction::Js(VMFunction::new(function, ty)),
+        ))
     }
 
     pub fn set(

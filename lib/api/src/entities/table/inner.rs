@@ -66,6 +66,26 @@ impl BackendTable {
         })
     }
 
+    /// Retrieves the function at the provided `index`, if its signature is
+    /// known.
+    #[inline]
+    pub fn get_typed_function(
+        &self,
+        store: &mut impl AsStoreMut,
+        index: u32,
+    ) -> Option<crate::Function> {
+        match self {
+            #[cfg(feature = "js")]
+            Self::Js(table) => table.get_typed_function(store, index),
+            // The other backends know the signature of every function.
+            #[allow(unreachable_patterns)]
+            _ => match self.get(store, index)? {
+                Value::FuncRef(function) => function,
+                _ => None,
+            },
+        }
+    }
+
     /// Sets an element `val` in the Table at the provided `index`.
     #[inline]
     pub fn set(

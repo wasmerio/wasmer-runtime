@@ -47,6 +47,49 @@ impl Table {
         self.0.get(store, index)
     }
 
+    /// Retrieves the function at the provided `index`, if its signature is
+    /// known.
+    ///
+    /// Returns `None` if `index` is out of bounds, if the element is null or
+    /// not a function, and on the `js` backend if the function carries no
+    /// signature. JavaScript does not tell the signature of a WebAssembly
+    /// function, so Wasmer only knows it for an export of an instance and,
+    /// with the `wasm-types-polyfill` feature, for a function that an active
+    /// element segment put in the table: not for one that a guest stored
+    /// there as it ran. [`Table::get`] returns such a function as a
+    /// `() -> ()` one, which this method tells from a function that really
+    /// has that signature. The other backends know the signature of every
+    /// function.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use wasmer::{FunctionType, Instance, Module, Store, Type, imports};
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mut store = Store::default();
+    /// let module = Module::new(&store, r#"(module
+    ///   (table (export "table") 2 funcref)
+    ///   (func $double (param i32) (result i32) (i32.mul (local.get 0) (i32.const 2)))
+    ///   (elem (i32.const 0) $double))"#)?;
+    /// let instance = Instance::new(&mut store, &module, &imports! {})?;
+    /// let table = instance.exports.get_table("table")?;
+    ///
+    /// let double = table.get_typed_function(&mut store, 0).unwrap();
+    /// assert_eq!(double.ty(&store), FunctionType::new([Type::I32], [Type::I32]));
+    /// // A null element, and an index outside the table.
+    /// assert!(table.get_typed_function(&mut store, 1).is_none());
+    /// assert!(table.get_typed_function(&mut store, 2).is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn get_typed_function(
+        &self,
+        store: &mut impl AsStoreMut,
+        index: u32,
+    ) -> Option<crate::Function> {
+        self.0.get_typed_function(store, index)
+    }
+
     /// Sets an element `val` in the Table at the provided `index`.
     pub fn set(
         &self,
