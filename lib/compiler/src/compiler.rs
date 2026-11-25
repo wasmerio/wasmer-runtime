@@ -188,7 +188,7 @@ pub trait Compiler: Send + std::fmt::Debug {
     /// optimizations map to different deterministic IDs.
     ///
     /// It covers the compiler's own configuration only. The id of an engine
-    /// adds its WebAssembly features and the compiler's middlewares.
+    /// adds the compiler's middlewares.
     fn deterministic_id(&self) -> String;
 
     /// Add suggested optimizations to this compiler.

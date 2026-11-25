@@ -313,7 +313,7 @@ fn middleware_locals_info_multiple_functions(mut config: crate::Config) -> Resul
 }
 
 #[compiler_test(middlewares)]
-fn deterministic_id_covers_features_and_middlewares(mut config: crate::Config) -> Result<()> {
+fn deterministic_id_covers_middlewares(mut config: crate::Config) -> Result<()> {
     let mut features = Features::default();
     config.set_features(features.clone());
     let plain = config.engine().deterministic_id();
@@ -325,23 +325,28 @@ fn deterministic_id_covers_features_and_middlewares(mut config: crate::Config) -
     );
     assert_eq!(plain, config.engine().deterministic_id());
 
+    // The features do not change the code of a module, so not the id either.
     features.tail_call = !features.tail_call;
     config.set_features(features);
-    let other_features = config.engine().deterministic_id();
-    assert_ne!(plain, other_features);
+    assert_eq!(plain, config.engine().deterministic_id());
 
-    config.set_features(Features::default());
+    // The middlewares add a hash of their own to the same id.
     config.set_middlewares(vec![
         Arc::new(Add2MulGen { value_off: 0 }) as Arc<dyn ModuleMiddleware>
     ]);
     let with_middleware = config.engine().deterministic_id();
-    assert_ne!(plain, with_middleware);
+    assert!(
+        with_middleware.starts_with(&format!("{plain}-")),
+        "{with_middleware}"
+    );
+    assert_eq!(with_middleware.len(), plain.len() + 17);
     assert!(
         with_middleware
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
         "{with_middleware}"
     );
+    assert_eq!(with_middleware, config.engine().deterministic_id());
 
     config.set_middlewares(vec![Arc::new(FusionGen) as Arc<dyn ModuleMiddleware>]);
     assert_ne!(with_middleware, config.engine().deterministic_id());
@@ -354,7 +359,6 @@ fn deterministic_id_covers_features_and_middlewares(mut config: crate::Config) -
     );
     let many = config.engine().deterministic_id();
     assert_ne!(with_middleware, many);
-    assert!(many.len() <= 80, "{many}");
-    assert_eq!(many.len(), plain.len());
+    assert_eq!(many.len(), with_middleware.len());
     Ok(())
 }
