@@ -25,6 +25,36 @@ fn test_serialize(config: crate::Config) -> Result<()> {
 }
 
 #[compiler_test(serialize)]
+fn test_artifact_size(config: crate::Config) -> Result<()> {
+    let store = config.store();
+    let wat = r#"
+        (module
+        (func $hello (import "" "hello"))
+        (func (export "run") (call $hello))
+        )
+    "#;
+
+    let module = Module::new(&store, wat)?;
+    let Some(artifact) = module.sys_artifact() else {
+        return Ok(());
+    };
+    let serialized_bytes = module.serialize()?;
+    assert_eq!(artifact.size()?, serialized_bytes.len());
+
+    // An artifact that is loaded from a file has the size of that file.
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("module.bin");
+    module.serialize_to_file(&path)?;
+    let headless_store = config.headless_store();
+    let deserialized_module = unsafe { Module::deserialize_from_file(&headless_store, &path)? };
+    let artifact = deserialized_module
+        .sys_artifact()
+        .expect("a sys module has an artifact");
+    assert_eq!(artifact.size()?, serialized_bytes.len());
+    Ok(())
+}
+
+#[compiler_test(serialize)]
 fn test_deserialize(config: crate::Config) -> Result<()> {
     let mut store = config.store();
     let wat = r#"
