@@ -10,10 +10,8 @@
 
 use super::trap::UnwindReason;
 use crate::Trap;
-use corosensei::{Coroutine, CoroutineResult, Yielder};
 use std::{
-    any::Any, cell::Cell, convert::Infallible, error::Error, marker::PhantomData, ptr::NonNull,
-    sync::Mutex,
+    any::Any, cell::Cell, convert::Infallible, error::Error, marker::PhantomData, sync::Mutex,
 };
 
 /// Uninhabited type - no OS signals exist, so no handler can be constructed.
@@ -166,116 +164,7 @@ pub unsafe fn catch_traps<F, R: 'static>(
 where
     F: FnOnce() -> R + 'static,
 {
-    // A call made from here cannot be suspended: its caller is beneath it.
-    let outer = SUSPENDABLE.with(|cell| cell.replace(None));
-    let result = closure();
-    SUSPENDABLE.with(|cell| cell.set(outer));
-    Ok(result)
-}
-
-thread_local! {
-    /// The yielder of the [`SuspendedCall`] that is running on this thread
-    /// and may be suspended: one that no synchronous call was made in since.
-    static SUSPENDABLE: Cell<Option<NonNull<WasmYielder>>> = const { Cell::new(None) };
-}
-
-type WasmYielder = Yielder<(), ()>;
-
-/// `wasmer_call_trampoline`, for a guest that an import it calls may suspend;
-/// see the signal-based backend. This is the one place where `baremetal`
-/// switches stacks: the call runs on a stack of its own.
-///
-/// # Safety
-/// `vmctx`, `callee` and `values_vec` must be valid until the call is over
-/// or dropped.
-pub unsafe fn wasmer_call_trampoline_suspendable(
-    trap_handler: Option<*const TrapHandlerFn<'static>>,
-    _config: &VMConfig,
-    vmctx: crate::VMFunctionContext,
-    trampoline: crate::VMTrampoline,
-    callee: *const crate::VMFunctionBody,
-    values_vec: *mut u8,
-) -> Result<Option<SuspendedCall>, Trap> {
-    let coroutine = Coroutine::new(move |yielder: &WasmYielder, ()| {
-        SUSPENDABLE.with(|cell| cell.set(Some(NonNull::from(yielder))));
-        unsafe {
-            // pointer types are ABI-compatible
-            std::mem::transmute::<
-                crate::VMTrampoline,
-                unsafe extern "C" fn(
-                    crate::VMFunctionContext,
-                    *const crate::VMFunctionBody,
-                    *mut u8,
-                ),
-            >(trampoline)(vmctx, callee, values_vec);
-        }
-    });
-    let mut call = SuspendedCall {
-        coroutine,
-        yielder: None,
-    };
-    Ok(unsafe { call.resume(trap_handler) }?.map_or(Some(call), |()| None))
-}
-
-/// A call made with [`wasmer_call_trampoline_suspendable`] whose guest waits;
-/// see the signal-based backend.
-///
-/// Dropping it resets its stack: none of it runs again.
-pub struct SuspendedCall {
-    coroutine: Coroutine<(), (), ()>,
-    /// The coroutine's yielder, once it has suspended.
-    yielder: Option<NonNull<WasmYielder>>,
-}
-
-impl SuspendedCall {
-    /// Runs the guest until it waits again, which is `Ok(None)`, or is over.
-    /// A trap leaves through the unwinder.
-    ///
-    /// # Safety
-    /// Called on the thread the call was made on, and not again once it is
-    /// over.
-    pub unsafe fn resume(
-        &mut self,
-        _trap_handler: Option<*const TrapHandlerFn<'static>>,
-    ) -> Result<Option<()>, Trap> {
-        let outer = SUSPENDABLE.with(|cell| cell.replace(self.yielder));
-        let resumed = self.coroutine.resume(());
-        // The coroutine published its yielder when it started.
-        self.yielder = SUSPENDABLE.with(|cell| cell.replace(outer));
-        Ok(match resumed {
-            CoroutineResult::Yield(()) => None,
-            CoroutineResult::Return(()) => Some(()),
-        })
-    }
-}
-
-impl Drop for SuspendedCall {
-    fn drop(&mut self) {
-        if !self.coroutine.done() {
-            // Safety: a suspended stack holds nothing to release, and is
-            // never resumed.
-            unsafe { self.coroutine.force_reset() };
-        }
-    }
-}
-
-/// Whether the Wasm call that is running is a [`SuspendedCall`] that an
-/// import called from it may suspend.
-pub fn wasm_call_is_suspendable() -> bool {
-    SUSPENDABLE.with(|cell| cell.get()).is_some()
-}
-
-/// Suspends the Wasm call that is running, from an import it called, until
-/// it is resumed.
-///
-/// # Safety
-/// Only if [`wasm_call_is_suspendable`], with nothing on the stack that a
-/// destructor would have to release: the call may be dropped while it waits.
-pub unsafe fn suspend_wasm_call() {
-    let yielder = SUSPENDABLE
-        .with(|cell| cell.get())
-        .expect("no Wasm call that can be suspended is running");
-    unsafe { yielder.as_ref().suspend(()) };
+    Ok(closure())
 }
 
 /// Registered unwinder, if any.
