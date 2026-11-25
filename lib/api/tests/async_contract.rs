@@ -299,6 +299,34 @@ fn a_host_function_finds_the_shared_handle_of_its_store() {
     assert!(shared.into_store().is_ok());
 }
 
+/// Two handles are compared without borrowing the store, so inside a slice
+/// too, where `try_with` on either would fail.
+#[test]
+fn handles_of_a_shared_store_are_compared_without_borrowing_it() {
+    let shared = Store::default().into_shared();
+    let other = Store::default().into_shared();
+    let clone = shared.clone();
+    assert!(shared.ptr_eq(&clone));
+    assert!(!shared.ptr_eq(&other));
+    assert!(shared.downgrade().ptr_eq(&clone.downgrade()));
+    assert!(!shared.downgrade().ptr_eq(&other.downgrade()));
+
+    shared
+        .try_with(|_store| {
+            assert!(clone.try_with(|_| ()).is_err());
+            assert!(shared.ptr_eq(&clone));
+            assert!(!shared.ptr_eq(&other));
+        })
+        .unwrap();
+
+    // A weak handle still answers once its store is gone.
+    let weak = shared.downgrade();
+    drop((shared, clone));
+    assert!(weak.upgrade().is_none());
+    assert!(weak.ptr_eq(&weak.clone()));
+    assert!(!weak.ptr_eq(&other.downgrade()));
+}
+
 /// `release` lends the store to a `SharedStore` handle while a host function
 /// runs, one holder at a time. Without it the store is busy.
 #[test]
