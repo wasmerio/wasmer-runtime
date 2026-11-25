@@ -1171,12 +1171,14 @@ fn issue_return_call_import(mut config: crate::Config) -> Result<()> {
     Ok(())
 }
 
-//#[cfg(all(feature = "cranelift", target_os = "macos", target_arch = "aarch64"))]
 #[compiler_test(issues)]
-fn issue_return_call_compact_unwind_stack_args(mut config: crate::Config) -> Result<()> {
-    // if !matches!(config.compiler, crate::Compiler::Cranelift) {
-    //     return Ok(());
-    // }
+fn issue_return_call_with_extra_stack_args(mut config: crate::Config) -> Result<()> {
+    if !matches!(
+        config.compiler,
+        crate::Compiler::Cranelift | crate::Compiler::LLVM
+    ) {
+        return Ok(());
+    }
 
     let mut features = wasmer::sys::Features::default();
     features.tail_call(true).exceptions(true);
