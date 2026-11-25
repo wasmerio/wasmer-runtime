@@ -16,6 +16,7 @@ use std::os::raw::c_void;
 use wasmer_api::{ExternRef, Value};
 
 use super::super::store::{StoreRef, WeakStoreRef, wasm_store_t};
+use crate::error::update_last_error;
 
 /// Host-info payload carried inside a foreign [`ExternRef`].
 ///
@@ -66,25 +67,33 @@ pub struct wasm_ref_t {
 impl wasm_ref_t {
     /// Box a reference value. Returns `None` (i.e. the null `wasm_ref_t*`) for
     /// null references and non-reference values.
+    ///
+    /// A reference of another store is refused too, with the error
+    /// registered: every later use of the box pairs the value with `store`,
+    /// and the Rust API panics on a value used with the wrong store.
     pub(crate) fn new(store: StoreRef, inner: Value) -> Option<Box<wasm_ref_t>> {
-        match &inner {
-            Value::ExternRef(Some(_)) | Value::FuncRef(Some(_)) => Some(Box::new(wasm_ref_t {
-                inner,
-                store: store.downgrade(),
-            })),
-            _ => None,
+        if !matches!(inner, Value::ExternRef(Some(_)) | Value::FuncRef(Some(_))) {
+            return None;
         }
+        let own = c_try!(store.with(|store| inner.is_from_store(&store)));
+        if !own {
+            update_last_error("cross-`Store` values are not supported");
+            return None;
+        }
+        Some(Box::new(wasm_ref_t {
+            inner,
+            store: store.downgrade(),
+        }))
     }
 }
 
-/// Runs `f` against the [`Foreign`] payload of `ref_`, if it carries one and
-/// the owning store is still alive.
+/// Runs `f` against the [`Foreign`] payload of `ref_`, if it carries one, the
+/// owning store is still alive and it can be borrowed.
 fn with_foreign<R>(ref_: &wasm_ref_t, f: impl FnOnce(&Foreign) -> R) -> Option<R> {
     match &ref_.inner {
         Value::ExternRef(Some(e)) => {
             let store = ref_.store.upgrade()?;
-            let store_ref = unsafe { store.store() };
-            e.downcast::<Foreign>(&store_ref).map(f)
+            c_try!(store.with(|store| e.downcast::<Foreign>(&store).map(f)))
         }
         _ => None,
     }
@@ -170,10 +179,11 @@ pub unsafe extern "C" fn wasm_foreign_new(
     store: Option<&mut wasm_store_t>,
 ) -> Option<Box<wasm_foreign_t>> {
     let store = store?;
-    let extern_ref = {
-        let mut store_mut = unsafe { store.inner.store_mut() };
-        ExternRef::new(&mut store_mut, Foreign::new())
-    };
+    let extern_ref = c_try!(
+        store
+            .inner
+            .with_mut(|mut store_mut| ExternRef::new(&mut store_mut, Foreign::new()))
+    );
     Some(Box::new(wasm_ref_t {
         inner: Value::ExternRef(Some(extern_ref)),
         store: store.inner.downgrade(),

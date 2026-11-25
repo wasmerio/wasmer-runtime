@@ -5,7 +5,7 @@ use super::super::types::wasm_globaltype_t;
 use super::super::value::wasm_val_t;
 use super::wasm_extern_t;
 use std::convert::TryInto;
-use wasmer_api::{Extern, Global, Value};
+use wasmer_api::{Extern, Global, Mutability, StoreMut, Value};
 
 #[allow(non_camel_case_types)]
 #[repr(C)]
@@ -23,6 +23,23 @@ impl wasm_global_t {
     }
 }
 
+/// Creates a global holding `val`, unless `val` is a reference of another
+/// store: `Global::new` panics on one instead of returning an error.
+fn new_global(
+    store: &mut StoreMut<'_>,
+    val: Value,
+    mutability: Mutability,
+) -> Result<Global, &'static str> {
+    if !val.is_from_store(store) {
+        return Err("cross-`Store` values are not supported");
+    }
+    Ok(if mutability.is_mutable() {
+        Global::new_mut(store, val)
+    } else {
+        Global::new(store, val)
+    })
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wasm_global_new(
     store: Option<&mut wasm_store_t>,
@@ -31,16 +48,16 @@ pub unsafe extern "C" fn wasm_global_new(
 ) -> Option<Box<wasm_global_t>> {
     let global_type = global_type?;
     let store = store?;
-    let mut store_mut = unsafe { store.inner.store_mut() };
     let val = val?;
 
-    let global_type = &global_type.inner().global_type;
+    let mutability = global_type.inner().global_type.mutability;
     let wasm_val = val.try_into().ok()?;
-    let global = if global_type.mutability.is_mutable() {
-        Global::new_mut(&mut store_mut, wasm_val)
-    } else {
-        Global::new(&mut store_mut, wasm_val)
-    };
+    let created = c_try!(store.inner.with_mut(|mut store_mut| new_global(
+        &mut store_mut,
+        wasm_val,
+        mutability
+    )));
+    let global = c_try!(created);
     Some(Box::new(wasm_global_t {
         extern_: wasm_extern_t::new(store.inner.clone(), global.into()),
     }))
@@ -70,12 +87,10 @@ pub unsafe extern "C" fn wasm_global_get(
         return;
     };
     let wasm_global = global.extern_.global();
-    let value = {
-        let mut store_mut = unsafe { global.extern_.store.store_mut() };
-        wasm_global.get(&mut store_mut)
-    };
-    let store = global.extern_.store.clone();
-    let new_val = c_try!(wasm_val_t::from_value(&value, &store); otherwise ());
+    let store = &global.extern_.store;
+    let value = store.with_mut(|mut store_mut| wasm_global.get(&mut store_mut));
+    let value = c_try!(value; otherwise ());
+    let new_val = c_try!(wasm_val_t::from_value(&value, store); otherwise ());
     // `out` is an owned out-parameter; write without dropping stale contents.
     unsafe { std::ptr::write(out, new_val) };
 }
@@ -97,8 +112,10 @@ pub unsafe extern "C" fn wasm_global_set(
     };
     let value: Value = c_try!(val.try_into(); otherwise ());
     let wasm_global = global.extern_.global();
-    let mut store_mut = unsafe { global.extern_.store.store_mut() };
-    c_try!(wasm_global.set(&mut store_mut, value); otherwise ());
+    let store = &global.extern_.store;
+    let set = store.with_mut(|mut store_mut| wasm_global.set(&mut store_mut, value));
+    let set = c_try!(set; otherwise ());
+    c_try!(set; otherwise ());
 }
 
 #[unsafe(no_mangle)]
@@ -114,15 +131,81 @@ pub unsafe extern "C" fn wasm_global_type(
     global: Option<&wasm_global_t>,
 ) -> Option<Box<wasm_globaltype_t>> {
     let global = global?;
-    let store_ref = unsafe { global.extern_.store.store() };
-    Some(Box::new(wasm_globaltype_t::new(
-        global.extern_.global().ty(&store_ref),
-    )))
+    let wasm_global = global.extern_.global();
+    let ty = c_try!(global.extern_.store.with(|store| wasm_global.ty(&store)));
+    Some(Box::new(wasm_globaltype_t::new(ty)))
 }
 
 #[cfg(test)]
 mod tests {
     use inline_c::assert_c;
+
+    // Externref creation is only implemented on the `sys` backend.
+    #[cfg(feature = "sys")]
+    #[allow(
+        unexpected_cfgs,
+        reason = "tools like cargo-llvm-coverage pass --cfg coverage"
+    )]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    #[test]
+    fn test_global_refuses_a_reference_of_another_store() {
+        (assert_c! {
+            #include "tests/wasmer.h"
+
+            // Asserts that the last call registered an error, and clears it.
+            static void assert_refused() {
+                int length = wasmer_last_error_length();
+                assert(length > 0);
+
+                char* message = malloc(length);
+                wasmer_last_error_message(message, length);
+                free(message);
+            }
+
+            int main() {
+                wasm_engine_t* engine = wasm_engine_new();
+                wasm_store_t* store = wasm_store_new(engine);
+                wasm_store_t* other_store = wasm_store_new(engine);
+
+                wasm_foreign_t* foreign = wasm_foreign_new(store);
+                wasm_foreign_t* other_foreign = wasm_foreign_new(other_store);
+                wasm_val_t value = WASM_REF_VAL(wasm_foreign_as_ref(foreign));
+                wasm_val_t other_value = WASM_REF_VAL(wasm_foreign_as_ref(other_foreign));
+
+                wasm_globaltype_t* global_type =
+                    wasm_globaltype_new(wasm_valtype_new_externref(), WASM_VAR);
+
+                // A global cannot start with a reference of another store.
+                assert(wasm_global_new(store, global_type, &other_value) == NULL);
+                assert_refused();
+
+                wasm_global_t* global = wasm_global_new(store, global_type, &value);
+                assert(global);
+                assert(wasmer_last_error_length() == 0);
+
+                // Nor can it be set to one. It keeps its value.
+                wasm_global_set(global, &other_value);
+                assert_refused();
+
+                wasm_val_t current;
+                wasm_global_get(global, &current);
+                assert(current.kind == WASM_EXTERNREF);
+                assert(wasm_ref_same(current.of.ref, value.of.ref));
+
+                wasm_val_delete(&current);
+                wasm_global_delete(global);
+                wasm_globaltype_delete(global_type);
+                wasm_foreign_delete(other_foreign);
+                wasm_foreign_delete(foreign);
+                wasm_store_delete(other_store);
+                wasm_store_delete(store);
+                wasm_engine_delete(engine);
+
+                return 0;
+            }
+        })
+        .success();
+    }
 
     #[allow(
         unexpected_cfgs,

@@ -2,13 +2,53 @@ use super::externals::{wasm_extern_t, wasm_extern_vec_t};
 use super::module::wasm_module_t;
 use super::store::{StoreRef, wasm_store_t};
 use super::trap::wasm_trap_t;
-use wasmer_api::{Extern, Instance, InstantiationError};
+use wasmer_api::{Extern, Instance, InstantiationError, Module, StoreMut};
 
 /// Opaque type representing a WebAssembly instance.
 #[allow(non_camel_case_types)]
 pub struct wasm_instance_t {
     pub store: StoreRef,
     pub inner: Instance,
+}
+
+/// Lets the origin of each import bind the memory the instance will import,
+/// before its start function can run.
+#[cfg(feature = "extensions")]
+fn prebind_memory(
+    store: &mut StoreMut<'_>,
+    imports: &[Option<Box<wasm_extern_t>>],
+    externs: &[Extern],
+) {
+    let Some(memory) = externs.iter().find_map(|value| match value {
+        Extern::Memory(memory) => Some(memory),
+        _ => None,
+    }) else {
+        return;
+    };
+    for import in imports.iter().flatten() {
+        if let Some(origin) = &import.origin {
+            origin.prebind_memory(store, memory);
+        }
+    }
+}
+
+/// Instantiates `module` with `externs`, the values of `imports`.
+///
+/// The error is boxed because it is large.
+fn instantiate(
+    store: &mut StoreMut<'_>,
+    module: &Module,
+    #[allow(unused_variables)] imports: &[Option<Box<wasm_extern_t>>],
+    externs: &[Extern],
+) -> Result<Instance, Box<InstantiationError>> {
+    // The Rust API refuses an import of another store as well, but only after
+    // the import origins would have been handed one.
+    if externs.iter().any(|value| !value.is_from_store(store)) {
+        return Err(Box::new(InstantiationError::DifferentStores));
+    }
+    #[cfg(feature = "extensions")]
+    prebind_memory(store, imports, externs);
+    Instance::new_by_index(store, module, externs).map_err(Box::new)
 }
 
 /// Creates a new instance from a WebAssembly module and a
@@ -42,38 +82,25 @@ pub unsafe extern "C" fn wasm_instance_new(
     trap: Option<&mut *mut wasm_trap_t>,
 ) -> Option<Box<wasm_instance_t>> {
     let store = store?;
-    let mut store_mut = unsafe { store.inner.store_mut() };
     let module = module?;
     let imports = imports?;
 
     let wasm_module = &module.inner;
     let module_imports = wasm_module.imports();
     let module_import_count = module_imports.len();
+    let imports = &imports.as_slice()[..module_import_count.min(imports.as_slice().len())];
     let externs = imports
-        .as_slice()
         .iter()
         .map(|imp| Extern::from(imp.as_ref().unwrap().as_ref().clone()))
-        .take(module_import_count)
         .collect::<Vec<Extern>>();
 
-    #[cfg(feature = "extensions")]
-    if let Some(memory) = externs.iter().find_map(|value| match value {
-        Extern::Memory(memory) => Some(memory),
-        _ => None,
-    }) {
-        for import in imports
-            .as_slice()
-            .iter()
-            .take(module_import_count)
-            .flatten()
-        {
-            if let Some(origin) = &import.origin {
-                origin.prebind_memory(&mut store_mut, memory);
-            }
-        }
-    }
-
-    let instance = match Instance::new_by_index(&mut store_mut, wasm_module, &externs) {
+    let created = c_try!(store.inner.with_mut(|mut store_mut| instantiate(
+        &mut store_mut,
+        wasm_module,
+        imports,
+        &externs
+    )));
+    let instance = match created.map_err(|error| *error) {
         Ok(instance) => instance,
 
         Err(InstantiationError::Link(link_error)) => {
@@ -274,16 +301,18 @@ mod tests {
         .unwrap();
         let bound = Arc::new(AtomicBool::new(false));
         let bound_at_start = Arc::new(AtomicBool::new(false));
-        let (module, function, memory) = {
-            let mut raw = unsafe { store.inner.store_mut() };
-            let module = Module::new(&raw, wasm).unwrap();
-            let (seen, record) = (bound.clone(), bound_at_start.clone());
-            let function = Function::new_typed(&mut raw, move || {
-                record.store(seen.load(Ordering::SeqCst), Ordering::SeqCst);
-            });
-            let memory = Memory::new(&mut raw, MemoryType::new(1, None, false)).unwrap();
-            (module, function, memory)
-        };
+        let (seen, record) = (bound.clone(), bound_at_start.clone());
+        let (module, function, memory) = store
+            .inner
+            .with_mut(|mut raw| {
+                let module = Module::new(&raw, wasm).unwrap();
+                let function = Function::new_typed(&mut raw, move || {
+                    record.store(seen.load(Ordering::SeqCst), Ordering::SeqCst);
+                });
+                let memory = Memory::new(&mut raw, MemoryType::new(1, None, false)).unwrap();
+                (module, function, memory)
+            })
+            .unwrap();
         let module = wasm_module_t { inner: module };
         let mut import = wasm_extern_t::new(store.inner.clone(), Extern::Function(function));
         import.origin = Some(Rc::new(Origin {
@@ -406,6 +435,78 @@ mod tests {
                 wasm_module_delete(module);
                 wasm_byte_vec_delete(&wasm);
                 wasm_byte_vec_delete(&wat);
+                wasm_store_delete(store);
+                wasm_engine_delete(engine);
+
+                return 0;
+            }
+        })
+        .success();
+    }
+
+    #[allow(
+        unexpected_cfgs,
+        reason = "tools like cargo-llvm-coverage pass --cfg coverage"
+    )]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    #[test]
+    fn test_instance_refuses_an_import_of_another_store() {
+        (assert_c! {
+            #include "tests/wasmer.h"
+
+            static int host_calls = 0;
+
+            wasm_trap_t* host_callback(
+                const wasm_val_vec_t* arguments,
+                wasm_val_vec_t* results
+            ) {
+                (void) arguments;
+                (void) results;
+                host_calls++;
+
+                return NULL;
+            }
+
+            int main() {
+                wasm_engine_t* engine = wasm_engine_new();
+                wasm_store_t* store = wasm_store_new(engine);
+                wasm_store_t* other_store = wasm_store_new(engine);
+
+                wasm_byte_vec_t wat;
+                wasmer_byte_vec_new_from_string(
+                    &wat,
+                    "(module\n"
+                    "  (import \"env\" \"host\" (func $host))\n"
+                    "  (func $run (call $host))\n"
+                    "  (start $run))"
+                );
+                wasm_byte_vec_t wasm;
+                wat2wasm(&wat, &wasm);
+
+                wasm_module_t* module = wasm_module_new(store, &wasm);
+                assert(module);
+
+                // The import is a function of the other store.
+                wasm_functype_t* host_type = wasm_functype_new_0_0();
+                wasm_func_t* other_host = wasm_func_new(other_store, host_type, host_callback);
+                wasm_extern_t* externs[] = { wasm_func_as_extern(other_host) };
+                wasm_extern_vec_t imports = WASM_ARRAY_VEC(externs);
+
+                wasm_trap_t* trap = NULL;
+                wasm_instance_t* instance = wasm_instance_new(store, module, &imports, &trap);
+
+                // It is a link error, and the start function did not run.
+                assert(instance == NULL);
+                assert(trap == NULL);
+                assert(wasmer_last_error_length() > 0);
+                assert(host_calls == 0);
+
+                wasm_func_delete(other_host);
+                wasm_functype_delete(host_type);
+                wasm_module_delete(module);
+                wasm_byte_vec_delete(&wasm);
+                wasm_byte_vec_delete(&wat);
+                wasm_store_delete(other_store);
                 wasm_store_delete(store);
                 wasm_engine_delete(engine);
 
