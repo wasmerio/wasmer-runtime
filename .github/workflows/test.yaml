@@ -302,7 +302,6 @@ jobs:
             target: x86_64-unknown-linux-musl
             os: ubuntu-22.04
             container: "alpine:edge"
-            v8: true
         include:
           - stage:
               key: test-all
@@ -424,8 +423,8 @@ jobs:
         env:
           TEST_PLATFORM: ${{ matrix.metadata.build }}
         run: |
-          # C API tests link a prebuilt libwasmer, which cannot include V8 on
-          # Linux, so the test-capi stage runs them with its own feature sets.
+          # C API tests link a prebuilt libwasmer, so the test-capi stage runs
+          # them with its own feature sets.
           args=(--workspace --release --locked --exclude wasmer-c-api --exclude wasmer-c-api-imports
             --exclude wasmer-c-api-test-runner --exclude wasmer-capi-examples-runner)
           features="$ARTIFACT_FEATURES,experimental-async,wasmer/experimental-host-interrupt"
@@ -481,9 +480,10 @@ jobs:
         with:
           backend: cranelift
           features: wat,compiler,middlewares,cranelift,singlepass,${{ env.ARTIFACT_FEATURES }}
-      # On Linux, wee8's hidden symbols prevent building a shared V8 C API.
+      # Linking V8 into the shared library needs its Linux archive to have
+      # library-safe TLS, which this covers.
       - name: Test C API (V8)
-        if: matrix.stage.key == 'test-capi' && matrix.metadata.build == 'macos-arm'
+        if: matrix.stage.key == 'test-capi' && (matrix.metadata.build == 'macos-arm' || matrix.metadata.build == 'linux-x64')
         uses: ./.github/actions/test_capi
         with:
           backend: v8

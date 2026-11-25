@@ -58,7 +58,8 @@ cargo build --locked -p wasmer --no-default-features --features llvm,wat
 
 On supported native targets, the build script downloads the V8 archive and
 uses `bindgen` to generate bindings, so it needs libclang as well as a native
-toolchain. CI uses this backend for Windows tests.
+toolchain. CI uses this backend for Windows tests. The archives cover x86_64
+Linux with glibc, aarch64 macOS, x86_64 Windows, and aarch64 Android.
 
 ```sh
 cargo build --locked -p wasmer --no-default-features --features v8-default
@@ -98,5 +99,4 @@ cargo build --locked --release -p wasmer-c-api --no-default-features --features 
 cargo build --locked --release -p wasmer-c-api --no-default-features --features wat,v8-default
 ```
 
-The V8 shared library does not link on Linux. See [TEST.md](./TEST.md#c-api) to
-run the C API tests.
+See [TEST.md](./TEST.md#c-api) to run the C API tests.
