@@ -251,6 +251,35 @@ impl From<crate::Memory> for Memory {
     }
 }
 
+impl crate::SharedMemory {
+    /// The `WebAssembly.Memory` behind this shared memory on the calling
+    /// worker, without attaching it to a store.
+    ///
+    /// Returns `None` if the memory has not been delivered to this worker
+    /// (see `wasmer::js::receive_shared_object_message`), where
+    /// [`SharedMemory::try_attach`] fails. The returned object belongs to the
+    /// calling worker: send the `SharedMemory` to another one, not the object.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// # use wasmer::{Memory, MemoryType, Store};
+    /// # let mut store = Store::default();
+    /// let memory = Memory::new(&mut store, MemoryType::new(1, Some(2), true)).unwrap();
+    /// let shared = memory.as_shared(&store).unwrap();
+    ///
+    /// // The same memory JavaScript sees: hand it to code that is not Wasmer's.
+    /// let js_memory: js_sys::WebAssembly::Memory = shared.local_js_memory().unwrap();
+    /// ```
+    pub fn local_js_memory(&self) -> Option<js_sys::WebAssembly::Memory> {
+        match &self.memory {
+            crate::vm::VMSharedMemory::Js(memory) => memory.local_memory(),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+}
+
 impl crate::Memory {
     /// Consume [`self`] into a [`crate::backend::js::mem::Memory`].
     pub fn into_js(self) -> crate::backend::js::memory::Memory {

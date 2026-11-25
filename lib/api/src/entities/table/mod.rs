@@ -4,7 +4,8 @@ pub(crate) mod inner;
 pub(crate) use inner::*;
 
 use crate::{
-    AsStoreMut, AsStoreRef, ExportError, Exportable, Extern, StoreMut, StoreRef, Value,
+    AsStoreMut, AsStoreRef, ExportError, Exportable, Extern, StoreMut, StoreRef, TypedFunction,
+    Value, WasmTypeList,
     error::RuntimeError,
     store::BackendStore,
     vm::{VMExtern, VMExternTable},
@@ -47,24 +48,29 @@ impl Table {
         self.0.get(store, index)
     }
 
-    /// Retrieves the function at the provided `index`, if its signature is
-    /// known.
+    /// Retrieves the function at the provided `index` as a [`TypedFunction`].
     ///
-    /// Returns `None` if `index` is out of bounds, if the element is null or
-    /// not a function, and on the `js` backend if the function carries no
-    /// signature. JavaScript does not tell the signature of a WebAssembly
-    /// function, so Wasmer only knows it for an export of an instance and,
-    /// with the `wasm-types-polyfill` feature, for a function that an active
-    /// element segment put in the table: not for one that a guest stored
-    /// there as it ran. [`Table::get`] returns such a function as a
-    /// `() -> ()` one, which this method tells from a function that really
-    /// has that signature. The other backends know the signature of every
-    /// function.
+    /// # Errors
+    ///
+    /// Returns an error if `index` is out of bounds, if the element is null,
+    /// if the table does not hold functions, and if the signature of the
+    /// function is not the one `Args` and `Rets` give, as
+    /// [`Function::typed`](crate::Function::typed) does.
+    ///
+    /// On the `js` backend it is also an error if Wasmer does not know the
+    /// signature of the function. JavaScript does not tell the signature of a
+    /// WebAssembly function, so Wasmer only knows it for an export of an
+    /// instance and, with the `wasm-types-polyfill` feature, for a function
+    /// that an active element segment put in the table: not for one that a
+    /// guest stored there as it ran. [`Table::get`] gives such a function as
+    /// a `() -> ()` one, whatever it takes and returns. This method does not:
+    /// the `TypedFunction<(), ()>` it returns is a function known to take and
+    /// return nothing.
     ///
     /// # Example
     ///
     /// ```
-    /// # use wasmer::{FunctionType, Instance, Module, Store, Type, imports};
+    /// # use wasmer::{Instance, Module, Store, TypedFunction, imports};
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// # let mut store = Store::default();
     /// let module = Module::new(&store, r#"(module
@@ -74,19 +80,26 @@ impl Table {
     /// let instance = Instance::new(&mut store, &module, &imports! {})?;
     /// let table = instance.exports.get_table("table")?;
     ///
-    /// let double = table.get_typed_function(&mut store, 0).unwrap();
-    /// assert_eq!(double.ty(&store), FunctionType::new([Type::I32], [Type::I32]));
+    /// let double: TypedFunction<i32, i32> = table.get_typed_function(&mut store, 0)?;
+    /// assert_eq!(double.call(&mut store, 21)?, 42);
+    ///
+    /// // Another signature than the function's.
+    /// assert!(table.get_typed_function::<(), ()>(&mut store, 0).is_err());
     /// // A null element, and an index outside the table.
-    /// assert!(table.get_typed_function(&mut store, 1).is_none());
-    /// assert!(table.get_typed_function(&mut store, 2).is_none());
+    /// assert!(table.get_typed_function::<i32, i32>(&mut store, 1).is_err());
+    /// assert!(table.get_typed_function::<i32, i32>(&mut store, 2).is_err());
     /// # Ok(())
     /// # }
     /// ```
-    pub fn get_typed_function(
+    pub fn get_typed_function<Args, Rets>(
         &self,
         store: &mut impl AsStoreMut,
         index: u32,
-    ) -> Option<crate::Function> {
+    ) -> Result<TypedFunction<Args, Rets>, RuntimeError>
+    where
+        Args: WasmTypeList,
+        Rets: WasmTypeList,
+    {
         self.0.get_typed_function(store, index)
     }
 
