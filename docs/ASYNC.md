@@ -92,6 +92,7 @@ impl SharedStore {
     pub fn try_with<R>(&self, f: impl FnOnce(StoreMut<'_>) -> R) -> Result<R, StoreBusy>;
     pub fn into_store(self) -> Result<Store, Self>;
     pub fn downgrade(&self) -> WeakSharedStore;
+    pub fn ptr_eq(&self, other: &Self) -> bool;
 }
 
 impl<T> FunctionEnvMut<'_, T> {
