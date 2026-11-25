@@ -80,9 +80,9 @@ cc = "1.2.47"
 cmake = "0.1.50"
 compiletest_rs = "0.11.2"
 corosensei = "0.3.0"
-cranelift-codegen = { version = "=0.138.0", default-features = false }
-cranelift-entity = { version = "=0.138.0", default-features = false }
-cranelift-frontend = { version = "=0.138.0", default-features = false }
+cranelift-codegen = { git = "https://github.com/marxin/wasmtime", rev = "8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2", default-features = false }
+cranelift-entity = { git = "https://github.com/marxin/wasmtime", rev = "8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2", default-features = false }
+cranelift-frontend = { git = "https://github.com/marxin/wasmtime", rev = "8244d2e2a2a1ef79b8e4462e2ebf98f9749f12e2", default-features = false }
 crc32fast = "1.5.0"
 criterion = { version = "0.8.1", default-features = false }
 crossbeam-channel = "0.5.15"

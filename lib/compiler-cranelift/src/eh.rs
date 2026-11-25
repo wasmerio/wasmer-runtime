@@ -340,6 +340,7 @@ pub fn compact_unwind_encoding_aarch64(unwind_info: &[(u32, UnwindInst)]) -> Res
                 return Err("aarch64 compact-unwind cannot encode RegStackOffset".to_owned());
             }
             UnwindInst::Aarch64SetPointerAuth { .. } => {}
+            UnwindInst::FrameRecordMoved { .. } => todo!(),
         }
     }
 
