@@ -52,8 +52,8 @@ impl BackendGlobal {
     /// # use wasmer::{Global, Mutability, Store, Type, Value, GlobalType};
     /// # let mut store = Store::default();
     /// #
-    /// let c = Global::new(&mut store, Value::I32(1));
-    /// let v = Global::new_mut(&mut store, Value::I64(1));
+    /// let c = Global::new(&mut store, Value::I32(1)).unwrap();
+    /// let v = Global::new_mut(&mut store, Value::I64(1)).unwrap();
     ///
     /// assert_eq!(c.ty(&mut store), GlobalType::new(Type::I32, Mutability::Const));
     /// assert_eq!(v.ty(&mut store), GlobalType::new(Type::I64, Mutability::Var));
@@ -73,7 +73,7 @@ impl BackendGlobal {
     /// # use wasmer::{Global, Store, Value};
     /// # let mut store = Store::default();
     /// #
-    /// let g = Global::new(&mut store, Value::I32(1));
+    /// let g = Global::new(&mut store, Value::I32(1)).unwrap();
     ///
     /// assert_eq!(g.get(&mut store), Value::I32(1));
     /// ```
@@ -92,7 +92,7 @@ impl BackendGlobal {
     /// # use wasmer::{Global, Store, Value};
     /// # let mut store = Store::default();
     /// #
-    /// let g = Global::new_mut(&mut store, Value::I32(1));
+    /// let g = Global::new_mut(&mut store, Value::I32(1)).unwrap();
     ///
     /// assert_eq!(g.get(&mut store), Value::I32(1));
     ///
@@ -109,7 +109,7 @@ impl BackendGlobal {
     /// # use wasmer::{Global, Store, Value};
     /// # let mut store = Store::default();
     /// #
-    /// let g = Global::new(&mut store, Value::I32(1));
+    /// let g = Global::new(&mut store, Value::I32(1)).unwrap();
     ///
     /// g.set(&mut store, Value::I32(2)).unwrap();
     /// ```
@@ -120,7 +120,7 @@ impl BackendGlobal {
     /// # use wasmer::{Global, Store, Value};
     /// # let mut store = Store::default();
     /// #
-    /// let g = Global::new(&mut store, Value::I32(1));
+    /// let g = Global::new(&mut store, Value::I32(1)).unwrap();
     ///
     /// // This results in an error: `RuntimeError`.
     /// g.set(&mut store, Value::I64(2)).unwrap();

@@ -1570,7 +1570,10 @@ fn wasm_global_new(
     } else {
         Global::new(&mut env, value)
     };
-    insert(&mut env, WasmObject::Global(global))
+    match global {
+        Ok(global) => insert(&mut env, WasmObject::Global(global)),
+        Err(_) => INVALID_HANDLE,
+    }
 }
 
 fn global_from_handle(env: &FunctionEnvMut<WasmCapiEnv>, global_handle: i32) -> Option<Global> {

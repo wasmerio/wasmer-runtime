@@ -1620,7 +1620,7 @@ fn issue_6534_declared_element_segment_with_global(config: crate::Config) -> Res
 
     let module = Module::new(&store, wasm_bytes)?;
     let add_one = Function::new_typed(&mut store, |value: i32| value + 1);
-    let g = Global::new(&mut store, Value::FuncRef(Some(add_one)));
+    let g = Global::new(&mut store, Value::FuncRef(Some(add_one)))?;
     let imports = imports! {
         "env" => {
             "g" => g,

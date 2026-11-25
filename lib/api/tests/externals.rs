@@ -7,7 +7,7 @@ use wasmer::*;
 #[engine_test]
 fn global_new() -> Result<(), String> {
     let mut store = Store::default();
-    let global = Global::new(&mut store, Value::I32(10));
+    let global = Global::new(&mut store, Value::I32(10)).map_err(|e| format!("{e:?}"))?;
     assert_eq!(
         global.ty(&store),
         GlobalType {
@@ -15,15 +15,17 @@ fn global_new() -> Result<(), String> {
             mutability: Mutability::Const
         }
     );
+    assert_eq!(global.get(&mut store), Value::I32(10));
 
-    let global_mut = Global::new_mut(&mut store, Value::I32(10));
+    let global_mut = Global::new_mut(&mut store, Value::F32(10.0)).map_err(|e| format!("{e:?}"))?;
     assert_eq!(
         global_mut.ty(&store),
         GlobalType {
-            ty: Type::I32,
+            ty: Type::F32,
             mutability: Mutability::Var
         }
     );
+    assert_eq!(global_mut.get(&mut store), Value::F32(10.0));
 
     Ok(())
 }
@@ -32,23 +34,23 @@ fn global_new() -> Result<(), String> {
 fn global_get() -> Result<(), String> {
     let mut store = Store::default();
 
-    let global_i32 = Global::new(&mut store, Value::I32(10));
+    let global_i32 = Global::new(&mut store, Value::I32(10)).map_err(|e| format!("{e:?}"))?;
     assert_eq!(global_i32.get(&mut store), Value::I32(10));
 
     // 64-bit values are not yet fully supported in some versions of Node
     #[cfg(feature = "sys")]
     {
-        let global_i64 = Global::new(&mut store, Value::I64(20));
+        let global_i64 = Global::new(&mut store, Value::I64(20)).map_err(|e| format!("{e:?}"))?;
         assert_eq!(global_i64.get(&mut store), Value::I64(20));
     }
 
-    let global_f32 = Global::new(&mut store, Value::F32(10.0));
+    let global_f32 = Global::new(&mut store, Value::F32(10.0)).map_err(|e| format!("{e:?}"))?;
     assert_eq!(global_f32.get(&mut store), Value::F32(10.0));
 
     // 64-bit values are not yet fully supported in some versions of Node
     #[cfg(feature = "sys")]
     {
-        let global_f64 = Global::new(&mut store, Value::F64(20.0));
+        let global_f64 = Global::new(&mut store, Value::F64(20.0)).map_err(|e| format!("{e:?}"))?;
         assert_eq!(global_f64.get(&mut store), Value::F64(20.0));
     }
 
@@ -58,11 +60,12 @@ fn global_get() -> Result<(), String> {
 #[engine_test]
 fn global_set() -> Result<(), String> {
     let mut store = Store::default();
-    let global_i32 = Global::new(&mut store, Value::I32(10));
+    let global_i32 = Global::new(&mut store, Value::I32(10)).map_err(|e| format!("{e:?}"))?;
     // Set on a constant should error
     assert!(global_i32.set(&mut store, Value::I32(20)).is_err());
 
-    let global_i32_mut = Global::new_mut(&mut store, Value::I32(10));
+    let global_i32_mut =
+        Global::new_mut(&mut store, Value::I32(10)).map_err(|e| format!("{e:?}"))?;
     // Set on different type should error
     assert!(global_i32_mut.set(&mut store, Value::I64(20)).is_err());
 
@@ -85,46 +88,7 @@ fn assert_cross_store(result: Result<Global, RuntimeError>) {
 }
 
 #[engine_test]
-fn global_try_new() -> Result<(), String> {
-    let mut store = Store::default();
-    let global = Global::try_new(&mut store, Value::I32(10)).map_err(|e| format!("{e:?}"))?;
-    assert_eq!(
-        global.ty(&store),
-        GlobalType {
-            ty: Type::I32,
-            mutability: Mutability::Const
-        }
-    );
-    assert_eq!(global.get(&mut store), Value::I32(10));
-
-    let global_mut =
-        Global::try_new_mut(&mut store, Value::F32(10.0)).map_err(|e| format!("{e:?}"))?;
-    assert_eq!(
-        global_mut.ty(&store),
-        GlobalType {
-            ty: Type::F32,
-            mutability: Mutability::Var
-        }
-    );
-    assert_eq!(global_mut.get(&mut store), Value::F32(10.0));
-
-    // 64-bit values are not yet fully supported in some versions of Node
-    #[cfg(feature = "sys")]
-    {
-        let global_i64 =
-            Global::try_new(&mut store, Value::I64(20)).map_err(|e| format!("{e:?}"))?;
-        assert_eq!(global_i64.get(&mut store), Value::I64(20));
-
-        let global_f64 =
-            Global::try_new_mut(&mut store, Value::F64(20.0)).map_err(|e| format!("{e:?}"))?;
-        assert_eq!(global_f64.get(&mut store), Value::F64(20.0));
-    }
-
-    Ok(())
-}
-
-#[engine_test]
-fn global_try_new_funcref() -> Result<(), String> {
+fn global_new_funcref() -> Result<(), String> {
     let mut store = Store::default();
 
     // Without `experimental-async`, `js` cannot tell the store of a function.
@@ -133,13 +97,13 @@ fn global_try_new_funcref() -> Result<(), String> {
         let mut other_store = Store::default();
         let foreign = Function::new_typed(&mut other_store, || {});
         let foreign = || Value::FuncRef(Some(foreign.clone()));
-        assert_cross_store(Global::try_new(&mut store, foreign()));
-        assert_cross_store(Global::try_new_mut(&mut store, foreign()));
+        assert_cross_store(Global::new(&mut store, foreign()));
+        assert_cross_store(Global::new_mut(&mut store, foreign()));
     }
 
     let f = Function::new_typed(&mut store, || 7i32);
-    let global = Global::try_new(&mut store, Value::FuncRef(Some(f.clone())));
-    let global_mut = Global::try_new_mut(&mut store, Value::FuncRef(Some(f)));
+    let global = Global::new(&mut store, Value::FuncRef(Some(f.clone())));
+    let global_mut = Global::new_mut(&mut store, Value::FuncRef(Some(f)));
 
     // `js` has no global of a reference yet: that is an error too.
     #[cfg(feature = "js")]
@@ -170,14 +134,14 @@ fn global_try_new_funcref() -> Result<(), String> {
     feature = "v8-default",
     ignore = "extern refs are not supported by the default v8 backend"
 )]
-fn global_try_new_externref() -> Result<(), String> {
+fn global_new_externref() -> Result<(), String> {
     let mut store = Store::default();
     let mut other_store = Store::default();
 
     let foreign = ExternRef::new(&mut other_store, 0u32);
     let foreign = || Value::ExternRef(Some(foreign.clone()));
-    assert_cross_store(Global::try_new(&mut store, foreign()));
-    assert_cross_store(Global::try_new_mut(&mut store, foreign()));
+    assert_cross_store(Global::new(&mut store, foreign()));
+    assert_cross_store(Global::new_mut(&mut store, foreign()));
 
     // Only `sys` can create an exception.
     #[cfg(feature = "sys")]
@@ -185,13 +149,13 @@ fn global_try_new_externref() -> Result<(), String> {
         let tag = Tag::new(&mut other_store, []);
         let foreign = Exception::new(&mut other_store, &tag, &[]);
         let foreign = Value::ExceptionRef(Some(foreign));
-        assert_cross_store(Global::try_new(&mut store, foreign));
+        assert_cross_store(Global::new(&mut store, foreign));
     }
 
     let extern_ref = ExternRef::new(&mut store, 1u32);
     let own = || Value::ExternRef(Some(extern_ref.clone()));
-    let global = Global::try_new(&mut store, own());
-    let global_mut = Global::try_new_mut(&mut store, own());
+    let global = Global::new(&mut store, own());
+    let global_mut = Global::new_mut(&mut store, own());
 
     // `js` has no global of a reference yet: that is an error too.
     #[cfg(feature = "js")]
@@ -215,42 +179,12 @@ fn global_try_new_externref() -> Result<(), String> {
 /// refuses the number it passes for an `i64`: each is an error, not a panic.
 #[cfg(feature = "js")]
 #[wasm_bindgen_test]
-fn global_try_new_refuses_what_js_cannot_create() {
+fn global_new_refuses_what_js_cannot_create() {
     let mut store = Store::default();
     for value in [Value::FuncRef(None), Value::V128(7), Value::I64(20)] {
-        assert!(Global::try_new(&mut store, value.clone()).is_err());
-        assert!(Global::try_new_mut(&mut store, value).is_err());
+        assert!(Global::new(&mut store, value.clone()).is_err());
+        assert!(Global::new_mut(&mut store, value).is_err());
     }
-}
-
-// `#[engine_test]` takes a test that returns a `Result`, which a
-// `#[should_panic]` test cannot.
-#[cfg_attr(feature = "js", wasm_bindgen_test)]
-#[cfg_attr(any(feature = "sys", feature = "wasm-c-api"), test)]
-#[cfg_attr(
-    feature = "v8-default",
-    ignore = "extern refs are not supported by the default v8 backend"
-)]
-#[should_panic(expected = "cross-`Store` values are not supported")]
-fn global_new_panics_on_an_externref_of_another_store() {
-    let mut store = Store::default();
-    let mut other_store = Store::default();
-    let foreign = ExternRef::new(&mut other_store, 0u32);
-
-    Global::new(&mut store, Value::ExternRef(Some(foreign)));
-}
-
-// Without `experimental-async`, `js` cannot tell the store of a function.
-#[cfg(any(not(feature = "js"), feature = "experimental-async"))]
-#[cfg_attr(feature = "js", wasm_bindgen_test)]
-#[cfg_attr(any(feature = "sys", feature = "wasm-c-api"), test)]
-#[should_panic(expected = "cross-`Store` values are not supported")]
-fn global_new_mut_panics_on_a_function_of_another_store() {
-    let mut store = Store::default();
-    let mut other_store = Store::default();
-    let foreign = Function::new_typed(&mut other_store, || {});
-
-    Global::new_mut(&mut store, Value::FuncRef(Some(foreign)));
 }
 
 #[engine_test]

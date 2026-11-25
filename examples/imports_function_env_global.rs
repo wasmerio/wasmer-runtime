@@ -56,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let module = Module::new(&store, wasm_bytes)?;
 
     // Create the global
-    let g_counter = Global::new_mut(&mut store, Value::I32(5));
+    let g_counter = Global::new_mut(&mut store, Value::I32(5))?;
 
     // We create some shared data here, `Arc` is required because we may
     // move our WebAssembly instance to another thread to run it. Mutex
