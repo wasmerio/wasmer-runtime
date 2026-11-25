@@ -308,9 +308,16 @@ pub unsafe extern "C" fn wasm_func_call(
 
     // The results are converted once the store is released: boxing a
     // reference borrows it again.
-    let outcome = store
-        .with_mut(|mut store_mut| function.call(&mut store_mut, &params))
-        .unwrap_or_else(|busy| Err(RuntimeError::new(busy.to_string())));
+    let call = || {
+        store
+            .with_mut(|mut store_mut| function.call(&mut store_mut, &params))
+            .unwrap_or_else(|busy| Err(RuntimeError::new(busy.to_string())))
+    };
+    #[cfg(not(feature = "extensions-async"))]
+    let outcome = call();
+    // An extension of the store may run the call itself.
+    #[cfg(feature = "extensions-async")]
+    let outcome = store.call_hooked(&function, &params, call);
 
     match outcome {
         Ok(wasm_results) => {
