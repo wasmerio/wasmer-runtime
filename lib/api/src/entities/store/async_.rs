@@ -384,11 +384,13 @@ impl CallStore<'_> {
     ///
     /// # Panics
     /// Panics if the call is polled from inside a slice of its own store, or
-    /// a nested call outside the poll of the host function that made it.
+    /// while a call of its backend holds the store with no slice (see
+    /// [`SharedStore::try_with`]), or a nested call outside the poll of the
+    /// host function that made it.
     pub(crate) fn resolve(&self) -> PollStore {
         match self {
             Self::Shared(store) => {
-                if store.0.busy.get() {
+                if store.is_held() {
                     polled_in_a_slice()
                 }
                 store.poll_store()
