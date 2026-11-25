@@ -11,7 +11,7 @@ use wasmer_types::RawValue;
 
 use crate::{
     AsStoreMut, AsyncEnv, BackendFunction, CallStore, Function, RuntimeError, SharedStore,
-    StoreInner, StoreMut, Value, WasmTypeList,
+    StoreInner, StoreMut, Value, WasmTypeList, WithSlice,
 };
 
 /// The future of every async call.
@@ -271,20 +271,24 @@ impl<T> AsyncCallStore for AsyncEnv<T> {
         A: AsRef<[RawValue]>,
         Rets: WasmTypeList + 'static,
     {
-        let store = CallStore::Env {
-            id: self.store_id(),
-            _borrow: PhantomData,
-        };
-        match &function.0 {
-            // The host function that makes the call is being polled, unless
-            // it makes it from a destructor: its store is in reach.
-            #[cfg(feature = "sys")]
-            BackendFunction::Sys(sys) if store.try_resolve().is_some() => {
-                let args = self.with(|mut env| args(&mut env.as_store_mut()));
-                typed(store, sys, args)
-            }
-            _ => self.start_call(AsyncCallRequest::typed(function.clone(), args)),
+        // Where the store is in reach, the arguments are made now: the host
+        // function that makes the call is being polled, and holds no slice.
+        // Elsewhere, in a destructor or inside a slice, they are left for
+        // the first poll of the call, as those of a dynamic call are.
+        #[cfg(feature = "sys")]
+        if let BackendFunction::Sys(sys) = &function.0
+            && let Some(slice) = WithSlice::enter_if_in_reach(self.store_id())
+        {
+            // Safety: the slice is the only holder of the store.
+            let args = args(&mut unsafe { StoreMut::from_raw(slice.ptr()) });
+            drop(slice);
+            let store = CallStore::Env {
+                id: self.store_id(),
+                _borrow: PhantomData,
+            };
+            return typed(store, sys, args);
         }
+        self.start_call(AsyncCallRequest::typed(function.clone(), args))
     }
 }
 

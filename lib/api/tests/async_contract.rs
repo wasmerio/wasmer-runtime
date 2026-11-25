@@ -8,7 +8,7 @@
 //! that remain where they cannot.
 
 use std::{
-    cell::{Cell, RefCell},
+    cell::{Cell, OnceCell, RefCell},
     future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
@@ -1015,6 +1015,51 @@ fn a_handle_takes_its_shared_store_in_the_first_poll_of_an_import() {
     }
     let value = shared.try_with(|store| env.as_ref(&store).value).unwrap();
     assert_eq!(value, 2000);
+}
+
+/// A typed call can be made with an `AsyncEnv` inside a slice of its shared
+/// store, as a dynamic one can: it leaves its arguments for its first poll,
+/// and runs once the slice is over.
+#[test]
+fn a_typed_call_is_made_inside_a_slice_of_its_shared_store() {
+    let mut store = Store::default();
+    let module = Module::new(
+        &store,
+        r#"(module
+          (import "h" "relay" (func $relay (param i32) (result i32)))
+          (func (export "inc") (param i32) (result i32)
+            (i32.add (local.get 0) (i32.const 1)))
+          (func (export "run") (param i32) (result i32) (call $relay (local.get 0))))"#,
+    )
+    .unwrap();
+    let env = FunctionEnv::new(&mut store, ());
+    let gate = Rc::new(Cell::new(false));
+    let inc: Rc<OnceCell<TypedFunction<i32, i32>>> = Rc::default();
+    let relay = Function::new_typed_async(&mut store, &env, {
+        let (gate, inc) = (gate.clone(), inc.clone());
+        async move |cx: &mut AsyncEnv<()>, x: i32| -> i32 {
+            // Once it has waited, its future is polled with no slice held,
+            // and the slice below is the only one.
+            Gate(gate.clone()).await;
+            let shared = cx.with(|env| env.shared().expect("a shared store"));
+            let inc = inc.get().expect("the guest's function");
+            let call = shared.try_with(move |_| inc.call_async(cx, x)).unwrap();
+            call.await.unwrap()
+        }
+    });
+    let imports = imports! { "h" => { "relay" => relay } };
+    let instance = Instance::new(&mut store, &module, &imports).unwrap();
+    let guest_inc = instance.exports.get_typed_function(&store, "inc").unwrap();
+    assert!(inc.set(guest_inc).is_ok());
+
+    let mut shared = store.into_shared();
+    let mut task = Box::pin(export(&instance, "run").call_async(&mut shared, &[Value::I32(1)]));
+    assert!(poll(&mut task).is_pending());
+    gate.set(true);
+    let Poll::Ready(results) = poll(&mut task) else {
+        panic!("the task did not finish");
+    };
+    assert_eq!(results.unwrap()[0].unwrap_i32(), 2);
 }
 
 /// A host future's destructor runs when its task is dropped. If that happens
