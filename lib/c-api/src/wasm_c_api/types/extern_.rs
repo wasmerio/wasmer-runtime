@@ -6,7 +6,7 @@ use super::{
 use std::convert::{TryFrom, TryInto};
 use std::mem;
 use thiserror::Error;
-use wasmer_api::ExternType;
+use wasmer_api::{Extern, ExternType};
 
 #[allow(non_camel_case_types)]
 pub type wasm_externkind_t = u8;
@@ -89,16 +89,31 @@ impl From<&ExternType> for wasm_externtype_t {
     }
 }
 
+// The kind is read off the extern itself: unlike its type, it does not need
+// the store, which may be in use.
+impl From<&Extern> for wasm_externkind_enum {
+    fn from(other: &Extern) -> Self {
+        match other {
+            Extern::Function(_) => Self::WASM_EXTERN_FUNC,
+            Extern::Global(_) => Self::WASM_EXTERN_GLOBAL,
+            Extern::Table(_) => Self::WASM_EXTERN_TABLE,
+            Extern::Memory(_) => Self::WASM_EXTERN_MEMORY,
+            Extern::Tag(_) => Self::WASM_EXTERN_TAG,
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wasm_extern_type(r#extern: &wasm_extern_t) -> Box<wasm_externtype_t> {
-    let ty = unsafe { r#extern.ty() };
-    Box::new(wasm_externtype_t::new(ty))
+pub unsafe extern "C" fn wasm_extern_type(
+    r#extern: &wasm_extern_t,
+) -> Option<Box<wasm_externtype_t>> {
+    let ty = c_try!(r#extern.ty());
+    Some(Box::new(wasm_externtype_t::new(ty)))
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn wasm_extern_kind(r#extern: &wasm_extern_t) -> wasm_externkind_t {
-    let ty = unsafe { r#extern.ty() };
-    wasm_externkind_enum::from(ty) as wasm_externkind_t
+    wasm_externkind_enum::from(&r#extern.inner) as wasm_externkind_t
 }
 
 #[unsafe(no_mangle)]

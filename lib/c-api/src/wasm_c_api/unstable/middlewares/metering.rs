@@ -132,6 +132,7 @@
 //! ```
 
 use super::super::super::instance::wasm_instance_t;
+use super::super::super::store::StoreBusy;
 use super::super::parser::operator::wasmer_parser_operator_t;
 use super::wasmer_middleware_t;
 use std::sync::Arc;
@@ -204,11 +205,17 @@ pub extern "C" fn wasmer_metering_delete(_metering: Option<Box<wasmer_metering_t
 pub unsafe extern "C" fn wasmer_metering_get_remaining_points(
     instance: &mut wasm_instance_t,
 ) -> u64 {
-    let mut store_mut = unsafe { instance.store.store_mut() };
-    match get_remaining_points(&mut store_mut, &instance.inner) {
+    match c_try!(remaining_points(instance); otherwise 0) {
         MeteringPoints::Remaining(value) => value,
         MeteringPoints::Exhausted => u64::MAX,
     }
+}
+
+/// The metering points `instance` has left.
+fn remaining_points(instance: &wasm_instance_t) -> Result<MeteringPoints, StoreBusy> {
+    instance
+        .store
+        .with_mut(|mut store_mut| get_remaining_points(&mut store_mut, &instance.inner))
 }
 
 /// Returns true if the remaining points are exhausted, false otherwise.
@@ -220,9 +227,8 @@ pub unsafe extern "C" fn wasmer_metering_get_remaining_points(
 pub unsafe extern "C" fn wasmer_metering_points_are_exhausted(
     instance: &mut wasm_instance_t,
 ) -> bool {
-    let mut store_mut = unsafe { instance.store.store_mut() };
     matches!(
-        get_remaining_points(&mut store_mut, &instance.inner),
+        c_try!(remaining_points(instance); otherwise false),
         MeteringPoints::Exhausted,
     )
 }
@@ -304,8 +310,10 @@ pub unsafe extern "C" fn wasmer_metering_set_remaining_points(
     instance: &mut wasm_instance_t,
     new_limit: u64,
 ) {
-    let mut store_mut = unsafe { instance.store.store_mut() };
-    set_remaining_points(&mut store_mut, &instance.inner, new_limit);
+    let set = instance
+        .store
+        .with_mut(|mut store_mut| set_remaining_points(&mut store_mut, &instance.inner, new_limit));
+    c_try!(set; otherwise ());
 }
 
 /// Transforms a [`wasmer_metering_t`] into a generic

@@ -3,7 +3,7 @@ mod global;
 mod memory;
 mod table;
 
-use super::store::StoreRef;
+use super::store::{StoreBusy, StoreRef};
 // use super::types::{wasm_externkind_enum, wasm_externkind_t};
 pub use function::*;
 pub use global::*;
@@ -77,9 +77,8 @@ impl wasm_extern_t {
 // }
 
 impl wasm_extern_t {
-    pub(crate) unsafe fn ty(&self) -> ExternType {
-        let store_ref = unsafe { self.store.store() };
-        self.inner.ty(&store_ref)
+    pub(crate) fn ty(&self) -> Result<ExternType, StoreBusy> {
+        self.store.with(|store| self.inner.ty(&store))
     }
 }
 
@@ -148,6 +147,97 @@ pub extern "C" fn wasm_extern_as_table(r#extern: Option<&wasm_extern_t>) -> Opti
 #[cfg(test)]
 mod tests {
     use inline_c::assert_c;
+
+    // Externref creation is only implemented on the `sys` backend.
+    #[cfg(feature = "sys")]
+    #[allow(
+        unexpected_cfgs,
+        reason = "tools like cargo-llvm-coverage pass --cfg coverage"
+    )]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    #[test]
+    fn test_externs_refuse_a_reference_of_another_store() {
+        (assert_c! {
+            #include "tests/wasmer.h"
+
+            static int host_calls = 0;
+
+            wasm_trap_t* host_callback(
+                const wasm_val_vec_t* arguments,
+                wasm_val_vec_t* results
+            ) {
+                (void) arguments;
+                (void) results;
+                host_calls++;
+
+                return NULL;
+            }
+
+            // Asserts that the last call registered an error, and clears it.
+            static void assert_refused() {
+                int length = wasmer_last_error_length();
+                assert(length > 0);
+
+                char* message = malloc(length);
+                wasmer_last_error_message(message, length);
+                free(message);
+            }
+
+            int main() {
+                wasm_engine_t* engine = wasm_engine_new();
+                wasm_store_t* store = wasm_store_new(engine);
+                wasm_store_t* other_store = wasm_store_new(engine);
+
+                wasm_foreign_t* other_foreign = wasm_foreign_new(other_store);
+                wasm_ref_t* other_ref = wasm_foreign_as_ref(other_foreign);
+
+                // A table takes no element of another store: not as its
+                // initial value, not when set, and not when grown.
+                wasm_limits_t limits = { 1, 4 };
+                wasm_tabletype_t* table_type =
+                    wasm_tabletype_new(wasm_valtype_new_externref(), &limits);
+
+                assert(wasm_table_new(store, table_type, other_ref) == NULL);
+                assert_refused();
+
+                wasm_table_t* table = wasm_table_new(store, table_type, NULL);
+                assert(table);
+
+                assert(!wasm_table_set(table, 0, other_ref));
+                assert_refused();
+                assert(!wasm_table_grow(table, 1, other_ref));
+                assert_refused();
+                assert(wasm_table_size(table) == 1);
+                assert(wasm_table_get(table, 0) == NULL);
+
+                // A function takes no argument of another store.
+                wasm_functype_t* take_type = wasm_functype_new_1_0(wasm_valtype_new_externref());
+                wasm_func_t* take = wasm_func_new(store, take_type, host_callback);
+                assert(take);
+
+                wasm_val_t arguments[1] = { WASM_REF_VAL(other_ref) };
+                wasm_val_vec_t arguments_as_array = WASM_ARRAY_VEC(arguments);
+                wasm_val_vec_t results_as_array = WASM_EMPTY_VEC;
+
+                wasm_trap_t* trap = wasm_func_call(take, &arguments_as_array, &results_as_array);
+                assert(trap != NULL);
+                assert(host_calls == 0);
+
+                wasm_trap_delete(trap);
+                wasm_func_delete(take);
+                wasm_functype_delete(take_type);
+                wasm_table_delete(table);
+                wasm_tabletype_delete(table_type);
+                wasm_foreign_delete(other_foreign);
+                wasm_store_delete(other_store);
+                wasm_store_delete(store);
+                wasm_engine_delete(engine);
+
+                return 0;
+            }
+        })
+        .success();
+    }
 
     #[allow(
         unexpected_cfgs,
