@@ -345,5 +345,16 @@ fn deterministic_id_covers_features_and_middlewares(mut config: crate::Config) -
 
     config.set_middlewares(vec![Arc::new(FusionGen) as Arc<dyn ModuleMiddleware>]);
     assert_ne!(with_middleware, config.engine().deterministic_id());
+
+    // The id stays short enough for a file name, whatever its middlewares are.
+    config.set_middlewares(
+        (0..64)
+            .map(|value_off| Arc::new(Add2MulGen { value_off }) as Arc<dyn ModuleMiddleware>)
+            .collect(),
+    );
+    let many = config.engine().deterministic_id();
+    assert_ne!(with_middleware, many);
+    assert!(many.len() <= 80, "{many}");
+    assert_eq!(many.len(), plain.len());
     Ok(())
 }
