@@ -3,7 +3,9 @@ use std::marker::PhantomData;
 use wasmer_vm::{HostMemoryMapping, LinearMemory, MemoryError};
 
 use super::MemoryBuffer;
-use crate::{BackendMemory, MemoryAccessError, entities::store::AsStoreRef};
+use crate::{
+    BackendMemory, MemoryAccessError, entities::store::AsStoreRef, vm::VMSharedMemory,
+};
 
 /// Reads and writes a memory from host code that cannot reach its store.
 ///
@@ -75,7 +77,7 @@ pub struct HostMemoryAccess {
 }
 
 impl HostMemoryAccess {
-    pub(crate) fn new(mapping: HostMemoryMapping) -> Self {
+    fn new(mapping: HostMemoryMapping) -> Self {
         Self { mapping }
     }
 
@@ -148,6 +150,26 @@ impl crate::Memory {
                 .get(store.as_store_ref().objects().as_sys())
                 .host_mapping()
                 .map(HostMemoryAccess::new),
+            #[allow(unreachable_patterns)]
+            _ => Err(MemoryError::UnsupportedOperation {
+                message: "host memory access is unsupported by this backend".into(),
+            }),
+        }
+    }
+}
+
+impl crate::SharedMemory {
+    /// Returns a handle that reads and writes this memory without a store,
+    /// on any thread, and that does not keep the memory alive. See
+    /// [`HostMemoryAccess`] for what it can observe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::UnsupportedOperation`] for a memory of another
+    /// backend.
+    pub fn host_memory_access(&self) -> Result<HostMemoryAccess, MemoryError> {
+        match &self.memory {
+            VMSharedMemory::Sys(memory) => memory.host_mapping().map(HostMemoryAccess::new),
             #[allow(unreachable_patterns)]
             _ => Err(MemoryError::UnsupportedOperation {
                 message: "host memory access is unsupported by this backend".into(),

@@ -12,7 +12,7 @@ use crate::{
 ///
 /// This type never represents non-shared linear memory or an owned byte snapshot.
 pub struct SharedMemory {
-    memory: VMSharedMemory,
+    pub(crate) memory: VMSharedMemory,
     ops: Option<Arc<dyn SharedMemoryOps + Send + Sync>>,
 }
 
@@ -80,29 +80,6 @@ impl SharedMemory {
     pub fn try_attach(self, store: &mut impl AsStoreMut) -> Result<Memory, MemoryError> {
         let memory = self.memory.try_into_vm_memory(store)?;
         Ok(Memory::new_from_existing(store, memory))
-    }
-
-    /// Returns a handle that reads and writes this memory without a store,
-    /// on any thread, and that does not keep the memory alive. See
-    /// [`HostMemoryAccess`](crate::sys::HostMemoryAccess) for what it can
-    /// observe.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MemoryError::UnsupportedOperation`] for a memory of another
-    /// backend.
-    #[cfg(feature = "sys")]
-    pub fn host_memory_access(&self) -> Result<crate::sys::HostMemoryAccess, MemoryError> {
-        use wasmer_vm::LinearMemory as _;
-        match &self.memory {
-            VMSharedMemory::Sys(memory) => {
-                memory.host_mapping().map(crate::sys::HostMemoryAccess::new)
-            }
-            #[allow(unreachable_patterns)]
-            _ => Err(MemoryError::UnsupportedOperation {
-                message: "host memory access is unsupported by this backend".into(),
-            }),
-        }
     }
 
     /// Create an operations handle that does not keep the underlying memory alive.
