@@ -163,6 +163,17 @@ impl<F: Fn(&Operator) -> u64 + Send + Sync> fmt::Debug for Metering<F> {
 }
 
 impl<F: Fn(&Operator) -> u64 + Send + Sync + 'static> ModuleMiddleware for Metering<F> {
+    /// The initial limit is in the module's globals, and the cost function
+    /// decides where the checks go, so both are part of the id. The cost
+    /// function is only known by the name of its type.
+    fn deterministic_id(&self) -> String {
+        format!(
+            "metering-{}-{}",
+            self.initial_limit,
+            std::any::type_name::<F>()
+        )
+    }
+
     /// Generates a `FunctionMiddleware` for a given function.
     fn generate_function_middleware<'a>(
         &self,

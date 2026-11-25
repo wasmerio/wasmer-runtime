@@ -186,6 +186,9 @@ pub trait Compiler: Send + std::fmt::Debug {
 
     /// Returns the deterministic id of this compiler. Same compilers with different
     /// optimizations map to different deterministic IDs.
+    ///
+    /// It covers the compiler's own configuration only. The id of an engine
+    /// adds the compiler's middlewares.
     fn deterministic_id(&self) -> String;
 
     /// Add suggested optimizations to this compiler.

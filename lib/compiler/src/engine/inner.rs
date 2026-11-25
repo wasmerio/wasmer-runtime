@@ -85,13 +85,34 @@ impl Engine {
         self.name.as_str()
     }
 
-    /// Returns the deterministic id of this engine
+    /// Returns the deterministic id of this engine.
+    ///
+    /// Engines that can compile the same module to different code have
+    /// different ids. The id is the deterministic id of the compiler, which
+    /// covers its configuration, followed by `-` and a hash of the compiler's
+    /// middlewares if it has any. It does not cover the engine's WebAssembly
+    /// features, which do not change the code of a module they accept, nor
+    /// the target.
+    ///
+    /// The id is short enough for a file name whatever the middlewares are,
+    /// and only has ASCII letters, digits, `_` and `-`. An engine has the
+    /// same id on every architecture, operating system and pointer width.
     pub fn deterministic_id(&self) -> String {
         #[cfg(feature = "compiler")]
         {
             let i = self.inner();
             if let Some(ref c) = i.compiler {
-                return c.deterministic_id();
+                let mut id = c.deterministic_id();
+                let middlewares: Vec<_> = c
+                    .get_middlewares()
+                    .iter()
+                    .map(|middleware| middleware.deterministic_id())
+                    .collect();
+                if !middlewares.is_empty() {
+                    id.push('-');
+                    id.push_str(&hash(&middlewares));
+                }
+                return id;
             } else {
                 return self.name.clone();
             }
@@ -337,8 +358,48 @@ impl Engine {
 
 impl std::fmt::Debug for Engine {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{}", self.deterministic_id())
+        write!(f, "{}", self.deterministic_id())?;
+        // The id only has a hash of the middlewares, so they are spelled out.
+        #[cfg(feature = "compiler")]
+        {
+            let i = self.inner();
+            let middlewares: Vec<_> = i
+                .compiler
+                .iter()
+                .flat_map(|c| c.get_middlewares())
+                .map(|middleware| middleware.deterministic_id())
+                .collect();
+            if !middlewares.is_empty() {
+                write!(f, " (middlewares: {middlewares:?})")?;
+            }
+        }
+        Ok(())
     }
+}
+
+/// The hash of a list of strings in an engine's deterministic id: the first
+/// 8 bytes, in hex, of the SHA-256 of the list. The order of the list is part
+/// of the hash.
+///
+/// Only bytes that are the same on every host go into the hash, so that it is
+/// the same on every architecture, operating system and pointer width: the
+/// list has its length in front and each string its length in bytes, both as
+/// a little-endian `u64`, which also keeps two different lists from giving
+/// the same bytes.
+#[cfg(any(test, feature = "compiler"))]
+fn hash(items: &[impl AsRef<str>]) -> String {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&(items.len() as u64).to_le_bytes());
+    for item in items {
+        let item = item.as_ref();
+        bytes.extend_from_slice(&(item.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(item.as_bytes());
+    }
+
+    wasmer_types::ModuleHash::sha256(bytes).as_bytes()[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// The inner contents of `Engine`
@@ -604,5 +665,44 @@ impl Default for EngineId {
         Self {
             id: NEXT_ID.fetch_add(1, SeqCst),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hash;
+
+    /// These were computed outside this crate, from the layout that `hash`
+    /// documents. A host that gets another value would give its engines other
+    /// ids than the rest.
+    #[test]
+    fn the_hash_is_the_same_on_every_host() {
+        assert_eq!(hash(&["middleware"]), "f010533e6de502ee");
+        assert_eq!(
+            hash(&["metering-100-fn(&Operator) -> u64"]),
+            "d0cdb8ff7dc5b047"
+        );
+        // A length is in bytes.
+        assert_eq!(hash(&["é"]), "07399cc60a669f6a");
+    }
+
+    #[test]
+    fn the_hash_tells_lists_apart() {
+        assert_eq!(hash(&["ab"]), "27b0096ed742a9b6");
+        assert_eq!(hash(&["a", "b"]), "3f5ca3a8d1e9bec8");
+    }
+
+    /// The order of a middleware chain changes what it does to a module.
+    #[test]
+    fn the_hash_keeps_the_order_of_its_list() {
+        assert_eq!(hash(&["a", "b"]), "3f5ca3a8d1e9bec8");
+        assert_eq!(hash(&["b", "a"]), "6842fb8f290819be");
+        assert_eq!(hash(&["a", "b", "a"]), "ef209ecfc4d401bb");
+    }
+
+    #[test]
+    fn the_hash_has_one_length() {
+        let long = "m".repeat(10_000);
+        assert_eq!(hash(&[&long, &long]).len(), 16);
     }
 }
