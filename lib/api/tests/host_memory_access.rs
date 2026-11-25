@@ -10,7 +10,8 @@ use wasmer::{
     MemoryError, MemoryStyle, MemoryType, Module, Store, TableStyle, TableType, TypedFunction,
     WASM_PAGE_SIZE, imports,
     sys::{
-        BaseTunables, HostMemoryAccess, NativeEngineExt, Tunables,
+        BaseTunables, HostMemoryAccess, NativeEngineExt, NativeMemoryExt, NativeSharedMemoryExt,
+        Tunables,
         vm::{VMMemory, VMMemoryDefinition, VMTable, VMTableDefinition},
     },
 };

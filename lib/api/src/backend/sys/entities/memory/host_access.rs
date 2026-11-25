@@ -19,8 +19,9 @@ use crate::{
 ///
 /// The handle is `Send`, `Sync` and `Clone`, and works for shared and
 /// non-shared memories. Get one with
-/// [`Memory::host_memory_access`](crate::Memory::host_memory_access) or
-/// [`SharedMemory::host_memory_access`](crate::SharedMemory::host_memory_access).
+/// [`NativeMemoryExt::host_memory_access`] for a [`Memory`](crate::Memory), or
+/// with [`NativeSharedMemoryExt::host_memory_access`] for a
+/// [`SharedMemory`](crate::SharedMemory).
 ///
 /// # What an access can observe
 ///
@@ -44,7 +45,9 @@ use crate::{
 /// # Example
 ///
 /// ```
+/// use wasmer::sys::NativeMemoryExt;
 /// # use wasmer::{Engine, Memory, MemoryAccessError, MemoryType, Store, sys::NativeEngineExt};
+///
 /// // A store of the `sys` backend: the memories of the others have no handle.
 /// let mut store = Store::new(Engine::headless());
 /// let memory = Memory::new(&mut store, MemoryType::new(1, None, false)).unwrap();
@@ -132,16 +135,25 @@ impl HostMemoryAccess {
     }
 }
 
-impl crate::Memory {
+/// The custom trait to access the `sys` functions of the common
+/// [`Memory`](crate::Memory).
+pub trait NativeMemoryExt {
     /// Returns a handle that reads and writes this memory without its store,
     /// on any thread. See [`HostMemoryAccess`] for what it can observe.
     ///
     /// # Errors
     ///
     /// Returns [`MemoryError::UnsupportedOperation`] for a memory of another
-    /// backend, and for a custom memory that has no
-    /// [`LinearMemory::host_mapping`].
-    pub fn host_memory_access(
+    /// backend, where more than one is enabled, and for a custom memory that
+    /// has no [`LinearMemory::host_mapping`].
+    fn host_memory_access(
+        &self,
+        store: &impl AsStoreRef,
+    ) -> Result<HostMemoryAccess, MemoryError>;
+}
+
+impl NativeMemoryExt for crate::Memory {
+    fn host_memory_access(
         &self,
         store: &impl AsStoreRef,
     ) -> Result<HostMemoryAccess, MemoryError> {
@@ -159,7 +171,9 @@ impl crate::Memory {
     }
 }
 
-impl crate::SharedMemory {
+/// The custom trait to access the `sys` functions of the common
+/// [`SharedMemory`](crate::SharedMemory).
+pub trait NativeSharedMemoryExt {
     /// Returns a handle that reads and writes this memory without a store,
     /// on any thread, and that does not keep the memory alive. See
     /// [`HostMemoryAccess`] for what it can observe.
@@ -167,8 +181,12 @@ impl crate::SharedMemory {
     /// # Errors
     ///
     /// Returns [`MemoryError::UnsupportedOperation`] for a memory of another
-    /// backend.
-    pub fn host_memory_access(&self) -> Result<HostMemoryAccess, MemoryError> {
+    /// backend, where more than one is enabled.
+    fn host_memory_access(&self) -> Result<HostMemoryAccess, MemoryError>;
+}
+
+impl NativeSharedMemoryExt for crate::SharedMemory {
+    fn host_memory_access(&self) -> Result<HostMemoryAccess, MemoryError> {
         match &self.memory {
             VMSharedMemory::Sys(memory) => memory.host_mapping().map(HostMemoryAccess::new),
             #[allow(unreachable_patterns)]

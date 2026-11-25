@@ -8,7 +8,7 @@ pub(crate) mod tunables;
 pub mod vm;
 
 pub use engine::NativeEngineExt;
-pub use entities::memory::HostMemoryAccess;
+pub use entities::memory::{HostMemoryAccess, NativeMemoryExt, NativeSharedMemoryExt};
 pub use entities::*;
 pub use tunables::*;
 
