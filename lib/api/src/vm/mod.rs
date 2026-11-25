@@ -38,5 +38,9 @@ define_vm_like!(SharedMemory);
 define_vm_like!(Table, Debug);
 
 define_vm_like!(ExceptionRef);
-define_vm_like!(ExternRef);
+// `VMExternRef` is an implementation detail of `ExternRef`; keep it out of the
+// public API.
+gen_rt_ty! {
+    pub(crate) VMExternRef(vm::VMExternRef);
+}
 define_vm_like!(FuncRef);
