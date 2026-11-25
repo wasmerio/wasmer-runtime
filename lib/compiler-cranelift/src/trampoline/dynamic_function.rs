@@ -15,10 +15,10 @@ use cranelift_codegen::{
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use std::{cmp, mem};
 use target_lexicon::Architecture;
-use wasmer_compiler::{misc::CompiledKind, types::function::Compilation};
+use wasmer_compiler::misc::CompiledKind;
 use wasmer_types::{CompileError, FunctionType, VMOffsets};
 
-/// Create a trampoline for invoking a WebAssembly function.
+/// Compile a trampoline for invoking a dynamic host function from WebAssembly.
 #[allow(clippy::too_many_arguments)]
 pub fn make_trampoline_dynamic_function(
     callbacks: &Option<CraneliftCallbacks>,
@@ -29,7 +29,7 @@ pub fn make_trampoline_dynamic_function(
     kind: &CompiledKind,
     func_type: &FunctionType,
     module_hash: &Option<String>,
-) -> Result<Compilation, CompileError> {
+) -> Result<Context, CompileError> {
     let pointer_type = isa.pointer_type();
     let frontend_config = isa.frontend_config();
     let signature = signature_to_cranelift_ir(func_type, frontend_config, arch);
@@ -145,17 +145,16 @@ pub fn make_trampoline_dynamic_function(
         );
     }
 
-    let mut code_buf = Vec::new();
     let mut ctrl_plane = Default::default();
     let compiled = context
         .compile(isa, &mut ctrl_plane)
         .map_err(|error| CompileError::Codegen(error.inner.to_string()))?;
-    code_buf.extend_from_slice(compiled.code_buffer());
 
     if let Some(callbacks) = callbacks.as_ref() {
-        callbacks.obj_memory_buffer(kind, module_hash, &code_buf);
-        callbacks.asm_memory_buffer(kind, module_hash, arch, &code_buf)?;
+        let code = compiled.code_buffer();
+        callbacks.obj_memory_buffer(kind, module_hash, code);
+        callbacks.asm_memory_buffer(kind, module_hash, arch, code)?;
     }
 
-    Ok(code_buf)
+    Ok(context)
 }
