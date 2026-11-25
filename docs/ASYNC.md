@@ -66,6 +66,11 @@ impl Function {
 impl<T> AsyncEnv<T> {
     /// Borrows the store for one synchronous slice of a poll.
     pub fn with<R>(&mut self, f: impl FnOnce(FunctionEnvMut<'_, T>) -> R) -> R;
+    /// `with`, for a destructor: it fails where a shared store is busy.
+    pub fn try_with<R>(
+        &mut self,
+        f: impl FnOnce(FunctionEnvMut<'_, T>) -> R,
+    ) -> Result<R, StoreBusy>;
 }
 ```
 
@@ -209,8 +214,8 @@ Checks that stay dynamic, and fail safely:
 - Polling a task from inside a slice of its own store panics. An executor
   whose `wake` polls inline must defer that poll.
 - `with` panics if a task is dropped inside another slice of its shared store
-  and its host future's destructor asks for the store. Destructors should not
-  use the store.
+  and its host future's destructor asks for the store. A destructor that needs
+  the store asks with `try_with`, which fails with `StoreBusy` there.
 
 ## Backends
 
