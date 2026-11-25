@@ -624,12 +624,14 @@ async fn two_stores_overlap_on_one_thread() {
 
 // --- cancellation ------------------------------------------------------------
 
-/// Guests that wait inside a handler which catches everything a guest can
-/// catch, and say so with `observe(9)`.
+/// Guests that wait, call a synchronous import that fails, and throw inside
+/// a handler which catches everything a guest can catch, and say so with
+/// `observe(9)`.
 const CATCH_ALL_LEGACY: &str = r#"(module
   (import "host" "wait" (func $wait (param i32) (result i32)))
   (import "host" "fail" (func $fail (param i32)))
   (import "host" "observe" (func $observe (param i32)))
+  (tag $own)
   (func (export "once") (param i32) (result i32)
     (call $observe (i32.const 1))
     try
@@ -651,12 +653,27 @@ const CATCH_ALL_LEGACY: &str = r#"(module
     catch_all
       (call $observe (i32.const 9))
     end
+    (call $wait (i32.const 1000)))
+  (func (export "wait_then_fail") (param i32)
+    (drop (call $wait (local.get 0)))
+    try
+      (call $fail (local.get 0))
+    catch_all
+      (call $observe (i32.const 9))
+    end)
+  (func (export "throw_then_wait") (result i32)
+    try
+      (throw $own)
+    catch_all
+      (call $observe (i32.const 9))
+    end
     (call $wait (i32.const 1000))))"#;
 
 const CATCH_ALL_TRY_TABLE: &str = r#"(module
   (import "host" "wait" (func $wait (param i32) (result i32)))
   (import "host" "fail" (func $fail (param i32)))
   (import "host" "observe" (func $observe (param i32)))
+  (tag $own)
   (func (export "once") (param i32) (result i32)
     (call $observe (i32.const 1))
     (block $done
@@ -680,6 +697,19 @@ const CATCH_ALL_TRY_TABLE: &str = r#"(module
           (call $fail (local.get 0)))
         (br $done))
       (call $observe (i32.const 9)))
+    (call $wait (i32.const 1000)))
+  (func (export "wait_then_fail") (param i32)
+    (drop (call $wait (local.get 0)))
+    (block $caught
+      (try_table (catch_all $caught)
+        (call $fail (local.get 0))
+        (return)))
+    (call $observe (i32.const 9)))
+  (func (export "throw_then_wait") (result i32)
+    (block $caught
+      (try_table (catch_all $caught)
+        (throw $own)))
+    (call $observe (i32.const 9))
     (call $wait (i32.const 1000))))"#;
 
 /// The guests of the tests below: without a handler, and with each kind of
@@ -744,8 +774,9 @@ async fn a_guest_cancelled_after_its_wake_runs_no_more_code() {
 }
 
 /// The handlers of the guests above do run: a guest that is not cancelled
-/// goes on, and they catch what a synchronous host function throws. A guest
-/// that caught one can wait in an async import right after.
+/// goes on, and they catch what the guest throws itself. A guest that caught
+/// that can wait in an async import right after. What a host function fails
+/// with is not theirs to catch (see the host errors below).
 #[wasm_bindgen_test]
 async fn the_handlers_catch_what_can_be_caught() {
     for (name, guest) in guests_with_handlers().into_iter().skip(1) {
@@ -753,20 +784,19 @@ async fn the_handlers_catch_what_can_be_caught() {
         guest.until_waiting(&mut call, 7).await;
         guest.gate.release(7);
         assert_eq!(i32_of(call.await), 7, "{name}");
-        guest.call("fail", &[3]).await.unwrap();
+        let waited = guest.call("throw_then_wait", &[]).await;
+        assert_eq!(i32_of(waited), AUTO, "{name}");
         assert_eq!(
             guest.log(),
             [
                 "1: async, locked",
                 "wait7",
                 "2: async, locked",
-                "9: async, locked"
+                "9: async, locked",
+                "wait1000"
             ],
             "{name}"
         );
-        let waited = guest.call("fail_then_wait", &[3]).await;
-        assert_eq!(i32_of(waited), AUTO, "{name}");
-        assert_eq!(guest.log()[4..], ["9: async, locked", "wait1000"], "{name}");
     }
 }
 
@@ -869,6 +899,36 @@ async fn a_host_error_is_a_trap_and_keeps_its_type() {
             "{name}: {error}"
         );
         assert_eq!(guest.log(), ["1: async, locked", "wait7"], "{name}");
+        assert!(!locked(&guest.store), "{name}");
+        guest.into_store();
+    }
+}
+
+/// An error from a synchronous host function is a trap as well, in a guest
+/// entered by `call_async`, before it first waits and once the engine has
+/// resumed it: no handler of the guest sees it, the guest does not go on to
+/// its next import, and the caller gets the error itself back.
+#[wasm_bindgen_test]
+async fn a_sync_host_error_is_a_trap_and_keeps_its_type() {
+    for (name, guest) in guests_with_handlers().into_iter().skip(1) {
+        for export in ["fail", "fail_then_wait"] {
+            let error = guest.call(export, &[3]).await.unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<HostExit>(),
+                Some(&HostExit(3)),
+                "{name}, {export}: {error}"
+            );
+        }
+        let mut call = guest.call("wait_then_fail", &[7]);
+        guest.until_waiting(&mut call, 7).await;
+        guest.gate.release(7);
+        let error = call.await.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<HostExit>(),
+            Some(&HostExit(7)),
+            "{name}: {error}"
+        );
+        assert_eq!(guest.log(), ["wait7"], "{name}");
         assert!(!locked(&guest.store), "{name}");
         guest.into_store();
     }
