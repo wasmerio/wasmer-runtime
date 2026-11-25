@@ -2,6 +2,10 @@
 use crate::entities::{Function, Global, Memory, Table, Tag};
 use crate::store::AsStoreMut;
 pub use wasmer_vm::*;
+// Deliberately shadow the glob re-export: `VMExternRef` is an implementation
+// detail of `ExternRef` and is not part of the public API.
+#[allow(hidden_glob_reexports)]
+pub(crate) use wasmer_vm::VMExternRef;
 
 /// The type of extern tables in the `sys` VM.
 pub type VMExternTable = InternalStoreHandle<VMTable>;
