@@ -31,6 +31,9 @@ pub enum MemoryAccessError {
     /// Pointer to memory is unaligned.
     #[error("unaligned pointer read")]
     UnalignedPointerRead,
+    /// The memory was already dropped.
+    #[error("the memory was already dropped")]
+    MemoryDropped,
 }
 
 impl From<MemoryAccessError> for RuntimeError {

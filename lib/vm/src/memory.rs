@@ -32,6 +32,8 @@ struct WasmMmap {
     size: Pages,
     /// The owned memory definition used by the generated code
     vm_memory_definition: MaybeInstanceOwned<VMMemoryDefinition>,
+    // Where host code that cannot reach the store finds the bytes above.
+    host_mapping: HostMemoryMapping,
 }
 
 /// # SAFETY: Not safe by rust standards, since guest code may do weird things
@@ -93,6 +95,10 @@ impl WasmMmap {
         let prev_bytes = prev_pages.bytes().0;
         let new_bytes = new_pages.bytes().0;
 
+        // A host access holds this lock while it copies, so none is inside the
+        // mapping while it moves, and none writes to bytes already copied out.
+        let mut mapped = self.host_mapping.lock_for_change();
+
         if new_bytes > self.alloc.len() - conf.offset_guard_size {
             // If the new size is within the declared maximum, but needs more memory than we
             // have on hand, it's a dynamic heap and it can move.
@@ -112,6 +118,9 @@ impl WasmMmap {
             let copy_len = self.alloc.len() - conf.offset_guard_size;
             new_mmap.as_mut_slice()[..copy_len].copy_from_slice(&self.alloc.as_slice()[..copy_len]);
 
+            // The old mapping is released below. Forget it first: this lock
+            // is not poisoned by a panic, which would leave it recorded.
+            *mapped = None;
             self.alloc = new_mmap;
         } else if delta_bytes > 0 {
             // Make the newly allocated pages accessible.
@@ -129,6 +138,7 @@ impl WasmMmap {
             md.current_length = new_pages.bytes().0;
             md.base = self.alloc.as_mut_ptr() as _;
         }
+        *mapped = Some(MappedBytes::new(&self.alloc, new_bytes));
 
         Ok(prev_pages)
     }
@@ -148,6 +158,7 @@ impl WasmMmap {
 
     /// Resets the memory down to a zero size
     fn reset(&mut self) -> Result<(), MemoryError> {
+        let mut mapped = self.host_mapping.lock_for_change();
         self.size.0 = 0;
         // update memory definition
         unsafe {
@@ -155,6 +166,7 @@ impl WasmMmap {
             let md = md_ptr.as_mut();
             md.current_length = 0;
         }
+        *mapped = Some(MappedBytes::new(&self.alloc, 0));
         Ok(())
     }
 
@@ -174,9 +186,87 @@ impl WasmMmap {
                     current_length: mem_length,
                 },
             ))),
+            host_mapping: HostMemoryMapping::new(MappedBytes::new(&alloc, mem_length)),
             alloc,
             size: self.size,
         })
+    }
+}
+
+impl Drop for WasmMmap {
+    fn drop(&mut self) {
+        // The mapping is released once this returns. Waiting for the lock lets
+        // the accesses in progress finish, and no later one finds the bytes.
+        *self.host_mapping.lock_for_change() = None;
+    }
+}
+
+/// The host bytes of a linear memory: what generated code reads from its
+/// `VMMemoryDefinition`.
+#[derive(Debug, Clone, Copy)]
+struct MappedBytes {
+    // A `usize`, as in `Mmap`, so that a handle is `Send` and `Sync`.
+    base: usize,
+    len: usize,
+}
+
+impl MappedBytes {
+    fn new(alloc: &Mmap, len: usize) -> Self {
+        Self {
+            base: alloc.as_ptr() as usize,
+            len,
+        }
+    }
+}
+
+/// Where a linear memory is mapped in the host, for code that cannot reach
+/// the store that owns the memory.
+///
+/// A store is the only way to a non-shared memory, and a store can be busy on
+/// another thread or borrowed further down the stack. This handle is not tied
+/// to it: it is `Send`, `Sync` and `Clone`, it does not keep the memory alive,
+/// and it follows the memory when [`LinearMemory::grow`] moves it.
+///
+/// Get one with [`LinearMemory::host_mapping`].
+#[derive(Debug, Clone)]
+pub struct HostMemoryMapping {
+    // `None` once the memory is dropped. An access holds the read side for as
+    // long as it uses the bytes; whatever moves, resizes or unmaps them holds
+    // the write side. Generated code takes neither.
+    //
+    // This lock keeps new readers out as soon as a writer waits. The one of
+    // `std` lets readers that keep coming overtake it on some platforms, so a
+    // host that polls a memory would stall its `memory.grow`.
+    bytes: Arc<parking_lot::RwLock<Option<MappedBytes>>>,
+}
+
+impl HostMemoryMapping {
+    fn new(bytes: MappedBytes) -> Self {
+        Self {
+            bytes: Arc::new(parking_lot::RwLock::new(Some(bytes))),
+        }
+    }
+
+    /// Runs `f` with the address and the length in bytes of the memory, or
+    /// returns `None` if the memory was dropped.
+    ///
+    /// The bytes stay mapped, at that address and with that length, until `f`
+    /// returns: growing, resetting and dropping the memory wait for it. So `f`
+    /// must be short, and must neither do any of the three nor use a handle of
+    /// this memory again, which could deadlock.
+    ///
+    /// The guest, and other host code, may read and write the same bytes while
+    /// `f` runs. Access them as raw, racing memory, with volatile reads and
+    /// writes, and never through a `&[u8]` or `&mut [u8]`.
+    pub fn with_bytes<R>(&self, f: impl FnOnce(*mut u8, usize) -> R) -> Option<R> {
+        let bytes = self.bytes.read();
+        (*bytes).map(|bytes| f(bytes.base as *mut u8, bytes.len))
+    }
+
+    /// Waits for the accesses in progress, and keeps new ones out until the
+    /// returned guard is dropped.
+    fn lock_for_change(&self) -> parking_lot::RwLockWriteGuard<'_, Option<MappedBytes>> {
+        self.bytes.write()
     }
 }
 
@@ -373,6 +463,7 @@ impl VMOwnedMemory {
                         current_length: mem_length,
                     })))
                 },
+                host_mapping: HostMemoryMapping::new(MappedBytes::new(&alloc, mem_length)),
                 alloc,
                 size: Bytes::from(mem_length).try_into().unwrap(),
             };
@@ -464,6 +555,10 @@ impl LinearMemory for VMOwnedMemory {
     /// Return a concrete shared memory handle for detached API sharing.
     fn as_shared(&self) -> Result<VMSharedMemory, MemoryError> {
         Err(MemoryError::MemoryNotShared)
+    }
+
+    fn host_mapping(&self) -> Result<HostMemoryMapping, MemoryError> {
+        Ok(self.mmap.host_mapping.clone())
     }
 }
 
@@ -624,6 +719,10 @@ impl LinearMemory for VMSharedMemory {
         Ok(self.clone())
     }
 
+    fn host_mapping(&self) -> Result<HostMemoryMapping, MemoryError> {
+        Ok(self.mmap.read().unwrap().host_mapping.clone())
+    }
+
     // Add current thread to waiter list
     unsafe fn do_wait(
         &mut self,
@@ -728,6 +827,10 @@ impl LinearMemory for VMMemory {
 
     fn as_shared(&self) -> Result<VMSharedMemory, MemoryError> {
         self.0.as_shared()
+    }
+
+    fn host_mapping(&self) -> Result<HostMemoryMapping, MemoryError> {
+        self.0.host_mapping()
     }
 
     // Add current thread to waiter list
@@ -898,6 +1001,18 @@ where
         Err(MemoryError::MemoryNotShared)
     }
 
+    /// Returns a handle to the host bytes of this memory that works without
+    /// its store, on any thread, and that does not keep the memory alive.
+    ///
+    /// The memories of this crate keep the handle in step with every change
+    /// of the address or the length of their bytes. A custom memory has none
+    /// by default, and can return the handle of a memory it wraps.
+    fn host_mapping(&self) -> Result<HostMemoryMapping, MemoryError> {
+        Err(MemoryError::UnsupportedOperation {
+            message: "host_mapping() is not supported".to_string(),
+        })
+    }
+
     /// Add current thread to the waiter hash, and wait until notified or timeout.
     /// Return 0 if the waiter has been notified, 1 if there was a value mismatch,
     /// or 2 if the timeout occurred.
@@ -925,5 +1040,212 @@ where
     /// Will be [`None`] if the memory does not support atomics.
     fn thread_conditions(&self) -> Option<&ThreadConditions> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        HostMemoryMapping, LinearMemory, MappedBytes, VMMemory, VMOwnedMemory, VMSharedMemory,
+    };
+    use wasmer_types::{MemoryStyle, MemoryType, Pages, WASM_PAGE_SIZE};
+
+    /// A style whose memories have no room to grow in place.
+    const DYNAMIC: MemoryStyle = MemoryStyle::Dynamic {
+        offset_guard_size: WASM_PAGE_SIZE as u64,
+    };
+
+    fn owned(style: MemoryStyle, maximum: u32) -> VMOwnedMemory {
+        VMOwnedMemory::new(&MemoryType::new(1, Some(maximum), false), &style).unwrap()
+    }
+
+    fn bytes(mapping: &HostMemoryMapping) -> Option<(usize, usize)> {
+        mapping.with_bytes(|base, len| (base as usize, len))
+    }
+
+    fn peek(mapping: &HostMemoryMapping, offset: usize) -> Option<u8> {
+        mapping.with_bytes(|base, len| {
+            assert!(offset < len);
+            unsafe { base.add(offset).read_volatile() }
+        })
+    }
+
+    fn poke(mapping: &HostMemoryMapping, offset: usize, value: u8) -> Option<()> {
+        mapping.with_bytes(|base, len| {
+            assert!(offset < len);
+            unsafe { base.add(offset).write_volatile(value) }
+        })
+    }
+
+    #[test]
+    fn host_mapping_keeps_its_base_when_a_static_memory_grows() {
+        let mut memory = owned(MemoryStyle::Static, 4);
+        let mapping = memory.host_mapping().unwrap();
+        let (base, len) = bytes(&mapping).unwrap();
+        assert_eq!(len, WASM_PAGE_SIZE);
+
+        memory.grow(Pages(2)).unwrap();
+
+        assert_eq!(bytes(&mapping), Some((base, 3 * WASM_PAGE_SIZE)));
+        poke(&mapping, 3 * WASM_PAGE_SIZE - 1, 7).unwrap();
+    }
+
+    #[test]
+    fn host_mapping_follows_a_dynamic_memory_that_moves() {
+        let mut memory = owned(DYNAMIC, 4);
+        let mapping = memory.host_mapping().unwrap();
+        let (base, _) = bytes(&mapping).unwrap();
+        poke(&mapping, 11, 42).unwrap();
+
+        memory.grow(Pages(1)).unwrap();
+
+        let (moved, len) = bytes(&mapping).unwrap();
+        assert_ne!(moved, base);
+        assert_eq!(moved, unsafe { memory.vmmemory().as_ref() }.base as usize);
+        assert_eq!(len, 2 * WASM_PAGE_SIZE);
+        assert_eq!(peek(&mapping, 11), Some(42));
+    }
+
+    #[test]
+    fn host_mapping_is_left_alone_by_a_grow_that_fails() {
+        let mut memory = owned(DYNAMIC, 1);
+        let mapping = memory.host_mapping().unwrap();
+        let before = bytes(&mapping);
+
+        memory.grow(Pages(1)).unwrap_err();
+
+        assert_eq!(bytes(&mapping), before);
+    }
+
+    #[test]
+    fn host_mapping_is_empty_after_a_reset() {
+        let mut memory = owned(MemoryStyle::Static, 1);
+        let mapping = memory.host_mapping().unwrap();
+
+        memory.reset().unwrap();
+
+        assert_eq!(bytes(&mapping).unwrap().1, 0);
+    }
+
+    #[test]
+    fn host_mapping_ends_with_its_memory() {
+        let memory = VMMemory::from(owned(MemoryStyle::Static, 1));
+        let mapping = memory.host_mapping().unwrap();
+        assert!(bytes(&mapping).is_some());
+
+        drop(memory);
+
+        assert_eq!(bytes(&mapping), None);
+        assert_eq!(poke(&mapping, 0, 1), None);
+    }
+
+    #[test]
+    fn host_mapping_is_shared_by_the_clones_of_a_shared_memory() {
+        let ty = MemoryType::new(1, Some(4), true);
+        let mut memory = VMSharedMemory::new(&ty, &MemoryStyle::Static).unwrap();
+        let clone = memory.clone();
+        let mapping = clone.host_mapping().unwrap();
+        poke(&mapping, 0, 9).unwrap();
+
+        memory.grow(Pages(1)).unwrap();
+        assert_eq!(bytes(&mapping).unwrap().1, 2 * WASM_PAGE_SIZE);
+        assert_eq!(peek(&memory.host_mapping().unwrap(), 0), Some(9));
+
+        // A copy is another memory, with bytes of its own.
+        let copy = memory.copy().unwrap();
+        poke(&copy.host_mapping().unwrap(), 0, 1).unwrap();
+        assert_eq!(peek(&mapping, 0), Some(9));
+
+        drop(memory);
+        assert!(bytes(&mapping).is_some());
+        drop(clone);
+        assert_eq!(bytes(&mapping), None);
+    }
+
+    /// Reads the memory from end to end, to stay in the mapping for a while.
+    fn scan(base: *mut u8, len: usize) -> usize {
+        for offset in (0..len).step_by(64) {
+            unsafe { base.add(offset).read_volatile() };
+        }
+        len
+    }
+
+    /// The handle alone, over bytes of the heap that move the way `grow`
+    /// moves a memory: no mapping is involved, so Miri can run this one.
+    #[test]
+    fn host_mapping_keeps_accesses_out_of_bytes_that_move() {
+        let record = |bytes: &mut Vec<u8>| MappedBytes {
+            base: bytes.as_mut_ptr() as usize,
+            len: bytes.len(),
+        };
+        let mut bytes = vec![0; 64];
+        let mapping = HostMemoryMapping::new(record(&mut bytes));
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut written = 0;
+                while let Some(read) = peek(&mapping, 0) {
+                    assert_eq!(read, written);
+                    written = written.wrapping_add(1);
+                    if poke(&mapping, 0, written).is_none() {
+                        break;
+                    }
+                }
+            });
+
+            for _ in 0..8 {
+                let mut mapped = mapping.lock_for_change();
+                let mut moved = vec![0; bytes.len() + 64];
+                moved[..bytes.len()].copy_from_slice(&bytes);
+                *mapped = None;
+                bytes = moved;
+                *mapped = Some(record(&mut bytes));
+            }
+            *mapping.lock_for_change() = None;
+            drop(bytes);
+        });
+        assert_eq!(peek(&mapping, 0), None);
+    }
+
+    /// Accesses on other threads never find a mapping that is gone, and never
+    /// lose a write, while the memory moves at every grow and is then dropped.
+    #[test]
+    fn host_mapping_survives_grows_and_the_drop_under_concurrent_accesses() {
+        const PAGES: u32 = 24;
+
+        for _ in 0..20 {
+            let mut memory = owned(DYNAMIC, PAGES);
+            let mapping = memory.host_mapping().unwrap();
+
+            std::thread::scope(|scope| {
+                for _ in 0..2 {
+                    scope.spawn(|| {
+                        let mut last_len = 0;
+                        while let Some(len) = mapping.with_bytes(scan) {
+                            assert!(len >= last_len);
+                            last_len = len;
+                        }
+                    });
+                }
+
+                // The only writer of this byte, so it reads back what it wrote
+                // unless a move dropped the write.
+                scope.spawn(|| {
+                    let mut written = 0;
+                    while let Some(read) = peek(&mapping, 0) {
+                        assert_eq!(read, written);
+                        written = written.wrapping_add(1);
+                        if poke(&mapping, 0, written).is_none() {
+                            break;
+                        }
+                    }
+                });
+
+                for _ in 1..PAGES {
+                    memory.grow(Pages(1)).unwrap();
+                }
+                drop(memory);
+            });
+        }
     }
 }

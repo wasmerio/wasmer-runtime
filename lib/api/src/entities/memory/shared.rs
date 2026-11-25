@@ -82,6 +82,29 @@ impl SharedMemory {
         Ok(Memory::new_from_existing(store, memory))
     }
 
+    /// Returns a handle that reads and writes this memory without a store,
+    /// on any thread, and that does not keep the memory alive. See
+    /// [`HostMemoryAccess`](crate::sys::HostMemoryAccess) for what it can
+    /// observe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MemoryError::UnsupportedOperation`] for a memory of another
+    /// backend.
+    #[cfg(feature = "sys")]
+    pub fn host_memory_access(&self) -> Result<crate::sys::HostMemoryAccess, MemoryError> {
+        use wasmer_vm::LinearMemory as _;
+        match &self.memory {
+            VMSharedMemory::Sys(memory) => {
+                memory.host_mapping().map(crate::sys::HostMemoryAccess::new)
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(MemoryError::UnsupportedOperation {
+                message: "host memory access is unsupported by this backend".into(),
+            }),
+        }
+    }
+
     /// Create an operations handle that does not keep the underlying memory alive.
     pub fn ops(&self) -> MemoryOps {
         MemoryOps {

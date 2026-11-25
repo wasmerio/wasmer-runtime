@@ -21,7 +21,9 @@ use crate::{
     vm::{VMExtern, VMExternMemory},
 };
 
+pub(crate) mod host_access;
 pub(crate) mod view;
+pub use host_access::*;
 pub use view::*;
 
 use super::store::Store;
