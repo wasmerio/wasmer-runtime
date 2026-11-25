@@ -44,8 +44,9 @@ use crate::{
 /// # Example
 ///
 /// ```
-/// # use wasmer::{Memory, MemoryAccessError, MemoryType, Store};
-/// # let mut store = Store::default();
+/// # use wasmer::{Engine, Memory, MemoryAccessError, MemoryType, Store, sys::NativeEngineExt};
+/// // A store of the `sys` backend: the memories of the others have no handle.
+/// let mut store = Store::new(Engine::headless());
 /// let memory = Memory::new(&mut store, MemoryType::new(1, None, false)).unwrap();
 /// let access = memory.host_memory_access(&store).unwrap();
 ///
