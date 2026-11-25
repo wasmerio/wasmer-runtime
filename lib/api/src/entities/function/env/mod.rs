@@ -58,6 +58,15 @@ impl<T> FunctionEnv<T> {
     {
         self.0.into_mut(store)
     }
+
+    /// What [`FunctionEnvMut::async_env`] gives, made without the store: for
+    /// code that has no reference to it, such as a callback of an embedded
+    /// engine. It finds out whether the store is in its reach with
+    /// [`AsyncEnv::with_if_in_reach`](crate::AsyncEnv::with_if_in_reach).
+    #[cfg(feature = "experimental-async")]
+    pub fn async_env(&self) -> crate::AsyncEnv<T> {
+        crate::AsyncEnv::new(self.clone(), self.0.store_id())
+    }
 }
 
 /// A temporary handle to a [`FunctionEnv`].

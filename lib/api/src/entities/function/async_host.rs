@@ -156,6 +156,54 @@ impl<T> AsyncEnv<T> {
         Ok(self.in_slice(slice, f))
     }
 
+    /// [`with`](Self::with), for code that cannot tell whether the store is
+    /// in its reach: it returns `None` wherever `with` panics.
+    ///
+    /// That is code a host function reaches through frames that carry no
+    /// reference, such as a callback of an embedded engine. It keeps a
+    /// handle of its own, the one of
+    /// [`FunctionEnv::async_env`](crate::FunctionEnv::async_env) or a clone,
+    /// and what is beneath it on the stack decides whether the store can be
+    /// had. It can while an async host function of the store is being
+    /// polled on this thread and holds no slice. It cannot while
+    ///
+    /// - no call on the store is being polled on this thread, or the call
+    ///   that is being polled is on another store;
+    /// - a guest of the store runs, also in a synchronous host function of
+    ///   that guest, which has the store itself;
+    /// - a slice has the store: a `with`, or one of a
+    ///   [`SharedStore`](crate::SharedStore).
+    ///
+    /// Where this returns `Some`, the same code can call a guest and wait
+    /// for it: it passes this handle to
+    /// [`Function::call_async`](crate::Function::call_async), and polls the
+    /// call there.
+    ///
+    /// ```
+    /// # use wasmer::{FunctionEnv, Store};
+    /// # #[derive(Default)]
+    /// # struct State {
+    /// #     events: Vec<u32>,
+    /// # }
+    /// /// Called by an embedded engine, with nothing of the store: from
+    /// /// inside a host function of any kind, or from none. Returns whether
+    /// /// the event was noted.
+    /// fn on_event(env: &FunctionEnv<State>, event: u32) -> bool {
+    ///     env.async_env()
+    ///         .with_if_in_reach(|mut env| env.data_mut().events.push(event))
+    ///         .is_some()
+    /// }
+    ///
+    /// let mut store = Store::default();
+    /// let env = FunctionEnv::new(&mut store, State::default());
+    /// // No call is being polled here: the store is out of reach.
+    /// assert!(!on_event(&env, 1));
+    /// ```
+    pub fn with_if_in_reach<R>(&mut self, f: impl FnOnce(FunctionEnvMut<'_, T>) -> R) -> Option<R> {
+        let slice = WithSlice::enter_if_in_reach(self.store_id)?;
+        Some(self.in_slice(slice, f))
+    }
+
     /// Runs `f` with the store, which `slice` holds until `f` has returned.
     fn in_slice<R>(&self, slice: WithSlice, f: impl FnOnce(FunctionEnvMut<'_, T>) -> R) -> R {
         // Safety: the slice is the only holder of the store until it drops,

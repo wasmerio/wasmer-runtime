@@ -75,6 +75,15 @@ at each use whether the store can be had: it panics outside a poll of a call
 on its store, and inside another `with`. So does `try_with`, which only
 reports a shared store that is busy in another slice.
 
+Code that cannot know where it runs asks with `with_if_in_reach`, which
+returns `None` in each of those places. That is code a host function reaches
+through frames that carry no reference, such as a callback of an embedded
+engine: it makes a handle from its environment (`FunctionEnv::async_env`),
+gets the store under an async host function of that store that holds no
+slice, and is refused under a synchronous one, which has the store itself.
+Where it gets the store it can also call a guest and wait for it, with
+`call_async` on the same handle.
+
 ### Exclusive calls
 
 ```rust
@@ -105,6 +114,12 @@ impl<T> AsyncEnv<T> {
         &mut self,
         f: impl FnOnce(FunctionEnvMut<'_, T>) -> R,
     ) -> Result<R, StoreBusy>;
+    /// `with`, for code that cannot tell whether the store is in its reach:
+    /// `None` wherever `with` panics.
+    pub fn with_if_in_reach<R>(
+        &mut self,
+        f: impl FnOnce(FunctionEnvMut<'_, T>) -> R,
+    ) -> Option<R>;
 }
 
 /// The results of a call, or a future for them.
@@ -117,6 +132,11 @@ impl<R> Deferred<R> {
 
 impl<T> FunctionEnvMut<'_, T> {
     /// A handle for code that outlives this borrow to keep.
+    pub fn async_env(&self) -> AsyncEnv<T>;
+}
+
+impl<T> FunctionEnv<T> {
+    /// The same handle, made without the store.
     pub fn async_env(&self) -> AsyncEnv<T>;
 }
 ```

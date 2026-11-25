@@ -1107,6 +1107,204 @@ fn try_with_takes_the_store_in_a_poll_as_with_does() {
     assert_eq!(results.unwrap()[0].unwrap_i32(), 7);
 }
 
+/// Asks for the store as code that no reference reaches does, such as a
+/// callback of an embedded engine: with a handle made from the environment.
+/// Adds one to the host state if it gets the store.
+fn reaches(env: &FunctionEnv<i32>) -> bool {
+    env.async_env()
+        .with_if_in_reach(|mut env| *env.data_mut() += 1)
+        .is_some()
+}
+
+/// A guest whose exports are each one import, which returns whether
+/// [`reaches`] got the store:
+///
+/// - `async` and `deferred` ask in an async host function, outside a slice;
+/// - `in_slice` asks in a `with` slice of one;
+/// - `sync` asks in a synchronous host function;
+/// - `nested` calls `sync` with a handle made from the environment, and
+///   returns its answer in the second bit and its own, asked afterwards, in
+///   the first.
+fn reaching_guest() -> (Store, FunctionEnv<i32>, Instance) {
+    let mut store = Store::default();
+    let env = FunctionEnv::new(&mut store, 0);
+    let sync = Function::new_typed(&mut store, {
+        let env = env.clone();
+        move || i32::from(reaches(&env))
+    });
+    let calls_sync = Module::new(
+        &store,
+        r#"(module
+          (import "h" "sync" (func $sync (result i32)))
+          (func (export "sync") (result i32) (call $sync)))"#,
+    )
+    .unwrap();
+    let calls_sync = Instance::new(
+        &mut store,
+        &calls_sync,
+        &imports! { "h" => { "sync" => sync } },
+    )
+    .unwrap();
+    let calls_sync = export(&calls_sync, "sync");
+
+    let module = Module::new(
+        &store,
+        r#"(module
+          (import "h" "async" (func $async (result i32)))
+          (import "h" "deferred" (func $deferred (result i32)))
+          (import "h" "in_slice" (func $in_slice (result i32)))
+          (import "h" "sync" (func $sync (result i32)))
+          (import "h" "nested" (func $nested (result i32)))
+          (func (export "async") (result i32) (call $async))
+          (func (export "deferred") (result i32) (call $deferred))
+          (func (export "in_slice") (result i32) (call $in_slice))
+          (func (export "sync") (result i32) (call $sync))
+          (func (export "nested") (result i32) (call $nested)))"#,
+    )
+    .unwrap();
+    let asks = Function::new_typed_async(&mut store, &env, {
+        let env = env.clone();
+        async move |_: &mut AsyncEnv<i32>| i32::from(reaches(&env))
+    });
+    let deferred = Function::new_typed_async(&mut store, &env, {
+        let env = env.clone();
+        move |_: &mut AsyncEnv<i32>| Deferred::ready(i32::from(reaches(&env)))
+    });
+    let in_slice = Function::new_typed_async(&mut store, &env, {
+        let env = env.clone();
+        async move |cx: &mut AsyncEnv<i32>| i32::from(cx.with(|_| reaches(&env)))
+    });
+    let nested = Function::new_typed_async(&mut store, &env, {
+        let (env, calls_sync) = (env.clone(), calls_sync.clone());
+        async move |_: &mut AsyncEnv<i32>| {
+            let mut handle = env.async_env();
+            let inner = calls_sync.call_async(&mut handle, &[]).await.unwrap()[0].unwrap_i32();
+            inner << 1 | i32::from(reaches(&env))
+        }
+    });
+    let imports = imports! { "h" => {
+        "async" => asks,
+        "deferred" => deferred,
+        "in_slice" => in_slice,
+        "sync" => calls_sync,
+        "nested" => nested,
+    } };
+    let instance = Instance::new(&mut store, &module, &imports).unwrap();
+    (store, env, instance)
+}
+
+/// `with_if_in_reach` has the store where `with` has it, in a poll of an
+/// async host function of the store, however the guest was called and
+/// whichever handle asks. Such a handle also makes a nested call.
+#[test]
+fn with_if_in_reach_takes_the_store_in_a_poll_as_with_does() {
+    let (mut store, env, instance) = reaching_guest();
+    let expected = [("async", 1), ("deferred", 1), ("nested", 0b01)];
+    let mut reached = 0;
+    for (name, bits) in expected {
+        let function = export(&instance, name);
+        let results = function.call(&mut store, &[]).unwrap();
+        assert_eq!(results[0].unwrap_i32(), bits, "{name}, called");
+
+        let mut call = Box::pin(function.call_async(&mut store, &[]));
+        let Poll::Ready(results) = poll(&mut call) else {
+            panic!("the call did not finish");
+        };
+        assert_eq!(results.unwrap()[0].unwrap_i32(), bits, "{name}, awaited");
+        drop(call);
+        reached += 2;
+        assert_eq!(*env.as_ref(&store), reached);
+    }
+
+    let mut shared = store.into_shared();
+    for (name, bits) in expected {
+        let mut task = Box::pin(export(&instance, name).call_async(&mut shared, &[]));
+        let Poll::Ready(results) = poll(&mut task) else {
+            panic!("the task did not finish");
+        };
+        assert_eq!(results.unwrap()[0].unwrap_i32(), bits, "{name}, as a task");
+    }
+    assert_eq!(
+        shared.try_with(|store| *env.as_ref(&store)),
+        Ok(reached + 3)
+    );
+}
+
+/// Where `with` panics, `with_if_in_reach` returns `None` and leaves the
+/// store to whoever has it: outside every call, in a synchronous host
+/// function, in a slice, and in a call of another store.
+#[test]
+fn with_if_in_reach_returns_none_where_the_store_is_out_of_reach() {
+    let (mut store, env, instance) = reaching_guest();
+    assert!(!reaches(&env), "no call is being polled");
+
+    for name in ["sync", "in_slice"] {
+        let function = export(&instance, name);
+        let results = function.call(&mut store, &[]).unwrap();
+        assert_eq!(results[0].unwrap_i32(), 0, "{name}, called");
+
+        let mut call = Box::pin(function.call_async(&mut store, &[]));
+        let Poll::Ready(results) = poll(&mut call) else {
+            panic!("the call did not finish");
+        };
+        assert_eq!(results.unwrap()[0].unwrap_i32(), 0, "{name}, awaited");
+    }
+
+    // A call of another store is being polled, and it has its own store.
+    let mut other = Store::default();
+    let other_env = FunctionEnv::new(&mut other, 0);
+    let asks_both = Function::new_typed_async(&mut other, &other_env, {
+        let (env, other_env) = (env.clone(), other_env.clone());
+        async move |_: &mut AsyncEnv<i32>| {
+            i32::from(reaches(&env)) << 1 | i32::from(reaches(&other_env))
+        }
+    });
+    let results = asks_both.call(&mut other, &[]).unwrap();
+    assert_eq!(results[0].unwrap_i32(), 0b01);
+    assert_eq!(*other_env.as_ref(&other), 1);
+
+    // A slice of a shared store is not a poll of a call.
+    let shared = store.into_shared();
+    assert_eq!(shared.try_with(|_| reaches(&env)), Ok(false));
+    assert_eq!(shared.try_with(|store| *env.as_ref(&store)), Ok(0));
+}
+
+/// The destructor of `try_with_fails_in_a_destructor_run_inside_another_slice`
+/// asking with `with_if_in_reach`: `None` where the store is busy, and the
+/// store where it is in reach.
+#[test]
+fn with_if_in_reach_asks_in_a_destructor_as_try_with_does() {
+    struct Asks<'a>(&'a mut AsyncEnv<i32>);
+    impl Drop for Asks<'_> {
+        fn drop(&mut self) {
+            let reached = self.0.with_if_in_reach(|mut env| *env.data_mut() += 1);
+            REACHED.with_borrow_mut(|so_far| so_far.push(reached.is_some()));
+        }
+    }
+    thread_local! {
+        static REACHED: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    }
+
+    let mut store = Store::default();
+    let env = FunctionEnv::new(&mut store, 0);
+    let waits = Function::new_typed_async(&mut store, &env, async |cx: &mut AsyncEnv<i32>| {
+        let _asks = Asks(cx);
+        std::future::pending::<()>().await;
+    });
+    let shared = store.into_shared();
+
+    // Dropped outside every slice: the call drops its host future with the
+    // store in reach.
+    drop(waiting_task(&shared, &waits));
+    assert_eq!(REACHED.take(), [true]);
+
+    // Dropped by the holder of a slice.
+    let task = waiting_task(&shared, &waits);
+    shared.try_with(|_| drop(task)).unwrap();
+    assert_eq!(REACHED.take(), [false]);
+    assert_eq!(shared.try_with(|store| *env.as_ref(&store)), Ok(1));
+}
+
 /// Keeps the helper types above honest: `SharedStore` is `Clone`.
 #[test]
 fn a_shared_handle_is_a_cheap_clone() {
