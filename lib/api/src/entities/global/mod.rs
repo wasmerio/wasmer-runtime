@@ -29,13 +29,33 @@ impl Global {
     /// # use wasmer::{Global, Mutability, Store, Value};
     /// # let mut store = Store::default();
     /// #
-    /// let g = Global::new(&mut store, Value::I32(1));
+    /// let g = Global::new(&mut store, Value::I32(1)).unwrap();
     ///
     /// assert_eq!(g.get(&mut store), Value::I32(1));
     /// assert_eq!(g.ty(&mut store).mutability, Mutability::Const);
     /// ```
-    pub fn new(store: &mut impl AsStoreMut, val: Value) -> Self {
-        Self(BackendGlobal::new(store, val))
+    ///
+    /// # Errors
+    ///
+    /// Trying to create a global with a reference (a `funcref`, an
+    /// `externref` or an exception reference) of another store will raise an
+    /// error:
+    ///
+    /// ```
+    /// # use wasmer::{Function, Global, Store, Value};
+    /// # let mut store = Store::default();
+    /// # let mut other_store = Store::default();
+    /// #
+    /// let f = Function::new_typed(&mut other_store, || {});
+    ///
+    /// assert!(Global::new(&mut store, Value::FuncRef(Some(f))).is_err());
+    /// ```
+    ///
+    /// So will a value of a type the backend of `store` cannot create a
+    /// global of: an `externref` or an exception reference on `v8`; a
+    /// reference, a `v128` or an `i64` on `js`.
+    pub fn new(store: &mut impl AsStoreMut, val: Value) -> Result<Self, RuntimeError> {
+        BackendGlobal::from_value(store, val, Mutability::Const).map(Self)
     }
 
     /// Create a mutable global with the initial [`Value`].
@@ -46,22 +66,27 @@ impl Global {
     /// # use wasmer::{Global, Mutability, Store, Value};
     /// # let mut store = Store::default();
     /// #
-    /// let g = Global::new_mut(&mut store, Value::I32(1));
+    /// let g = Global::new_mut(&mut store, Value::I32(1)).unwrap();
     ///
     /// assert_eq!(g.get(&mut store), Value::I32(1));
     /// assert_eq!(g.ty(&mut store).mutability, Mutability::Var);
     /// ```
-    pub fn new_mut(store: &mut impl AsStoreMut, val: Value) -> Self {
-        Self(BackendGlobal::new_mut(store, val))
-    }
-
-    /// Create a global with the initial [`Value`] and the provided [`Mutability`].
-    fn from_value(
-        store: &mut impl AsStoreMut,
-        val: Value,
-        mutability: Mutability,
-    ) -> Result<Self, RuntimeError> {
-        BackendGlobal::from_value(store, val, mutability).map(Self)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on the same values as [`Global::new`]:
+    ///
+    /// ```
+    /// # use wasmer::{Function, Global, Store, Value};
+    /// # let mut store = Store::default();
+    /// # let mut other_store = Store::default();
+    /// #
+    /// let f = Function::new_typed(&mut other_store, || {});
+    ///
+    /// assert!(Global::new_mut(&mut store, Value::FuncRef(Some(f))).is_err());
+    /// ```
+    pub fn new_mut(store: &mut impl AsStoreMut, val: Value) -> Result<Self, RuntimeError> {
+        BackendGlobal::from_value(store, val, Mutability::Var).map(Self)
     }
 
     /// Returns the [`GlobalType`] of the global.
@@ -72,8 +97,8 @@ impl Global {
     /// # use wasmer::{Global, Mutability, Store, Type, Value, GlobalType};
     /// # let mut store = Store::default();
     /// #
-    /// let c = Global::new(&mut store, Value::I32(1));
-    /// let v = Global::new_mut(&mut store, Value::I64(1));
+    /// let c = Global::new(&mut store, Value::I32(1)).unwrap();
+    /// let v = Global::new_mut(&mut store, Value::I64(1)).unwrap();
     ///
     /// assert_eq!(c.ty(&mut store), GlobalType::new(Type::I32, Mutability::Const));
     /// assert_eq!(v.ty(&mut store), GlobalType::new(Type::I64, Mutability::Var));
@@ -90,7 +115,7 @@ impl Global {
     /// # use wasmer::{Global, Store, Value};
     /// # let mut store = Store::default();
     /// #
-    /// let g = Global::new(&mut store, Value::I32(1));
+    /// let g = Global::new(&mut store, Value::I32(1)).unwrap();
     ///
     /// assert_eq!(g.get(&mut store), Value::I32(1));
     /// ```
@@ -106,7 +131,7 @@ impl Global {
     /// # use wasmer::{Global, Store, Value};
     /// # let mut store = Store::default();
     /// #
-    /// let g = Global::new_mut(&mut store, Value::I32(1));
+    /// let g = Global::new_mut(&mut store, Value::I32(1)).unwrap();
     ///
     /// assert_eq!(g.get(&mut store), Value::I32(1));
     ///
@@ -123,7 +148,7 @@ impl Global {
     /// # use wasmer::{Global, Store, Value};
     /// # let mut store = Store::default();
     /// #
-    /// let g = Global::new(&mut store, Value::I32(1));
+    /// let g = Global::new(&mut store, Value::I32(1)).unwrap();
     ///
     /// g.set(&mut store, Value::I32(2)).unwrap();
     /// ```
@@ -134,7 +159,7 @@ impl Global {
     /// # use wasmer::{Global, Store, Value};
     /// # let mut store = Store::default();
     /// #
-    /// let g = Global::new(&mut store, Value::I32(1));
+    /// let g = Global::new(&mut store, Value::I32(1)).unwrap();
     ///
     /// // This results in an error: `RuntimeError`.
     /// g.set(&mut store, Value::I64(2)).unwrap();

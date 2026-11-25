@@ -41,6 +41,7 @@ pub unsafe extern "C" fn wasm_global_new(
     } else {
         Global::new(&mut store_mut, wasm_val)
     };
+    let global = c_try!(global);
     Some(Box::new(wasm_global_t {
         extern_: wasm_extern_t::new(store.inner.clone(), global.into()),
     }))
@@ -197,6 +198,55 @@ mod tests {
                 wasm_byte_vec_delete(&wasm_bytes);
                 wasm_byte_vec_delete(&wat);
                 wasm_extern_vec_delete(&exports);
+                wasm_store_delete(store);
+                wasm_engine_delete(engine);
+
+                return 0;
+            }
+        })
+        .success();
+    }
+
+    #[allow(
+        unexpected_cfgs,
+        reason = "tools like cargo-llvm-coverage pass --cfg coverage"
+    )]
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    #[test]
+    fn test_new_global_with_a_function_of_another_store() {
+        (assert_c! {
+            #include "tests/wasmer.h"
+
+            wasm_trap_t* nothing(const wasm_val_vec_t* args, wasm_val_vec_t* results) {
+                (void) args;
+                (void) results;
+                return NULL;
+            }
+
+            int main() {
+                wasm_engine_t* engine = wasm_engine_new();
+                wasm_store_t* store = wasm_store_new(engine);
+                wasm_store_t* other_store = wasm_store_new(engine);
+
+                wasm_functype_t* func_type = wasm_functype_new_0_0();
+                wasm_func_t* foreign = wasm_func_new(other_store, func_type, nothing);
+                wasm_val_t value = {.kind = WASM_FUNCREF, .of = {.ref = wasm_func_as_ref(foreign)}};
+
+                wasm_mutability_t mutabilities[] = {WASM_CONST, WASM_VAR};
+                for (int i = 0; i < 2; i++) {
+                    wasm_globaltype_t* global_type =
+                        wasm_globaltype_new(wasm_valtype_new_funcref(), mutabilities[i]);
+                    wasm_global_t* global = wasm_global_new(store, global_type, &value);
+
+                    assert(global == NULL);
+                    assert(wasmer_last_error_length() > 0);
+
+                    wasm_globaltype_delete(global_type);
+                }
+
+                wasm_func_delete(foreign);
+                wasm_functype_delete(func_type);
+                wasm_store_delete(other_store);
                 wasm_store_delete(store);
                 wasm_engine_delete(engine);
 

@@ -311,7 +311,7 @@ mod test {
     #[test]
     fn namespace() {
         let mut store = Store::default();
-        let g1 = Global::new(&mut store, Value::I32(0));
+        let g1 = Global::new(&mut store, Value::I32(0)).unwrap();
         let namespace = namespace! {
             "happy" => g1
         };
@@ -384,7 +384,7 @@ mod test {
     fn chaining_works() {
         let mut store = Store::default();
 
-        let g = Global::new(&mut store, Value::I32(0));
+        let g = Global::new(&mut store, Value::I32(0)).unwrap();
 
         let mut imports1 = imports! {
             "dog" => {
@@ -415,8 +415,8 @@ mod test {
     #[test]
     fn extending_conflict_overwrites() {
         let mut store = Store::default();
-        let g1 = Global::new(&mut store, Value::I32(0));
-        let g2 = Global::new(&mut store, Value::I64(0));
+        let g1 = Global::new(&mut store, Value::I32(0)).unwrap();
+        let g2 = Global::new(&mut store, Value::I64(0)).unwrap();
 
         let mut imports1 = imports! {
             "dog" => {
@@ -443,8 +443,8 @@ mod test {
         */
         // now test it in reverse
         let mut store = Store::default();
-        let g1 = Global::new(&mut store, Value::I32(0));
-        let g2 = Global::new(&mut store, Value::I64(0));
+        let g1 = Global::new(&mut store, Value::I32(0)).unwrap();
+        let g2 = Global::new(&mut store, Value::I64(0)).unwrap();
 
         let imports1 = imports! {
             "dog" => {
