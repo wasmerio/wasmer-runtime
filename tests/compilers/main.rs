@@ -7,6 +7,9 @@ extern crate compiler_test_derive;
 
 mod artifact;
 mod config;
+// The engine only registers modules with a debugger on Unix.
+#[cfg(unix)]
+mod debugger;
 mod deterministic;
 mod imports;
 mod issues;
