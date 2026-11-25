@@ -71,7 +71,7 @@ pub use crate::translator::{
     translate_module, wpheaptype_to_type, wptype_to_type,
 };
 
-pub use wasmer_types::{Addend, CodeOffset, Features};
+pub use wasmer_types::{Addend, CodeOffset, Features, WasmFeature};
 
 #[cfg(feature = "translator")]
 /// wasmparser is exported as a module to slim compiler dependencies

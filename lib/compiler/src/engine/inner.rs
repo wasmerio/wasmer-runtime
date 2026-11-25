@@ -98,9 +98,11 @@ impl Engine {
         {
             let i = self.inner();
             if let Some(ref c) = i.compiler {
-                let features = crate::DeterministicIdComponent::of_features(&i.features)
+                let features = i
+                    .features
+                    .enabled()
                     .into_iter()
-                    .map(|component| component.to_string());
+                    .map(|feature| feature.to_string());
                 let middlewares = c.get_middlewares().iter().map(|middleware| {
                     let id: String = middleware
                         .deterministic_id()
