@@ -530,16 +530,27 @@ impl Function {
 // throwing exceptions won't work since libunwind requires
 // considerable stack space to do its magic, but everything else
 // should work.
-enum InvocationResult<T, E> {
+enum InvocationResult<T> {
     Success(T),
     Exception(crate::Exception),
-    Trap(Box<E>),
+    Trap(Box<dyn Error + Send + Sync>),
     YieldOutsideAsyncContext,
 }
 
-fn to_invocation_result<T, E>(result: Result<T, E>) -> InvocationResult<T, E>
+/// The error of a host function that gives the guest a reference of another
+/// store, which is what `call` reports for such an argument.
+///
+/// The guest gets a reference in its raw form, which only says where the
+/// object is in a store. One of another store would be taken for whatever
+/// this store has there.
+fn cross_store_error() -> RuntimeError {
+    RuntimeError::new("cross-`Store` values are not supported")
+}
+
+/// What the host function of the store `store_id` ended with.
+fn to_invocation_result<T, E>(result: Result<T, E>, store_id: StoreId) -> InvocationResult<T>
 where
-    E: Error + 'static,
+    E: Error + Send + Sync + 'static,
 {
     match result {
         Ok(value) => InvocationResult::Success(value),
@@ -548,10 +559,33 @@ where
             if let Some(runtime_error) = dyn_err_ref.downcast_ref::<RuntimeError>()
                 && let Some(exception) = runtime_error.to_exception()
             {
+                // An exception is thrown into the guest by its raw form too.
+                if exception.vm_exceptionref().unwrap_sys_ref().0.store_id() != store_id {
+                    return InvocationResult::Trap(Box::new(cross_store_error()));
+                }
                 return InvocationResult::Exception(exception);
             }
             InvocationResult::Trap(Box::new(trap))
         }
+    }
+}
+
+/// What a typed host function of the store `store_id` ended with. Its results
+/// are refused if one of them is a reference of another store.
+fn typed_invocation_result<Rets, E>(
+    result: Result<Rets, E>,
+    store: &impl AsStoreRef,
+    store_id: StoreId,
+) -> InvocationResult<Rets>
+where
+    Rets: WasmTypeList,
+    E: Error + Send + Sync + 'static,
+{
+    match result {
+        Ok(rets) if !rets.is_from_store(store) => {
+            InvocationResult::Trap(Box::new(cross_store_error()))
+        }
+        result => to_invocation_result(result, store_id),
     }
 }
 
@@ -572,6 +606,11 @@ fn write_dynamic_results(
         )));
     }
     for (i, ret) in returns.iter().enumerate() {
+        // What was written before a refused result is never read: the call
+        // ends with the error.
+        if !ret.is_from_store(&store) {
+            return Err(cross_store_error());
+        }
         unsafe {
             values_vec.add(i).write_unaligned(ret.as_raw(&store));
         }
@@ -620,12 +659,15 @@ where
     ) {
         let result = on_host_stack(|| {
             panic::catch_unwind(AssertUnwindSafe(|| match (this.ctx.func)(values_vec) {
-                HostCallOutcome::Ready(result) => to_invocation_result(finalize_dynamic_call(
+                HostCallOutcome::Ready(result) => to_invocation_result(
+                    finalize_dynamic_call(
+                        this.ctx.store_id,
+                        &this.ctx.func_ty,
+                        values_vec,
+                        result,
+                    ),
                     this.ctx.store_id,
-                    &this.ctx.func_ty,
-                    values_vec,
-                    result,
-                )),
+                ),
                 #[cfg(feature = "experimental-async")]
                 HostCallOutcome::Future { future, store_id } => {
                     let awaited = block_on_host_future(store_id, future);
@@ -636,12 +678,15 @@ where
                             return InvocationResult::YieldOutsideAsyncContext;
                         }
                     };
-                    to_invocation_result(finalize_dynamic_call(
+                    to_invocation_result(
+                        finalize_dynamic_call(
+                            this.ctx.store_id,
+                            &this.ctx.func_ty,
+                            values_vec,
+                            result,
+                        ),
                         this.ctx.store_id,
-                        &this.ctx.func_ty,
-                        values_vec,
-                        result,
-                    ))
+                    )
                 }
             }))
         });
@@ -769,7 +814,8 @@ macro_rules! impl_host_function {
                                 FromToNativeWasmType::from_native(NativeWasmTypeInto::from_abi(&mut store, $x))
                             };
                         )*
-                        to_invocation_result((env.func)($($x),* ).into_result())
+                        let result = (env.func)($($x),* ).into_result();
+                        typed_invocation_result(result, &store, env.store_id)
                     }))
                 });
 
@@ -873,7 +919,10 @@ macro_rules! impl_host_function {
                             store_mut: store,
                             func_env: env.env.as_sys().clone(),
                         }.into();
-                        to_invocation_result((env.func)(f_env, $($x),* ).into_result())
+                        let result = (env.func)(f_env, $($x),* ).into_result();
+                        // The host function was given the store with its
+                        // environment, and has given it back by now.
+                        typed_invocation_result(result, &store_wrapper.as_ref(), env.store_id)
                     }))
                 });
 
