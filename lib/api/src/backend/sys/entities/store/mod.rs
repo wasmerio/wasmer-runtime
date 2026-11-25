@@ -130,16 +130,7 @@ impl Interrupter {
     pub fn interrupt(&self) {
         use wasmer_vm::interrupt_registry;
 
-        // Even though `interrupt` reports whether it sent the signal successfully,
-        // there's nothing meaningful embedders can do with the result; a sent
-        // signal may not be processed in rare cases, and none of the error cases
-        // are hard errors in the sense that retrying the interrupt at a later
-        // point is *guaranteed* to fail again. Hence, we don't return any
-        // indication of success or failure to embedder code.
-        if !matches!(
-            interrupt_registry::interrupt(self.store_id),
-            Err(interrupt_registry::InterruptError::StoreNotRunning)
-        ) {
+        if interrupt_registry::interrupt(self.store_id).is_ok() {
             #[cfg(feature = "experimental-async")]
             crate::backend::sys::async_runtime::notify_pending_futures_of_interrupt(self.store_id);
         }

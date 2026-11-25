@@ -105,6 +105,9 @@ impl FuncTranslator {
         // `environ`. The callback functions may need to insert things in the entry block.
         builder.ensure_inserted_block();
 
+        #[cfg(feature = "experimental-host-interrupt")]
+        environ.emit_interrupt_check(&mut builder)?;
+
         let num_params = declare_wasm_parameters(&mut builder, entry_block, environ);
 
         // Set up the translation state with a single pushed control block representing the whole

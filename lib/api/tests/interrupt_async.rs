@@ -94,7 +94,7 @@ fn async_function_can_be_interrupted() -> Result<()> {
     });
 
     barrier.wait();
-    // Make absolutely sure the function is waiting on the channel when we raise the signal
+    // Give the function time to suspend before requesting interruption.
     thread::sleep(Duration::from_millis(500));
 
     interrupter_slot
@@ -158,17 +158,23 @@ fn all_futures_from_store_are_interrupted() -> Result<()> {
 
     interrupter.interrupt();
 
-    for f in &mut futures {
-        let result = f.as_mut().poll(&mut cx);
-        let Poll::Ready(result) = result else {
-            panic!("Futures should be ready by now")
+    for pending in &mut futures {
+        // Until the last pending call unwinds, a new call must be refused.
+        let mut new_call = Box::pin(f.call_async(&mut shared));
+        let Poll::Ready(Err(error)) = new_call.as_mut().poll(&mut cx) else {
+            panic!("new call entered an interrupted store")
         };
-        assert_eq!(
-            result.unwrap_err().to_trap().unwrap(),
-            TrapCode::HostInterrupt
-        );
+        assert_eq!(error.to_trap(), Some(TrapCode::HostInterrupt));
+
+        let Poll::Ready(Err(error)) = pending.as_mut().poll(&mut cx) else {
+            panic!("pending call was not interrupted")
+        };
+        assert_eq!(error.to_trap(), Some(TrapCode::HostInterrupt));
     }
 
+    let mut new_call = Box::pin(f.call_async(&mut shared));
+    assert!(new_call.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(pending_count.load(std::sync::atomic::Ordering::SeqCst), 5);
     Ok(())
 }
 
@@ -242,11 +248,10 @@ fn an_interrupt_wakes_a_waker_that_polls_at_once() -> Result<()> {
     Ok(())
 }
 
-/// A call forgotten while it is suspended keeps its store's interrupt state,
-/// aimed at its thread. Once the thread is gone, an interrupt does not signal
-/// it: the store is not running anywhere.
+/// A forgotten suspended call may keep an interrupt registration, but it
+/// cannot resume once its thread is gone.
 #[test]
-fn a_forgotten_call_on_an_exited_thread_is_not_signalled() -> Result<()> {
+fn a_forgotten_call_on_an_exited_thread_is_not_interruptible() -> Result<()> {
     let id = thread::spawn(|| -> Result<_> {
         let (store, waits, _) = waiting_guest()?;
         let id = store.id();
@@ -327,17 +332,7 @@ fn a_sync_call_nested_after_an_interrupt_is_interrupted() -> Result<()> {
 }
 
 /// The same through an async import, whose nested call is a `call_async`.
-// TODO: fails today, so it is ignored. The import runs while its call is
-// suspended, so that call's entry of the store is not on the thread when the
-// nested call enters it. `interrupt_registry::install` then gives the nested
-// entry a fresh flag, which it does so that a forgotten suspended call cannot
-// keep its store interrupted, and the nested guest runs as if the store was
-// never interrupted. A guest that loops there misses the interrupt until it
-// is sent again. Either drop that reset, or keep the stores of a suspended
-// call on the thread while it polls its host future. Found in the review of
-// https://github.com/wasmerio/wasmer-runtime/pull/18.
 #[test]
-#[ignore = "TODO: a call nested in an async import runs after its store was interrupted"]
 fn an_async_call_nested_after_an_interrupt_is_interrupted() -> Result<()> {
     let (mut store, env, run) = relaying_guest(|store, env| {
         Function::new_typed_async(

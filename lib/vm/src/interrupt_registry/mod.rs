@@ -1,9 +1,8 @@
-//! Implements the necessary infrastructure for interrupting running WASM code
-//! via OS signals.
+//! Tracks cooperative host interrupts for running and suspended Wasm calls.
 //!
 //! This module is meant to be used from within the wasmer crate. Embedders
 //! should not call any of the functions here; instead, they should go
-//! through [`wasmer::Store::get_interrupter`].
+//! through `wasmer::Store::interrupter`.
 
 // TODO: Windows support
 
@@ -34,10 +33,6 @@ pub enum InstallError {
 pub enum InterruptError {
     #[error("Store not running")]
     StoreNotRunning,
-    #[error("Another interrupt is already in progress on the target thread")]
-    OtherInterruptInProgress,
-    #[error("Failed to send interrupt signal due to OS error: {0}")]
-    FailedToSendSignal(&'static str),
 }
 
 /// Uninstalls interrupt state when dropped

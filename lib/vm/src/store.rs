@@ -3,6 +3,7 @@ use crate::{
     VMTable, VMTag,
 };
 use core::slice::Iter;
+use std::sync::{Arc, atomic::AtomicBool};
 use std::{cell::UnsafeCell, fmt, marker::PhantomData, num::NonZeroUsize, ptr::NonNull};
 use wasmer_types::StoreId;
 
@@ -52,6 +53,7 @@ pub struct StoreObjects {
     globals: Vec<VMGlobal>,
     functions: Vec<VMFunction>,
     instances: Vec<VMInstance>,
+    pub(crate) interrupted: Arc<AtomicBool>,
     extern_objs: Vec<VMExternObj>,
     exceptions: Vec<VMExceptionObj>,
     tags: Vec<VMTag>,
@@ -80,6 +82,7 @@ impl StoreObjects {
             globals,
             functions,
             instances,
+            interrupted: Arc::default(),
             extern_objs,
             function_environments,
             exceptions,

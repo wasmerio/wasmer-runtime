@@ -368,7 +368,7 @@ impl Function {
             let store_id = store.objects_mut().id();
 
             #[cfg(feature = "experimental-host-interrupt")]
-            let interrupt_guard = match interrupt_registry::install(store_id) {
+            let interrupt_guard = match interrupt_registry::install(store.objects_mut().as_sys()) {
                 Ok(x) => x,
                 Err(interrupt_registry::InstallError::AlreadyInterrupted) => {
                     return Err(Trap::lib(TrapCode::HostInterrupt).into());

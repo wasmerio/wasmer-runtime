@@ -139,7 +139,7 @@ headless = []
 experimental-async = ["dep:futures", "dep:corosensei"]
 
 # Experimental host-triggered interruption support
-experimental-host-interrupt = ["wasmer-vm/experimental-host-interrupt"]
+experimental-host-interrupt = ["wasmer-vm/experimental-host-interrupt", "wasmer-compiler-cranelift?/experimental-host-interrupt"]
 
 # - Compilers.
 compiler = [
