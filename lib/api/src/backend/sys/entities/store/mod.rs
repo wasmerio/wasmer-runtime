@@ -119,7 +119,7 @@ impl Interrupter {
             interrupt_registry::interrupt(self.store_id),
             Err(interrupt_registry::InterruptError::StoreNotRunning)
         ) {
-            #[cfg(feature = "experimental-async")]
+            #[cfg(feature = "async")]
             crate::backend::sys::async_runtime::notify_pending_futures_of_interrupt(self.store_id);
         }
     }

@@ -287,7 +287,7 @@ fn a_host_function_can_run_on_the_wasm_stack() -> Result<(), Box<dyn std::error:
 /// An asynchronous host function always runs on the native stack, where its
 /// future may suspend the coroutine the call came from: setting it to run on
 /// the Wasm stack changes nothing.
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 #[test]
 fn an_async_host_function_always_runs_on_the_native_stack() {
     let mut store = Store::default();
@@ -369,7 +369,7 @@ fn a_call_back_into_wasm_starts_from_the_native_stack() -> Result<(), Box<dyn st
 /// The same with `call_async`, polled to its end inside the host function:
 /// its guest runs on a coroutine of its own, which is resumed from the native
 /// stack too.
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 #[test]
 fn a_call_async_from_a_host_function_in_place_starts_from_the_native_stack()
 -> Result<(), Box<dyn std::error::Error>> {

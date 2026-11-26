@@ -277,6 +277,14 @@
 //!    JavaScript host (see [Using Wasmer in a JavaScript
 //!    environment](#using-wasmer-in-a-javascript-environment)).
 //!
+//! The `async` feature
+#![cfg_attr(feature = "async", doc = "(enabled),")]
+#![cfg_attr(not(feature = "async"), doc = "(disabled),")]
+//! one of the default features, adds async calls into WebAssembly
+//! (`Function::call_async`) and async host functions
+//! (`Function::new_typed_async`) to every backend. It cannot be built with
+//! `baremetal`.
+//!
 #![cfg_attr(
     feature = "sys",
     doc = "## Features for the `sys` feature group (enabled)"
@@ -466,9 +474,9 @@ compile_error!(
     "the `sys` and `v8` features require a native target: use `js` or `js-default` for `wasm32`."
 );
 
-#[cfg(all(feature = "sys", feature = "experimental-async", feature = "baremetal"))]
+#[cfg(all(feature = "sys", feature = "async", feature = "baremetal"))]
 compile_error!(
-    "the `experimental-async` feature is not supported with `baremetal`: traps and cancelled calls cannot unwind a `call_async` coroutine there."
+    "the `async` feature is not supported with `baremetal`: traps and cancelled calls cannot unwind a `call_async` coroutine there. `async` is a default feature: disable default features to use `baremetal`."
 );
 
 cfg_compiler! {

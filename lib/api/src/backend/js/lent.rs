@@ -114,7 +114,7 @@ impl Drop for Lend {
 }
 
 /// The depth of the lends, and whether the innermost one is held.
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub(crate) fn checkpoint() -> (usize, bool) {
     LENDS.with(|lends| {
         let depth = lends.depth.get();
@@ -125,7 +125,7 @@ pub(crate) fn checkpoint() -> (usize, bool) {
 
 /// Puts the lends back as [`checkpoint`] found them, after a JavaScript
 /// exception skipped the frames that held them.
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub(crate) fn restore((depth, held): (usize, bool)) {
     LENDS.with(|lends| {
         lends.depth.set(depth);
@@ -141,7 +141,7 @@ pub(crate) enum Hold {
     /// The flag of the lend held, in the thread's lends.
     Lend(*const Cell<bool>),
     /// The store of the call of a guest that the engine resumed.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     Running(crate::js::jspi::Held),
 }
 
@@ -155,7 +155,7 @@ impl Drop for Hold {
             // does, and an exception that unwinds the host function skips
             // this.
             Self::Lend(held) => unsafe { (*held).set(false) },
-            #[cfg(feature = "experimental-async")]
+            #[cfg(feature = "async")]
             Self::Running(_) => {}
         }
     }
@@ -181,7 +181,7 @@ pub(crate) fn hold(id: usize) -> Result<(*mut StoreInner, Hold), RuntimeError> {
     match top {
         Some(result) => result,
         None => {
-            #[cfg(feature = "experimental-async")]
+            #[cfg(feature = "async")]
             if let Some(running) = crate::js::jspi::hold_running(id) {
                 return running.map(|(store, held)| (store, Hold::Running(held)));
             }
@@ -230,7 +230,7 @@ fn too_deep() -> RuntimeError {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     use std::future::Future;
 
     use wasm_bindgen::{JsCast, JsValue, prelude::Closure};
@@ -415,7 +415,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     thread_local! {
         /// What a host function of another store hands a test below.
         static OTHER: RefCell<Option<(Function, crate::SharedStore)>> =
@@ -430,7 +430,7 @@ mod tests {
     /// `call_async` lends its store for the slice of the guest it runs, also
     /// from a host function of another store: the guest's host functions run
     /// with their own store there.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     #[wasm_bindgen_test]
     async fn a_call_async_made_in_a_host_function_lends_its_store() {
         let mut other = Store::default();
@@ -465,7 +465,7 @@ mod tests {
     /// A slice of a guest of `call_async` that JavaScript resumes, once
     /// what the guest waited for is ready, runs with no call that lends a
     /// store: its host functions run with the store of its call.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     #[wasm_bindgen_test]
     async fn a_resumed_guest_runs_its_host_functions_with_its_store() {
         let mut store = Store::default();
@@ -649,7 +649,7 @@ mod tests {
 
     /// A host function of a slice of a guest of `call_async` that JavaScript
     /// resumed holds the store of its call, the same way.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     #[wasm_bindgen_test]
     async fn a_host_function_of_a_resumed_guest_holds_its_store() {
         let mut store = Store::default();

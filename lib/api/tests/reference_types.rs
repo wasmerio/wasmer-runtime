@@ -1116,7 +1116,7 @@ pub mod reference_types {
 
     /// The async host functions of `store` that return `value`: a dynamic one
     /// and a typed one.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     fn async_returning(store: &mut Store, value: Value) -> [Function; 2] {
         let env = FunctionEnv::new(store, ());
         let ty = FunctionType::new([], [value.ty()]);
@@ -1147,7 +1147,7 @@ pub mod reference_types {
 
     /// The results of `host`, called by the embedder and by a guest: in place,
     /// and on a coroutine.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     fn call_every_way(
         store: &mut Store,
         host: &Function,
@@ -1160,7 +1160,7 @@ pub mod reference_types {
         Ok(results)
     }
 
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     #[engine_test]
     #[cfg_attr(
         feature = "v8-default",
@@ -1180,7 +1180,7 @@ pub mod reference_types {
         Ok(())
     }
 
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     #[engine_test]
     #[cfg_attr(
         feature = "v8-default",
@@ -1200,7 +1200,7 @@ pub mod reference_types {
         Ok(())
     }
 
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     #[engine_test]
     #[cfg_attr(
         feature = "v8-default",
@@ -1281,10 +1281,10 @@ pub mod reference_types {
     // and a function that returns `Deferred` has a trampoline of its own.
 
     /// Pending once, then ready: the guest of an import that awaits it waits.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     struct Once(bool);
 
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     impl std::future::Future for Once {
         type Output = ();
 
@@ -1302,13 +1302,13 @@ pub mod reference_types {
 
     /// A kind of async host function, whether its guest waits for it, and
     /// one that returns a given value.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     type AsyncKind = (&'static str, bool, Function);
 
     /// The typed async host functions of a store that return `$value`, of the
     /// type `$ty`: an `async` one that waits, and those that return each
     /// form of `Deferred`.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     macro_rules! typed_async_kinds {
         ($store:expr, $env:expr, $value:expr, $ty:ty) => {{
             let value: $ty = $value;
@@ -1372,7 +1372,7 @@ pub mod reference_types {
 
     /// The dynamic async host functions of `store` that return `value`: an
     /// `async` one that waits, and one that returns `Deferred`.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     fn dynamic_async_kinds(
         store: &mut Store,
         env: &FunctionEnv<()>,
@@ -1406,7 +1406,7 @@ pub mod reference_types {
 
     /// Every kind of async host function of `store` that returns `function`,
     /// and every kind that returns `object`.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     fn async_kinds(
         store: &mut Store,
         function: Option<Function>,
@@ -1428,7 +1428,7 @@ pub mod reference_types {
     /// The results of `host`, called by the embedder and by a guest: on a
     /// coroutine, and in place too unless its guest has to wait, which it
     /// cannot do there.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     fn call_where_it_can_wait(
         store: &mut Store,
         host: &Function,
@@ -1445,7 +1445,7 @@ pub mod reference_types {
         Ok(results)
     }
 
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     #[engine_test]
     #[cfg_attr(
         feature = "v8-default",
@@ -1465,7 +1465,7 @@ pub mod reference_types {
         Ok(())
     }
 
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     #[engine_test]
     #[cfg_attr(
         feature = "v8-default",

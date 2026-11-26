@@ -7,7 +7,7 @@
 //! let add_one = instance.exports.get_function("function_name")?;
 //! let add_one_native: TypedFunction<i32, i32> = add_one.typed(&store)?;
 //! ```
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 use crate::{AsyncCallStore, NativeWasmTypeInto, StoreMut};
 use crate::{
     AsStoreMut, BackendStore, CallWrapper, FromToNativeWasmType, Function, RuntimeError,
@@ -95,7 +95,7 @@ macro_rules! impl_native_traits {
             /// Call the typed func asynchronously.
             ///
             /// See [`Function::call_async`] for what `store` can be.
-            #[cfg(feature = "experimental-async")]
+            #[cfg(feature = "async")]
             #[allow(clippy::too_many_arguments)]
             // A function without arguments does not use the store.
             #[allow(unused_variables)]

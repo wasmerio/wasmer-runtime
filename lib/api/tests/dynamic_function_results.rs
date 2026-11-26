@@ -34,7 +34,7 @@ fn a_dynamic_function_returns_what_its_type_says() {
     }
 }
 
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 #[test]
 fn an_async_dynamic_function_returns_what_its_type_says() {
     let mut store = Store::default();

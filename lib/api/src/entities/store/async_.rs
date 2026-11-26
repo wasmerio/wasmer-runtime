@@ -737,7 +737,7 @@ impl std::fmt::Debug for WeakSharedStore {
 /// always pass; they earn their keep under Miri:
 ///
 /// ```text
-/// cargo +nightly miri test -p wasmer --features sys,headless,experimental-async --lib store::async_
+/// cargo +nightly miri test -p wasmer --features sys,headless,async --lib store::async_
 /// ```
 #[cfg(all(test, feature = "sys"))]
 mod tests {

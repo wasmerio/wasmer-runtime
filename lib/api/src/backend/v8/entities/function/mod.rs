@@ -73,7 +73,7 @@ impl Function {
     /// Creates an async host function from its body. The guest cannot
     /// suspend on this backend, so the import blocks its stack until the
     /// future is ready (see `v8::async_call`).
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     pub(crate) fn new_async<FT, F, T>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,

@@ -1,4 +1,4 @@
-#![cfg(all(feature = "experimental-async", feature = "js", target_arch = "wasm32"))]
+#![cfg(all(feature = "async", feature = "js", target_arch = "wasm32"))]
 
 use js_sys::Promise;
 use wasm_bindgen::JsValue;

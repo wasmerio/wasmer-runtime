@@ -2,17 +2,17 @@
 //! store.
 
 /// Defines [`SharedStore`] and how async calls reach their store.
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 mod async_;
-#[cfg(all(feature = "experimental-async", feature = "js"))]
+#[cfg(all(feature = "async", feature = "js"))]
 pub(crate) use async_::StoreSlice;
-#[cfg(all(test, feature = "experimental-async", feature = "sys"))]
+#[cfg(all(test, feature = "async", feature = "sys"))]
 pub(crate) use async_::is_published;
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub(crate) use async_::{CallStore, PollScope, PollStore, SharedState, WithSlice};
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub use async_::{SharedStore, StoreBusy, WeakSharedStore};
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 #[allow(unused_imports)]
 pub(crate) use async_::{publish_store, published_store};
 
@@ -77,7 +77,7 @@ impl StoreBox {
     }
 
     /// Gives the allocation up to another owner.
-    #[cfg(any(feature = "experimental-async", feature = "v8"))]
+    #[cfg(any(feature = "async", feature = "v8"))]
     pub(crate) fn into_box(self) -> Box<StoreInner> {
         self.keeper.check_owner();
         let mut this = ManuallyDrop::new(self);
@@ -138,7 +138,7 @@ impl Store {
         let objects = StoreObjects::from_store_ref(&store);
         #[cfg(all(
             feature = "sys",
-            feature = "experimental-async",
+            feature = "async",
             feature = "experimental-host-interrupt"
         ))]
         let _teardown = crate::backend::sys::async_runtime::StoreTeardown(objects.id());
@@ -147,11 +147,11 @@ impl Store {
             store,
             #[cfg(all(
                 feature = "sys",
-                feature = "experimental-async",
+                feature = "async",
                 feature = "experimental-host-interrupt"
             ))]
             _teardown,
-            #[cfg(feature = "experimental-async")]
+            #[cfg(feature = "async")]
             shared: std::rc::Weak::new(),
         });
         Self {
@@ -260,7 +260,7 @@ impl Store {
     /// a guest that runs several stacks at once. Two stacks on one instance
     /// share its globals and memory, so this is only correct for guests built
     /// for it.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     pub fn into_shared(self) -> SharedStore {
         SharedStore::new(self.inner.into_box())
     }

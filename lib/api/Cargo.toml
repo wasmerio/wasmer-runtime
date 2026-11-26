@@ -115,7 +115,7 @@ wasm-opt = false
 maintenance = { status = "actively-developed" }
 
 [features]
-default = ["sys-default"]
+default = ["sys-default", "async"]
 # `std` and `core` gate nothing: the crate always uses `std`. They are kept
 # so that manifests naming them still build.
 std = []
@@ -136,8 +136,8 @@ demangle = ["dep:symbolic-demangle"]
 # The `sys` runtime without a compiler, which loads precompiled artifacts.
 headless = ["sys"]
 
-# Experimental concurrent execution support
-experimental-async = ["dep:futures"]
+# Async calls into WebAssembly and async host functions (see docs/ASYNC.md).
+async = ["dep:futures"]
 
 # Experimental host-triggered interruption support
 experimental-host-interrupt = ["wasmer-vm/experimental-host-interrupt"]

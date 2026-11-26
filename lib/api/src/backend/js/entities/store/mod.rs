@@ -7,18 +7,18 @@ pub(crate) use handle::*;
 pub(crate) use obj::*;
 
 /// What this backend keeps beside a store's allocation: the store's guest
-/// guard, with `experimental-async`. The engine can resume a guest once its
+/// guard, with `async`. The engine can resume a guest once its
 /// call's borrow of the store is over (see `guard`).
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub(crate) use crate::backend::js::guard::StoreKeeper;
 
 /// What this backend keeps beside a store's allocation: nothing, without
-/// `experimental-async`.
-#[cfg(not(feature = "experimental-async"))]
+/// `async`.
+#[cfg(not(feature = "async"))]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StoreKeeper {}
 
-#[cfg(not(feature = "experimental-async"))]
+#[cfg(not(feature = "async"))]
 impl crate::entities::store::KeepsStore for StoreKeeper {}
 
 #[derive(Debug)]

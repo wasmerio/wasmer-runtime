@@ -1,5 +1,5 @@
 #![cfg(all(
-    feature = "experimental-async",
+    feature = "async",
     feature = "sys",
     not(feature = "v8-default"),
     not(target_arch = "wasm32")

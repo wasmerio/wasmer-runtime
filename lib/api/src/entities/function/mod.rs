@@ -13,22 +13,22 @@ pub use env::*;
 pub(crate) mod call_wrapper;
 pub use call_wrapper::{CallWrapper, WasmCall};
 
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub(crate) mod async_call;
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub(crate) mod async_host;
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub(crate) mod deferred;
 #[doc(hidden)]
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub use async_call::AsyncCallRequest;
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub use async_call::{AsyncCall, AsyncCallStore};
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub use async_host::{
     AsyncDynamicHostFunction, AsyncEnv, AsyncHostFunction, ReturnsDeferred, ReturnsFuture,
 };
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub use deferred::Deferred;
 
 use wasmer_types::{FunctionType, RawValue};
@@ -185,7 +185,7 @@ impl Function {
     /// [`Function::call_async`], it may wait. Called synchronously, it must be
     /// ready at once, or the guest traps with `YieldOutsideAsyncContext`; on
     /// `js` it traps there either way.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     pub fn new_async<T, FT, F, Kind>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
@@ -226,7 +226,7 @@ impl Function {
     /// no future, and costs what a call of a sync host function costs. On
     /// the other backends that function is called as an `async` one, whose
     /// future is ready at once.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     pub fn new_typed_async<T, Args, Rets, Kind>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
@@ -450,7 +450,7 @@ impl Function {
     /// `poll` blocks while an import's future is driven, and a
     /// [`SharedStore`](crate::SharedStore) task whose import must wait fails
     /// with a trap.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     pub fn call_async<'a, S: AsyncCallStore>(
         &'a self,
         store: &'a mut S,

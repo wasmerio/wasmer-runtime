@@ -272,7 +272,7 @@ impl RuntimeError {
         Ok(())
     }
 
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     pub(crate) fn from_dyn(err: Box<dyn std::error::Error + Send + Sync>) -> Self {
         match err.downcast::<Self>() {
             Ok(runtime_error) => *runtime_error,

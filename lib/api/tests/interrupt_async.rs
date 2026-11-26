@@ -1,8 +1,4 @@
-#![cfg(all(
-    unix,
-    feature = "experimental-host-interrupt",
-    feature = "experimental-async"
-))]
+#![cfg(all(unix, feature = "experimental-host-interrupt", feature = "async"))]
 
 // TODO: tests for recursive function calls across different stores
 

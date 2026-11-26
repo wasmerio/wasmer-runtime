@@ -1,6 +1,6 @@
 use wasmer_types::{FunctionType, RawValue};
 
-#[cfg(all(feature = "experimental-async", any(feature = "js", feature = "v8")))]
+#[cfg(all(feature = "async", any(feature = "js", feature = "v8")))]
 use crate::entities::function::async_host::{boxed_body, typed_host_body};
 use crate::{
     AsStoreMut, AsStoreRef, CallWrapper, ExportError, Exportable, Extern, FunctionEnv,
@@ -9,7 +9,7 @@ use crate::{
     macros::backend::{gen_rt_ty, match_rt},
     vm::{VMExtern, VMExternFunction, VMFuncRef},
 };
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 use crate::{AsyncEnv, AsyncHostFunction};
 
 // A WebAssembly `function` instance.
@@ -204,7 +204,7 @@ impl BackendFunction {
     /// Creates an async host `Function` from its body, which takes the
     /// arguments of a call and returns its future.
     #[inline]
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     pub(crate) fn new_async<T, FT, F, Fut>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
@@ -250,7 +250,7 @@ impl BackendFunction {
     /// the trampoline has them, and one that returns `Deferred` is called
     /// without a future. The other backends call it as a dynamic one.
     #[inline]
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     pub(crate) fn new_typed_async<T, Args, Rets, Kind>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,

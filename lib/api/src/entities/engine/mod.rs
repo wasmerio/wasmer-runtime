@@ -149,7 +149,7 @@ impl Engine {
         Ok(())
     }
 
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     /// Returns true if the engine supports async operations.
     pub fn supports_async(&self) -> bool {
         match self.be {

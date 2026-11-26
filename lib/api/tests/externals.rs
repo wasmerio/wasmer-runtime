@@ -91,8 +91,8 @@ fn assert_cross_store(result: Result<Global, RuntimeError>) {
 fn global_new_funcref() -> Result<(), String> {
     let mut store = Store::default();
 
-    // Without `experimental-async`, `js` cannot tell the store of a function.
-    #[cfg(any(not(feature = "js"), feature = "experimental-async"))]
+    // Without `async`, `js` cannot tell the store of a function.
+    #[cfg(any(not(feature = "js"), feature = "async"))]
     {
         let mut other_store = Store::default();
         let foreign = Function::new_typed(&mut other_store, || {});
