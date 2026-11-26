@@ -598,29 +598,27 @@ impl VMSharedTagIndex {
     }
 }
 
-/// An index into the shared signature registry, usable for checking signatures
-/// at indirect calls.
-#[repr(C)]
+/// A function signature hash used by the shared signature registry and indirect calls.
+#[repr(transparent)]
 #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 #[derive(Debug, Eq, PartialEq, Clone, Copy, Hash)]
-pub struct VMSignatureHash(u32);
+pub struct VMSignatureHash(u64);
 
 impl VMSignatureHash {
     /// Create a new `VMSignatureHash`.
-    pub fn new(value: u32) -> Self {
+    pub fn new(value: u64) -> Self {
         Self(value)
     }
 }
 
 /// The VM caller-checked "anyfunc" record, for caller-side signature checking.
-/// It consists of the actual function pointer and a signature id to be checked
-/// by the caller.
+/// It contains the function pointer and the signature hash checked by the caller.
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct VMCallerCheckedAnyfunc {
     /// Function body.
     pub func_ptr: *const VMFunctionBody,
-    /// Function signature id.
+    /// Function signature hash.
     pub type_signature_hash: VMSignatureHash,
     /// Whether the function entry point takes a hidden memory #0 base parameter.
     pub include_m0_param: bool,

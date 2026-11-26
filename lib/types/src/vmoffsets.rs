@@ -676,7 +676,7 @@ impl VMOffsets {
 
     /// The offset of the `include_m0_param` field.
     pub const fn vmcaller_checked_anyfunc_include_m0_param(&self) -> u8 {
-        self.vmcaller_checked_anyfunc_signature_hash() + 4
+        self.vmcaller_checked_anyfunc_signature_hash() + 8
     }
 
     /// Return the size of `VMCallerCheckedAnyfunc`.

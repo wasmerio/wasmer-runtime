@@ -3612,8 +3612,8 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                     .filter(|_| table.is_fixed_funcref_table());
                 let expected_signature_hash = self
                     .intrinsics
-                    .i32_ty
-                    .const_int(u64::from(self.signature_hashes[sigindex].as_u32()), false);
+                    .i64_ty
+                    .const_int(self.signature_hashes[sigindex].as_u64(), false);
 
                 let func_index = self.state.pop1()?.into_int_value();
                 let generic_table = if local_fixed_funcref_table.is_none() {
@@ -3783,7 +3783,7 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                     .into_pointer_value(),
                     err!(
                         self.builder
-                            .build_load(self.intrinsics.i32_ty, sig_hash_ptr, "sig_hash")
+                            .build_load(self.intrinsics.i64_ty, sig_hash_ptr, "sig_hash")
                     )
                     .into_int_value(),
                 );

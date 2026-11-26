@@ -1765,13 +1765,13 @@ impl FuncEnvironment<'_> {
         // If necessary, check the signature.
         match self.table_styles[table_index] {
             TableStyle::CallerChecksSignature => {
-                let sig_hash_type = ir::types::I32;
+                let sig_hash_type = ir::types::I64;
                 let expected_sig_hash = builder.ins().iconst(
                     sig_hash_type,
-                    i64::from(self.signature_hashes[sig_index].as_u32()),
+                    self.signature_hashes[sig_index].as_u64() as i64,
                 );
 
-                // Load the callee ID.
+                // Load the callee signature hash.
                 let mem_flags = ir::MemFlagsData::trusted();
                 let callee_sig_hash = builder.ins().load(
                     sig_hash_type,

@@ -4916,8 +4916,8 @@ dependencies = [
 name = "wasmer-types"
 version = "7.5.0"
 dependencies = [
+ "blake3",
  "bytecheck",
- "crc32fast",
  "criterion",
  "enum-iterator",
  "enumset",
