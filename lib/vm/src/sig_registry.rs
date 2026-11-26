@@ -56,6 +56,29 @@ impl SignatureRegistry {
         sig_hash
     }
 
+    /// Registers each of `signatures` that is not registered yet.
+    ///
+    /// Only a read lock is taken when all of them are, which is the common
+    /// case of a module instantiated with the engine that compiled it.
+    pub fn register_missing<'a>(
+        &self,
+        signatures: impl Iterator<Item = (&'a FunctionType, SignatureHash)> + Clone,
+    ) {
+        let all_known = {
+            let inner = self.inner.read().unwrap();
+            signatures.clone().all(|(_, hash)| {
+                inner
+                    .hash_to_signature
+                    .contains_key(&VMSignatureHash::new(hash.0))
+            })
+        };
+        if !all_known {
+            for (sig, hash) in signatures {
+                self.register(sig, hash);
+            }
+        }
+    }
+
     /// Looks up a registered signature by its hash.
     pub fn lookup_signature(&self, sig_hash: VMSignatureHash) -> Option<FunctionType> {
         self.inner

@@ -184,7 +184,7 @@ impl NativeEngineExt for crate::engine::Engine {
             .map_err(|e| DeserializeError::Generic(format!("{e:?}")))?;
         let artifact = unsafe { Arc::new(Artifact::deserialize_unchecked(self.as_sys(), buffer)?) };
         Ok(crate::Module(BackendModule::Sys(
-            super::module::Module::from_artifact(artifact),
+            super::module::Module::from_artifact(self, artifact),
         )))
     }
 
@@ -197,7 +197,7 @@ impl NativeEngineExt for crate::engine::Engine {
             .map_err(|e| DeserializeError::Generic(format!("{e:?}")))?;
         let artifact = unsafe { Arc::new(Artifact::deserialize(self.as_sys(), buffer)?) };
         Ok(crate::Module(BackendModule::Sys(
-            super::module::Module::from_artifact(artifact),
+            super::module::Module::from_artifact(self, artifact),
         )))
     }
 }
