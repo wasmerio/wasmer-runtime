@@ -14,12 +14,10 @@
     ambiguous_wide_pointer_comparisons,
     unreachable_patterns
 )]
-// Parts of the shared layer, and their `js` implementations, are only reached
-// from the native backends (`sys` and `v8`), which a `js` build never has.
-#![cfg_attr(
-    all(feature = "js", not(any(feature = "sys", feature = "v8"))),
-    allow(dead_code)
-)]
+// Parts of the shared layer, and their implementations in other backends,
+// are only reached from `sys` (or from `sys` and `v8`): a build without
+// `sys` does not use them.
+#![cfg_attr(not(feature = "sys"), allow(dead_code))]
 #![warn(
     clippy::float_arithmetic,
     clippy::mut_mut,

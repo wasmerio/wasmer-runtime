@@ -65,7 +65,7 @@ impl VMSharedMemory {
             Self::Sys(s) => VMMemory::Sys(s.into()),
             #[cfg(feature = "v8")]
             Self::V8(s) => {
-                let mut store = store.as_store_mut();
+                let store = store.as_store_mut();
                 VMMemory::V8(s.into_vm_memory(store.inner.store.as_v8_mut()))
             }
             #[cfg(feature = "js")]

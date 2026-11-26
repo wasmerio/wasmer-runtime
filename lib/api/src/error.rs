@@ -159,7 +159,8 @@ impl RuntimeError {
     ///
     /// If this error is returned from an imported function, the exception
     /// will be thrown in the WebAssembly code instead of the usual trapping.
-    #[cfg_attr(not(any(feature = "sys", feature = "v8")), allow(unused_variables))]
+    // Only `sys` has exceptions to raise.
+    #[cfg_attr(not(feature = "sys"), allow(unused_variables))]
     pub fn exception(ctx: &impl AsStoreRef, exception: Exception) -> Self {
         let exnref = exception.vm_exceptionref();
         let store = ctx.as_store_ref();

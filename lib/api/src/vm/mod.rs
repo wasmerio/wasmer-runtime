@@ -28,7 +28,12 @@ define_vm_like!(Trampoline, Debug);
 define_vm_like!(Memory, Debug);
 define_vm_like!(SharedMemory);
 
-define_vm_like!(ExceptionRef);
+// Only `sys` has exceptions (see `crate::Exception`), so in a build with
+// other backends theirs are made but never read.
+gen_rt_ty! {
+    #[allow(dead_code)]
+    pub VMExceptionRef(vm::VMExceptionRef);
+}
 // `VMExternRef` is an implementation detail of `ExternRef`; keep it out of the
 // public API.
 gen_rt_ty! {

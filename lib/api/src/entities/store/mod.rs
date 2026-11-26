@@ -77,7 +77,7 @@ impl StoreBox {
     }
 
     /// Gives the allocation up to another owner.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(any(feature = "experimental-async", feature = "v8"))]
     pub(crate) fn into_box(self) -> Box<StoreInner> {
         self.keeper.check_owner();
         let mut this = ManuallyDrop::new(self);
