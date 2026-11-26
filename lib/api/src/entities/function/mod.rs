@@ -434,20 +434,41 @@ impl Function {
         store.start_call(AsyncCallRequest::dynamic(self.clone(), params))
     }
 
+    /// Calls the function with arguments that are already raw values.
+    ///
+    /// Returns an error if `params` does not have one value per parameter of
+    /// the function, or if the backend has no raw calls (only `sys` does).
+    ///
+    /// # Safety
+    ///
+    /// Each value must be a valid raw value of the type of its parameter, as
+    /// [`Value::as_raw`] makes it, and a reference must come from `store`.
     #[doc(hidden)]
-    #[allow(missing_docs)]
-    pub fn call_raw(
+    pub unsafe fn call_raw(
         &self,
         store: &mut impl AsStoreMut,
         params: Vec<RawValue>,
     ) -> Result<Box<[Value]>, RuntimeError> {
-        self.0.call_raw(store, params)
+        unsafe { self.0.call_raw(store, params) }
     }
 
     pub(crate) fn vm_funcref(&self, store: &impl AsStoreRef) -> VMFuncRef {
         self.0.vm_funcref(store)
     }
+}
 
+/// Refuses a raw call that does not have one value per parameter.
+pub(crate) fn check_raw_arity(params: usize, given: usize) -> Result<(), RuntimeError> {
+    if params == given {
+        Ok(())
+    } else {
+        Err(RuntimeError::new(format!(
+            "the function takes {params} arguments, but {given} raw values were given"
+        )))
+    }
+}
+
+impl Function {
     pub(crate) unsafe fn from_vm_funcref(store: &mut impl AsStoreMut, funcref: VMFuncRef) -> Self {
         unsafe { Self(BackendFunction::from_vm_funcref(store, funcref)) }
     }

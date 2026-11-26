@@ -593,19 +593,25 @@ impl Function {
         self.call_wasm(store, wrapper, params)
     }
 
-    #[doc(hidden)]
-    #[allow(missing_docs)]
-    pub(crate) fn call_raw(
+    /// See [`Function::call_raw`](crate::Function::call_raw).
+    pub(crate) unsafe fn call_raw(
         &self,
         store: &mut impl AsStoreMut,
         mut params: Vec<RawValue>,
     ) -> Result<Box<[Value]>, RuntimeError> {
-        let (trampoline, result_types) = {
+        let (trampoline, param_count, result_types) = {
             let vm_function = self.handle.get(store.objects_mut().as_sys());
             let trampoline = unsafe { vm_function.anyfunc.as_ptr().as_ref().call_trampoline };
             let result_types = InlineValues::<Type>::from_slice(vm_function.signature.results());
-            (trampoline, result_types)
+            (
+                trampoline,
+                vm_function.signature.params().len(),
+                result_types,
+            )
         };
+        crate::entities::function::check_raw_arity(param_count, params.len())?;
+        // The trampoline writes the results over the arguments.
+        params.resize(param_count.max(result_types.len()), RawValue { i32: 0 });
         self.call_wasm_raw(store, None, trampoline, &mut params)?;
         Ok(unsafe { results_from_raw(store, &result_types, &params) })
     }

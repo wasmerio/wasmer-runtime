@@ -70,7 +70,7 @@ macro_rules! impl_native_traits {
         {
             /// Call the typed func and return results.
             #[allow(clippy::too_many_arguments)]
-            pub fn call_js(&self, store: &mut impl AsStoreMut, $( $x: $x, )* ) -> Result<Rets, RuntimeError> where
+            pub(crate) fn call_js(&self, store: &mut impl AsStoreMut, $( $x: $x, )* ) -> Result<Rets, RuntimeError> where
             $( $x: FromToNativeWasmType,  )*
             {
                 self.call_wrapped_js(store, None, $( $x, )*)
@@ -150,12 +150,9 @@ macro_rules! impl_native_traits {
                 Ok(unsafe { Rets::from_array(store, rets_list_array) })
             }
 
-            #[doc(hidden)]
-            #[allow(missing_docs)]
-            #[allow(unused_mut)]
-            #[allow(clippy::too_many_arguments)]
-            pub fn call_raw_js(&self, store: &mut impl AsStoreMut, mut params_list: Vec<RawValue> ) -> Result<Rets, RuntimeError> {
-                todo!("Raw calls from js are not supported yet!")
+            /// See [`TypedFunction::call_raw`].
+            pub(crate) unsafe fn call_raw_js(&self, _store: &mut impl AsStoreMut, _params_list: Vec<RawValue> ) -> Result<Rets, RuntimeError> {
+                Err(RuntimeError::new("raw calls are not supported by the js backend"))
             }
         }
     };

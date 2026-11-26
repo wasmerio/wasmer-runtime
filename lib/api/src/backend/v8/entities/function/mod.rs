@@ -400,15 +400,14 @@ impl Function {
         FunctionType::new(params, returns)
     }
 
-    pub fn call_raw(
+    pub(crate) unsafe fn call_raw(
         &self,
         _store: &mut impl AsStoreMut,
         _params: Vec<RawValue>,
     ) -> Result<Box<[Value]>, RuntimeError> {
-        // There is no optimal call_raw in JSC, so we just
-        // simply rely the call
-        // self.call(store, params)
-        unimplemented!();
+        Err(RuntimeError::new(
+            "raw calls are not supported by the v8 backend",
+        ))
     }
 
     pub fn call(

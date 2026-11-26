@@ -109,7 +109,10 @@ macro_rules! impl_native_traits {
                 $(
                     let [<p_ $x>] = $x;
                 )*
-                store.start_typed_call(&self.func, move |store: &mut StoreMut<'_>| {
+                // Safety: a `TypedFunction` is only made for a function whose
+                // signature its `Args` and `Rets` match, and the closure makes
+                // one raw value of each argument's type.
+                unsafe { store.start_typed_call(&self.func, move |store: &mut StoreMut<'_>| {
                     // Ensure all parameters come from the same context.
                     if $(!FromToNativeWasmType::is_from_store(&[<p_ $x>], store) ||)* false {
                         return Err(RuntimeError::new(
@@ -118,21 +121,32 @@ macro_rules! impl_native_traits {
                     }
                     let args: [RawValue; _] = [ $( [<p_ $x>].to_native().into_raw(store) ),* ];
                     Ok(args)
-                })
+                }) }
             }
 
+            /// Calls the function with arguments that are already raw values.
+            ///
+            /// Returns an error if `params_list` does not have one value per
+            /// argument, or if the backend has no raw calls (only `sys` does).
+            ///
+            /// # Safety
+            ///
+            /// Each value must be a valid raw value of the type of its
+            /// argument, as [`FromToNativeWasmType`] makes it, and a reference
+            /// must come from `store`.
             #[doc(hidden)]
-            #[allow(missing_docs)]
-            #[allow(unused_mut)]
-            #[allow(clippy::too_many_arguments)]
-            pub fn call_raw(&self, store: &mut impl AsStoreMut, mut params_list: Vec<RawValue> ) -> Result<Rets, RuntimeError> {
+            pub unsafe fn call_raw(&self, store: &mut impl AsStoreMut, params_list: Vec<RawValue> ) -> Result<Rets, RuntimeError> {
+                crate::entities::function::check_raw_arity(
+                    <( $( $x ),* ) as WasmTypeList>::size() as usize,
+                    params_list.len(),
+                )?;
                 match store.as_store_mut().inner.store {
                     #[cfg(feature = "sys")]
-                    BackendStore::Sys(_) => self.call_raw_sys(store, params_list),
+                    BackendStore::Sys(_) => unsafe { self.call_raw_sys(store, params_list) },
                     #[cfg(feature = "v8")]
-                    BackendStore::V8(_) => self.call_raw_v8(store, params_list),
+                    BackendStore::V8(_) => unsafe { self.call_raw_v8(store, params_list) },
                     #[cfg(feature = "js")]
-                    BackendStore::Js(_) => self.call_raw_js(store, params_list),
+                    BackendStore::Js(_) => unsafe { self.call_raw_js(store, params_list) },
                 }
             }
         }

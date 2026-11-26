@@ -413,16 +413,15 @@ impl BackendFunction {
         })
     }
 
-    #[doc(hidden)]
-    #[allow(missing_docs)]
+    /// See [`Function::call_raw`](crate::Function::call_raw).
     #[inline]
-    pub fn call_raw(
+    pub(crate) unsafe fn call_raw(
         &self,
         store: &mut impl AsStoreMut,
         params: Vec<RawValue>,
     ) -> Result<Box<[Value]>, RuntimeError> {
         match_rt!(on self => f {
-            f.call_raw(store, params)
+            unsafe { f.call_raw(store, params) }
         })
     }
 

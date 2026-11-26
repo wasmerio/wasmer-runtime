@@ -22,7 +22,7 @@ macro_rules! impl_native_traits {
         {
             /// Call the typed func and return results.
             #[allow(clippy::too_many_arguments)]
-            pub fn call_sys(&self, store: &mut impl AsStoreMut, $( $x: $x, )* ) -> Result<Rets, RuntimeError> {
+            pub(crate) fn call_sys(&self, store: &mut impl AsStoreMut, $( $x: $x, )* ) -> Result<Rets, RuntimeError> {
                 self.call_wrapped_sys(store, None, $( $x, )*)
             }
 
@@ -130,11 +130,9 @@ macro_rules! impl_native_traits {
                 // Ok(Rets::from_c_struct(results))
             }
 
-            #[doc(hidden)]
-            #[allow(missing_docs)]
-            #[allow(unused_mut)]
-            #[allow(clippy::too_many_arguments)]
-            pub fn call_raw_sys(&self, store: &mut impl AsStoreMut, mut params_list: Vec<RawValue> ) -> Result<Rets, RuntimeError> {
+            /// See [`TypedFunction::call_raw`], which checks the number of
+            /// arguments.
+            pub(crate) unsafe fn call_raw_sys(&self, store: &mut impl AsStoreMut, mut params_list: Vec<RawValue> ) -> Result<Rets, RuntimeError> {
                 let anyfunc = unsafe {
                     *self.func.as_sys()
                         .handle

@@ -40,12 +40,12 @@ impl Exception {
     }
 
     /// Get the `VMExceptionRef` corresponding to this `Exception`.
-    pub fn vm_exceptionref(&self) -> VMExceptionRef {
+    pub(crate) fn vm_exceptionref(&self) -> VMExceptionRef {
         self.0.vm_exceptionref()
     }
 
-    /// Create an `Exception` from a `VMExceptionRef`.
-    pub fn from_vm_exceptionref(exnref: VMExceptionRef) -> Self {
+    /// Create an `Exception` from a `VMExceptionRef`, which is not checked.
+    pub(crate) fn from_vm_exceptionref(exnref: VMExceptionRef) -> Self {
         Self(BackendException::from_vm_exceptionref(exnref))
     }
 }

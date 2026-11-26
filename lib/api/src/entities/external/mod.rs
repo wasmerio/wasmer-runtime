@@ -8,8 +8,11 @@ use crate::{
     vm::VMExtern,
 };
 
-/// Trait convert a VMExtern to a Extern
-pub trait VMExternToExtern {
+/// Converts a `VMExtern` to an [`Extern`] of the given store.
+///
+/// The handle inside a `VMExtern` is not checked against the store, so this
+/// is for the backends only.
+pub(crate) trait VMExternToExtern {
     /// Convert to [`Extern`]
     fn to_extern(self, store: &mut impl AsStoreMut) -> Extern;
 }
@@ -29,7 +32,7 @@ pub enum Extern {
     Table(Table),
     /// An external [`Memory`].
     Memory(Memory),
-    /// An external [`Memory`].
+    /// An external [`Tag`].
     Tag(Tag),
 }
 
@@ -45,8 +48,8 @@ impl Extern {
         }
     }
 
-    /// Create an `Extern` from an `wasmer_engine::Export`.
-    pub fn from_vm_extern(store: &mut impl AsStoreMut, vm_extern: VMExtern) -> Self {
+    /// Create an `Extern` from a `VMExtern` of `store`, which is not checked.
+    pub(crate) fn from_vm_extern(store: &mut impl AsStoreMut, vm_extern: VMExtern) -> Self {
         vm_extern.to_extern(store)
     }
 
@@ -62,7 +65,7 @@ impl Extern {
     }
 
     /// To `VMExtern`.
-    pub fn to_vm_extern(&self) -> VMExtern {
+    pub(crate) fn to_vm_extern(&self) -> VMExtern {
         match self {
             Self::Function(f) => f.to_vm_extern(),
             Self::Global(g) => g.to_vm_extern(),
