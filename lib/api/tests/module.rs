@@ -552,7 +552,8 @@ fn module_from_file_non_utf8_path() -> Result<(), String> {
 }
 
 #[test]
-#[cfg(feature = "sys")]
+// `Engine::default()` is a `sys` engine.
+#[cfg(all(feature = "sys", not(feature = "v8-default")))]
 fn funcrefs_of_a_module_compiled_by_another_engine() -> Result<(), String> {
     // Each engine has a registry of signatures, and the memory of the code it
     // compiled, of its own. The module keeps the engine that compiled it.

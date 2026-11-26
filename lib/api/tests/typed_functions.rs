@@ -174,8 +174,9 @@ fn holochain_typed_function() -> anyhow::Result<()> {
 
 #[engine_test]
 fn raw_calls_check_the_number_of_arguments() -> anyhow::Result<()> {
-    // Raw calls are only supported by `sys`: the others return an error.
-    #[cfg(feature = "sys")]
+    // Raw calls are only supported by `sys`: the others return an error. The
+    // default store is a `sys` one.
+    #[cfg(all(feature = "sys", not(feature = "v8-default")))]
     {
         let mut store = Store::default();
         let module = Module::new(

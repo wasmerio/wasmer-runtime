@@ -5,7 +5,8 @@ use wasmer_types::{
     target::{Target, UserCompilerOptimizations},
 };
 
-#[cfg(feature = "compiler")]
+// The compilers are configured through this trait.
+#[cfg(any(feature = "cranelift", feature = "llvm", feature = "singlepass"))]
 use wasmer_compiler::CompilerConfig;
 
 /// Create temporary handles to engines.

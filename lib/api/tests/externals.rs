@@ -504,8 +504,9 @@ fn table_grow() -> Result<(), String> {
 
 #[engine_test]
 fn table_copy() -> Result<(), String> {
-    // `Table::copy` is unimplemented on js, and returns an error on v8.
-    #[cfg(feature = "sys")]
+    // `Table::copy` is unimplemented on js, and returns an error on v8: this
+    // needs the default store to be a `sys` one.
+    #[cfg(all(feature = "sys", not(feature = "v8-default")))]
     {
         let mut store = Store::default();
         let table_type = TableType {
@@ -819,7 +820,8 @@ fn exception_new_checks_its_arguments() -> Result<(), String> {
     let mut store = Store::default();
     let tag = Tag::new(&mut store, [Type::I32]).map_err(|e| format!("{e:?}"))?;
 
-    #[cfg(feature = "sys")]
+    // The default store is a `sys` one.
+    #[cfg(all(feature = "sys", not(feature = "v8-default")))]
     {
         let exception = Exception::new(&mut store, &tag, &[Value::I32(1)]);
         assert_eq!(exception.unwrap().payload(&mut store), vec![Value::I32(1)]);
@@ -838,8 +840,8 @@ fn exception_new_checks_its_arguments() -> Result<(), String> {
         assert!(Exception::new(&mut store, &ref_tag, &[foreign]).is_err());
     }
 
-    // Only `sys` has exceptions.
-    #[cfg(not(feature = "sys"))]
+    // Only `sys` has exceptions: other default stores refuse them.
+    #[cfg(not(all(feature = "sys", not(feature = "v8-default"))))]
     assert!(Exception::new(&mut store, &tag, &[Value::I32(1)]).is_err());
 
     // `js` has tags of numbers only.
@@ -852,8 +854,9 @@ fn exception_new_checks_its_arguments() -> Result<(), String> {
 #[engine_test]
 fn dynamic_functions_are_refused_as_funcrefs() -> anyhow::Result<()> {
     // A dynamic host function of `sys` has no code that a funcref can point
-    // to: everything that would give one to WebAssembly refuses it.
-    #[cfg(feature = "sys")]
+    // to: everything that would give one to WebAssembly refuses it. The
+    // default store is a `sys` one.
+    #[cfg(all(feature = "sys", not(feature = "v8-default")))]
     {
         let mut store = Store::default();
         let dynamic = Function::new(&mut store, FunctionType::new([], []), |_| Ok(vec![]));
