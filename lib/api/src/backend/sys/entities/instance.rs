@@ -6,7 +6,6 @@ use crate::{
 };
 use wasmer_vm::{StoreHandle, VMInstance};
 
-use super::store::Store;
 
 #[derive(Clone, PartialEq, Eq)]
 /// A WebAssembly `instance` in the `sys` runtime.
@@ -74,15 +73,6 @@ impl Instance {
     }
 }
 
-impl crate::BackendInstance {
-    /// Consume [`self`] into a [`crate::backend::sys::instance::Instance`].
-    pub(crate) fn into_sys(self) -> crate::backend::sys::instance::Instance {
-        match self {
-            Self::Sys(s) => s,
-            _ => panic!("Not a `sys` instance"),
-        }
-    }
-}
 
 #[cfg(test)]
 mod send_test {

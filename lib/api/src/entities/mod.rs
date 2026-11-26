@@ -6,7 +6,7 @@
 //! documentation].
 //!
 //! [WebAssembly specification]: https://webassembly.github.io/spec/core/
-//! [Wasmer Runtime documentation]: https://webassembly.github.io/spec/core/
+//! [Wasmer Runtime documentation]: https://github.com/wasmerio/wasmer-runtime/tree/main/docs
 
 pub(crate) mod engine;
 pub use engine::*;

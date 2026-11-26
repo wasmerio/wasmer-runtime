@@ -1,8 +1,8 @@
-use super::{SharedMemory, shared_memory_detach_error, view::*};
+use super::{SharedMemory, shared_memory_detach_error};
 use wasmer_types::{MemoryError, MemoryType, Pages};
 
 use crate::{
-    AsStoreMut, AsStoreRef, ExportError, Exportable, Extern, StoreMut, StoreRef,
+    AsStoreMut, AsStoreRef,
     macros::backend::{gen_rt_ty, match_rt},
     vm::{VMExtern, VMExternMemory, VMMemory},
 };
@@ -31,15 +31,15 @@ impl BackendMemory {
     pub fn new(store: &mut impl AsStoreMut, ty: MemoryType) -> Result<Self, MemoryError> {
         match &store.as_store_mut().inner.store {
             #[cfg(feature = "sys")]
-            crate::BackendStore::Sys(s) => Ok(Self::Sys(
+            crate::BackendStore::Sys(_) => Ok(Self::Sys(
                 crate::backend::sys::entities::memory::Memory::new(store, ty)?,
             )),
             #[cfg(feature = "v8")]
-            crate::BackendStore::V8(s) => Ok(Self::V8(
+            crate::BackendStore::V8(_) => Ok(Self::V8(
                 crate::backend::v8::entities::memory::Memory::new(store, ty)?,
             )),
             #[cfg(feature = "js")]
-            crate::BackendStore::Js(s) => Ok(Self::Js(
+            crate::BackendStore::Js(_) => Ok(Self::Js(
                 crate::backend::js::entities::memory::Memory::new(store, ty)?,
             )),
         }
@@ -192,15 +192,15 @@ impl BackendMemory {
     pub(crate) fn from_vm_extern(store: &mut impl AsStoreMut, vm_extern: VMExternMemory) -> Self {
         match &store.as_store_mut().inner.store {
             #[cfg(feature = "sys")]
-            crate::BackendStore::Sys(s) => Self::Sys(
+            crate::BackendStore::Sys(_) => Self::Sys(
                 crate::backend::sys::entities::memory::Memory::from_vm_extern(store, vm_extern),
             ),
             #[cfg(feature = "v8")]
-            crate::BackendStore::V8(s) => Self::V8(
+            crate::BackendStore::V8(_) => Self::V8(
                 crate::backend::v8::entities::memory::Memory::from_vm_extern(store, vm_extern),
             ),
             #[cfg(feature = "js")]
-            crate::BackendStore::Js(s) => Self::Js(
+            crate::BackendStore::Js(_) => Self::Js(
                 crate::backend::js::entities::memory::Memory::from_vm_extern(store, vm_extern),
             ),
         }

@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut store = Store::new(engine);
 
     // Declare a tag.
-    let tag = wasmer::Tag::new(&mut store, vec![Type::I32]);
+    let tag = wasmer::Tag::new(&mut store, vec![Type::I32])?;
 
     // Store the tag in an environment so we can access it in the `throw` function.
     struct MyEnv {
@@ -93,7 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // return it wrapped in a `RuntimeError`. The Wasmer runtime will
         // recognize it and will start the unwinding process.
         let tag = env.data().tag.clone();
-        let exn = wasmer::Exception::new(&mut env, &tag, &[Value::I32(69)]);
+        let exn = wasmer::Exception::new(&mut env, &tag, &[Value::I32(69)])?;
         Err(RuntimeError::exception(&env, exn))
     }
     let throw1 =
@@ -102,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fn throw2(mut env: FunctionEnvMut<MyEnv>) -> Result<(), RuntimeError> {
         println!("Throwing exception 2");
         let tag = env.data().tag.clone();
-        let exn = wasmer::Exception::new(&mut env, &tag, &[Value::I32(42)]);
+        let exn = wasmer::Exception::new(&mut env, &tag, &[Value::I32(42)])?;
         Err(RuntimeError::exception(&env, exn))
     }
     let throw2 = Function::new_typed_with_env(&mut store, &env, throw2);

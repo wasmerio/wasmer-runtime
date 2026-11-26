@@ -56,7 +56,7 @@ pub(crate) struct StorePtrWrapper {
     /// returns, and a borrow is given back within that call.
     entry: NonNull<StoreContext>,
     /// The store's id, so that giving the borrow back does not use `store_ptr`.
-    #[cfg_attr(not(feature = "experimental-async"), allow(dead_code))]
+    #[cfg_attr(not(feature = "async"), allow(dead_code))]
     id: StoreId,
 }
 
@@ -212,7 +212,7 @@ impl StoreContext {
     }
 
     /// [`Self::try_get_current_unborrowed`], if the active entry is `id`'s.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     pub(crate) fn try_get_lent(id: StoreId) -> Option<StorePtrWrapper> {
         with_top(|top| {
             let entry = top_entry(top)?;
@@ -225,13 +225,13 @@ impl StoreContext {
     /// An async import asks before it has its guest wait: the frames the
     /// guest waits on are reset, not unwound, if its call is dropped, so a
     /// borrow they held would never be given back.
-    #[cfg(all(feature = "sys", feature = "experimental-async"))]
+    #[cfg(all(feature = "sys", feature = "async"))]
     pub(crate) fn top_is_unborrowed() -> bool {
         with_top(|top| top_entry(top).is_none_or(|entry| entry.borrow_count.get() == 0))
     }
 
     /// Whether `entry` is the active entry of this thread.
-    #[cfg(all(feature = "sys", feature = "experimental-async"))]
+    #[cfg(all(feature = "sys", feature = "async"))]
     pub(crate) fn is_active(entry: *const Self) -> bool {
         with_top(|top| ptr::eq(top.get(), entry))
     }
@@ -291,7 +291,7 @@ impl StorePtrWrapper {
         self.store_ptr
     }
 
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     pub(crate) fn id(&self) -> StoreId {
         self.id
     }
@@ -481,7 +481,7 @@ mod unwinding {
 
     /// What an async import checks before its guest waits: a borrow of the
     /// active entry that is still held shows.
-    #[cfg(all(feature = "sys", feature = "experimental-async"))]
+    #[cfg(all(feature = "sys", feature = "async"))]
     #[test]
     fn a_live_borrow_of_the_active_entry_shows() {
         assert!(StoreContext::top_is_unborrowed());
@@ -557,7 +557,7 @@ mod unwinding {
     }
 
     /// A store lent with `parked` is given out once.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     #[test]
     fn a_lent_store_has_one_holder() {
         let mut store = Store::default();

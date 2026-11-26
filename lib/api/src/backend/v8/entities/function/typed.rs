@@ -5,7 +5,7 @@
 //!
 //! ```ignore
 //! let add_one = instance.exports.get_function("function_name")?;
-//! let add_one_native: TypedFunction<i32, i32> = add_one.typed().unwrap();
+//! let add_one_native: TypedFunction<i32, i32> = add_one.typed(&store)?;
 //! ```
 
 use std::iter::FromIterator;
@@ -28,7 +28,7 @@ macro_rules! impl_native_traits {
          {
              /// Call the typed func and return results.
             #[allow(clippy::too_many_arguments)]
-            pub fn call_v8(&self, store: &mut impl AsStoreMut, $( $x: $x, )* ) -> Result<Rets, RuntimeError> where
+            pub(crate) fn call_v8(&self, store: &mut impl AsStoreMut, $( $x: $x, )* ) -> Result<Rets, RuntimeError> where
             $( $x: FromToNativeWasmType, )*
             {
                 self.call_wrapped_v8(store, None, $( $x, )*)
@@ -107,12 +107,9 @@ macro_rules! impl_native_traits {
                 }
             }
 
-            #[doc(hidden)]
-            #[allow(missing_docs)]
-            #[allow(unused_mut)]
-            #[allow(clippy::too_many_arguments)]
-            pub fn call_raw_v8(&self, store: &mut impl AsStoreMut, mut params_list: Vec<RawValue> ) -> Result<Rets, RuntimeError> {
-                todo!("Raw calls from v8 are not supported yet!")
+            /// See [`TypedFunction::call_raw`].
+            pub(crate) unsafe fn call_raw_v8(&self, _store: &mut impl AsStoreMut, _params_list: Vec<RawValue> ) -> Result<Rets, RuntimeError> {
+                Err(RuntimeError::new("raw calls are not supported by the v8 backend"))
             }
         }
     };

@@ -1,13 +1,13 @@
 use wasmer_types::{TagType, Type};
 
 use crate::{
-    AsStoreMut, AsStoreRef, BackendTag, TagKind,
+    AsStoreMut, AsStoreRef, BackendTag, RuntimeError, TagKind,
     js::vm::VMTag,
     vm::{VMExtern, VMExternTag},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-/// A WebAssembly `tag` in the `v8` runtime.
+/// A WebAssembly `tag` in the `js` runtime.
 pub(crate) struct Tag {
     pub(crate) handle: VMTag,
 }
@@ -20,38 +20,50 @@ unsafe impl Sync for Tag {}
 // unsafe impl Send for Tag {}
 
 impl Tag {
-    pub fn new<P: Into<Box<[Type]>>>(store: &mut impl AsStoreMut, params: P) -> Self {
+    pub fn new<P: Into<Box<[Type]>>>(
+        _store: &mut impl AsStoreMut,
+        params: P,
+    ) -> Result<Self, RuntimeError> {
         let descriptor = js_sys::Object::new();
         let params: Box<[Type]> = params.into();
-        let parameters: Vec<String> = params
+        let parameters = params
             .iter()
             .map(|param| match param {
-                Type::I32 => "i32".to_string(),
-                Type::I64 => "i64".to_string(),
-                Type::F32 => "f32".to_string(),
-                Type::F64 => "f64".to_string(),
-                _ => unimplemented!("The type is not yet supported in the JS Global API"),
+                Type::I32 => Ok("i32"),
+                Type::I64 => Ok("i64"),
+                Type::F32 => Ok("f32"),
+                Type::F64 => Ok("f64"),
+                other => Err(RuntimeError::new(format!(
+                    "a tag parameter of type {other} is not supported by the js backend"
+                ))),
             })
-            .collect();
-        js_sys::Reflect::set(&descriptor, &"parameters".into(), &parameters.into()).unwrap();
+            .collect::<Result<Vec<_>, _>>()?;
+        js_sys::Reflect::set(&descriptor, &"parameters".into(), &parameters.into())
+            .map_err(|_| RuntimeError::new("could not describe the tag to the JavaScript host"))?;
 
-        let tag = js_sys::WebAssembly::Tag::new(&descriptor);
+        let tag = js_sys::WebAssembly::Tag::new(&descriptor).map_err(|error| {
+            RuntimeError::new(format!(
+                "the JavaScript host could not make the tag: {}",
+                error.as_string().unwrap_or_else(|| format!("{error:?}"))
+            ))
+        })?;
         let ty = TagType::new(TagKind::Exception, params);
-        let handle = VMTag::new(tag.unwrap(), ty);
-        Self { handle }
+        Ok(Self {
+            handle: VMTag::new(tag, ty),
+        })
     }
 
-    pub fn ty(&self, store: &impl AsStoreRef) -> TagType {
+    pub fn ty(&self, _store: &impl AsStoreRef) -> TagType {
         self.handle.ty.clone()
     }
 
-    pub(crate) fn from_vm_extern(store: &mut impl AsStoreMut, vm_extern: VMExternTag) -> Self {
+    pub(crate) fn from_vm_extern(_store: &mut impl AsStoreMut, vm_extern: VMExternTag) -> Self {
         Self {
             handle: vm_extern.unwrap_js(),
         }
     }
 
-    pub fn is_from_store(&self, store: &impl AsStoreRef) -> bool {
+    pub fn is_from_store(&self, _store: &impl AsStoreRef) -> bool {
         true
     }
 
@@ -61,26 +73,10 @@ impl Tag {
 }
 
 impl crate::Tag {
-    /// Consume [`self`] into [`crate::backend::js::tag::Tag`].
-    pub(crate) fn into_js(self) -> crate::backend::js::tag::Tag {
-        match self.0 {
-            BackendTag::Js(s) => s,
-            _ => panic!("Not a `js` tag!"),
-        }
-    }
-
     /// Convert a reference to [`self`] into a reference [`crate::backend::js::tag::Tag`].
     pub(crate) fn as_js(&self) -> &crate::backend::js::tag::Tag {
         match self.0 {
             BackendTag::Js(ref s) => s,
-            _ => panic!("Not a `js` tag!"),
-        }
-    }
-
-    /// Convert a mutable reference to [`self`] into a mutable reference [`crate::backend::js::tag::Tag`].
-    pub(crate) fn as_js_mut(&mut self) -> &mut crate::backend::js::tag::Tag {
-        match self.0 {
-            BackendTag::Js(ref mut s) => s,
             _ => panic!("Not a `js` tag!"),
         }
     }

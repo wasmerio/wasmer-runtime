@@ -1,7 +1,5 @@
-use std::{any::Any, error::Error, fmt::Debug};
+use std::{error::Error, fmt::Debug};
 
-#[cfg(feature = "sys")]
-use crate::BackendException;
 use crate::{Exception, RuntimeError, macros::backend::match_rt};
 
 /// An enumeration of all the trap kinds supported by the runtimes.
@@ -24,6 +22,9 @@ impl BackendTrap {
     /// Construct a new Error with the given a user error.
     ///
     /// Internally saves a backtrace when constructed.
+    // The first backend enabled makes the trap; the code after it is
+    // unreachable.
+    #[allow(unreachable_code)]
     pub fn user(err: Box<dyn Error + Send + Sync>) -> RuntimeError {
         #[cfg(feature = "sys")]
         {

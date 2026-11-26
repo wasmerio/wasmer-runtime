@@ -355,6 +355,16 @@ where
     fn is_from_store(&self, _store: &impl AsStoreRef) -> bool {
         true
     }
+
+    /// Returns whether WebAssembly can be given this value as it is: not if it
+    /// is a dynamic host function of the `sys` backend, which has no code of
+    /// its own that a funcref could point to.
+    ///
+    /// Only asked of values of the given store.
+    #[doc(hidden)]
+    fn is_funcref_usable(&self, _store: &impl AsStoreRef) -> bool {
+        true
+    }
 }
 
 macro_rules! from_to_native_wasm_type {
@@ -440,6 +450,9 @@ unsafe impl FromToNativeWasmType for Option<Function> {
     }
     fn is_from_store(&self, store: &impl AsStoreRef) -> bool {
         self.as_ref().is_none_or(|f| f.is_from_store(store))
+    }
+    fn is_funcref_usable(&self, store: &impl AsStoreRef) -> bool {
+        self.as_ref().is_none_or(|f| f.is_funcref_usable(store))
     }
 }
 
@@ -542,6 +555,17 @@ where
     /// can be used with any store.
     #[inline]
     fn is_from_store(&self, _store: &impl AsStoreRef) -> bool {
+        true
+    }
+
+    /// Returns whether WebAssembly can be given these values as they are: not if one
+    /// is a dynamic host function of the `sys` backend, which has no code of
+    /// its own that a funcref could point to.
+    ///
+    /// Only asked of values of the given store.
+    #[doc(hidden)]
+    #[inline]
+    fn is_funcref_usable(&self, _store: &impl AsStoreRef) -> bool {
         true
     }
 }
@@ -812,6 +836,14 @@ macro_rules! impl_wasmtypelist {
                 let ( $( $x ),* ) = self;
 
                 $( FromToNativeWasmType::is_from_store($x, _store) && )* true
+            }
+
+            #[inline]
+            #[allow(non_snake_case)]
+            fn is_funcref_usable(&self, _store: &impl AsStoreRef) -> bool {
+                let ( $( $x ),* ) = self;
+
+                $( FromToNativeWasmType::is_funcref_usable($x, _store) && )* true
             }
         }
 

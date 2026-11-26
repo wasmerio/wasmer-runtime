@@ -298,7 +298,7 @@ impl AsJs for Function {
     /// `call_async` calls it.
     fn as_jsvalue(&self, _store: &impl AsStoreRef) -> wasm_bindgen::JsValue {
         let function: JsValue = self.as_js().handle.function.clone().into();
-        #[cfg(feature = "experimental-async")]
+        #[cfg(feature = "async")]
         let function = crate::js::jspi::public(&function);
         function
     }
@@ -310,7 +310,7 @@ impl AsJs for Function {
         function_type: &Self::DefinitionType,
         value: &JsValue,
     ) -> Result<Self, JsError> {
-        #[cfg(feature = "experimental-async")]
+        #[cfg(feature = "async")]
         let value = &crate::js::jspi::host_of(value);
         Self::from_js_function(store, function_type, value)
     }
@@ -325,7 +325,7 @@ impl Function {
         function_type: &crate::FunctionType,
         value: &JsValue,
     ) -> Result<Self, JsError> {
-        #[cfg(feature = "experimental-async")]
+        #[cfg(feature = "async")]
         let value = &crate::js::jspi::host_of(value);
         Self::from_js_function(store, function_type, value)
     }

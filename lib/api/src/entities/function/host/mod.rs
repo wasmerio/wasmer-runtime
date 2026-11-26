@@ -1,9 +1,6 @@
 mod imp;
 
-use crate::{
-    BackendKind, WasmTypeList,
-    vm::{VMFunctionCallback, VMTrampoline},
-};
+use crate::{BackendKind, WasmTypeList};
 
 /// The `HostFunction` trait represents the set of functions that
 /// can be used as host function. To uphold this statement, it is

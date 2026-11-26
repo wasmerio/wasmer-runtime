@@ -11,7 +11,7 @@ mod tests {
     use crate::sys::NativeEngineExt;
     use std::ptr::NonNull;
     use wasmer_compiler::Tunables;
-    use wasmer_types::{MemoryType, Pages};
+    use wasmer_types::MemoryType;
     use wasmer_vm::{
         MemoryError, MemoryStyle, TableStyle, VMConfig, VMMemory, VMMemoryDefinition, VMTable,
         VMTableDefinition,
@@ -46,6 +46,11 @@ mod tests {
         }
     }
 
+    // Only the tests that compile a module use it.
+    #[cfg_attr(
+        not(any(feature = "cranelift", feature = "llvm", feature = "singlepass")),
+        allow(dead_code)
+    )]
     struct TinyTunables;
     impl Tunables for TinyTunables {
         fn memory_style(&self, _memory: &MemoryType) -> MemoryStyle {

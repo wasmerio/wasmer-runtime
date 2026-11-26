@@ -88,9 +88,19 @@ fn build_v8() {
                 .read_to_vec()
                 .expect("failed to download v8 lib");
 
-            fs::write(&archive_path, tar_data).unwrap_or_else(|err| {
+            // Written beside its name and renamed to it, so that no build
+            // finds half an archive there: not one stopped while writing it,
+            // nor one running alongside.
+            let partial = cache_dir.join(format!("{asset_name}.{}.partial", std::process::id()));
+            fs::write(&partial, tar_data).unwrap_or_else(|err| {
                 panic!(
                     "failed to write v8 archive cache {}: {err}",
+                    partial.display()
+                )
+            });
+            fs::rename(&partial, &archive_path).unwrap_or_else(|err| {
+                panic!(
+                    "failed to move v8 archive cache to {}: {err}",
                     archive_path.display()
                 )
             });
@@ -102,15 +112,34 @@ fn build_v8() {
                 archive_path.display()
             )
         });
+        // The library being there is what says the cache is complete, so it
+        // is unpacked beside the cache and its directory moved in at once.
+        let unpack_dir = cache_dir.join(format!(".unpack.{}", std::process::id()));
+        let _ = fs::remove_dir_all(&unpack_dir);
         let tar = xz::read::XzDecoder::new(tar_data.as_slice());
         let mut archive = tar::Archive::new(tar);
-        archive.unpack(&cache_dir).unwrap_or_else(|err| {
+        archive.unpack(&unpack_dir).unwrap_or_else(|err| {
             panic!(
                 "failed to unpack v8 archive cache {} into {}: {err}",
                 archive_path.display(),
-                cache_dir.display()
+                unpack_dir.display()
             )
         });
+        // What an interrupted unpack left of the directory, before this
+        // script unpacked atomically.
+        if v8_lib_dir.exists() && !v8_lib_path.exists() {
+            let _ = fs::remove_dir_all(&v8_lib_dir);
+        }
+        match fs::rename(unpack_dir.join("lib"), &v8_lib_dir) {
+            Ok(()) => {}
+            // A build running alongside moved its own copy in first.
+            Err(_) if v8_lib_path.exists() => {}
+            Err(err) => panic!(
+                "failed to move the unpacked v8 library to {}: {err}",
+                v8_lib_dir.display()
+            ),
+        }
+        let _ = fs::remove_dir_all(&unpack_dir);
     }
 
     // The library with its symbols renamed goes next to the one it is made
@@ -153,13 +182,26 @@ fn build_v8() {
     }
 
     let header_path = v8_header_path.join("wasm.h");
-    let mut args = vec![];
+    println!("cargo:rerun-if-changed={}", header_path.display());
+    let mut args: Vec<String> = vec![];
     if target_os == "macos" {
-        args.push("-I/usr/local/include");
-        args.push("-I/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include/c++/v1");
-        args.push("-I/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/include");
-        args.push("-I/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include");
-        args.push("-I/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/System/Library/Frameworks");
+        // The SDK that `xcrun` selects, which need not be the one inside
+        // `/Applications/Xcode.app`: the Command Line Tools have their own.
+        let sdk = std::process::Command::new("xcrun")
+            .args(["--sdk", "macosx", "--show-sdk-path"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|sdk| !sdk.is_empty())
+            .unwrap_or_else(|| {
+                "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk".to_string()
+            });
+        args.push("-I/usr/local/include".to_string());
+        args.push(format!("-I{sdk}/usr/include/c++/v1"));
+        args.push(format!("-I{sdk}/usr/include"));
+        args.push("-I/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/include".to_string());
+        args.push(format!("-I{sdk}/System/Library/Frameworks"));
     }
     let bindings = bindgen::Builder::default()
         .header(header_path.display().to_string())
@@ -208,21 +250,33 @@ fn build_v8() {
             }
         })
         .collect();
+    // The cache is shared by every build, so the renamed library is written
+    // beside its name and renamed to it: a build linking it never reads one
+    // that another build is writing.
     let prefixed_v8_lib_path = prefixed_lib_dir.join("libv8prefixed.a");
+    let partial_v8_lib_path =
+        prefixed_lib_dir.join(format!("libv8prefixed.a.{}.partial", std::process::id()));
     let output = std::process::Command::new(objcopy)
         .args(syms)
         .arg(v8_lib_path.display().to_string())
-        .arg(prefixed_v8_lib_path.display().to_string())
+        .arg(partial_v8_lib_path.display().to_string())
         .output()
         .expect("objcopy command failed");
 
     if !output.status.success() {
+        let _ = fs::remove_file(&partial_v8_lib_path);
         panic!(
             "{objcopy} failed with error code {}: {}",
             output.status,
-            String::from_utf8(output.stderr).unwrap()
+            String::from_utf8_lossy(&output.stderr)
         );
     }
+    fs::rename(&partial_v8_lib_path, &prefixed_v8_lib_path).unwrap_or_else(|err| {
+        panic!(
+            "failed to move the renamed v8 library to {}: {err}",
+            prefixed_v8_lib_path.display()
+        )
+    });
 
     println!("cargo:rustc-link-lib=static=v8prefixed");
 

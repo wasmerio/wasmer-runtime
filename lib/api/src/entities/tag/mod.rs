@@ -3,7 +3,7 @@ pub(crate) use inner::*;
 use wasmer_types::{TagType, Type};
 
 use crate::{
-    AsStoreMut, AsStoreRef, ExportError, Exportable, Extern,
+    AsStoreMut, AsStoreRef, ExportError, Exportable, Extern, RuntimeError,
     vm::{VMExtern, VMExternTag},
 };
 
@@ -19,6 +19,11 @@ pub struct Tag(pub(crate) BackendTag);
 impl Tag {
     /// Create a new tag with event of type P -> [], that is a function that takes parameters `P`
     /// and has no return value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot make a tag of these parameters:
+    /// the `js` backend only has numeric ones.
     //
     // Note: in the future, a tag might express other kinds of events other than just exceptions.
     // This would imply that the signature of this function becomes
@@ -28,8 +33,11 @@ impl Tag {
     // For now, since the only possible kind is `TagKind::Exception`, we decided to make the
     // external API easier to use, while having the internal types in place to allow the needed
     // changes.
-    pub fn new<P: Into<Box<[Type]>>>(store: &mut impl AsStoreMut, params: P) -> Self {
-        Self(BackendTag::new(store, params))
+    pub fn new<P: Into<Box<[Type]>>>(
+        store: &mut impl AsStoreMut,
+        params: P,
+    ) -> Result<Self, RuntimeError> {
+        BackendTag::new(store, params).map(Self)
     }
 
     /// Returns the [`TagType`] of the tag.

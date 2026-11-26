@@ -26,6 +26,9 @@ impl Global {
         if !val.is_from_store(store) {
             return Err(RuntimeError::new("cross-`Store` values are not supported"));
         }
+        if !val.is_funcref_usable(store) {
+            return Err(crate::entities::function::dynamic_funcref_error());
+        }
         let global = VMGlobal::new(GlobalType {
             mutability,
             ty: val.ty(),
@@ -58,6 +61,9 @@ impl Global {
     pub(crate) fn set(&self, store: &mut impl AsStoreMut, val: Value) -> Result<(), RuntimeError> {
         if !val.is_from_store(store) {
             return Err(RuntimeError::new("cross-`Store` values are not supported"));
+        }
+        if !val.is_funcref_usable(store) {
+            return Err(crate::entities::function::dynamic_funcref_error());
         }
         let global = self.handle.get_mut(store.objects_mut().as_sys_mut());
         if global.ty().mutability != Mutability::Var {

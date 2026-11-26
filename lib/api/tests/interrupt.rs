@@ -189,8 +189,8 @@ fn imported_functions_are_interrupted_if_exception_is_thrown() -> Result<()> {
         Function::new_typed_with_env(store, &env, move |mut env: wasmer::FunctionEnvMut<_>| {
             rx.recv().unwrap();
             let mut store = env.as_store_mut();
-            let tag = Tag::new(&mut store, []);
-            let exc = Exception::new(&mut store, &tag, &[]);
+            let tag = Tag::new(&mut store, [])?;
+            let exc = Exception::new(&mut store, &tag, &[])?;
             Result::<(), _>::Err(RuntimeError::exception(&store, exc))
         })
     })

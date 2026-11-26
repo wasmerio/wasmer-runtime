@@ -12,9 +12,12 @@
 #![allow(
     clippy::new_without_default,
     ambiguous_wide_pointer_comparisons,
-    unreachable_patterns,
-    unused
+    unreachable_patterns
 )]
+// Parts of the shared layer, and their implementations in other backends,
+// are only reached from `sys` (or from `sys` and `v8`): a build without
+// `sys` does not use them.
+#![cfg_attr(not(feature = "sys"), allow(dead_code))]
 #![warn(
     clippy::float_arithmetic,
     clippy::mut_mut,
@@ -27,8 +30,9 @@
 
 //! [`Wasmer`](https://wasmer.io/) is the most popular
 //! [WebAssembly](https://webassembly.org/) runtime for Rust. It supports
-//! JIT (Just In Time) and AOT (Ahead Of Time) compilation as well as
-//! pluggable compilers suited to your needs and interpreters.
+//! JIT (Just In Time) and AOT (Ahead Of Time) compilation, with pluggable
+//! compilers suited to your needs, and can also run on V8 or in a
+//! JavaScript host.
 //!
 //! It's designed to be safe and secure, and runnable in any kind of environment.
 //!
@@ -245,10 +249,11 @@
 //!
 //! ## Runtimes
 //!
-//! A runtime is a system that handles the details of making a Wasm module executable. We support
-//! multiple kinds of runtimes: compilers, which generate native machine code for each Wasm
-//! function and interpreter, in which no native machine code is generated and can be used on
-//! platforms where JIT compilation is not allowed, such as iOS.
+//! A runtime is a system that handles the details of making a Wasm module executable. The `sys`
+//! runtime generates native machine code for each Wasm function with one of the compilers. With
+//! `headless`, it only loads code compiled ahead of time, which also works on platforms where JIT
+//! compilation is not allowed, such as iOS. The `v8` and `js` runtimes hand the module to V8 and
+//! to the JavaScript host's own engine.
 //!
 //! # Cargo Features
 //!
@@ -257,7 +262,7 @@
 #![cfg_attr(not(feature = "sys"), doc = "(disabled),")]
 //!    where `wasmer` will be compiled to a native executable
 //!    which provides compilers, engines, a full VM etc.
-//!    By default, the `singlepass` and `cranelift` backends are enabled.
+//!    By default (`sys-default`), the `cranelift` compiler is enabled.
 //!
 //! 2. `v8`
 #![cfg_attr(feature = "v8", doc = "(enabled),")]
@@ -271,6 +276,14 @@
 //!    where `wasmer` will be compiled to WebAssembly to run in a
 //!    JavaScript host (see [Using Wasmer in a JavaScript
 //!    environment](#using-wasmer-in-a-javascript-environment)).
+//!
+//! The `async` feature
+#![cfg_attr(feature = "async", doc = "(enabled),")]
+#![cfg_attr(not(feature = "async"), doc = "(disabled),")]
+//! one of the default features, adds async calls into WebAssembly
+//! (`Function::call_async`) and async host functions
+//! (`Function::new_typed_async`) to every backend. It cannot be built with
+//! `baremetal`.
 //!
 #![cfg_attr(
     feature = "sys",
@@ -304,10 +317,15 @@
 #![cfg_attr(feature = "wat", doc = "(enabled),")]
 #![cfg_attr(not(feature = "wat"), doc = "(disabled),")]
 //!   enables `wasmer` to parse the WebAssembly text format,
-//! - `compilation`
+//! - `compiler`
 #![cfg_attr(feature = "compiler", doc = "(enabled),")]
 #![cfg_attr(not(feature = "compiler"), doc = "(disabled),")]
-//!   enables compilation with the wasmer engine.
+//!   enables compilation with the wasmer engine (each compiler enables it),
+//! - `headless`
+#![cfg_attr(feature = "headless", doc = "(enabled),")]
+#![cfg_attr(not(feature = "headless"), doc = "(disabled),")]
+//!   enables the `sys` runtime without a compiler, which loads modules
+//!   compiled ahead of time with [`Module::deserialize`].
 //!
 //! Notice that the `sys` and `v8` features are composable together,
 //! so a single build of Wasmer using `llvm`, `cranelift`, `singlepass`, and `v8`
@@ -331,9 +349,9 @@
 #![cfg_attr(not(feature = "wasm-types-polyfill"), doc = "(disabled),")]
 //!   parses the Wasm file, allowing to do type reflection of the
 //!   inner Wasm types. It adds 100kb to the Wasm bundle (28kb
-//!   gzipped). It is possible to disable it and to use
-//!   `Module::set_type_hints` manually instead for a lightweight
-//!   alternative. This is needed until the [Wasm JS introspection API
+//!   gzipped). Without it, the types that [`Module::imports`] and
+//!   [`Module::exports`] report are placeholders, not those of the
+//!   module. This is needed until the [Wasm JS introspection API
 //!   proposal](https://github.com/WebAssembly/js-types/blob/master/proposals/js-types/Overview.md)
 //!   is adopted by browsers,
 //! - `wat`
@@ -445,9 +463,20 @@ compile_error!(
 // A `baremetal` trap leaves through the embedder's unwinder, which cannot
 // stop at the coroutine of a `call_async`, and a call dropped while suspended
 // cannot be unwound either: it would be forgotten, stack and all.
-#[cfg(all(feature = "sys", feature = "experimental-async", feature = "baremetal"))]
+// The `js` backend runs in a JavaScript host, and the native backends do not.
+#[cfg(all(feature = "js", not(target_arch = "wasm32")))]
 compile_error!(
-    "the `experimental-async` feature is not supported with `baremetal`: traps and cancelled calls cannot unwind a `call_async` coroutine there."
+    "the `js` feature requires the `wasm32` target architecture: build with `--target wasm32-unknown-unknown`."
+);
+
+#[cfg(all(any(feature = "sys", feature = "v8"), target_arch = "wasm32"))]
+compile_error!(
+    "the `sys` and `v8` features require a native target: use `js` or `js-default` for `wasm32`."
+);
+
+#[cfg(all(feature = "sys", feature = "async", feature = "baremetal"))]
+compile_error!(
+    "the `async` feature is not supported with `baremetal`: traps and cancelled calls cannot unwind a `call_async` coroutine there. `async` is a default feature: disable default features to use `baremetal`."
 );
 
 cfg_compiler! {

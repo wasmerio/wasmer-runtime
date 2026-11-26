@@ -550,3 +550,40 @@ fn module_from_file_non_utf8_path() -> Result<(), String> {
     assert_eq!(module.name(), Some("name"));
     Ok(())
 }
+
+#[test]
+// `Engine::default()` is a `sys` engine.
+#[cfg(all(feature = "sys", not(feature = "v8-default")))]
+fn funcrefs_of_a_module_compiled_by_another_engine() -> Result<(), String> {
+    // Each engine has a registry of signatures, and the memory of the code it
+    // compiled, of its own. The module keeps the engine that compiled it.
+    let module = Module::new(
+        &Engine::default(),
+        r#"(module
+            (type $t (func (param i64 i64 f32) (result f64)))
+            (func $f (type $t) f64.const 1.5)
+            (table (export "table") 1 funcref)
+            (elem (i32.const 0) $f))"#,
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    let mut store = Store::new(Engine::default());
+    let instance =
+        Instance::new(&mut store, &module, &imports! {}).map_err(|e| format!("{e:?}"))?;
+    let table = instance
+        .exports
+        .get_table("table")
+        .map_err(|e| format!("{e:?}"))?;
+
+    let Some(Value::FuncRef(Some(function))) = table.get(&mut store, 0) else {
+        return Err("the table does not hold the function".into());
+    };
+    assert_eq!(
+        function.ty(&store),
+        FunctionType::new([Type::I64, Type::I64, Type::F32], [Type::F64])
+    );
+    let results = function
+        .call(&mut store, &[Value::I64(0), Value::I64(0), Value::F32(0.0)])
+        .map_err(|e| format!("{e:?}"))?;
+    assert_eq!(results.to_vec(), vec![Value::F64(1.5)]);
+    Ok(())
+}

@@ -13,7 +13,7 @@
 //! Run it with at least one compiler:
 //!
 //! ```sh
-//! cargo bench --locked -p wasmer-workspace --features cranelift,experimental-async --bench async_import
+//! cargo bench --locked -p wasmer-workspace --features cranelift,async --bench async_import
 //! ```
 
 use std::{

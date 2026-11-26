@@ -29,13 +29,25 @@ pub(crate) type HostFuture =
 /// The store is reachable only through [`with`](Self::with), a synchronous
 /// closure, so no store borrow can cross an `.await`:
 ///
-/// ```ignore
+/// ```
+/// # use wasmer::{AsyncEnv, Function, FunctionEnv, RuntimeError, Store};
+/// struct State {
+///     offset: i32,
+///     last: i32,
+/// }
+///
+/// # async fn lookup(key: i32) -> i32 { key }
 /// async fn fetch(cx: &mut AsyncEnv<State>, key: i32) -> Result<i32, RuntimeError> {
-///     let client = cx.with(|env| env.data().client.clone());
-///     let value = client.get(key).await?;
+///     let offset = cx.with(|env| env.data().offset);
+///     // The store is not borrowed here, so other calls can use it.
+///     let value = lookup(key + offset).await;
 ///     cx.with(|mut env| env.data_mut().last = value);
 ///     Ok(value)
 /// }
+///
+/// let mut store = Store::default();
+/// let env = FunctionEnv::new(&mut store, State { offset: 1, last: 0 });
+/// let fetch = Function::new_typed_async(&mut store, &env, fetch);
 /// ```
 ///
 /// To call a guest and wait for it, pass `cx` to
@@ -259,6 +271,8 @@ where
 
 macro_rules! impl_async_host_function {
     ( $( $x:ident ),* ) => {
+        // A single argument is `(A1)`, which is `A1` itself.
+        #[allow(unused_parens)]
         impl<$( $x, )* Rets, RetsAsResult, T, F>
             sealed::Sealed<T, ( $( $x ),* ), Rets, ReturnsFuture> for F
         where
@@ -271,6 +285,8 @@ macro_rules! impl_async_host_function {
         {
         }
 
+        // A single argument is `(A1)`, which is `A1` itself.
+        #[allow(unused_parens)]
         impl<$( $x, )* Rets, RetsAsResult, T, F>
             sealed::Sealed<T, ( $( $x ),* ), Rets, ReturnsDeferred> for F
         where
@@ -283,6 +299,8 @@ macro_rules! impl_async_host_function {
         {
         }
 
+        // A single argument is `(A1)`, which is `A1` itself.
+        #[allow(unused_parens)]
         impl<$( $x, )* Rets, RetsAsResult, T, F>
             AsyncHostFunction<T, ( $( $x ),* ), Rets, ReturnsDeferred> for F
         where
@@ -312,6 +330,8 @@ macro_rules! impl_async_host_function {
             }
         }
 
+        // A single argument is `(A1)`, which is `A1` itself.
+        #[allow(unused_parens)]
         impl<$( $x, )* Rets, RetsAsResult, T, F>
             AsyncHostFunction<T, ( $( $x ),* ), Rets, ReturnsFuture> for F
         where

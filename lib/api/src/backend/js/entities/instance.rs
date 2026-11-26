@@ -48,7 +48,7 @@ impl Instance {
 
     /// Creates a Wasmer `Instance` from a Wasmer `Module` and a WebAssembly Instance
     pub(crate) fn from_module_and_instance(
-        mut store: &mut impl AsStoreMut,
+        store: &mut impl AsStoreMut,
         module: &Module,
         instance: WebAssembly::Instance,
     ) -> Result<(Self, Exports), InstantiationError> {

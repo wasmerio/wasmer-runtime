@@ -5,7 +5,7 @@ use wasm_bindgen::{JsValue, prelude::*};
 
 use crate::{
     RuntimeError,
-    js::{exception::Exception, vm::VMExceptionRef},
+    js::vm::VMExceptionRef,
 };
 
 #[derive(Debug)]
@@ -99,7 +99,7 @@ impl From<JsValue> for RuntimeError {
         if let Some(trap) = carried.or_else(|| downcast_from_ptr(&value)) {
             return trap.into();
         }
-        #[cfg(feature = "experimental-async")]
+        #[cfg(feature = "async")]
         if let Some(refusal) = crate::js::jspi::refusal(&value) {
             return refusal;
         }
@@ -356,7 +356,7 @@ extern "C" {
 
 /// The error of a trap, which stands for no error of the host: what a guest
 /// that is only to be unwound is woken with.
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub(crate) fn trap_error() -> JsValue {
     shim_trap_error()
 }

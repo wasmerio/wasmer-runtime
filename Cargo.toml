@@ -77,7 +77,6 @@ bytes = "1.11.1"
 bytesize = "2.3.1"
 cbindgen = { version = "0.29", default-features = false }
 cc = "1.2.47"
-cmake = "0.1.50"
 compiletest_rs = "0.11.2"
 corosensei = "0.3.0"
 cranelift-codegen = { version = "=0.138.0", default-features = false }
@@ -182,7 +181,6 @@ wat = "1.263.0"
 which = "8.0.0"
 windows-sys = { version = "0.61.2", default-features = false }
 xz = "0.1.0"
-zip = { version = "9.0.4", default-features = false }
 libwild = { version = "0.11.0", default-features = false, features = ["macho"] }
 
 [build-dependencies]
@@ -226,7 +224,7 @@ wasmer = { version = "=7.5.0", path = "lib/api", default-features = false, featu
 
 [features]
 # Select compiler features explicitly for examples and integration tests.
-default = ["wat", "wast", "cache", "middlewares"]
+default = ["wat", "wast", "cache", "middlewares", "async"]
 # backend means that the `wasmer` crate will be compiled with the `wasmer-compiler`.
 # That means: that is able to execute modules
 backend = []
@@ -249,7 +247,7 @@ wasmer-artifact-load = ["wasmer-compiler/wasmer-artifact-load"]
 wasmer-artifact-create = ["wasmer-compiler/wasmer-artifact-create"]
 static-artifact-load = ["wasmer-compiler/static-artifact-load"]
 static-artifact-create = ["wasmer-compiler/static-artifact-create"]
-experimental-async = ["wasmer/experimental-async"]
+async = ["wasmer/async"]
 
 # Testing features
 test-singlepass = ["singlepass"]
@@ -322,7 +320,7 @@ required-features = ["wat", "cranelift"]
 [[bench]]
 name = "async_import"
 harness = false
-required-features = ["wat", "experimental-async"]
+required-features = ["wat", "async"]
 
 [[example]]
 name = "early-exit"

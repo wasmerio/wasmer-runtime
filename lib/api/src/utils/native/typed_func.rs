@@ -5,13 +5,13 @@
 //!
 //! ```ignore
 //! let add_one = instance.exports.get_function("function_name")?;
-//! let add_one_native: TypedFunction<i32, i32> = add_one.native().unwrap();
+//! let add_one_native: TypedFunction<i32, i32> = add_one.typed(&store)?;
 //! ```
-#[cfg(feature = "experimental-async")]
-use crate::{AsyncCallStore, StoreMut};
+#[cfg(feature = "async")]
+use crate::{AsyncCallStore, NativeWasmTypeInto, StoreMut};
 use crate::{
-    AsStoreMut, BackendStore, CallWrapper, FromToNativeWasmType, Function, NativeWasmTypeInto,
-    RuntimeError, WasmTypeList, store::AsStoreRef,
+    AsStoreMut, BackendStore, CallWrapper, FromToNativeWasmType, Function, RuntimeError,
+    WasmTypeList, store::AsStoreRef,
 };
 use std::marker::PhantomData;
 use wasmer_types::RawValue;
@@ -95,8 +95,10 @@ macro_rules! impl_native_traits {
             /// Call the typed func asynchronously.
             ///
             /// See [`Function::call_async`] for what `store` can be.
-            #[cfg(feature = "experimental-async")]
+            #[cfg(feature = "async")]
             #[allow(clippy::too_many_arguments)]
+            // A function without arguments does not use the store.
+            #[allow(unused_variables)]
             pub fn call_async<'a, S: AsyncCallStore>(
                 &'a self,
                 store: &'a mut S,
@@ -109,30 +111,47 @@ macro_rules! impl_native_traits {
                 $(
                     let [<p_ $x>] = $x;
                 )*
-                store.start_typed_call(&self.func, move |store: &mut StoreMut<'_>| {
+                // Safety: a `TypedFunction` is only made for a function whose
+                // signature its `Args` and `Rets` match, and the closure makes
+                // one raw value of each argument's type.
+                unsafe { store.start_typed_call(&self.func, move |store: &mut StoreMut<'_>| {
                     // Ensure all parameters come from the same context.
                     if $(!FromToNativeWasmType::is_from_store(&[<p_ $x>], store) ||)* false {
                         return Err(RuntimeError::new(
                             "cross-`Store` values are not supported",
                         ));
                     }
+                    if $(!FromToNativeWasmType::is_funcref_usable(&[<p_ $x>], store) ||)* false {
+                        return Err(crate::entities::function::dynamic_funcref_error());
+                    }
                     let args: [RawValue; _] = [ $( [<p_ $x>].to_native().into_raw(store) ),* ];
                     Ok(args)
-                })
+                }) }
             }
 
+            /// Calls the function with arguments that are already raw values.
+            ///
+            /// Returns an error if `params_list` does not have one value per
+            /// argument, or if the backend has no raw calls (only `sys` does).
+            ///
+            /// # Safety
+            ///
+            /// Each value must be a valid raw value of the type of its
+            /// argument, as [`FromToNativeWasmType`] makes it, and a reference
+            /// must come from `store`.
             #[doc(hidden)]
-            #[allow(missing_docs)]
-            #[allow(unused_mut)]
-            #[allow(clippy::too_many_arguments)]
-            pub fn call_raw(&self, store: &mut impl AsStoreMut, mut params_list: Vec<RawValue> ) -> Result<Rets, RuntimeError> {
+            pub unsafe fn call_raw(&self, store: &mut impl AsStoreMut, params_list: Vec<RawValue> ) -> Result<Rets, RuntimeError> {
+                crate::entities::function::check_raw_arity(
+                    <( $( $x ),* ) as WasmTypeList>::size() as usize,
+                    params_list.len(),
+                )?;
                 match store.as_store_mut().inner.store {
                     #[cfg(feature = "sys")]
-                    BackendStore::Sys(_) => self.call_raw_sys(store, params_list),
+                    BackendStore::Sys(_) => unsafe { self.call_raw_sys(store, params_list) },
                     #[cfg(feature = "v8")]
-                    BackendStore::V8(_) => self.call_raw_v8(store, params_list),
+                    BackendStore::V8(_) => unsafe { self.call_raw_v8(store, params_list) },
                     #[cfg(feature = "js")]
-                    BackendStore::Js(_) => self.call_raw_js(store, params_list),
+                    BackendStore::Js(_) => unsafe { self.call_raw_js(store, params_list) },
                 }
             }
         }

@@ -2,10 +2,9 @@ pub(crate) mod env;
 pub(crate) mod numeric;
 pub(crate) mod typed;
 use std::marker::PhantomData;
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 use std::rc::Rc;
 
-pub(crate) use typed::*;
 
 #[wasm_bindgen(inline_js = r#"
 export function variadic(f) {
@@ -21,7 +20,7 @@ extern "C" {
     fn variadic(f: &JsValue) -> JsFunction;
 }
 
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 thread_local! {
     /// Whether the innermost entry into a guest on this thread is a
     /// synchronous call, rather than `call_async`. Saved and restored around
@@ -32,7 +31,7 @@ thread_local! {
 /// Marks the guest about to be entered as entered synchronously, until the
 /// guard is dropped: one that cannot be suspended. Some engines run the body
 /// of an async import before they refuse to suspend such a guest; the body
-/// refuses itself instead (see `jspi`). Without `experimental-async` there is
+/// refuses itself instead (see `jspi`). Without `async` there is
 /// nothing to mark.
 ///
 /// Synchronous calls of this crate mark the guest they enter, and the host
@@ -46,13 +45,13 @@ pub(crate) fn enter_sync() -> EnteredGuest {
 
 /// Marks the guest about to be entered by `call_async` as not entered
 /// synchronously, until the guard is dropped, whatever called `call_async`.
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub(crate) fn enter_async() -> EnteredGuest {
     EnteredGuest::new(false)
 }
 
 /// Whether the innermost entry into the running guest was a synchronous call.
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub(crate) fn entered_synchronously() -> bool {
     ENTERED_SYNCHRONOUSLY.get()
 }
@@ -60,7 +59,7 @@ pub(crate) fn entered_synchronously() -> bool {
 /// Marks what runs from now on as entered synchronously, or not, and returns
 /// how it was marked before: for a guest the engine resumes, and for what an
 /// exception boundary puts back (see `jspi` and `boundary`).
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub(crate) fn mark_entered(synchronously: bool) -> bool {
     ENTERED_SYNCHRONOUSLY.replace(synchronously)
 }
@@ -68,29 +67,29 @@ pub(crate) fn mark_entered(synchronously: bool) -> bool {
 /// `function`, a host function made for the store `id`, recorded as that
 /// store's (see `Function::is_from_store`).
 fn owned(function: JsFunction, id: wasmer_types::StoreId) -> JsFunction {
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     jspi::own(&function, id);
-    #[cfg(not(feature = "experimental-async"))]
+    #[cfg(not(feature = "async"))]
     let _ = id;
     function
 }
 
 /// Restores how the guest before was entered when dropped.
 pub(crate) struct EnteredGuest {
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     previous: bool,
 }
 
 impl EnteredGuest {
     #[inline]
     fn new(synchronously: bool) -> Self {
-        #[cfg(feature = "experimental-async")]
+        #[cfg(feature = "async")]
         {
             Self {
                 previous: ENTERED_SYNCHRONOUSLY.replace(synchronously),
             }
         }
-        #[cfg(not(feature = "experimental-async"))]
+        #[cfg(not(feature = "async"))]
         {
             let _ = synchronously;
             Self {}
@@ -101,19 +100,17 @@ impl EnteredGuest {
 impl Drop for EnteredGuest {
     #[inline]
     fn drop(&mut self) {
-        #[cfg(feature = "experimental-async")]
+        #[cfg(feature = "async")]
         ENTERED_SYNCHRONOUSLY.set(self.previous);
     }
 }
 
 use js_sys::{Array, Function as JsFunction};
-#[cfg(feature = "experimental-async")]
-use js_sys::Reflect;
 use wasm_bindgen::{JsCast, prelude::*};
 use wasmer_types::{FunctionType, RawValue, Type};
 
 use crate::{
-    AsStoreMut, AsStoreRef, BackendFunction, BackendFunctionEnv, BackendFunctionEnvMut,
+    AsStoreMut, AsStoreRef, BackendFunction, BackendFunctionEnvMut,
     CallWrapper, FromToNativeWasmType, FunctionEnv, FunctionEnvMut, HostFunction,
     HostFunctionKind, IntoResult, NativeWasmType, NativeWasmTypeInto, RuntimeError, StoreMut,
     Value, WasmTypeList, WithEnv, WithoutEnv,
@@ -126,7 +123,7 @@ use crate::{
     },
     vm::{VMExtern, VMExternFunction},
 };
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 use crate::{AsyncEnv, entities::function::async_host::HostFuture, js::jspi};
 
 use std::panic::{self, AssertUnwindSafe};
@@ -166,7 +163,7 @@ fn result_to_js(value: &Value, ty: Option<&Type>) -> JsValue {
 }
 
 /// Whether `values` are of the types `types`, as many as there are.
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub(crate) fn values_match(values: &[Value], types: &[Type]) -> bool {
     values.len() == types.len() && values.iter().zip(types).all(|(value, ty)| value.ty() == *ty)
 }
@@ -200,7 +197,7 @@ impl Function {
         ))
     }
 
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     pub(crate) fn new_async<FT, F, T>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
@@ -407,15 +404,14 @@ impl Function {
         self.handle.ty.clone()
     }
 
-    pub fn call_raw(
+    pub(crate) unsafe fn call_raw(
         &self,
         _store: &mut impl AsStoreMut,
         _params: Vec<RawValue>,
     ) -> Result<Box<[Value]>, RuntimeError> {
-        // There is no optimal call_raw in JS, so we just
-        // simply rely the call
-        // self.call(store, params)
-        unimplemented!();
+        Err(RuntimeError::new(
+            "raw calls are not supported by the js backend",
+        ))
     }
 
     pub fn call(
@@ -517,12 +513,12 @@ impl Function {
 
     /// Checks whether this `Function` can be used with the given context.
     pub fn is_from_store(&self, _store: &impl AsStoreRef) -> bool {
-        #[cfg(feature = "experimental-async")]
+        #[cfg(feature = "async")]
         return jspi::belongs_to(
             &self.handle.function,
             _store.as_store_ref().objects().id(),
         );
-        #[cfg(not(feature = "experimental-async"))]
+        #[cfg(not(feature = "async"))]
         true
     }
 }
@@ -711,7 +707,7 @@ mod tests {
 }
 
 /// The arguments of a call of an async host function, as they arrived.
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 enum Arguments {
     Array(Array),
     /// Parameters that are all numbers.
@@ -719,7 +715,7 @@ enum Arguments {
 }
 
 /// An async host function, as the body of its import needs it.
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 struct AsyncHost<T, F> {
     func: F,
     env: FunctionEnv<T>,
@@ -727,7 +723,7 @@ struct AsyncHost<T, F> {
     store_id: wasmer_types::StoreId,
 }
 
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 impl<T, F> AsyncHost<T, F>
 where
     T: 'static,
@@ -873,7 +869,7 @@ macro_rules! impl_host_function {
         #[allow(non_snake_case)]
         pub(crate) fn [<gen_fn_callback_ $c_struct_name:lower _no_env>]
             <$( $x: FromToNativeWasmType, )* Rets: WasmTypeList, RetsAsResult: IntoResult<Rets>, Func: Fn($( $x , )*) -> RetsAsResult + 'static>
-            (this: &Func) -> crate::backend::js::vm::VMFunctionCallback {
+            (_this: &Func) -> crate::backend::js::vm::VMFunctionCallback {
 
             /// This is a function that wraps the real host
             /// function. Its address will be used inside the
@@ -925,7 +921,7 @@ macro_rules! impl_host_function {
         #[allow(non_snake_case)]
         pub(crate) fn [<gen_fn_callback_ $c_struct_name:lower>]
             <$( $x: FromToNativeWasmType, )* Rets: WasmTypeList, RetsAsResult: IntoResult<Rets>, T: Send + 'static,  Func: Fn(FunctionEnvMut<T>, $( $x , )*) -> RetsAsResult + 'static>
-            (this: &Func) -> crate::backend::js::vm::VMFunctionCallback {
+            (_this: &Func) -> crate::backend::js::vm::VMFunctionCallback {
 
             /// This is a function that wraps the real host
             /// function. Its address will be used inside the
@@ -978,10 +974,6 @@ macro_rules! impl_host_function {
 
                 match result {
                     Ok(Ok(c_struct)) => c_struct,
-                    #[allow(deprecated)]
-                    #[cfg(feature = "std")]
-                    Ok(Err(trap)) => crate::js::error::raise(Box::new(trap)),
-                    #[cfg(feature = "core")]
                     #[allow(deprecated)]
                     Ok(Err(trap)) => crate::js::error::raise(Box::new(trap)),
                     Err(panic) => raise_host_function_panic(panic),

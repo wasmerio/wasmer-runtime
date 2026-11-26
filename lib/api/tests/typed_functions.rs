@@ -171,3 +171,42 @@ fn holochain_typed_function() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[engine_test]
+fn raw_calls_check_the_number_of_arguments() -> anyhow::Result<()> {
+    // Raw calls are only supported by `sys`: the others return an error. The
+    // default store is a `sys` one.
+    #[cfg(all(feature = "sys", not(feature = "v8-default")))]
+    {
+        let mut store = Store::default();
+        let module = Module::new(
+            &store,
+            r#"(module
+                (func (export "add") (param i32 i32) (result i32)
+                    local.get 0 local.get 1 i32.add))"#,
+        )?;
+        let instance = Instance::new(&mut store, &module, &imports! {})?;
+        let add = instance.exports.get_function("add")?.clone();
+        let one = Value::I32(1).as_raw(&store);
+        let two = Value::I32(2).as_raw(&store);
+
+        // Safety: every value is an `i32`, which is what `add` takes.
+        unsafe {
+            assert!(add.call_raw(&mut store, vec![one]).is_err());
+            assert!(add.call_raw(&mut store, vec![one, two, two]).is_err());
+            assert_eq!(
+                add.call_raw(&mut store, vec![one, two])?.to_vec(),
+                vec![Value::I32(3)]
+            );
+        }
+
+        let add: TypedFunction<(i32, i32), i32> = add.typed(&store)?;
+        // Safety: as above.
+        unsafe {
+            assert!(add.call_raw(&mut store, vec![one]).is_err());
+            assert_eq!(add.call_raw(&mut store, vec![one, two])?, 3);
+        }
+    }
+
+    Ok(())
+}

@@ -9,7 +9,7 @@
         "wasmer/llvm",
         "wasmer/cranelift",
         "wasmer/singlepass",
-        "wasmer/experimental-async",
+        "wasmer/async",
         "wasmer/experimental-host-interrupt",
         "wasmer-bin-fuzz/llvm",
         "wasmer-bin-fuzz/cranelift",

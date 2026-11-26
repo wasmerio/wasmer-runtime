@@ -2,7 +2,7 @@
 //! runs, is suspended and resumes; what dropping a call does to its guest;
 //! what a guest sees when it cannot be suspended; and what goes through an
 //! async import.
-#![cfg(all(feature = "experimental-async", feature = "js", target_arch = "wasm32"))]
+#![cfg(all(feature = "async", feature = "js", target_arch = "wasm32"))]
 
 use std::{
     cell::{Cell, RefCell},

@@ -1,39 +1,43 @@
+#[cfg(feature = "sys")]
+use crate::BackendTag;
 use crate::vm::VMExceptionRef;
-use crate::{
-    AsStoreMut, AsStoreRef, BackendTag, ExportError, Exportable, Extern, Tag, Value,
-    macros::backend::{gen_rt_ty, match_rt},
-    vm::{VMExtern, VMExternTag},
-};
+use crate::{AsStoreMut, AsStoreRef, RuntimeError, Tag, Value, macros::backend::gen_rt_ty};
 
-/// A WebAssembly `global` instance.
-///
-/// A global instance is the runtime representation of a global variable.
-/// It consists of an individual value and a flag indicating whether it is mutable.
-///
-/// Spec: <https://webassembly.github.io/spec/core/exec/runtime.html#global-instances>
+// The exception of each backend, behind [`crate::Exception`].
 gen_rt_ty! {
     #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
     #[derive(Debug, Clone, PartialEq, Eq, derive_more::From)]
     pub(crate) BackendException(entities::exception::Exception);
 }
 
+/// Only `sys` has exceptions. Elsewhere [`BackendException::new`] refuses to
+/// make one, and a trap never carries one, so no other variant is made.
+const ONLY_SYS: &str = "only the `sys` backend has exceptions, so no other backend makes one";
+
+// Only `sys` has exceptions: elsewhere the arguments go unused.
+#[cfg_attr(not(feature = "sys"), allow(unused_variables))]
 impl BackendException {
     /// Create a new exception with the given tag type and payload.
     #[inline]
     #[allow(irrefutable_let_patterns)]
-    pub fn new(store: &mut impl AsStoreMut, tag: &Tag, payload: &[Value]) -> Self {
+    pub fn new(
+        store: &mut impl AsStoreMut,
+        tag: &Tag,
+        payload: &[Value],
+    ) -> Result<Self, RuntimeError> {
         match &store.as_store_mut().inner.store {
             #[cfg(feature = "sys")]
             crate::BackendStore::Sys(_) => {
                 let BackendTag::Sys(tag) = &tag.0 else {
-                    panic!("cannot create Exception with Tag from another backend");
+                    return Err(RuntimeError::new(
+                        "the tag of an exception must come from the same backend as its store",
+                    ));
                 };
-
-                Self::Sys(crate::backend::sys::exception::Exception::new(
-                    store, tag, payload,
-                ))
+                crate::backend::sys::exception::Exception::new(store, tag, payload).map(Self::Sys)
             }
-            _ => unimplemented!("new is only implemented for the sys backend"),
+            _ => Err(RuntimeError::new(
+                "exceptions are only supported by the `sys` backend",
+            )),
         }
     }
 
@@ -43,7 +47,7 @@ impl BackendException {
         match self {
             #[cfg(feature = "sys")]
             Self::Sys(s) => s.is_from_store(store),
-            _ => unimplemented!("is_from_store is only implemented for the sys backend"),
+            _ => unreachable!("{ONLY_SYS}"),
         }
     }
 
@@ -53,7 +57,7 @@ impl BackendException {
         match self {
             #[cfg(feature = "sys")]
             Self::Sys(s) => Tag(BackendTag::Sys(s.tag(store))),
-            _ => unimplemented!("tag is only implemented for the sys backend"),
+            _ => unreachable!("{ONLY_SYS}"),
         }
     }
 
@@ -63,7 +67,7 @@ impl BackendException {
         match self {
             #[cfg(feature = "sys")]
             Self::Sys(s) => s.payload(store),
-            _ => unimplemented!("payload is only implemented for the sys backend"),
+            _ => unreachable!("{ONLY_SYS}"),
         }
     }
 
@@ -73,7 +77,7 @@ impl BackendException {
         match self {
             #[cfg(feature = "sys")]
             Self::Sys(s) => VMExceptionRef::Sys(s.exnref()),
-            _ => unimplemented!("vm_exceptionref is only implemented for the sys backend"),
+            _ => unreachable!("{ONLY_SYS}"),
         }
     }
 
@@ -85,7 +89,7 @@ impl BackendException {
             VMExceptionRef::Sys(s) => {
                 Self::Sys(crate::backend::sys::exception::Exception::from_exnref(s))
             }
-            _ => unimplemented!("from_vm_exceptionref is only implemented for the sys backend"),
+            _ => unreachable!("{ONLY_SYS}"),
         }
     }
 }

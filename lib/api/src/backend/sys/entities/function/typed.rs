@@ -1,16 +1,13 @@
+use crate::backend::sys::engine::NativeEngineExt;
 #[cfg(feature = "experimental-host-interrupt")]
-use crate::backend::sys::vm::interrupt_registry;
-use crate::backend::sys::{
-    engine::NativeEngineExt,
-    vm::{Trap, TrapCode},
-};
+use crate::backend::sys::vm::{Trap, TrapCode, interrupt_registry};
 use crate::{
-    CallWrapper, FromToNativeWasmType, Function, NativeWasmTypeInto, RuntimeError, StoreContext,
-    TypedFunction, Value, WasmTypeList,
+    CallWrapper, FromToNativeWasmType, NativeWasmTypeInto, RuntimeError, StoreContext,
+    TypedFunction, WasmTypeList,
     entities::function::call_wrapper::call_wrapped,
     store::{AsStoreMut, AsStoreRef},
 };
-use wasmer_types::{FunctionType, RawValue, Type};
+use wasmer_types::RawValue;
 
 macro_rules! impl_native_traits {
     (  $( $x:ident ),* ) => {
@@ -22,7 +19,7 @@ macro_rules! impl_native_traits {
         {
             /// Call the typed func and return results.
             #[allow(clippy::too_many_arguments)]
-            pub fn call_sys(&self, store: &mut impl AsStoreMut, $( $x: $x, )* ) -> Result<Rets, RuntimeError> {
+            pub(crate) fn call_sys(&self, store: &mut impl AsStoreMut, $( $x: $x, )* ) -> Result<Rets, RuntimeError> {
                 self.call_wrapped_sys(store, None, $( $x, )*)
             }
 
@@ -44,6 +41,9 @@ macro_rules! impl_native_traits {
                         "cross-`Store` values are not supported",
                     ));
                 }
+                if $(!FromToNativeWasmType::is_funcref_usable(&$x, store) ||)* false {
+                    return Err(crate::entities::function::dynamic_funcref_error());
+                }
                 // TODO: when `const fn` related features mature more, we can declare a single array
                 // of the correct size here.
                 let mut params_list = [ $( $x.to_native().into_raw(store) ),* ];
@@ -61,10 +61,8 @@ macro_rules! impl_native_traits {
                     rets_list.as_mut()
                 };
 
-                let store_id = store.objects_mut().id();
-
                 #[cfg(feature = "experimental-host-interrupt")]
-                let interrupt_guard = match interrupt_registry::install(store_id) {
+                let interrupt_guard = match interrupt_registry::install(store.objects_mut().id()) {
                     Ok(x) => x,
                     Err(interrupt_registry::InstallError::AlreadyInterrupted) => {
                         return Err(Trap::lib(TrapCode::HostInterrupt).into());
@@ -130,11 +128,9 @@ macro_rules! impl_native_traits {
                 // Ok(Rets::from_c_struct(results))
             }
 
-            #[doc(hidden)]
-            #[allow(missing_docs)]
-            #[allow(unused_mut)]
-            #[allow(clippy::too_many_arguments)]
-            pub fn call_raw_sys(&self, store: &mut impl AsStoreMut, mut params_list: Vec<RawValue> ) -> Result<Rets, RuntimeError> {
+            /// See [`TypedFunction::call_raw`], which checks the number of
+            /// arguments.
+            pub(crate) unsafe fn call_raw_sys(&self, store: &mut impl AsStoreMut, mut params_list: Vec<RawValue> ) -> Result<Rets, RuntimeError> {
                 let anyfunc = unsafe {
                     *self.func.as_sys()
                         .handle
@@ -159,10 +155,8 @@ macro_rules! impl_native_traits {
                     rets_list.as_mut()
                 };
 
-                let store_id = store.objects_mut().id();
-
                 #[cfg(feature = "experimental-host-interrupt")]
-                let interrupt_guard = match interrupt_registry::install(store_id) {
+                let interrupt_guard = match interrupt_registry::install(store.objects_mut().id()) {
                     Ok(x) => x,
                     Err(interrupt_registry::InstallError::AlreadyInterrupted) => {
                         return Err(Trap::lib(TrapCode::HostInterrupt).into());

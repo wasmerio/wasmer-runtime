@@ -1,5 +1,4 @@
 /// Automatically generate "backend" types.
-#[macro_use]
 macro_rules! gen_rt_ty {
     {
         $(#[$meta:meta])*
@@ -35,20 +34,8 @@ macro_rules! gen_rt_ty {
 }
 
 /// Automatically create a match statement, repeating the expression for each backend.
-#[macro_use]
 macro_rules! match_rt {
     (on $self:expr => $var:ident { $stmt:expr }) => {
-        match $self {
-            #[cfg(feature = "sys")]
-            Self::Sys($var) => $stmt,
-            #[cfg(feature = "v8")]
-            Self::V8($var) => $stmt,
-            #[cfg(feature = "js")]
-            Self::Js($var) => $stmt,
-        }
-    };
-
-    (on $value:expr ; $match:expr => $var:ident { $stmt:expr }) => {
         match $self {
             #[cfg(feature = "sys")]
             Self::Sys($var) => $stmt,

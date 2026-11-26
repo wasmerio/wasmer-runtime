@@ -39,11 +39,13 @@ use crate::{
     StoreMut, StorePtrWrapper, Value,
     backend::sys::entities::{
         engine::NativeEngineExt,
-        function::{Function, RawEntry, RawHostFuture, RawResults, RawValues},
+        function::{Function, RawHostFuture, RawResults, RawValues},
     },
     entities::function::async_call::CallFinish,
 };
-use wasmer_types::{RawValue, StoreId, Type};
+#[cfg(feature = "experimental-host-interrupt")]
+use wasmer_types::StoreId;
+use wasmer_types::{RawValue, Type};
 use std::{marker::PhantomPinned, ptr::NonNull};
 use wasmer_vm::{SuspendedCall, wasmer_call_trampoline_suspendable};
 
@@ -373,6 +375,7 @@ impl<E: Entry> Future for AsyncCallFuture<'_, E> {
         let trap_handler = unsafe { StoreMut::from_raw(slice.ptr()) }
             .as_store_ref()
             .signal_handler();
+        #[cfg(feature = "experimental-host-interrupt")]
         let store_id = this.store.id();
         // A call that starts in this poll keeps what it shares with an async
         // import on this frame, and makes nothing to keep unless its guest
@@ -885,7 +888,6 @@ fn sys_store() -> crate::Store {
 mod instantiation {
     use std::{
         future::Future,
-        pin::Pin,
         task::{Context, Poll},
     };
 
@@ -1010,6 +1012,8 @@ mod future_block {
     use super::*;
 
     /// A future the size of a small host future's, which counts its drops.
+    // The array is only there for its size.
+    #[allow(dead_code)]
     struct Counted(Rc<Cell<u32>>, [u64; 8]);
 
     impl Counted {
@@ -1094,6 +1098,8 @@ mod future_block {
 
     #[test]
     fn a_destructor_that_panics_still_gives_the_block_back() {
+        // The array is only there for its size.
+        #[allow(dead_code)]
         struct Panics([u64; 8]);
         impl Drop for Panics {
             fn drop(&mut self) {

@@ -9,9 +9,11 @@ use std::{
 
 use wasmer_types::RawValue;
 
+#[cfg(feature = "sys")]
+use crate::WithSlice;
 use crate::{
     AsStoreMut, AsyncEnv, BackendFunction, CallStore, Function, RuntimeError, SharedStore,
-    StoreInner, StoreMut, Value, WasmTypeList, WithSlice,
+    StoreInner, StoreMut, Value, WasmTypeList,
 };
 
 /// The future of every async call.
@@ -180,8 +182,14 @@ pub trait AsyncCallStore: sealed::Sealed {
 
     /// Starts a typed call of `function`, whose arguments `args` makes as raw
     /// values. A store that can be reached now makes them now.
+    ///
+    /// # Safety
+    ///
+    /// `args` must make one valid raw value per parameter of `function`, of
+    /// its type, and `Rets` must be the function's results. Nothing checks
+    /// either: [`TypedFunction`](crate::TypedFunction) is what guarantees them.
     #[doc(hidden)]
-    fn start_typed_call<'a, A, Rets>(
+    unsafe fn start_typed_call<'a, A, Rets>(
         &'a mut self,
         function: &Function,
         args: impl FnOnce(&mut StoreMut<'_>) -> Result<A, RuntimeError> + 'static,
@@ -207,7 +215,7 @@ impl<S: AsStoreMut> AsyncCallStore for S {
         start(exclusive(self.as_store_mut()), request)
     }
 
-    fn start_typed_call<'a, A, Rets>(
+    unsafe fn start_typed_call<'a, A, Rets>(
         &'a mut self,
         function: &Function,
         args: impl FnOnce(&mut StoreMut<'_>) -> Result<A, RuntimeError> + 'static,
@@ -262,7 +270,7 @@ impl<T> AsyncCallStore for AsyncEnv<T> {
         )
     }
 
-    fn start_typed_call<'a, A, Rets>(
+    unsafe fn start_typed_call<'a, A, Rets>(
         &'a mut self,
         function: &Function,
         args: impl FnOnce(&mut StoreMut<'_>) -> Result<A, RuntimeError> + 'static,

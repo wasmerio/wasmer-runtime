@@ -91,12 +91,12 @@ jobs:
         run: |
           cargo fmt --all -- --check
           native_features="cranelift,singlepass,llvm,$ARTIFACT_FEATURES"
-          cargo clippy --workspace --examples --features "$native_features,experimental-async,wasmer/experimental-host-interrupt" --locked -- -D clippy::all
+          cargo clippy --workspace --examples --features "$native_features,async,wasmer/experimental-host-interrupt" --locked -- -D clippy::all
           cargo clippy -p wasmer-bin-fuzz --features "$native_features" --locked -- -D clippy::all
       - name: Lint JavaScript backend
         run: |
           cargo clippy --target wasm32-unknown-unknown -p wasmer --no-default-features --features js-default --locked -- -D clippy::all
-          cargo clippy --target wasm32-unknown-unknown -p wasmer --no-default-features --features js-default,experimental-async --locked -- -D clippy::all
+          cargo clippy --target wasm32-unknown-unknown -p wasmer --no-default-features --features js-default,async --locked -- -D clippy::all
       - name: Assert no files have changed
         shell: bash
         run: |
@@ -156,7 +156,7 @@ jobs:
             node --experimental-wasm-jspi -e "$has_jspi"
             node_args=$node_args,--experimental-wasm-jspi
           fi
-          features=js-default,experimental-async,wat
+          features=js-default,async,wat
           NODE_ARGS="$node_args" wasm-pack test --node -- --no-default-features --features "$features"
           NODE_ARGS="$node_args,--disallow-code-generation-from-strings" wasm-pack test --node -- --no-default-features --features "$features"
       # Node 24 runs a suspending import before it refuses to suspend one, where
@@ -223,7 +223,7 @@ jobs:
       - name: Test V8 API
         run: cargo nextest run -p wasmer --release --no-default-features --features v8-default --locked
       - name: Test async V8 API
-        run: cargo nextest run -p wasmer --release --no-default-features --features v8-default,experimental-async --test async_v8 --locked
+        run: cargo nextest run -p wasmer --release --no-default-features --features v8-default,async --test async_v8 --locked
   test_store_context_miri:
     name: Store context under Miri
     runs-on: ubuntu-22.04
@@ -427,7 +427,7 @@ jobs:
           # them with its own feature sets.
           args=(--workspace --release --locked --exclude wasmer-c-api --exclude wasmer-c-api-imports
             --exclude wasmer-c-api-test-runner --exclude wasmer-capi-examples-runner)
-          features="$ARTIFACT_FEATURES,experimental-async,wasmer/experimental-host-interrupt"
+          features="$ARTIFACT_FEATURES,async,wasmer/experimental-host-interrupt"
           if [[ "$TEST_PLATFORM" == windows-x64 ]]; then
             # Use V8 as the default backend on Windows, as the Makefile did.
             features+=,v8-default

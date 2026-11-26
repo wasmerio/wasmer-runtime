@@ -4,7 +4,9 @@ use std::{path::Path, sync::Arc};
 
 use shared_buffer::OwnedBuffer;
 pub use wasmer_compiler::{Artifact, BaseTunables, Engine, EngineBuilder, Tunables};
-use wasmer_types::{CompilationProgressCallback, DeserializeError, Features, target::Target};
+#[cfg(feature = "compiler")]
+use wasmer_types::Features;
+use wasmer_types::{CompilationProgressCallback, DeserializeError, target::Target};
 
 use crate::{BackendEngine, BackendModule};
 
@@ -182,7 +184,7 @@ impl NativeEngineExt for crate::engine::Engine {
             .map_err(|e| DeserializeError::Generic(format!("{e:?}")))?;
         let artifact = unsafe { Arc::new(Artifact::deserialize_unchecked(self.as_sys(), buffer)?) };
         Ok(crate::Module(BackendModule::Sys(
-            super::module::Module::from_artifact(artifact),
+            super::module::Module::from_artifact(self, artifact),
         )))
     }
 
@@ -195,7 +197,7 @@ impl NativeEngineExt for crate::engine::Engine {
             .map_err(|e| DeserializeError::Generic(format!("{e:?}")))?;
         let artifact = unsafe { Arc::new(Artifact::deserialize(self.as_sys(), buffer)?) };
         Ok(crate::Module(BackendModule::Sys(
-            super::module::Module::from_artifact(artifact),
+            super::module::Module::from_artifact(self, artifact),
         )))
     }
 }

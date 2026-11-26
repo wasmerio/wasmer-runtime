@@ -10,16 +10,17 @@ use wasmer_types::{
 };
 #[cfg(feature = "experimental-host-interrupt")]
 use wasmer_vm::interrupt_registry;
+#[cfg(feature = "experimental-host-interrupt")]
 use wasmer_vm::{Trap, TrapCode};
 
 use crate::{
     AsStoreMut, AsStoreRef, BackendModule, IntoBytes, StoreContext,
     backend::sys::entities::engine::NativeEngineExt, engine::AsEngineRef,
-    error::InstantiationError, vm::VMInstance,
+    error::InstantiationError,
 };
 use wasmer_vm::StoreHandle;
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
 /// A WebAssembly `module` in the `sys` runtime.
 pub struct Module {
@@ -28,9 +29,10 @@ pub struct Module {
     //
     // The reason for this is that dropping the Artifact will de-register the
     // trap handling metadata from the global registry. This must be done before
-    // the code memory for the artifact is freed (which happens when the store
-    // is dropped) since there is a chance that this memory could be reused by
-    // another module which will try to register its own trap information.
+    // the code memory for the artifact is freed (which happens when the last
+    // handle to the engine that compiled it is dropped) since there is a chance
+    // that this memory could be reused by another module which will try to
+    // register its own trap information.
     //
     // Note that in Rust, the drop order for struct fields is from top to
     // bottom: the opposite of C++.
@@ -38,7 +40,20 @@ pub struct Module {
     // In the future, this code should be refactored to properly describe the
     // ownership of the code and its metadata.
     artifact: Arc<Artifact>,
+    /// The engine that compiled the module, which owns the memory of its code:
+    /// a store of another engine can run the module after this one is gone.
+    #[cfg_attr(feature = "artifact-size", loupe(skip))]
+    #[allow(dead_code)] // Held for what it owns: it is never read.
+    engine: Engine,
 }
+
+impl PartialEq for Module {
+    fn eq(&self, other: &Self) -> bool {
+        self.artifact == other.artifact
+    }
+}
+
+impl Eq for Module {}
 
 impl Module {
     pub(crate) fn from_binary(
@@ -61,7 +76,7 @@ impl Module {
             .engine()
             .as_sys()
             .compile_with_progress(binary, Some(callback))?;
-        Ok(Self::from_artifact(artifact))
+        Ok(Self::from_artifact(engine, artifact))
     }
 
     pub(crate) unsafe fn from_binary_unchecked(
@@ -87,7 +102,7 @@ impl Module {
     #[cfg(feature = "compiler")]
     fn compile(engine: &impl AsEngineRef, binary: &[u8]) -> Result<Self, CompileError> {
         let artifact = engine.as_engine_ref().engine().as_sys().compile(binary)?;
-        Ok(Self::from_artifact(artifact))
+        Ok(Self::from_artifact(engine, artifact))
     }
 
     #[cfg(not(feature = "compiler"))]
@@ -115,7 +130,7 @@ impl Module {
                 .as_sys()
                 .deserialize_unchecked(bytes.into())?
         };
-        Ok(Self::from_artifact(artifact))
+        Ok(Self::from_artifact(engine, artifact))
     }
 
     #[tracing::instrument(level = "debug", skip_all)]
@@ -131,7 +146,7 @@ impl Module {
                 .as_sys()
                 .deserialize(bytes.into())?
         };
-        Ok(Self::from_artifact(artifact))
+        Ok(Self::from_artifact(engine, artifact))
     }
 
     pub(crate) unsafe fn deserialize_from_file_unchecked(
@@ -145,7 +160,7 @@ impl Module {
                 .as_sys()
                 .deserialize_from_file_unchecked(path.as_ref())?
         };
-        Ok(Self::from_artifact(artifact))
+        Ok(Self::from_artifact(engine, artifact))
     }
 
     pub(crate) unsafe fn deserialize_from_file(
@@ -159,11 +174,14 @@ impl Module {
                 .as_sys()
                 .deserialize_from_file(path.as_ref())?
         };
-        Ok(Self::from_artifact(artifact))
+        Ok(Self::from_artifact(engine, artifact))
     }
 
-    pub(super) fn from_artifact(artifact: Arc<Artifact>) -> Self {
-        Self { artifact }
+    pub(super) fn from_artifact(engine: &impl AsEngineRef, artifact: Arc<Artifact>) -> Self {
+        Self {
+            artifact,
+            engine: engine.as_engine_ref().engine().as_sys().clone(),
+        }
     }
 
     #[allow(clippy::result_large_err)]
@@ -187,6 +205,17 @@ impl Module {
         let mut store_mut = store.as_store_mut();
         let store_ptr = store_mut.inner as *mut _;
         let (engine, objects) = store_mut.engine_and_objects_mut();
+        // The store's engine reads the funcrefs of the instance back, and
+        // must know their signatures: it does not if another engine, with a
+        // registry of its own, compiled the module.
+        {
+            let info = self.info();
+            engine.as_sys().inner().signatures().register_missing(
+                info.signatures
+                    .values()
+                    .zip(info.signature_hashes.values().copied()),
+            );
+        }
         let config = engine.tunables().vmconfig();
         unsafe {
             let instance_handle = self.artifact.instantiate(

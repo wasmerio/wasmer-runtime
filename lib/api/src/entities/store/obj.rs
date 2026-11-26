@@ -19,8 +19,8 @@ pub enum StoreObjects {
 }
 
 impl StoreObjects {
-    /// Checks whether two stores are identical. A store is considered
-    /// equal to another store if both have the same engine.
+    /// Checks whether two handles are of the same store. Stores of different
+    /// backends are never the same.
     #[inline]
     pub fn same(a: &Self, b: &Self) -> bool {
         match (a, b) {
@@ -30,12 +30,7 @@ impl StoreObjects {
             (Self::V8(a), Self::V8(b)) => a.id() == b.id(),
             #[cfg(feature = "js")]
             (Self::Js(a), Self::Js(b)) => a.id() == b.id(),
-
-            _ => panic!(
-                "Incompatible `StoreObjects` instance: {}, {}!",
-                a.id(),
-                b.id()
-            ),
+            _ => false,
         }
     }
 

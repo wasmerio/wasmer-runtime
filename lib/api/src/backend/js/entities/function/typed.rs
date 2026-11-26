@@ -5,7 +5,7 @@
 //!
 //! ```ignore
 //! let add_one = instance.exports.get_function("function_name")?;
-//! let add_one_native: TypedFunction<i32, i32> = add_one.typed().unwrap();
+//! let add_one_native: TypedFunction<i32, i32> = add_one.typed(&store)?;
 //! ```
 use crate::{
     AsStoreMut, CallWrapper, FromToNativeWasmType, NativeWasmType, NativeWasmTypeInto,
@@ -70,7 +70,7 @@ macro_rules! impl_native_traits {
         {
             /// Call the typed func and return results.
             #[allow(clippy::too_many_arguments)]
-            pub fn call_js(&self, store: &mut impl AsStoreMut, $( $x: $x, )* ) -> Result<Rets, RuntimeError> where
+            pub(crate) fn call_js(&self, store: &mut impl AsStoreMut, $( $x: $x, )* ) -> Result<Rets, RuntimeError> where
             $( $x: FromToNativeWasmType,  )*
             {
                 self.call_wrapped_js(store, None, $( $x, )*)
@@ -78,7 +78,7 @@ macro_rules! impl_native_traits {
 
             /// Call the typed func through `wrapper` and return results.
             #[allow(clippy::too_many_arguments)]
-            pub(crate) fn call_wrapped_js(&self, mut store: &mut impl AsStoreMut, wrapper: Option<&mut dyn CallWrapper>, $( $x: $x, )* ) -> Result<Rets, RuntimeError> where
+            pub(crate) fn call_wrapped_js(&self, store: &mut impl AsStoreMut, wrapper: Option<&mut dyn CallWrapper>, $( $x: $x, )* ) -> Result<Rets, RuntimeError> where
             $( $x: FromToNativeWasmType,  )*
             {
                 #[allow(unused_unsafe)]
@@ -132,17 +132,17 @@ macro_rules! impl_native_traits {
                     0 => {},
                     1 => unsafe {
                         let ty = Rets::wasm_types()[0];
-                        let val = js_value_to_wasmer(&mut store, &ty, &results);
-                        *mut_rets = val.as_raw(&mut store);
+                        let val = js_value_to_wasmer(store, &ty, &results);
+                        *mut_rets = val.as_raw(store);
                     }
                     _n => {
                         let results: Array = results.into();
                         for (i, ret_type) in Rets::wasm_types().iter().enumerate() {
                             let ret = results.get(i as u32);
                             unsafe {
-                                let val = js_value_to_wasmer(&mut store, &ret_type, &ret);
+                                let val = js_value_to_wasmer(store, &ret_type, &ret);
                                 let slot = mut_rets.add(i);
-                                *slot = val.as_raw(&mut store);
+                                *slot = val.as_raw(store);
                             }
                         }
                     }
@@ -150,12 +150,9 @@ macro_rules! impl_native_traits {
                 Ok(unsafe { Rets::from_array(store, rets_list_array) })
             }
 
-            #[doc(hidden)]
-            #[allow(missing_docs)]
-            #[allow(unused_mut)]
-            #[allow(clippy::too_many_arguments)]
-            pub fn call_raw_js(&self, store: &mut impl AsStoreMut, mut params_list: Vec<RawValue> ) -> Result<Rets, RuntimeError> {
-                todo!("Raw calls from js are not supported yet!")
+            /// See [`TypedFunction::call_raw`].
+            pub(crate) unsafe fn call_raw_js(&self, _store: &mut impl AsStoreMut, _params_list: Vec<RawValue> ) -> Result<Rets, RuntimeError> {
+                Err(RuntimeError::new("raw calls are not supported by the js backend"))
             }
         }
     };

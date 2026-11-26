@@ -55,7 +55,7 @@ impl MemoryBuffer<'_> {
             return Err(MemoryAccessError::HeapOutOfBounds);
         }
         let buf_ptr = buf.as_mut_ptr() as *mut u8;
-        let mut slice = unsafe { slice::from_raw_parts_mut(buf_ptr, buf.len()) };
+        let slice = unsafe { slice::from_raw_parts_mut(buf_ptr, buf.len()) };
         view.subarray(offset as _, end as _).copy_to(slice);
 
         Ok(slice)

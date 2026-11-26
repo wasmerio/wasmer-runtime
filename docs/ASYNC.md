@@ -1,7 +1,7 @@
 # Async calls
 
 This is the design of the async API in `lib/api`, behind the
-`experimental-async` feature: the contract it offers, why that contract is
+`async` feature: the contract it offers, why that contract is
 sound, how each backend implements it, and what it does not support yet. It
 is implemented for `sys`, JavaScript and V8. WASIX and NAPI live on `next` and
 are not ported to it yet.
@@ -352,8 +352,9 @@ its stack, which runs no guest or host code: a suspended stack holds only the
 frames of the guest and of the import that suspended it. A call dropped as its
 thread exits gives up its interrupt registrations.
 
-`baremetal` does not support `experimental-async`, and the two features fail
-to build together. A `baremetal` trap leaves through the embedder's unwinder,
+`baremetal` does not support `async`, and the two features fail
+to build together: `async` is a default feature, so a `baremetal` build
+disables the default features. A `baremetal` trap leaves through the embedder's unwinder,
 which cannot stop at the coroutine a call's guest runs on.
 
 ### JavaScript

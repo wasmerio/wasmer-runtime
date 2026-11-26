@@ -1,13 +1,8 @@
-//! Data types, functions and traits for `sys` runtime's `Tag` implementation.
-use std::any::Any;
+//! Data types, functions and traits for `sys` runtime's `Exception` implementation.
 
-use wasmer_types::{TagType, Type};
-use wasmer_vm::{StoreHandle, StoreId};
+use wasmer_vm::StoreHandle;
 
-use crate::{
-    AsStoreMut, AsStoreRef, BackendTag, Tag, Value,
-    sys::vm::{VMExceptionObj, VMExceptionRef},
-};
+use crate::{AsStoreMut, AsStoreRef, RuntimeError, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A WebAssembly `exnref` in the `sys` runtime.
@@ -18,30 +13,47 @@ pub(crate) struct Exception {
 impl Exception {
     /// Creates a new exception with the given tag and payload, and also creates
     /// a reference to it, returning the reference.
-    #[allow(irrefutable_let_patterns)]
-    pub fn new(store: &mut impl AsStoreMut, tag: &crate::sys::tag::Tag, payload: &[Value]) -> Self {
+    pub fn new(
+        store: &mut impl AsStoreMut,
+        tag: &crate::sys::tag::Tag,
+        payload: &[Value],
+    ) -> Result<Self, RuntimeError> {
         if !tag.is_from_store(store) {
-            panic!("cannot create Exception with Tag from another Store");
+            return Err(RuntimeError::new(
+                "the tag of an exception must come from its store",
+            ));
         }
 
         let store_objects = store.as_store_ref().objects().as_sys();
-        let store_id = store_objects.id();
-
         let tag_ty = tag.handle.get(store_objects).signature.params();
-
         if tag_ty.len() != payload.len() {
-            panic!("payload length mismatch");
+            return Err(RuntimeError::new(format!(
+                "the tag takes {} values, but the payload has {}",
+                tag_ty.len(),
+                payload.len()
+            )));
+        }
+        for (i, (value, ty)) in payload.iter().zip(tag_ty).enumerate() {
+            if value.ty() != *ty {
+                return Err(RuntimeError::new(format!(
+                    "payload value {i} is of type {}, but the tag takes {ty}",
+                    value.ty()
+                )));
+            }
+            // A reference is stored raw, so it must be one of this store.
+            if !value.is_from_store(store) {
+                return Err(RuntimeError::new(format!(
+                    "payload value {i} comes from another store"
+                )));
+            }
+            if !value.is_funcref_usable(store) {
+                return Err(crate::entities::function::dynamic_funcref_error());
+            }
         }
 
         let values = payload
             .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                if v.ty() != tag_ty[i] {
-                    panic!("payload type mismatch");
-                }
-                v.as_raw(store)
-            })
+            .map(|value| value.as_raw(store))
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
@@ -50,7 +62,7 @@ impl Exception {
         let exn_handle = wasmer_vm::StoreHandle::new(ctx, exception);
         let exnref = wasmer_vm::VMExceptionRef(exn_handle);
 
-        Self { exnref }
+        Ok(Self { exnref })
     }
 
     pub fn exnref(&self) -> wasmer_vm::VMExceptionRef {

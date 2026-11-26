@@ -91,8 +91,8 @@ fn assert_cross_store(result: Result<Global, RuntimeError>) {
 fn global_new_funcref() -> Result<(), String> {
     let mut store = Store::default();
 
-    // Without `experimental-async`, `js` cannot tell the store of a function.
-    #[cfg(any(not(feature = "js"), feature = "experimental-async"))]
+    // Without `async`, `js` cannot tell the store of a function.
+    #[cfg(any(not(feature = "js"), feature = "async"))]
     {
         let mut other_store = Store::default();
         let foreign = Function::new_typed(&mut other_store, || {});
@@ -146,8 +146,8 @@ fn global_new_externref() -> Result<(), String> {
     // Only `sys` can create an exception.
     #[cfg(feature = "sys")]
     {
-        let tag = Tag::new(&mut other_store, []);
-        let foreign = Exception::new(&mut other_store, &tag, &[]);
+        let tag = Tag::new(&mut other_store, []).unwrap();
+        let foreign = Exception::new(&mut other_store, &tag, &[]).unwrap();
         let foreign = Value::ExceptionRef(Some(foreign));
         assert_cross_store(Global::new(&mut store, foreign));
     }
@@ -504,7 +504,49 @@ fn table_grow() -> Result<(), String> {
 
 #[engine_test]
 fn table_copy() -> Result<(), String> {
-    // TODO: table copy test not yet implemented
+    // `Table::copy` is unimplemented on js, and returns an error on v8: this
+    // needs the default store to be a `sys` one.
+    #[cfg(all(feature = "sys", not(feature = "v8-default")))]
+    {
+        let mut store = Store::default();
+        let table_type = TableType {
+            ty: Type::ExternRef,
+            minimum: 1,
+            maximum: Some(1),
+            readonly: false,
+        };
+        // Three tables, so that a copy between two of them can reach the one
+        // next to either, and one of them is the last in the store.
+        let tables = (1..=3u32)
+            .map(|n| {
+                let value = Value::ExternRef(Some(ExternRef::new(&mut store, n)));
+                Table::new(&mut store, table_type, value).map_err(|e| format!("{e:?}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let read = |store: &mut Store| -> Vec<u32> {
+            tables
+                .iter()
+                .map(|table| match table.get(store, 0) {
+                    Some(Value::ExternRef(Some(ext))) => *ext.downcast::<u32>(store).unwrap(),
+                    other => panic!("unexpected table element: {other:?}"),
+                })
+                .collect()
+        };
+        let copy = |store: &mut Store, dst: usize, src: usize| {
+            Table::copy(store, &tables[dst], 0, &tables[src], 0, 1).map_err(|e| format!("{e:?}"))
+        };
+
+        // From an earlier table to a later one.
+        copy(&mut store, 1, 0)?;
+        assert_eq!(read(&mut store), [1, 1, 3]);
+        // From a later table to an earlier one.
+        copy(&mut store, 0, 2)?;
+        assert_eq!(read(&mut store), [3, 1, 3]);
+        // Into the last table in the store.
+        copy(&mut store, 2, 1)?;
+        assert_eq!(read(&mut store), [3, 1, 1]);
+    }
+
     Ok(())
 }
 
@@ -770,5 +812,95 @@ fn function_new_dynamic_env() -> Result<(), String> {
             [Type::I32, Type::F32, Type::F64]
         );
     }
+    Ok(())
+}
+
+#[engine_test]
+fn exception_new_checks_its_arguments() -> Result<(), String> {
+    let mut store = Store::default();
+    let tag = Tag::new(&mut store, [Type::I32]).map_err(|e| format!("{e:?}"))?;
+
+    // The default store is a `sys` one.
+    #[cfg(all(feature = "sys", not(feature = "v8-default")))]
+    {
+        let exception = Exception::new(&mut store, &tag, &[Value::I32(1)]);
+        assert_eq!(exception.unwrap().payload(&mut store), vec![Value::I32(1)]);
+
+        // The payload must have one value of each parameter's type.
+        assert!(Exception::new(&mut store, &tag, &[]).is_err());
+        assert!(Exception::new(&mut store, &tag, &[Value::I32(1), Value::I32(2)]).is_err());
+        assert!(Exception::new(&mut store, &tag, &[Value::I64(1)]).is_err());
+
+        // The tag and the references of the payload must be of the store.
+        let mut other = Store::default();
+        let foreign_tag = Tag::new(&mut other, [Type::I32]).unwrap();
+        assert!(Exception::new(&mut store, &foreign_tag, &[Value::I32(1)]).is_err());
+        let ref_tag = Tag::new(&mut store, [Type::ExternRef]).unwrap();
+        let foreign = Value::ExternRef(Some(ExternRef::new(&mut other, 0u32)));
+        assert!(Exception::new(&mut store, &ref_tag, &[foreign]).is_err());
+    }
+
+    // Only `sys` has exceptions: other default stores refuse them.
+    #[cfg(not(all(feature = "sys", not(feature = "v8-default"))))]
+    assert!(Exception::new(&mut store, &tag, &[Value::I32(1)]).is_err());
+
+    // `js` has tags of numbers only.
+    #[cfg(feature = "js")]
+    assert!(Tag::new(&mut store, [Type::ExternRef]).is_err());
+
+    Ok(())
+}
+
+#[engine_test]
+fn dynamic_functions_are_refused_as_funcrefs() -> anyhow::Result<()> {
+    // A dynamic host function of `sys` has no code that a funcref can point
+    // to: everything that would give one to WebAssembly refuses it. The
+    // default store is a `sys` one.
+    #[cfg(all(feature = "sys", not(feature = "v8-default")))]
+    {
+        let mut store = Store::default();
+        let dynamic = Function::new(&mut store, FunctionType::new([], []), |_| Ok(vec![]));
+        let typed = Function::new_typed(&mut store, || {});
+        let funcref = |f: &Function| Value::FuncRef(Some(f.clone()));
+
+        let table_type = TableType::new(Type::FuncRef, 1, None);
+        assert!(Table::new(&mut store, table_type, funcref(&dynamic)).is_err());
+        let table = Table::new(&mut store, table_type, funcref(&typed))?;
+        assert!(table.set(&mut store, 0, funcref(&dynamic)).is_err());
+        assert!(table.grow(&mut store, 1, funcref(&dynamic)).is_err());
+
+        assert!(Global::new(&mut store, funcref(&dynamic)).is_err());
+        let global = Global::new_mut(&mut store, funcref(&typed))?;
+        assert!(global.set(&mut store, funcref(&dynamic)).is_err());
+
+        let tag = Tag::new(&mut store, [Type::FuncRef])?;
+        assert!(Exception::new(&mut store, &tag, &[funcref(&dynamic)]).is_err());
+
+        let module = Module::new(
+            &store,
+            r#"(module
+                (import "env" "get" (func $get (result funcref)))
+                (func (export "take") (param funcref))
+                (func (export "get") (result funcref) call $get))"#,
+        )?;
+        let given = dynamic.clone();
+        let get = Function::new(
+            &mut store,
+            FunctionType::new([], [Type::FuncRef]),
+            move |_| Ok(vec![Value::FuncRef(Some(given.clone()))]),
+        );
+        let instance = Instance::new(&mut store, &module, &imports! { "env" => { "get" => get } })?;
+
+        let take = instance.exports.get_function("take")?;
+        assert!(take.call(&mut store, &[funcref(&dynamic)]).is_err());
+        take.call(&mut store, &[funcref(&typed)])?;
+        let take: TypedFunction<Option<Function>, ()> = take.typed(&store)?;
+        assert!(take.call(&mut store, Some(dynamic.clone())).is_err());
+
+        // A host function that returns one traps.
+        let get = instance.exports.get_function("get")?;
+        assert!(get.call(&mut store, &[]).is_err());
+    }
+
     Ok(())
 }

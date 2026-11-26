@@ -13,9 +13,6 @@ pub use native::*;
 pub(crate) mod mem;
 pub use mem::*;
 
-/// Useful macros to generate enums to represent `Runtime`-types.
-pub(crate) mod rt_macros;
-
 #[cfg(feature = "wasm-types-polyfill")]
 pub(crate) mod polyfill;
 

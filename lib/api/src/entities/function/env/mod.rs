@@ -1,7 +1,7 @@
 pub(crate) mod inner;
 pub(crate) use inner::*;
 
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 use crate::SharedStore;
 use crate::{AsStoreMut, AsStoreRef, StoreMut, StoreRef};
 use std::any::Any;
@@ -63,7 +63,7 @@ impl<T> FunctionEnv<T> {
     /// code that has no reference to it, such as a callback of an embedded
     /// engine. It finds out whether the store is in its reach with
     /// [`AsyncEnv::with_if_in_reach`](crate::AsyncEnv::with_if_in_reach).
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     pub fn async_env(&self) -> crate::AsyncEnv<T> {
         crate::AsyncEnv::new(self.clone(), self.0.store_id())
     }
@@ -107,13 +107,13 @@ impl<T: Send + 'static> FunctionEnvMut<'_, T> {
     /// code that outlives this borrow to keep. It reaches the store with
     /// [`AsyncEnv::with`](crate::AsyncEnv::with) while a call on the store is
     /// polled.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     pub fn async_env(&self) -> crate::AsyncEnv<T> {
         crate::AsyncEnv::new(self.as_ref(), self.as_store_ref().objects().id())
     }
 
     /// The store's shared handle, if it has one: see [`Store::into_shared`](crate::Store::into_shared).
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     pub fn shared(&self) -> Option<SharedStore> {
         self.as_store_ref().inner.shared.upgrade().map(SharedStore)
     }
@@ -123,7 +123,7 @@ impl<T: Send + 'static> FunctionEnvMut<'_, T> {
     /// This borrow is unreachable until `f` returns, so the store can be lent
     /// to code that holds no reference to it. Inside `f`,
     /// [`SharedStore::try_with`] succeeds once at a time.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     pub fn release<R>(&mut self, f: impl FnOnce() -> R) -> R {
         self.as_store_mut().parked(f)
     }

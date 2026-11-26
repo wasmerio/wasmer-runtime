@@ -1,7 +1,7 @@
 use crate::{
     ExportError, Exportable, Extern,
     error::RuntimeError,
-    store::{AsStoreMut, AsStoreRef, StoreMut, StoreRef},
+    store::{AsStoreMut, AsStoreRef},
     value::Value,
     vm::{VMExtern, VMExternGlobal},
 };

@@ -8,7 +8,7 @@ use crate::{
     vm::{VMExtern, VMExternTable},
 };
 use wasmer_types::TableType;
-use wasmer_vm::{StoreHandle, TableElement, Trap, VMTable};
+use wasmer_vm::{StoreHandle, TableElement, VMTable};
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
@@ -49,6 +49,9 @@ fn value_to_table_element(
     if !val.is_from_store(store) {
         return Err(RuntimeError::new("cannot pass Value across contexts"));
     }
+    if !val.is_funcref_usable(store) {
+        return Err(crate::entities::function::dynamic_funcref_error());
+    }
     Ok(match val {
         Value::ExternRef(extern_ref) => {
             wasmer_vm::TableElement::ExternRef(extern_ref.map(|e| e.vm_externref().unwrap_sys()))
@@ -76,7 +79,7 @@ fn value_from_table_element(store: &mut impl AsStoreMut, item: wasmer_vm::TableE
 
 impl Table {
     pub(crate) fn new(
-        mut store: &mut impl AsStoreMut,
+        store: &mut impl AsStoreMut,
         ty: TableType,
         init: Value,
     ) -> Result<Self, RuntimeError> {

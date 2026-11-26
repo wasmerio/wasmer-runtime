@@ -1,4 +1,4 @@
-use wasmer_types::{Features, target::Target};
+use wasmer_types::Features;
 
 /// The engine for the JavaScript runtime.
 #[derive(Clone, Debug)]
@@ -8,10 +8,6 @@ impl Engine {
     pub(crate) fn deterministic_id(&self) -> String {
         // All js engines have the same id
         String::from("js-generic")
-    }
-
-    pub(crate) fn artifact_format(&self) -> String {
-        String::from("js")
     }
 
     /// Returns the WebAssembly features supported by the JS engine.

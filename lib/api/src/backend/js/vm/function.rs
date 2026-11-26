@@ -57,7 +57,7 @@ impl VMFunction {
 
     /// `WebAssembly.promising(function)`, made by the first `call_async` and
     /// kept for the next ones (see `jspi::promising`).
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     pub(crate) fn promising(&self) -> Option<JsFunction> {
         crate::js::jspi::promising(&self.function)
     }
@@ -122,13 +122,7 @@ impl VMFunctionEnvironment {
     /// Returns a mutable reference to the underlying value.
     pub fn as_mut(&mut self) -> &mut (dyn Any + Send + 'static) {
         &mut *self.contents
-    }
-
-    /// Returns the underlying value, consuming the environment.
-    pub fn into_contents(self) -> Box<dyn Any + Send + 'static> {
-        self.contents
-    }
-}
+    }}
 
 #[repr(C)]
 /// The type of function bodies in the `js` VM.

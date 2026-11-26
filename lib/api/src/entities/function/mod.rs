@@ -2,7 +2,7 @@
 //! interact with them.
 
 pub(crate) mod inner;
-pub use inner::*;
+pub(crate) use inner::*;
 
 pub(crate) mod host;
 pub use host::*;
@@ -13,29 +13,28 @@ pub use env::*;
 pub(crate) mod call_wrapper;
 pub use call_wrapper::{CallWrapper, WasmCall};
 
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub(crate) mod async_call;
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub(crate) mod async_host;
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub(crate) mod deferred;
 #[doc(hidden)]
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub use async_call::AsyncCallRequest;
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub use async_call::{AsyncCall, AsyncCallStore};
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub use async_host::{
     AsyncDynamicHostFunction, AsyncEnv, AsyncHostFunction, ReturnsDeferred, ReturnsFuture,
 };
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub use deferred::Deferred;
 
 use wasmer_types::{FunctionType, RawValue};
 
 use crate::{
-    AsStoreMut, AsStoreRef, ExportError, Exportable, Extern, StoreMut, StoreRef, TypedFunction,
-    Value, WasmTypeList,
+    AsStoreMut, AsStoreRef, ExportError, Exportable, Extern, TypedFunction, Value, WasmTypeList,
     error::RuntimeError,
     vm::{VMExtern, VMExternFunction, VMFuncRef},
 };
@@ -186,7 +185,7 @@ impl Function {
     /// [`Function::call_async`], it may wait. Called synchronously, it must be
     /// ready at once, or the guest traps with `YieldOutsideAsyncContext`; on
     /// `js` it traps there either way.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     pub fn new_async<T, FT, F, Kind>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
@@ -227,7 +226,7 @@ impl Function {
     /// no future, and costs what a call of a sync host function costs. On
     /// the other backends that function is called as an `async` one, whose
     /// future is ready at once.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     pub fn new_typed_async<T, Args, Rets, Kind>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
@@ -389,13 +388,39 @@ impl Function {
 
     /// Calls the function asynchronously.
     ///
-    /// `store` is a store, the [`AsyncEnv`] of an async host function, or a
-    /// [`SharedStore`](crate::SharedStore):
+    /// `store` is a store, for a call that has it exclusively; the
+    /// [`AsyncEnv`] of an async host function, for a call made from inside
+    /// one; or a [`SharedStore`](crate::SharedStore), for a `'static` guest
+    /// task:
     ///
-    /// ```ignore
-    /// f.call_async(&mut store, &params).await?;  // exclusive call
-    /// f.call_async(cx, &params).await?;          // inside an async host function
-    /// f.call_async(&mut shared, &params).await?; // 'static guest task
+    /// ```
+    /// # use wasmer::{imports, AsyncEnv, Function, FunctionEnv, Instance, Module, Store, Value};
+    /// # futures::executor::block_on(async {
+    /// let mut store = Store::default();
+    /// let module = Module::new(
+    ///     &store,
+    ///     r#"(module
+    ///         (import "host" "double" (func $double (param i32) (result i32)))
+    ///         (func (export "run") (param i32) (result i32)
+    ///             local.get 0
+    ///             call $double))"#,
+    /// )?;
+    /// let env = FunctionEnv::new(&mut store, ());
+    /// // An async import, which may wait without blocking the thread.
+    /// let double = Function::new_typed_async(
+    ///     &mut store,
+    ///     &env,
+    ///     async |_cx: &mut AsyncEnv<()>, x: i32| -> i32 { x * 2 },
+    /// );
+    /// let imports = imports! { "host" => { "double" => double } };
+    /// let instance = Instance::new(&mut store, &module, &imports)?;
+    /// let run = instance.exports.get_function("run")?;
+    ///
+    /// let results = run.call_async(&mut store, &[Value::I32(21)]).await?;
+    /// assert_eq!(results[0], Value::I32(42));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # })
+    /// # .unwrap();
     /// ```
     ///
     /// The call borrows a store or `AsyncEnv` exclusively until it finishes or
@@ -425,7 +450,7 @@ impl Function {
     /// `poll` blocks while an import's future is driven, and a
     /// [`SharedStore`](crate::SharedStore) task whose import must wait fails
     /// with a trap.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     pub fn call_async<'a, S: AsyncCallStore>(
         &'a self,
         store: &'a mut S,
@@ -434,20 +459,52 @@ impl Function {
         store.start_call(AsyncCallRequest::dynamic(self.clone(), params))
     }
 
+    /// Calls the function with arguments that are already raw values.
+    ///
+    /// Returns an error if `params` does not have one value per parameter of
+    /// the function, or if the backend has no raw calls (only `sys` does).
+    ///
+    /// # Safety
+    ///
+    /// Each value must be a valid raw value of the type of its parameter, as
+    /// [`Value::as_raw`] makes it, and a reference must come from `store`.
     #[doc(hidden)]
-    #[allow(missing_docs)]
-    pub fn call_raw(
+    pub unsafe fn call_raw(
         &self,
         store: &mut impl AsStoreMut,
         params: Vec<RawValue>,
     ) -> Result<Box<[Value]>, RuntimeError> {
-        self.0.call_raw(store, params)
+        unsafe { self.0.call_raw(store, params) }
     }
 
     pub(crate) fn vm_funcref(&self, store: &impl AsStoreRef) -> VMFuncRef {
         self.0.vm_funcref(store)
     }
+}
 
+/// Why a dynamic host function is refused as a funcref.
+pub(crate) const DYNAMIC_FUNCREF: &str = "a dynamic host function (made with `Function::new` or \
+     `Function::new_with_env`) cannot be used as a funcref on the `sys` backend: make it with \
+     `Function::new_typed` or `Function::new_typed_with_env` instead";
+
+/// The error of a value that is refused as it holds a dynamic host function
+/// where a funcref goes.
+pub(crate) fn dynamic_funcref_error() -> RuntimeError {
+    RuntimeError::new(DYNAMIC_FUNCREF)
+}
+
+/// Refuses a raw call that does not have one value per parameter.
+pub(crate) fn check_raw_arity(params: usize, given: usize) -> Result<(), RuntimeError> {
+    if params == given {
+        Ok(())
+    } else {
+        Err(RuntimeError::new(format!(
+            "the function takes {params} arguments, but {given} raw values were given"
+        )))
+    }
+}
+
+impl Function {
     pub(crate) unsafe fn from_vm_funcref(store: &mut impl AsStoreMut, funcref: VMFuncRef) -> Self {
         unsafe { Self(BackendFunction::from_vm_funcref(store, funcref)) }
     }
@@ -551,6 +608,15 @@ impl Function {
     /// Checks whether this `Function` can be used with the given store.
     pub fn is_from_store(&self, store: &impl AsStoreRef) -> bool {
         self.0.is_from_store(store)
+    }
+
+    /// Returns whether WebAssembly can be given this function as a funcref: not
+    /// if it is a dynamic host function of the `sys` backend, which has no code of
+    /// its own that a funcref could point to.
+    ///
+    /// Only asked of values of the given store.
+    pub(crate) fn is_funcref_usable(&self, store: &impl AsStoreRef) -> bool {
+        self.0.is_funcref_usable(store)
     }
 
     /// With `false`, lets calls from Wasm to this host function run on the

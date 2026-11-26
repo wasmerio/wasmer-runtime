@@ -92,7 +92,6 @@ wasmer-derive = { path = "../derive", version = "=7.5.0" }
 wasmer-compiler = { path = "../compiler", version = "=7.5.0" }
 # - Optional dependencies for `js`.
 wasmparser = { workspace = true, default-features = false, optional = true }
-hashbrown = { workspace = true, optional = true }
 serde-wasm-bindgen.workspace = true
 serde.workspace = true
 target-lexicon.workspace = true
@@ -116,9 +115,11 @@ wasm-opt = false
 maintenance = { status = "actively-developed" }
 
 [features]
-default = ["sys-default"]
+default = ["sys-default", "async"]
+# `std` and `core` gate nothing: the crate always uses `std`. They are kept
+# so that manifests naming them still build.
 std = []
-core = ["hashbrown"]
+core = []
 artifact-size = [
   "dep:loupe",
   "wasmer-vm/artifact-size",
@@ -132,10 +133,11 @@ sys-default = ["sys", "wat", "cranelift", "demangle"]
 # Improve native stack traces without forcing the demanglers into browser builds.
 demangle = ["dep:symbolic-demangle"]
 
-headless = []
+# The `sys` runtime without a compiler, which loads precompiled artifacts.
+headless = ["sys"]
 
-# Experimental concurrent execution support
-experimental-async = ["dep:futures"]
+# Async calls into WebAssembly and async host functions (see docs/ASYNC.md).
+async = ["dep:futures"]
 
 # Experimental host-triggered interruption support
 experimental-host-interrupt = ["wasmer-vm/experimental-host-interrupt"]
@@ -152,7 +154,15 @@ cranelift = ["compiler", "wasmer-compiler-cranelift"]
 llvm = ["compiler", "wasmer-compiler-llvm"]
 
 # --- Enable the v8 backend and use it as default backend.
-v8 = ["wasm-c-api", "std", "dep:tempfile", "dep:which", "dep:xz", "dep:ureq"]
+v8 = [
+  "wasm-c-api",
+  "std",
+  "dep:bindgen",
+  "dep:tar",
+  "dep:ureq",
+  "dep:which",
+  "dep:xz",
+]
 # --- Enable the v8 backend and use it as defaul backend only if it is the only one enabled.
 v8-default = ["v8", "wat"]
 
@@ -188,21 +198,19 @@ wasmer-artifact-create = ["wasmer-compiler/wasmer-artifact-create"]
 static-artifact-load = ["wasmer-compiler/static-artifact-load"]
 static-artifact-create = ["wasmer-compiler/static-artifact-create"]
 
+# Only the `v8` backend has a build script that does anything.
 [build-dependencies]
-cmake.workspace = true
-tar.workspace = true
-tempfile = { workspace = true, optional = true }
+tar = { workspace = true, optional = true }
 ureq = { workspace = true, optional = true }
 which = { workspace = true, optional = true }
 xz = { workspace = true, optional = true }
-zip = { workspace = true, optional = true, features = ["deflate"] }
 
 [target.'cfg(not(target_env = "musl"))'.build-dependencies]
-bindgen = { workspace = true, default-features = true }
+bindgen = { workspace = true, optional = true, default-features = true }
 
 # musl does not support dlopen/dlsym functionality used by the bindgen (using libclang).
 [target.'cfg(target_env = "musl")'.build-dependencies]
-bindgen = { workspace = true, default-features = false, features = [
+bindgen = { workspace = true, optional = true, default-features = false, features = [
   "logging",
   "prettyplease",
   "static",

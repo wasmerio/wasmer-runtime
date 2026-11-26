@@ -131,7 +131,7 @@ impl Memory {
         MemoryView::new(self, store)
     }
 
-    pub fn size(&self, store: &impl AsStoreRef) -> Pages {
+    pub fn size(&self, _store: &impl AsStoreRef) -> Pages {
         let js_memory = &self.handle.memory;
         let our_js_memory: &JSMemory = JsCast::unchecked_from_js_ref(js_memory);
         let buffer = our_js_memory.buffer();

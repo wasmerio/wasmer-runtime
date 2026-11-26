@@ -11,7 +11,7 @@ use wasmer_types::entity::packed_option::ReservedValue;
 use wasmer_types::{
     ExportIndex, FunctionIndex, FunctionType, GlobalIndex, GlobalType, ImportIndex, InitExpr,
     InitExprOp, MemoryIndex, MemoryType, ModuleInfo, Pages, SignatureHash, SignatureIndex,
-    TableIndex, TableInitializer, TableType, TagIndex, TagType, Type,
+    TableIndex, TableInitializer, TableType, TagIndex, Type,
 };
 
 use wasmparser::{
@@ -666,7 +666,9 @@ pub fn parse_import_section(
                     field_name,
                 )?;
             }
-            TypeRef::FuncExact(_) => unimplemented!("custom-descriptors not implemented yet"),
+            TypeRef::FuncExact(_) => {
+                return Err("custom descriptors are not implemented yet".to_owned());
+            }
         }
     }
     Ok(())

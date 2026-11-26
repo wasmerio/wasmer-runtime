@@ -7,12 +7,12 @@ use crate::{
     macros::backend::{gen_rt_ty, match_rt},
 };
 
-/// A WebAssembly `memory` view.
-///
-/// A memory view is used to read and write to the linear memory.
-///
-/// After a memory is grown a view must not be used anymore. Views are
-/// created using the Memory.view() method.
+// A WebAssembly `memory` view.
+//
+// A memory view is used to read and write to the linear memory.
+//
+// After a memory is grown a view must not be used anymore. Views are
+// created using the Memory.view() method.
 gen_rt_ty! {
     #[derive(Debug, derive_more::From)]
     pub BackendMemoryView<'a>(entities::memory::view::MemoryView<'a>);
@@ -24,18 +24,18 @@ impl<'a> BackendMemoryView<'a> {
     pub(crate) fn new(memory: &Memory, store: &'a (impl AsStoreRef + ?Sized)) -> Self {
         match &store.as_store_ref().inner.store {
             #[cfg(feature = "sys")]
-            crate::BackendStore::Sys(s) => Self::Sys(
+            crate::BackendStore::Sys(_) => Self::Sys(
                 crate::backend::sys::entities::memory::view::MemoryView::new(
                     memory.as_sys(),
                     store,
                 ),
             ),
             #[cfg(feature = "v8")]
-            crate::BackendStore::V8(s) => Self::V8(
+            crate::BackendStore::V8(_) => Self::V8(
                 crate::backend::v8::entities::memory::view::MemoryView::new(memory.as_v8(), store),
             ),
             #[cfg(feature = "js")]
-            crate::BackendStore::Js(s) => Self::Js(
+            crate::BackendStore::Js(_) => Self::Js(
                 crate::backend::js::entities::memory::view::MemoryView::new(memory.as_js(), store),
             ),
         }

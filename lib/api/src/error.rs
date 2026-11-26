@@ -14,19 +14,18 @@ pub use wasmer_types::error::AtomicsError;
 /// This is based on the [link error][link-error] API.
 ///
 /// [link-error]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/WebAssembly/LinkError
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "std", derive(Error))]
-#[cfg_attr(feature = "std", error("Link error: {0}"))]
+#[derive(Debug, Clone, Error)]
+#[error("Link error: {0}")]
 pub enum LinkError {
     /// An error occurred when checking the import types.
-    #[cfg_attr(feature = "std", error("Error while importing {0:?}.{1:?}: {2}"))]
+    #[error("Error while importing {0:?}.{1:?}: {2}")]
     Import(String, String, ImportError),
 
     /// A trap occurred during linking.
-    #[cfg_attr(feature = "std", error("RuntimeError occurred during linking: {0}"))]
-    Trap(#[cfg_attr(feature = "std", source)] RuntimeError),
+    #[error("RuntimeError occurred during linking: {0}")]
+    Trap(#[source] RuntimeError),
     /// Insufficient resources available for linking.
-    #[cfg_attr(feature = "std", error("Insufficient resources: {0}"))]
+    #[error("Insufficient resources: {0}")]
     Resource(String),
 }
 
@@ -38,30 +37,29 @@ pub enum LinkError {
 /// Trap that occurs when calling the WebAssembly module
 /// start function, and an error when initializing the user's
 /// host environments.
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "std", derive(Error))]
+#[derive(Debug, Clone, Error)]
 pub enum InstantiationError {
     /// A linking occurred during instantiation.
-    #[cfg_attr(feature = "std", error(transparent))]
+    #[error(transparent)]
     Link(LinkError),
 
     /// A runtime error occurred while invoking the start function
-    #[cfg_attr(feature = "std", error(transparent))]
+    #[error(transparent)]
     Start(RuntimeError),
 
     /// The module was compiled with a CPU feature that is not available on
     /// the current host.
-    #[cfg_attr(feature = "std", error("missing required CPU features: {0:?}"))]
+    #[error("missing required CPU features: {0:?}")]
     CpuFeature(String),
 
     /// Import from a different [`Store`][super::Store].
     /// This error occurs when an import from a different store is used.
-    #[cfg_attr(feature = "std", error("cannot mix imports from different stores"))]
+    #[error("cannot mix imports from different stores")]
     DifferentStores,
 
     /// Import from a different Store.
     /// This error occurs when an import from a different store is used.
-    #[cfg_attr(feature = "std", error("incorrect OS or architecture"))]
+    #[error("incorrect OS or architecture")]
     DifferentArchOS,
 }
 
@@ -161,6 +159,8 @@ impl RuntimeError {
     ///
     /// If this error is returned from an imported function, the exception
     /// will be thrown in the WebAssembly code instead of the usual trapping.
+    // Only `sys` has exceptions to raise.
+    #[cfg_attr(not(feature = "sys"), allow(unused_variables))]
     pub fn exception(ctx: &impl AsStoreRef, exception: Exception) -> Self {
         let exnref = exception.vm_exceptionref();
         let store = ctx.as_store_ref();
@@ -272,6 +272,7 @@ impl RuntimeError {
         Ok(())
     }
 
+    #[cfg(feature = "async")]
     pub(crate) fn from_dyn(err: Box<dyn std::error::Error + Send + Sync>) -> Self {
         match err.downcast::<Self>() {
             Ok(runtime_error) => *runtime_error,

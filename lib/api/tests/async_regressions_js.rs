@@ -1,6 +1,6 @@
 //! Regressions from adversarial reviews of the JavaScript guest guard. Each
 //! test uses only safe public API.
-#![cfg(all(feature = "experimental-async", feature = "js", target_arch = "wasm32"))]
+#![cfg(all(feature = "async", feature = "js", target_arch = "wasm32"))]
 #![deny(unsafe_code)]
 
 use js_sys::Promise;

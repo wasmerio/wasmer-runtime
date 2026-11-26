@@ -73,7 +73,7 @@ impl Function {
     /// Creates an async host function from its body. The guest cannot
     /// suspend on this backend, so the import blocks its stack until the
     /// future is ready (see `v8::async_call`).
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     pub(crate) fn new_async<FT, F, T>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
@@ -400,15 +400,14 @@ impl Function {
         FunctionType::new(params, returns)
     }
 
-    pub fn call_raw(
+    pub(crate) unsafe fn call_raw(
         &self,
         _store: &mut impl AsStoreMut,
         _params: Vec<RawValue>,
     ) -> Result<Box<[Value]>, RuntimeError> {
-        // There is no optimal call_raw in JSC, so we just
-        // simply rely the call
-        // self.call(store, params)
-        unimplemented!();
+        Err(RuntimeError::new(
+            "raw calls are not supported by the v8 backend",
+        ))
     }
 
     pub fn call(

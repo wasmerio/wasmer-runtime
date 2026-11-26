@@ -4,7 +4,6 @@ use crate::{
     AsStoreMut, Memory, MemoryError,
     error::AtomicsError,
     location::{MemoryLocation, SharedMemoryOps},
-    vm::VMMemory,
     vm::VMSharedMemory,
 };
 

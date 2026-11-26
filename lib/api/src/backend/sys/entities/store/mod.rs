@@ -1,12 +1,10 @@
 //! Data types, functions and traits for `sys` runtime's `Store` implementation.
-use crate::BackendStore;
 use crate::entities::engine::{AsEngineRef, Engine, EngineRef};
 use wasmer_vm::TrapHandlerFn;
 use wasmer_vm::init_traps;
 pub use wasmer_vm::{StoreHandle, StoreId, StoreObjects};
 
 mod obj;
-pub use obj::*;
 
 /// A WebAssembly `store` in the `sys` runtime.
 pub struct Store {
@@ -83,14 +81,6 @@ impl NativeStoreExt for Store {
 }
 
 impl crate::BackendStore {
-    /// Consume [`self`] into [`crate::backend::sys::store::Store`].
-    pub fn into_sys(self) -> crate::backend::sys::store::Store {
-        match self {
-            Self::Sys(s) => s,
-            _ => panic!("Not a `sys` store!"),
-        }
-    }
-
     /// Convert a reference to [`self`] into a reference [`crate::backend::sys::store::Store`].
     pub fn as_sys(&self) -> &crate::backend::sys::store::Store {
         match self {
@@ -99,17 +89,6 @@ impl crate::BackendStore {
         }
     }
 
-    /// Convert a mutable reference to [`self`] into a mutable reference [`crate::backend::sys::store::Store`].
-    pub fn as_sys_mut(&mut self) -> &mut crate::backend::sys::store::Store {
-        match self {
-            Self::Sys(s) => s,
-            _ => panic!("Not a `sys` store!"),
-        }
-    }
-    /// Return true if [`self`] is a store from the `sys` runtime.
-    pub fn is_sys(&self) -> bool {
-        matches!(self, Self::Sys(_))
-    }
 }
 
 /// Allows embedders to interrupt a running WASM instance.
@@ -140,7 +119,7 @@ impl Interrupter {
             interrupt_registry::interrupt(self.store_id),
             Err(interrupt_registry::InterruptError::StoreNotRunning)
         ) {
-            #[cfg(feature = "experimental-async")]
+            #[cfg(feature = "async")]
             crate::backend::sys::async_runtime::notify_pending_futures_of_interrupt(self.store_id);
         }
     }

@@ -990,7 +990,7 @@ fn issue_7036_exception_payload(mut config: crate::Config) -> Result<()> {
         assert_eq!(exception.payload(&mut store), expected, "payload: {types}");
 
         let tag: &Tag = instance.exports.get::<Tag>("tag")?;
-        let host_exception = Exception::new(&mut store, tag, &expected);
+        let host_exception = Exception::new(&mut store, tag, &expected)?;
         let catch = instance.exports.get_function("catch")?;
         for exception in [exception, host_exception] {
             let result = catch.call(&mut store, &[Value::ExceptionRef(Some(exception))])?;

@@ -4,7 +4,10 @@
 #[cfg(feature = "sys")]
 pub mod sys;
 
+// The `v8` backend has not been brought under the `unused` lints that the
+// rest of the crate keeps yet.
 #[cfg(feature = "v8")]
+#[allow(unused)]
 pub mod v8;
 
 #[cfg(feature = "js")]
@@ -40,6 +43,9 @@ pub enum BackendKind {
 }
 
 impl Default for BackendKind {
+    // The first backend enabled is returned; the code after it is
+    // unreachable.
+    #[allow(unreachable_code)]
     fn default() -> Self {
         #[cfg(feature = "sys-default")]
         {

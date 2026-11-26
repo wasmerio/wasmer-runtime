@@ -1,7 +1,7 @@
 // With `v8-default` (the Windows test lane) `Store::default()` is a V8 store,
 // which these native scenarios cannot run on.
 #![cfg(all(
-    feature = "experimental-async",
+    feature = "async",
     feature = "sys",
     not(feature = "v8-default"),
     not(target_arch = "wasm32")

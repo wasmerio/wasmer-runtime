@@ -1,6 +1,5 @@
 use std::any::Any;
 
-use crate::StoreRef;
 use crate::entities::store::{AsStoreMut, AsStoreRef};
 use crate::vm::VMExternRef;
 

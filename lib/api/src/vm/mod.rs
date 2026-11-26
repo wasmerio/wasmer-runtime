@@ -22,22 +22,18 @@ define_vm_like!(ExternGlobal);
 define_vm_like!(ExternTag);
 define_vm_like!(ExternMemory);
 define_vm_like!(ExternTable);
-//define_vm_like!(ExternObj, Debug);
 define_vm_like!(FunctionCallback, Debug);
-define_vm_like!(FunctionBody);
-define_vm_like!(FunctionEnvironment, Debug);
-define_vm_like!(Instance, Debug);
 define_vm_like!(Trampoline, Debug);
 
-//define_vm_like!(Config);
-define_vm_like!(Function, Debug);
-define_vm_like!(Global, Debug);
-define_vm_like!(Tag, Debug);
 define_vm_like!(Memory, Debug);
 define_vm_like!(SharedMemory);
-define_vm_like!(Table, Debug);
 
-define_vm_like!(ExceptionRef);
+// Only `sys` has exceptions (see `crate::Exception`), so in a build with
+// other backends theirs are made but never read.
+gen_rt_ty! {
+    #[allow(dead_code)]
+    pub VMExceptionRef(vm::VMExceptionRef);
+}
 // `VMExternRef` is an implementation detail of `ExternRef`; keep it out of the
 // public API.
 gen_rt_ty! {

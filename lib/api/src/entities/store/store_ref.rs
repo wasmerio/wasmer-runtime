@@ -2,7 +2,6 @@ use std::ops::{Deref, DerefMut};
 
 use super::{StoreObjects, inner::StoreInner};
 use crate::entities::engine::{AsEngineRef, Engine, EngineRef};
-use wasmer_types::ExternType;
 //use wasmer_vm::{StoreObjects, TrapHandlerFn};
 
 #[cfg(feature = "sys")]
@@ -77,8 +76,7 @@ impl<'a> StoreRef<'a> {
         self.inner.store.engine()
     }
 
-    /// Checks whether two stores are identical. A store is considered
-    /// equal to another store if both have the same engine.
+    /// Checks whether two handles are of the same store.
     pub fn same(a: &Self, b: &Self) -> bool {
         StoreObjects::same(&a.inner.objects, &b.inner.objects)
     }
@@ -113,8 +111,7 @@ impl StoreMut<'_> {
         self.inner.store.engine()
     }
 
-    /// Checks whether two stores are identical. A store is considered
-    /// equal to another store if both have the same engine.
+    /// Checks whether two handles are of the same store.
     pub fn same(a: &Self, b: &Self) -> bool {
         StoreObjects::same(&a.inner.objects, &b.inner.objects)
     }

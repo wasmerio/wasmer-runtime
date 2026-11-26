@@ -1,11 +1,11 @@
-use std::{marker::PhantomData, mem::MaybeUninit};
+use std::mem::MaybeUninit;
 
 use crate::{
     MemoryAccessError,
     macros::backend::{gen_rt_ty, match_rt},
 };
 
-/// Underlying buffer for a memory.
+// Underlying buffer for a memory.
 gen_rt_ty! {
     #[derive(Debug, Copy, Clone, derive_more::From)]
     pub BackendMemoryBuffer<'a>(entities::memory::MemoryBuffer<'a>);
@@ -71,7 +71,7 @@ impl BackendMemoryBuffer<'_> {
             #[cfg(feature = "v8")]
             Self::V8(s) => s.base,
             #[cfg(feature = "js")]
-            Self::Js(s) => panic!("js memory buffers do not support the `base` function!"),
+            Self::Js(_) => panic!("js memory buffers do not support the `base` function!"),
         }
     }
 }

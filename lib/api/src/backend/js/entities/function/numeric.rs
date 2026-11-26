@@ -145,7 +145,7 @@ pub(crate) fn closure(
 
 /// A JavaScript function of `arity` numbers that calls `body` with them, and
 /// returns any value: the body of an async host function's import.
-#[cfg(feature = "experimental-async")]
+#[cfg(feature = "async")]
 pub(crate) fn closure_returning_any(
     arity: usize,
     body: impl Fn(&[f64]) -> Result<JsValue, JsValue> + 'static,

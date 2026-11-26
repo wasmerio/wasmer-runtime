@@ -1,13 +1,7 @@
 use crate::{
-    AsStoreMut, AsStoreRef, BackendFunctionEnv, BackendFunctionEnvMut, FunctionEnvMut,
-    FunctionType, HostFunction, RuntimeError, StoreInner, StoreMut, StoreRef, Value, WithEnv,
-    WithoutEnv,
-    utils::{FromToNativeWasmType, IntoResult, NativeWasmTypeInto, WasmTypeList},
+    FunctionEnvMut, WithEnv, WithoutEnv,
+    utils::{FromToNativeWasmType, IntoResult, WasmTypeList},
 };
-
-use std::panic::{self, AssertUnwindSafe};
-use std::{cell::UnsafeCell, cmp::max, ffi::c_void};
-use wasmer_types::{NativeWasmType, RawValue};
 
 macro_rules! impl_host_function {
     ([$c_struct_representation:ident] $c_struct_name:ident, $( $x:ident ),* ) => {
@@ -116,18 +110,6 @@ macro_rules! impl_host_function {
                     }
                 }
             }
-        }
-    };
-}
-
-// Black-magic to count the number of identifiers at compile-time.
-macro_rules! count_idents {
-    ( $($idents:ident),* ) => {
-        {
-            #[allow(dead_code, non_camel_case_types)]
-            enum Idents { $( $idents, )* __CountIdentsLast }
-            const COUNT: usize = Idents::__CountIdentsLast as usize;
-            COUNT
         }
     };
 }

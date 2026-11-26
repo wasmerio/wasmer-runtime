@@ -7,9 +7,6 @@ use crate::{
     macros::backend::{gen_rt_ty, match_rt},
 };
 
-#[cfg(feature = "sys")]
-use wasmer_vm::TrapHandlerFn;
-
 /// We require the context to have a fixed memory address for its lifetime since
 /// various bits of the VM have raw pointers that point back to it. Hence we
 /// wrap the actual context in a box.
@@ -18,12 +15,12 @@ pub(crate) struct StoreInner {
     pub(crate) store: BackendStore,
     /// The shared handle of this store, if it has one: how a host function
     /// finds it. A back-reference here keeps `T` in a `FunctionEnv` `Send`.
-    #[cfg(feature = "experimental-async")]
+    #[cfg(feature = "async")]
     pub(crate) shared: std::rc::Weak<super::SharedState>,
     /// Releases what forgotten calls left registered for this store.
     #[cfg(all(
         feature = "sys",
-        feature = "experimental-async",
+        feature = "async",
         feature = "experimental-host-interrupt"
     ))]
     pub(crate) _teardown: crate::backend::sys::async_runtime::StoreTeardown,
@@ -76,6 +73,7 @@ pub(crate) trait KeepsStore {
     fn check_owner(&self) {}
 
     /// Whether a call holds the store while no slice of it runs.
+    #[cfg(feature = "async")]
     #[inline]
     fn holds_store(&self) -> bool {
         false
@@ -105,6 +103,7 @@ impl BackendStoreKeeper {
     }
 
     /// See [`KeepsStore::holds_store`].
+    #[cfg(feature = "async")]
     #[inline]
     pub(crate) fn holds_store(&self) -> bool {
         match_rt!(on self => k {
