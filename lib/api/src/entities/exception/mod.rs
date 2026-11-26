@@ -17,8 +17,14 @@ impl Exception {
     /// Create a new exception with the given tag and payload, and also creates
     /// a reference to it, returning the reference.
     ///
+    /// On the `sys` backend, which is the only one with exceptions:
+    ///
     /// ```
     /// # use wasmer::{Exception, Store, Tag, Type, Value};
+    /// # // The default store is not a `sys` one with `v8-default`.
+    /// # if cfg!(not(all(feature = "sys", not(feature = "v8-default")))) {
+    /// #     return Ok(());
+    /// # }
     /// let mut store = Store::default();
     /// let tag = Tag::new(&mut store, [Type::I32])?;
     ///
