@@ -209,12 +209,26 @@ impl Function {
         F: Fn(AsyncEnv<T>, Vec<Value>) -> HostFuture + 'static,
         T: Send + 'static,
     {
+        // Only this is instantiated per host function: what follows is once
+        // per environment type.
+        Self::new_async_boxed(store, env, ty.into(), Box::new(func))
+    }
+
+    #[cfg(feature = "async")]
+    fn new_async_boxed<T>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        func_ty: FunctionType,
+        func: AsyncBody<T>,
+    ) -> Self
+    where
+        T: Send + 'static,
+    {
         assert!(
             jspi::is_supported(),
             "the JavaScript host does not support WebAssembly JSPI"
         );
 
-        let func_ty: FunctionType = ty.into();
         let host = Rc::new(AsyncHost {
             func,
             env: env.clone(),
@@ -257,18 +271,21 @@ impl Function {
             // Nothing but numbers: the guest calls the closure itself, with
             // no array of arguments in between.
             let arity = function_type.params().len();
-            let function = numeric::closure(arity, move |numbers| {
-                let (store, _hold) = lent::hold(store_id).map_err(trap_value)?;
-                let mut store: StoreMut = unsafe { StoreMut::from_raw(store) };
-                let _entered = enter_sync();
-                let arguments = numeric::values(function_type.params(), numbers);
-                let env: FunctionEnvMut<T> = raw_env.clone().into_mut(&mut store);
-                let results = func(env, &arguments[..numbers.len()]).map_err(trap_value)?;
-                Ok(match function_type.results() {
-                    [] => 0.0,
-                    _ => numeric::result(&results)?,
-                })
-            });
+            let function = numeric::closure(
+                arity,
+                Box::new(move |numbers| {
+                    let (store, _hold) = lent::hold(store_id).map_err(trap_value)?;
+                    let mut store: StoreMut = unsafe { StoreMut::from_raw(store) };
+                    let _entered = enter_sync();
+                    let arguments = numeric::values(function_type.params(), numbers);
+                    let env: FunctionEnvMut<T> = raw_env.clone().into_mut(&mut store);
+                    let results = func(env, &arguments[..numbers.len()]).map_err(trap_value)?;
+                    Ok(match function_type.results() {
+                        [] => 0.0,
+                        _ => numeric::result(&results)?,
+                    })
+                }),
+            );
             let function = owned(function, store.as_store_ref().objects().id());
             let vm_function = VMFunction::new(function, func_ty);
             return Self::from_vm_extern(&mut store, VMExternFunction::Js(vm_function));
@@ -714,21 +731,23 @@ enum Arguments {
     Numbers(numeric::Numbers),
 }
 
+/// The body of an async host function: given the arguments of a call, its
+/// future. Boxed, so that the glue around it is instantiated once per
+/// environment type rather than once per host function.
+#[cfg(feature = "async")]
+type AsyncBody<T> = Box<dyn Fn(AsyncEnv<T>, Vec<Value>) -> HostFuture>;
+
 /// An async host function, as the body of its import needs it.
 #[cfg(feature = "async")]
-struct AsyncHost<T, F> {
-    func: F,
+struct AsyncHost<T> {
+    func: AsyncBody<T>,
     env: FunctionEnv<T>,
     ty: FunctionType,
     store_id: wasmer_types::StoreId,
 }
 
 #[cfg(feature = "async")]
-impl<T, F> AsyncHost<T, F>
-where
-    T: 'static,
-    F: Fn(AsyncEnv<T>, Vec<Value>) -> HostFuture + 'static,
-{
+impl<T: 'static> AsyncHost<T> {
     /// The body of the `WebAssembly.Suspending` import a guest calls, given
     /// the arguments in an array: it returns the promise the guest waits on.
     /// Nothing of the host function runs here: its future runs on the
@@ -741,10 +760,14 @@ where
         let id = self.store_id;
         if numeric::takes_numbers(&self.ty) {
             let arity = self.ty.params().len();
-            let start = numeric::closure_returning_any(arity, move |numbers| {
-                let (host, args) = (Rc::clone(&self), Arguments::Numbers(numeric::copy(numbers)));
-                jspi::start(id, move || host.import(args))
-            });
+            let start = numeric::closure_returning_any(
+                arity,
+                Box::new(move |numbers| {
+                    let numbers = Arguments::Numbers(numeric::copy(numbers));
+                    let (host, args) = (Rc::clone(&self), numbers);
+                    jspi::start(id, move || host.import(args))
+                }),
+            );
             return (start.into(), false);
         }
         let start = Closure::wrap(Box::new(move |args: Array| {

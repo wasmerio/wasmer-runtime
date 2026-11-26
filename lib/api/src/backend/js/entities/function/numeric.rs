@@ -134,22 +134,23 @@ macro_rules! closure_of_arity {
     }};
 }
 
+/// The body of a function on the numeric lane, given the numbers of a call.
+///
+/// Boxed, so that [`closure_of_arity!`] expands once rather than once per
+/// host function: its arms are nine `wasm_bindgen` closures, each with its
+/// own shims, of which a host function only uses one.
+pub(crate) type NumericBody<R> = Box<dyn Fn(&[f64]) -> Result<R, JsValue>>;
+
 /// A JavaScript function of `arity` numbers that calls `body` with them. For
 /// a function without a result, what `body` returns is ignored by the engine.
-pub(crate) fn closure(
-    arity: usize,
-    body: impl Fn(&[f64]) -> Result<f64, JsValue> + 'static,
-) -> JsFunction {
+pub(crate) fn closure(arity: usize, body: NumericBody<f64>) -> JsFunction {
     closure_of_arity!(f64; arity, body)
 }
 
 /// A JavaScript function of `arity` numbers that calls `body` with them, and
 /// returns any value: the body of an async host function's import.
 #[cfg(feature = "async")]
-pub(crate) fn closure_returning_any(
-    arity: usize,
-    body: impl Fn(&[f64]) -> Result<JsValue, JsValue> + 'static,
-) -> JsFunction {
+pub(crate) fn closure_returning_any(arity: usize, body: NumericBody<JsValue>) -> JsFunction {
     closure_of_arity!(JsValue; arity, body)
 }
 

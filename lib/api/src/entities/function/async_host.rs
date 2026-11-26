@@ -514,17 +514,39 @@ where
     Args: WasmTypeList + 'static,
     Rets: WasmTypeList + 'static,
 {
+    // Only the call of `func` is instantiated per host function. The
+    // conversions are once per environment type and signature.
     let func = Rc::new(func);
     let ty = Rc::new(ty);
     move |mut cx, values| -> HostFuture {
         let func = Rc::clone(&func);
         let ty = Rc::clone(&ty);
         Box::pin(async move {
-            let args = cx.with(|mut env| args_from_values::<Args>(&mut env, &ty, &values))?;
+            let args = typed_args::<T, Args>(&mut cx, &ty, &values)?;
             let rets = func.invoke(&mut cx, args).await?;
-            cx.with(|mut env| results_to_values::<Rets>(&mut env, &ty, rets))
+            typed_results::<T, Rets>(&mut cx, &ty, rets)
         })
     }
+}
+
+#[cfg(any(feature = "js", feature = "v8"))]
+#[inline(never)]
+fn typed_args<T, Args: WasmTypeList>(
+    cx: &mut AsyncEnv<T>,
+    ty: &FunctionType,
+    values: &[Value],
+) -> Result<Args, RuntimeError> {
+    cx.with(|mut env| args_from_values::<Args>(&mut env, ty, values))
+}
+
+#[cfg(any(feature = "js", feature = "v8"))]
+#[inline(never)]
+fn typed_results<T, Rets: WasmTypeList>(
+    cx: &mut AsyncEnv<T>,
+    ty: &FunctionType,
+    rets: Rets,
+) -> Result<Vec<Value>, RuntimeError> {
+    cx.with(|mut env| results_to_values::<Rets>(&mut env, ty, rets))
 }
 
 #[cfg(any(feature = "js", feature = "v8"))]
