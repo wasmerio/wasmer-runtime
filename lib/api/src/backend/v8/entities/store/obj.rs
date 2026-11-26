@@ -96,14 +96,11 @@ impl StoreObjects {
         b: InternalStoreHandle<T>,
     ) -> (&mut T, &mut T) {
         assert_ne!(a.index(), b.index());
-        let list = T::list_mut(self);
-        if a.index() < b.index() {
-            let (low, high) = list.split_at_mut(b.index());
-            (&mut low[a.index()], &mut high[0])
-        } else {
-            let (low, high) = list.split_at_mut(a.index());
-            (&mut high[0], &mut low[a.index()])
-        }
+        // Handles are 1-based, like `InternalStoreHandle::get`.
+        let [a, b] = T::list_mut(self)
+            .get_disjoint_mut([a.index() - 1, b.index() - 1])
+            .expect("store handle out of range");
+        (a, b)
     }
 
     /// Return an immutable iterator over all globals

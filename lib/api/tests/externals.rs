@@ -504,7 +504,48 @@ fn table_grow() -> Result<(), String> {
 
 #[engine_test]
 fn table_copy() -> Result<(), String> {
-    // TODO: table copy test not yet implemented
+    // `Table::copy` is unimplemented on js, and returns an error on v8.
+    #[cfg(feature = "sys")]
+    {
+        let mut store = Store::default();
+        let table_type = TableType {
+            ty: Type::ExternRef,
+            minimum: 1,
+            maximum: Some(1),
+            readonly: false,
+        };
+        // Three tables, so that a copy between two of them can reach the one
+        // next to either, and one of them is the last in the store.
+        let tables = (1..=3u32)
+            .map(|n| {
+                let value = Value::ExternRef(Some(ExternRef::new(&mut store, n)));
+                Table::new(&mut store, table_type, value).map_err(|e| format!("{e:?}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let read = |store: &mut Store| -> Vec<u32> {
+            tables
+                .iter()
+                .map(|table| match table.get(store, 0) {
+                    Some(Value::ExternRef(Some(ext))) => *ext.downcast::<u32>(store).unwrap(),
+                    other => panic!("unexpected table element: {other:?}"),
+                })
+                .collect()
+        };
+        let copy = |store: &mut Store, dst: usize, src: usize| {
+            Table::copy(store, &tables[dst], 0, &tables[src], 0, 1).map_err(|e| format!("{e:?}"))
+        };
+
+        // From an earlier table to a later one.
+        copy(&mut store, 1, 0)?;
+        assert_eq!(read(&mut store), [1, 1, 3]);
+        // From a later table to an earlier one.
+        copy(&mut store, 0, 2)?;
+        assert_eq!(read(&mut store), [3, 1, 3]);
+        // Into the last table in the store.
+        copy(&mut store, 2, 1)?;
+        assert_eq!(read(&mut store), [3, 1, 1]);
+    }
+
     Ok(())
 }
 
