@@ -25,6 +25,7 @@ enum-iterator.workspace = true
 scopeguard.workspace = true
 region.workspace = true
 corosensei.workspace = true
+psm = "0.1.32"
 fnv.workspace = true
 parking_lot.workspace = true
 # - Optional shared dependencies.

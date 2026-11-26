@@ -72,10 +72,10 @@ struct ucontext_t {
 use libc::ucontext_t;
 
 /// Sets the process-wide default stack size for new Wasmer coroutines.
-/// The value is clamped to [8 KiB, MAX_STACK_SIZE].
+/// The value is clamped to [16 KiB, MAX_STACK_SIZE].
 pub fn set_stack_size(size: usize) {
     DEFAULT_STACK_SIZE.store(
-        size.clamp(ByteSize::kib(8).as_u64() as usize, MAX_STACK_SIZE),
+        size.clamp(ByteSize::kib(16).as_u64() as usize, MAX_STACK_SIZE),
         Ordering::Relaxed,
     );
 }
@@ -1063,6 +1063,37 @@ impl WasmStack {
     fn limit_of(stack: &DefaultStack) -> usize {
         // `Stack::limit` includes the guard page.
         stack.limit().get() + region::page::size()
+    }
+
+    /// Returns the available bytes when running on this stack.
+    #[inline(always)]
+    fn available_space(&self) -> usize {
+        // A frame can reach into the guard page before touching it. Treat a
+        // stack pointer below the limit as having no space left.
+        stack_pointer().saturating_sub(self.limit)
+    }
+}
+
+/// Traps if the active guest stack lacks headroom for native code.
+/// Does nothing outside guest execution.
+///
+/// # Safety
+///
+/// The caller must be able to unwind via a Wasm trap without running destructors.
+pub unsafe fn check_stack_space() {
+    #[cfg(not(miri))]
+    {
+        // Reserve space for the native unwinder (including sanitizer overhead).
+        const UNWIND_STACK_HEADROOM: usize = ByteSize::kib(8).as_u64() as usize;
+
+        if let Some(stack) = with_stacks(|stacks| stacks.wasm.get()) {
+            // SAFETY: this describes the coroutine stack currently running guest code.
+            if unsafe { stack.as_ref() }.available_space() < UNWIND_STACK_HEADROOM {
+                // Capture the backtrace on the host stack, where there is room for it.
+                let trap = on_host_stack(|| Trap::lib(wasmer_types::TrapCode::StackOverflow));
+                unsafe { raise_lib_trap(trap) }
+            }
+        }
     }
 }
 
@@ -2147,15 +2178,10 @@ pub fn host_call_in_place() -> Option<HostCallInPlace> {
         let wasm_stack = stacks.wasm.get();
         let in_place = match wasm_stack {
             Some(stack) => {
-                // Safety: it lives on the stack of the coroutine that is
-                // running.
-                let limit = unsafe { stack.as_ref() }.limit;
-                // Below the limit is none: a frame can reach below it, into
-                // the guard page, before it touches the page. Then the host
-                // function must not run as host code there, where the signal
-                // handler leaves its fault alone and the process dies;
-                // switching stacks faults as the guest.
-                if stack_pointer().saturating_sub(limit) < HOST_CALL_RESERVE {
+                // If the stack pointer is already in the guard page, leave
+                // the switch to fault as guest code rather than host code.
+                // Safety: this describes the coroutine stack currently running guest code.
+                if unsafe { stack.as_ref() }.available_space() < HOST_CALL_RESERVE {
                     return None;
                 }
                 stacks.wasm.set(None);
@@ -2172,30 +2198,10 @@ pub fn host_call_in_place() -> Option<HostCallInPlace> {
     })
 }
 
-/// The current stack pointer, or an address in the current frame where it
-/// cannot be read directly.
+/// The current stack pointer.
 #[inline(always)]
 fn stack_pointer() -> usize {
-    let sp: usize;
-    cfg_select! {
-        target_arch = "aarch64" => {
-            unsafe { std::arch::asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
-        }
-        target_arch = "x86_64" => {
-            unsafe { std::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
-        }
-        target_arch = "riscv64" => {
-            unsafe { std::arch::asm!("mv {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
-        }
-        target_arch = "loongarch64" => {
-            unsafe { std::arch::asm!("move {}, $sp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
-        }
-        _ => {
-            let probe = 0u8;
-            sp = std::hint::black_box(ptr::from_ref(&probe)) as usize;
-        }
-    }
-    sp
+    psm::stack_pointer().addr()
 }
 
 #[cfg(windows)]
@@ -2357,8 +2363,8 @@ mod tests {
     fn set_stack_size_clamps_to_min() {
         let _lock = GLOBAL_STATE.lock().unwrap();
         let _restore = RestoreStackSize(get_stack_size());
-        set_stack_size(1); // way below 8 KiB minimum
-        assert_eq!(get_stack_size(), ByteSize::kib(8).as_u64() as usize);
+        set_stack_size(1); // way below 16 KiB minimum
+        assert_eq!(get_stack_size(), ByteSize::kib(16).as_u64() as usize);
     }
 
     #[test]
