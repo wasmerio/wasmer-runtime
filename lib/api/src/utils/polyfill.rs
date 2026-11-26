@@ -666,7 +666,9 @@ pub fn parse_import_section(
                     field_name,
                 )?;
             }
-            TypeRef::FuncExact(_) => unimplemented!("custom-descriptors not implemented yet"),
+            TypeRef::FuncExact(_) => {
+                return Err("custom descriptors are not implemented yet".to_owned());
+            }
         }
     }
     Ok(())

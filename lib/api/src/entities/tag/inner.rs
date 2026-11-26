@@ -1,17 +1,12 @@
 use wasmer_types::{TagType, Type};
 
 use crate::{
-    AsStoreMut, AsStoreRef, ExportError, Exportable, Extern,
+    AsStoreMut, AsStoreRef, ExportError, Exportable, Extern, RuntimeError,
     macros::backend::{gen_rt_ty, match_rt},
     vm::{VMExtern, VMExternTag},
 };
 
-// A WebAssembly `global` instance.
-//
-// A global instance is the runtime representation of a global variable.
-// It consists of an individual value and a flag indicating whether it is mutable.
-//
-// Spec: <https://webassembly.github.io/spec/core/exec/runtime.html#global-instances>
+// The tag of each backend, behind [`crate::Tag`].
 gen_rt_ty! {
     #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
     #[derive(Debug, Clone, PartialEq, Eq, derive_more::From)]
@@ -22,19 +17,22 @@ impl BackendTag {
     /// Create a new tag with event of type P -> [], that is a function that takes parameters `P`
     /// and has no return value.
     #[inline]
-    pub fn new<P: Into<Box<[Type]>>>(store: &mut impl AsStoreMut, params: P) -> Self {
+    pub fn new<P: Into<Box<[Type]>>>(
+        store: &mut impl AsStoreMut,
+        params: P,
+    ) -> Result<Self, RuntimeError> {
         match &store.as_store_mut().inner.store {
             #[cfg(feature = "sys")]
             crate::BackendStore::Sys(_) => {
-                Self::Sys(crate::backend::sys::tag::Tag::new(store, params))
+                Ok(Self::Sys(crate::backend::sys::tag::Tag::new(store, params)))
             }
             #[cfg(feature = "v8")]
             crate::BackendStore::V8(_) => {
-                Self::V8(crate::backend::v8::entities::tag::Tag::new(store, params))
+                crate::backend::v8::entities::tag::Tag::new(store, params).map(Self::V8)
             }
             #[cfg(feature = "js")]
             crate::BackendStore::Js(_) => {
-                Self::Js(crate::backend::js::tag::Tag::new(store, params))
+                crate::backend::js::tag::Tag::new(store, params).map(Self::Js)
             }
         }
     }

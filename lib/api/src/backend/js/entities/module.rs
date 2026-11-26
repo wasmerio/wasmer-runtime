@@ -160,7 +160,7 @@ impl Module {
                 )
             })?;
 
-        Ok(unsafe { Self::from_js_module(module, binary) })
+        unsafe { Self::from_js_module(module, binary) }
     }
 
     pub(crate) fn from_binary(
@@ -182,23 +182,27 @@ impl Module {
                     .to_string(),
             )
         })?;
-        Ok(unsafe { Self::from_js_module(module, binary) })
+        unsafe { Self::from_js_module(module, binary) }
     }
 
     /// Creates a new WebAssembly module skipping any kind of validation from a javascript module
     ///
     /// With `js-serializable-module`, the module keeps `binary`: owned bytes
     /// as they are, borrowed bytes as a copy.
+    ///
+    /// Fails if `wasm-types-polyfill` cannot parse the types of a module that
+    /// the host compiled: one that uses a proposal it does not know.
     pub(crate) unsafe fn from_js_module(
         module: WebAssembly::Module,
         binary: impl IntoBytes,
-    ) -> Self {
+    ) -> Result<Self, CompileError> {
         let binary = binary.into_bytes();
 
         // The module is now validated, so we can safely parse it's types
         #[cfg(feature = "wasm-types-polyfill")]
         let (type_hints, name, module_info) = {
-            let translated = crate::polyfill::translate_module(&binary[..]).unwrap();
+            let translated =
+                crate::polyfill::translate_module(&binary[..]).map_err(CompileError::Validate)?;
 
             (
                 Some(ModuleTypeHints {
@@ -220,7 +224,7 @@ impl Module {
         #[cfg(not(feature = "wasm-types-polyfill"))]
         let (type_hints, name) = (None, None);
 
-        Self {
+        Ok(Self {
             module: SharedJsHandle::new(module),
             type_hints,
             name,
@@ -230,7 +234,7 @@ impl Module {
             parsed: true,
             #[cfg(feature = "js-serializable-module")]
             raw_bytes: Some(binary),
-        }
+        })
     }
 
     pub fn validate(_engine: &impl AsEngineRef, binary: &[u8]) -> Result<(), CompileError> {
@@ -689,13 +693,13 @@ impl From<WebAssembly::Module> for Module {
 }
 
 impl<T: IntoBytes> From<(WebAssembly::Module, T)> for crate::module::Module {
+    /// A module whose types cannot be parsed is kept without them, as one
+    /// made from the [`WebAssembly::Module`] alone is.
     fn from((module, binary): (WebAssembly::Module, T)) -> Self {
-        unsafe {
-            Self(BackendModule::Js(Module::from_js_module(
-                module,
-                binary.into_bytes(),
-            )))
-        }
+        let untyped = module.clone();
+        let module = unsafe { Module::from_js_module(module, binary.into_bytes()) }
+            .unwrap_or_else(|_| untyped.into());
+        Self(BackendModule::Js(module))
     }
 }
 

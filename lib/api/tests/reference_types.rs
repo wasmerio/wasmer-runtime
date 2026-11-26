@@ -1240,10 +1240,10 @@ pub mod reference_types {
     fn exception_of_another_store_thrown_by_host_function() -> Result<()> {
         let (mut store, mut other) = (Store::default(), Store::default());
         let no_payload = Vec::<Type>::new();
-        let mine = Tag::new(&mut store, no_payload.clone());
-        let mine = Exception::new(&mut store, &mine, &[]);
-        let theirs = Tag::new(&mut other, no_payload);
-        let theirs = Exception::new(&mut other, &theirs, &[]);
+        let mine = Tag::new(&mut store, no_payload.clone())?;
+        let mine = Exception::new(&mut store, &mine, &[])?;
+        let theirs = Tag::new(&mut other, no_payload)?;
+        let theirs = Exception::new(&mut other, &theirs, &[])?;
 
         // A guest that catches what `host` throws, and returns whether it
         // threw.

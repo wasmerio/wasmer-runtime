@@ -1,7 +1,7 @@
 pub(crate) mod inner;
 pub(crate) use inner::*;
 
-use crate::{AsStoreMut, AsStoreRef, Tag, Value, vm::VMExceptionRef};
+use crate::{AsStoreMut, AsStoreRef, RuntimeError, Tag, Value, vm::VMExceptionRef};
 
 /// A WebAssembly `exception` instance.
 ///
@@ -16,8 +16,32 @@ pub struct Exception(pub(crate) BackendException);
 impl Exception {
     /// Create a new exception with the given tag and payload, and also creates
     /// a reference to it, returning the reference.
-    pub fn new(store: &mut impl AsStoreMut, tag: &Tag, payload: &[Value]) -> Self {
-        Self(BackendException::new(store, tag, payload))
+    ///
+    /// ```
+    /// # use wasmer::{Exception, Store, Tag, Type, Value};
+    /// let mut store = Store::default();
+    /// let tag = Tag::new(&mut store, [Type::I32])?;
+    ///
+    /// let exception = Exception::new(&mut store, &tag, &[Value::I32(42)])?;
+    /// assert_eq!(exception.payload(&mut store), vec![Value::I32(42)]);
+    ///
+    /// // The payload must match the parameters of the tag.
+    /// assert!(Exception::new(&mut store, &tag, &[Value::I64(42)]).is_err());
+    /// # Ok::<(), wasmer::RuntimeError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `tag` or a value of `payload` comes from another
+    /// store, if `payload` does not have one value of the type of each
+    /// parameter of `tag`, or if the backend has no exceptions (only `sys`
+    /// does).
+    pub fn new(
+        store: &mut impl AsStoreMut,
+        tag: &Tag,
+        payload: &[Value],
+    ) -> Result<Self, RuntimeError> {
+        BackendException::new(store, tag, payload).map(Self)
     }
 
     /// Check whether this `Exception` comes from the given store.
@@ -26,11 +50,19 @@ impl Exception {
     }
 
     /// Get the exception tag.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the exception comes from another store, as other objects do.
     pub fn tag(&self, store: &impl AsStoreRef) -> Tag {
         self.0.tag(store)
     }
 
     /// Get the exception payload values.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the exception comes from another store, as other objects do.
     pub fn payload(&self, store: &mut impl AsStoreMut) -> Vec<Value> {
         self.0.payload(store)
     }

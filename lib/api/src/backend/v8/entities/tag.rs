@@ -2,7 +2,7 @@
 use wasmer_types::{TagType, Type, StoreId};
 
 use crate::{
-    AsStoreMut, AsStoreRef,
+    AsStoreMut, AsStoreRef, RuntimeError,
     v8::{
         bindings::*,
         utils::convert::{IntoCApiType, IntoWasmerType},
@@ -25,7 +25,10 @@ unsafe impl Send for Tag {}
 unsafe impl Sync for Tag {}
 
 impl Tag {
-    pub fn new<P: Into<Box<[Type]>>>(store: &mut impl AsStoreMut, params: P) -> Self {
+    pub fn new<P: Into<Box<[Type]>>>(
+        store: &mut impl AsStoreMut,
+        params: P,
+    ) -> Result<Self, RuntimeError> {
         check_isolate(store);
         let store_mut = store.as_store_mut();
         let v8_store = store_mut.inner.store.as_v8();
@@ -47,18 +50,18 @@ impl Tag {
 
         let tag_type = unsafe { wasm_tagtype_new(&mut params) };
         if tag_type.is_null() {
-            panic!("failed to create new tag: returned tag type is null");
+            return Err(RuntimeError::new("v8 could not make the type of the tag"));
         }
 
         let handle = unsafe { wasm_tag_new(v8_store.inner, tag_type) };
         if handle.is_null() {
-            panic!("failed to create new tag: returned tag is null");
+            return Err(RuntimeError::new("v8 could not make the tag"));
         }
 
-        Self {
+        Ok(Self {
             handle,
             store_id: store_mut.inner.objects.id(),
-        }
+        })
     }
 
     pub fn ty(&self, store: &impl AsStoreRef) -> TagType {

@@ -146,8 +146,8 @@ fn global_new_externref() -> Result<(), String> {
     // Only `sys` can create an exception.
     #[cfg(feature = "sys")]
     {
-        let tag = Tag::new(&mut other_store, []);
-        let foreign = Exception::new(&mut other_store, &tag, &[]);
+        let tag = Tag::new(&mut other_store, []).unwrap();
+        let foreign = Exception::new(&mut other_store, &tag, &[]).unwrap();
         let foreign = Value::ExceptionRef(Some(foreign));
         assert_cross_store(Global::new(&mut store, foreign));
     }
@@ -811,5 +811,40 @@ fn function_new_dynamic_env() -> Result<(), String> {
             [Type::I32, Type::F32, Type::F64]
         );
     }
+    Ok(())
+}
+
+#[engine_test]
+fn exception_new_checks_its_arguments() -> Result<(), String> {
+    let mut store = Store::default();
+    let tag = Tag::new(&mut store, [Type::I32]).map_err(|e| format!("{e:?}"))?;
+
+    #[cfg(feature = "sys")]
+    {
+        let exception = Exception::new(&mut store, &tag, &[Value::I32(1)]);
+        assert_eq!(exception.unwrap().payload(&mut store), vec![Value::I32(1)]);
+
+        // The payload must have one value of each parameter's type.
+        assert!(Exception::new(&mut store, &tag, &[]).is_err());
+        assert!(Exception::new(&mut store, &tag, &[Value::I32(1), Value::I32(2)]).is_err());
+        assert!(Exception::new(&mut store, &tag, &[Value::I64(1)]).is_err());
+
+        // The tag and the references of the payload must be of the store.
+        let mut other = Store::default();
+        let foreign_tag = Tag::new(&mut other, [Type::I32]).unwrap();
+        assert!(Exception::new(&mut store, &foreign_tag, &[Value::I32(1)]).is_err());
+        let ref_tag = Tag::new(&mut store, [Type::ExternRef]).unwrap();
+        let foreign = Value::ExternRef(Some(ExternRef::new(&mut other, 0u32)));
+        assert!(Exception::new(&mut store, &ref_tag, &[foreign]).is_err());
+    }
+
+    // Only `sys` has exceptions.
+    #[cfg(not(feature = "sys"))]
+    assert!(Exception::new(&mut store, &tag, &[Value::I32(1)]).is_err());
+
+    // `js` has tags of numbers only.
+    #[cfg(feature = "js")]
+    assert!(Tag::new(&mut store, [Type::ExternRef]).is_err());
+
     Ok(())
 }
