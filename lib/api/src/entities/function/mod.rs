@@ -388,13 +388,39 @@ impl Function {
 
     /// Calls the function asynchronously.
     ///
-    /// `store` is a store, the [`AsyncEnv`] of an async host function, or a
-    /// [`SharedStore`](crate::SharedStore):
+    /// `store` is a store, for a call that has it exclusively; the
+    /// [`AsyncEnv`] of an async host function, for a call made from inside
+    /// one; or a [`SharedStore`](crate::SharedStore), for a `'static` guest
+    /// task:
     ///
-    /// ```ignore
-    /// f.call_async(&mut store, &params).await?;  // exclusive call
-    /// f.call_async(cx, &params).await?;          // inside an async host function
-    /// f.call_async(&mut shared, &params).await?; // 'static guest task
+    /// ```
+    /// # use wasmer::{imports, AsyncEnv, Function, FunctionEnv, Instance, Module, Store, Value};
+    /// # futures::executor::block_on(async {
+    /// let mut store = Store::default();
+    /// let module = Module::new(
+    ///     &store,
+    ///     r#"(module
+    ///         (import "host" "double" (func $double (param i32) (result i32)))
+    ///         (func (export "run") (param i32) (result i32)
+    ///             local.get 0
+    ///             call $double))"#,
+    /// )?;
+    /// let env = FunctionEnv::new(&mut store, ());
+    /// // An async import, which may wait without blocking the thread.
+    /// let double = Function::new_typed_async(
+    ///     &mut store,
+    ///     &env,
+    ///     async |_cx: &mut AsyncEnv<()>, x: i32| -> i32 { x * 2 },
+    /// );
+    /// let imports = imports! { "host" => { "double" => double } };
+    /// let instance = Instance::new(&mut store, &module, &imports)?;
+    /// let run = instance.exports.get_function("run")?;
+    ///
+    /// let results = run.call_async(&mut store, &[Value::I32(21)]).await?;
+    /// assert_eq!(results[0], Value::I32(42));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// # })
+    /// # .unwrap();
     /// ```
     ///
     /// The call borrows a store or `AsyncEnv` exclusively until it finishes or

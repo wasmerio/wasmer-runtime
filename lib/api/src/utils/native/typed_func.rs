@@ -5,7 +5,7 @@
 //!
 //! ```ignore
 //! let add_one = instance.exports.get_function("function_name")?;
-//! let add_one_native: TypedFunction<i32, i32> = add_one.native().unwrap();
+//! let add_one_native: TypedFunction<i32, i32> = add_one.typed(&store)?;
 //! ```
 #[cfg(feature = "experimental-async")]
 use crate::{AsyncCallStore, NativeWasmTypeInto, StoreMut};

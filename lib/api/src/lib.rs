@@ -32,8 +32,9 @@
 
 //! [`Wasmer`](https://wasmer.io/) is the most popular
 //! [WebAssembly](https://webassembly.org/) runtime for Rust. It supports
-//! JIT (Just In Time) and AOT (Ahead Of Time) compilation as well as
-//! pluggable compilers suited to your needs and interpreters.
+//! JIT (Just In Time) and AOT (Ahead Of Time) compilation, with pluggable
+//! compilers suited to your needs, and can also run on V8 or in a
+//! JavaScript host.
 //!
 //! It's designed to be safe and secure, and runnable in any kind of environment.
 //!
@@ -250,10 +251,11 @@
 //!
 //! ## Runtimes
 //!
-//! A runtime is a system that handles the details of making a Wasm module executable. We support
-//! multiple kinds of runtimes: compilers, which generate native machine code for each Wasm
-//! function and interpreter, in which no native machine code is generated and can be used on
-//! platforms where JIT compilation is not allowed, such as iOS.
+//! A runtime is a system that handles the details of making a Wasm module executable. The `sys`
+//! runtime generates native machine code for each Wasm function with one of the compilers. With
+//! `headless`, it only loads code compiled ahead of time, which also works on platforms where JIT
+//! compilation is not allowed, such as iOS. The `v8` and `js` runtimes hand the module to V8 and
+//! to the JavaScript host's own engine.
 //!
 //! # Cargo Features
 //!
@@ -262,7 +264,7 @@
 #![cfg_attr(not(feature = "sys"), doc = "(disabled),")]
 //!    where `wasmer` will be compiled to a native executable
 //!    which provides compilers, engines, a full VM etc.
-//!    By default, the `singlepass` and `cranelift` backends are enabled.
+//!    By default (`sys-default`), the `cranelift` compiler is enabled.
 //!
 //! 2. `v8`
 #![cfg_attr(feature = "v8", doc = "(enabled),")]
@@ -309,10 +311,15 @@
 #![cfg_attr(feature = "wat", doc = "(enabled),")]
 #![cfg_attr(not(feature = "wat"), doc = "(disabled),")]
 //!   enables `wasmer` to parse the WebAssembly text format,
-//! - `compilation`
+//! - `compiler`
 #![cfg_attr(feature = "compiler", doc = "(enabled),")]
 #![cfg_attr(not(feature = "compiler"), doc = "(disabled),")]
-//!   enables compilation with the wasmer engine.
+//!   enables compilation with the wasmer engine (each compiler enables it),
+//! - `headless`
+#![cfg_attr(feature = "headless", doc = "(enabled),")]
+#![cfg_attr(not(feature = "headless"), doc = "(disabled),")]
+//!   enables the `sys` runtime without a compiler, which loads modules
+//!   compiled ahead of time with [`Module::deserialize`].
 //!
 //! Notice that the `sys` and `v8` features are composable together,
 //! so a single build of Wasmer using `llvm`, `cranelift`, `singlepass`, and `v8`
@@ -336,9 +343,9 @@
 #![cfg_attr(not(feature = "wasm-types-polyfill"), doc = "(disabled),")]
 //!   parses the Wasm file, allowing to do type reflection of the
 //!   inner Wasm types. It adds 100kb to the Wasm bundle (28kb
-//!   gzipped). It is possible to disable it and to use
-//!   `Module::set_type_hints` manually instead for a lightweight
-//!   alternative. This is needed until the [Wasm JS introspection API
+//!   gzipped). Without it, the types that [`Module::imports`] and
+//!   [`Module::exports`] report are placeholders, not those of the
+//!   module. This is needed until the [Wasm JS introspection API
 //!   proposal](https://github.com/WebAssembly/js-types/blob/master/proposals/js-types/Overview.md)
 //!   is adopted by browsers,
 //! - `wat`
