@@ -57,7 +57,13 @@ pub const WASMER_TRAPS_SECTION_NAME: &[u8] = b".w.traps";
 pub const UNWIND_HAS_LSDA: u32 = 0x4000_0000;
 
 /// ELF's EH frame section name.
-pub const EH_FRAME_SECTION_NAME: &[u8] = b".eh_frame";
+pub const ELF_EH_FRAME_SECTION_NAME: &[u8] = b".eh_frame";
+/// Mach-O's EH frame section name.
+pub const MACHO_EH_FRAME_SECTION_NAME: &[u8] = b"__eh_frame";
+/// ELF's GCC exception table section name.
+pub const ELF_GCC_EXCEPT_TABLE_SECTION_NAME: &[u8] = b".gcc_except_table";
+/// Mach-O's GCC exception table section name.
+pub const MACHO_GCC_EXCEPT_TABLE_SECTION_NAME: &[u8] = b"__gcc_except_tab";
 /// Name of the section containing exception handling tags.
 pub const WASMER_EH_TAGS_SECTION_NAME: &[u8] = b"wasmer_eh_tags";
 /// Name of the section containing language-specific exception handling data.

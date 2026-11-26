@@ -79,9 +79,9 @@ cbindgen = { version = "0.29", default-features = false }
 cc = "1.2.47"
 compiletest_rs = "0.11.2"
 corosensei = "0.3.0"
-cranelift-codegen = { version = "=0.138.0", default-features = false }
-cranelift-entity = { version = "=0.138.0", default-features = false }
-cranelift-frontend = { version = "=0.138.0", default-features = false }
+cranelift-codegen = { git = "https://github.com/marxin/wasmtime", rev = "ee0b427c78fed451026e8c7b137522027fcd0c18", default-features = false }
+cranelift-entity = { git = "https://github.com/marxin/wasmtime", rev = "ee0b427c78fed451026e8c7b137522027fcd0c18", default-features = false }
+cranelift-frontend = { git = "https://github.com/marxin/wasmtime", rev = "ee0b427c78fed451026e8c7b137522027fcd0c18", default-features = false }
 crc32fast = "1.5.0"
 criterion = { version = "0.8.1", default-features = false }
 crossbeam-channel = "0.5.15"
@@ -127,7 +127,6 @@ quote = "1.0.20"
 rand = "0.10.1"
 rangemap = "1.7.1"
 rayon = "1.7.0"
-regalloc2 = "0.15.1"
 regex = "1.11"
 region = "4.0"
 reqwest = { version = "0.13.0", default-features = false }

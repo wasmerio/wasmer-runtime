@@ -36,7 +36,6 @@ singlepass spec::cast::
 
 # Tail-call
 singlepass return_call
-cranelift return_call
 
 # Traps
 # Experimental Mach-O artifacts lack source-location DWARF; frame names and ordering work.

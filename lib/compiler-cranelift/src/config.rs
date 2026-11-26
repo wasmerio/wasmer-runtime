@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 use std::{num::NonZero, path::PathBuf};
-use target_lexicon::{OperatingSystem, Vendor};
+use target_lexicon::OperatingSystem;
 use wasmer_compiler::{
     Compiler, CompilerConfig, DEFAULT_MAX_TABLE_ELEMENTS, Debugger, Engine, EngineBuilder,
     ModuleMiddleware,
@@ -255,6 +255,11 @@ impl Cranelift {
             flags.enable("is_pic").expect("should be a valid flag");
         }
 
+        // Cranelift's tail-call lowering requires frame pointers.
+        flags
+            .enable("preserve_frame_pointers")
+            .expect("should be a valid flag");
+
         // These trampolines are always reachable through short jumps.
         flags
             .enable("use_colocated_libcalls")
@@ -289,12 +294,6 @@ impl Cranelift {
                 &self.enable_nan_canonicalization.to_string(),
             )
             .expect("should be valid flag");
-
-        if matches!(target.triple().vendor, Vendor::Apple) {
-            flags
-                .enable("enable_compact_unwind_abi")
-                .expect("should be valid flag");
-        }
 
         settings::Flags::new(flags)
     }
@@ -358,6 +357,7 @@ impl CompilerConfig for Cranelift {
         feats.exceptions(true);
         feats.relaxed_simd(true);
         feats.wide_arithmetic(true);
+        feats.tail_call(true);
         feats
     }
 }
