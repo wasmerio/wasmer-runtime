@@ -445,6 +445,9 @@ impl Function {
             if !arg.is_from_store(&store_ref) {
                 return Err(RuntimeError::new("cross-`Store` values are not supported"));
             }
+            if !arg.is_funcref_usable(&store_ref) {
+                return Err(crate::entities::function::dynamic_funcref_error());
+            }
             *slot = arg.as_raw(&store_ref);
         }
 
@@ -561,6 +564,9 @@ impl Function {
         if params.iter().any(|param| !param.is_from_store(&store_ref)) {
             return Err(RuntimeError::new("cross-`Store` values are not supported"));
         }
+        if params.iter().any(|param| !param.is_funcref_usable(&store_ref)) {
+            return Err(crate::entities::function::dynamic_funcref_error());
+        }
         let mut values = RawValues::from_elem(
             RawValue { i32: 0 },
             max(params.len(), signature.results().len()),
@@ -614,7 +620,8 @@ impl Function {
     pub(crate) fn vm_funcref(&self, store: &impl AsStoreRef) -> VMFuncRef {
         let vm_function = self.handle.get(store.as_store_ref().objects().as_sys());
         if vm_function.kind == VMFunctionKind::Dynamic {
-            panic!("dynamic functions cannot be used in tables or as funcrefs");
+            // Callers refuse such a function first: see `is_funcref_usable`.
+            panic!("{}", crate::entities::function::DYNAMIC_FUNCREF);
         }
         VMFuncRef(vm_function.anyfunc.as_ptr())
     }
@@ -653,6 +660,13 @@ impl Function {
     /// Checks whether this `Function` can be used with the given store.
     pub(crate) fn is_from_store(&self, store: &impl AsStoreRef) -> bool {
         self.handle.store_id() == store.as_store_ref().objects().id()
+    }
+
+    /// Whether the function can be a funcref: a dynamic one has no code that
+    /// WebAssembly can call with its own calling convention.
+    pub(crate) fn is_funcref_usable(&self, store: &impl AsStoreRef) -> bool {
+        let vm_function = self.handle.get(store.as_store_ref().objects().as_sys());
+        vm_function.kind != VMFunctionKind::Dynamic
     }
 
     /// See [`crate::Function::set_calls_on_native_stack`].
@@ -747,6 +761,9 @@ where
         Ok(rets) if !rets.is_from_store(store) => {
             InvocationResult::Trap(Box::new(cross_store_error()))
         }
+        Ok(rets) if !rets.is_funcref_usable(store) => {
+            InvocationResult::Trap(Box::new(crate::entities::function::dynamic_funcref_error()))
+        }
         result => to_invocation_result(result.map(|rets| (rets, store_ptr)), store_id),
     }
 }
@@ -810,6 +827,9 @@ fn dynamic_result_as_raw(
     if !value.is_from_store(store) {
         return Err(cross_store_error());
     }
+    if !value.is_funcref_usable(store) {
+        return Err(crate::entities::function::dynamic_funcref_error());
+    }
     Ok(value.as_raw(store))
 }
 
@@ -824,6 +844,9 @@ fn typed_results_into_raw<Rets: WasmTypeList>(
 ) -> Result<RawResults, RuntimeError> {
     if !rets.is_from_store(store) {
         return Err(cross_store_error());
+    }
+    if !rets.is_funcref_usable(store) {
+        return Err(crate::entities::function::dynamic_funcref_error());
     }
     // Safety: the trampoline reads the raw values back as `Rets`.
     let mut array = unsafe { rets.into_array(store) };

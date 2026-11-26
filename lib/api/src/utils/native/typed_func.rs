@@ -121,6 +121,9 @@ macro_rules! impl_native_traits {
                             "cross-`Store` values are not supported",
                         ));
                     }
+                    if $(!FromToNativeWasmType::is_funcref_usable(&[<p_ $x>], store) ||)* false {
+                        return Err(crate::entities::function::dynamic_funcref_error());
+                    }
                     let args: [RawValue; _] = [ $( [<p_ $x>].to_native().into_raw(store) ),* ];
                     Ok(args)
                 }) }

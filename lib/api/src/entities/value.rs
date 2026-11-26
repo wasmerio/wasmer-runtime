@@ -214,6 +214,18 @@ impl Value {
         }
     }
 
+    /// Returns whether WebAssembly can be given this value as it is: not if it
+    /// is a dynamic host function of the `sys` backend, which has no code of
+    /// its own that a funcref could point to.
+    ///
+    /// Only asked of values of the given store.
+    pub(crate) fn is_funcref_usable(&self, store: &impl AsStoreRef) -> bool {
+        match self {
+            Self::FuncRef(Some(f)) => f.is_funcref_usable(store),
+            _ => true,
+        }
+    }
+
     accessors! {
         e
         (I32(i32) i32 unwrap_i32 *e)

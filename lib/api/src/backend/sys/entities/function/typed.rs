@@ -41,6 +41,9 @@ macro_rules! impl_native_traits {
                         "cross-`Store` values are not supported",
                     ));
                 }
+                if $(!FromToNativeWasmType::is_funcref_usable(&$x, store) ||)* false {
+                    return Err(crate::entities::function::dynamic_funcref_error());
+                }
                 // TODO: when `const fn` related features mature more, we can declare a single array
                 // of the correct size here.
                 let mut params_list = [ $( $x.to_native().into_raw(store) ),* ];

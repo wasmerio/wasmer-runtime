@@ -482,6 +482,17 @@ impl Function {
     }
 }
 
+/// Why a dynamic host function is refused as a funcref.
+pub(crate) const DYNAMIC_FUNCREF: &str = "a dynamic host function (made with `Function::new` or \
+     `Function::new_with_env`) cannot be used as a funcref on the `sys` backend: make it with \
+     `Function::new_typed` or `Function::new_typed_with_env` instead";
+
+/// The error of a value that is refused as it holds a dynamic host function
+/// where a funcref goes.
+pub(crate) fn dynamic_funcref_error() -> RuntimeError {
+    RuntimeError::new(DYNAMIC_FUNCREF)
+}
+
 /// Refuses a raw call that does not have one value per parameter.
 pub(crate) fn check_raw_arity(params: usize, given: usize) -> Result<(), RuntimeError> {
     if params == given {
@@ -597,6 +608,15 @@ impl Function {
     /// Checks whether this `Function` can be used with the given store.
     pub fn is_from_store(&self, store: &impl AsStoreRef) -> bool {
         self.0.is_from_store(store)
+    }
+
+    /// Returns whether WebAssembly can be given this function as a funcref: not
+    /// if it is a dynamic host function of the `sys` backend, which has no code of
+    /// its own that a funcref could point to.
+    ///
+    /// Only asked of values of the given store.
+    pub(crate) fn is_funcref_usable(&self, store: &impl AsStoreRef) -> bool {
+        self.0.is_funcref_usable(store)
     }
 
     /// With `false`, lets calls from Wasm to this host function run on the

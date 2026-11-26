@@ -563,6 +563,17 @@ impl BackendFunction {
         })
     }
 
+    /// See [`crate::Function::is_funcref_usable`].
+    #[inline]
+    #[cfg_attr(not(feature = "sys"), allow(unused_variables))]
+    pub(crate) fn is_funcref_usable(&self, store: &impl AsStoreRef) -> bool {
+        match self {
+            #[cfg(feature = "sys")]
+            Self::Sys(f) => f.is_funcref_usable(store),
+            _ => true,
+        }
+    }
+
     /// See [`crate::Function::set_calls_on_native_stack`].
     pub fn set_calls_on_native_stack(&self, store: &mut impl AsStoreMut, always: bool) {
         match self {

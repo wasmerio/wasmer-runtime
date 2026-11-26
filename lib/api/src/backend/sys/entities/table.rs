@@ -49,6 +49,9 @@ fn value_to_table_element(
     if !val.is_from_store(store) {
         return Err(RuntimeError::new("cannot pass Value across contexts"));
     }
+    if !val.is_funcref_usable(store) {
+        return Err(crate::entities::function::dynamic_funcref_error());
+    }
     Ok(match val {
         Value::ExternRef(extern_ref) => {
             wasmer_vm::TableElement::ExternRef(extern_ref.map(|e| e.vm_externref().unwrap_sys()))

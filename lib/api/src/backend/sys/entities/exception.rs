@@ -46,6 +46,9 @@ impl Exception {
                     "payload value {i} comes from another store"
                 )));
             }
+            if !value.is_funcref_usable(store) {
+                return Err(crate::entities::function::dynamic_funcref_error());
+            }
         }
 
         let values = payload

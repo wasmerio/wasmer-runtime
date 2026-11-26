@@ -848,3 +848,56 @@ fn exception_new_checks_its_arguments() -> Result<(), String> {
 
     Ok(())
 }
+
+#[engine_test]
+fn dynamic_functions_are_refused_as_funcrefs() -> anyhow::Result<()> {
+    // A dynamic host function of `sys` has no code that a funcref can point
+    // to: everything that would give one to WebAssembly refuses it.
+    #[cfg(feature = "sys")]
+    {
+        let mut store = Store::default();
+        let dynamic = Function::new(&mut store, FunctionType::new([], []), |_| Ok(vec![]));
+        let typed = Function::new_typed(&mut store, || {});
+        let funcref = |f: &Function| Value::FuncRef(Some(f.clone()));
+
+        let table_type = TableType::new(Type::FuncRef, 1, None);
+        assert!(Table::new(&mut store, table_type, funcref(&dynamic)).is_err());
+        let table = Table::new(&mut store, table_type, funcref(&typed))?;
+        assert!(table.set(&mut store, 0, funcref(&dynamic)).is_err());
+        assert!(table.grow(&mut store, 1, funcref(&dynamic)).is_err());
+
+        assert!(Global::new(&mut store, funcref(&dynamic)).is_err());
+        let global = Global::new_mut(&mut store, funcref(&typed))?;
+        assert!(global.set(&mut store, funcref(&dynamic)).is_err());
+
+        let tag = Tag::new(&mut store, [Type::FuncRef])?;
+        assert!(Exception::new(&mut store, &tag, &[funcref(&dynamic)]).is_err());
+
+        let module = Module::new(
+            &store,
+            r#"(module
+                (import "env" "get" (func $get (result funcref)))
+                (func (export "take") (param funcref))
+                (func (export "get") (result funcref) call $get))"#,
+        )?;
+        let given = dynamic.clone();
+        let get = Function::new(
+            &mut store,
+            FunctionType::new([], [Type::FuncRef]),
+            move |_| Ok(vec![Value::FuncRef(Some(given.clone()))]),
+        );
+        let instance = Instance::new(&mut store, &module, &imports! { "env" => { "get" => get } })?;
+
+        let take = instance.exports.get_function("take")?;
+        assert!(take.call(&mut store, &[funcref(&dynamic)]).is_err());
+        take.call(&mut store, &[funcref(&typed)])?;
+        let take: TypedFunction<Option<Function>, ()> = take.typed(&store)?;
+        assert!(take.call(&mut store, Some(dynamic.clone())).is_err());
+
+        // A host function that returns one traps.
+        let get = instance.exports.get_function("get")?;
+        assert!(get.call(&mut store, &[]).is_err());
+    }
+
+    Ok(())
+}
