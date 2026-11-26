@@ -1,22 +1,17 @@
+#[cfg(feature = "sys")]
+use crate::BackendTag;
 use crate::vm::VMExceptionRef;
-use crate::{
-    AsStoreMut, AsStoreRef, BackendTag, ExportError, Exportable, Extern, Tag, Value,
-    macros::backend::{gen_rt_ty, match_rt},
-    vm::{VMExtern, VMExternTag},
-};
+use crate::{AsStoreMut, AsStoreRef, Tag, Value, macros::backend::gen_rt_ty};
 
-/// A WebAssembly `global` instance.
-///
-/// A global instance is the runtime representation of a global variable.
-/// It consists of an individual value and a flag indicating whether it is mutable.
-///
-/// Spec: <https://webassembly.github.io/spec/core/exec/runtime.html#global-instances>
+// The exception of each backend, behind [`crate::Exception`].
 gen_rt_ty! {
     #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
     #[derive(Debug, Clone, PartialEq, Eq, derive_more::From)]
     pub(crate) BackendException(entities::exception::Exception);
 }
 
+// Only `sys` has exceptions: elsewhere the arguments go unused.
+#[cfg_attr(not(feature = "sys"), allow(unused_variables))]
 impl BackendException {
     /// Create a new exception with the given tag type and payload.
     #[inline]

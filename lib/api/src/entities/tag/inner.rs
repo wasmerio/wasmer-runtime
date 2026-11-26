@@ -6,12 +6,12 @@ use crate::{
     vm::{VMExtern, VMExternTag},
 };
 
-/// A WebAssembly `global` instance.
-///
-/// A global instance is the runtime representation of a global variable.
-/// It consists of an individual value and a flag indicating whether it is mutable.
-///
-/// Spec: <https://webassembly.github.io/spec/core/exec/runtime.html#global-instances>
+// A WebAssembly `global` instance.
+//
+// A global instance is the runtime representation of a global variable.
+// It consists of an individual value and a flag indicating whether it is mutable.
+//
+// Spec: <https://webassembly.github.io/spec/core/exec/runtime.html#global-instances>
 gen_rt_ty! {
     #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
     #[derive(Debug, Clone, PartialEq, Eq, derive_more::From)]

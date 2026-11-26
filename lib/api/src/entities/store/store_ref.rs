@@ -2,7 +2,6 @@ use std::ops::{Deref, DerefMut};
 
 use super::{StoreObjects, inner::StoreInner};
 use crate::entities::engine::{AsEngineRef, Engine, EngineRef};
-use wasmer_types::ExternType;
 //use wasmer_vm::{StoreObjects, TrapHandlerFn};
 
 #[cfg(feature = "sys")]

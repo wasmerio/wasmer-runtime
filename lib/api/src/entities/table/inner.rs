@@ -1,22 +1,21 @@
 use wasmer_types::TableType;
 
 use crate::{
-    AsStoreMut, AsStoreRef, ExportError, Exportable, Extern, StoreMut, StoreRef, TypedFunction,
-    Value, WasmTypeList,
+    AsStoreMut, AsStoreRef, TypedFunction, Value, WasmTypeList,
     error::RuntimeError,
     macros::backend::{gen_rt_ty, match_rt},
     store::BackendStore,
     vm::{VMExtern, VMExternTable},
 };
-/// A WebAssembly `table` instance.
-///
-/// The `Table` struct is an array-like structure representing a WebAssembly Table,
-/// which stores function references.
-///
-/// A table created by the host or in WebAssembly code will be accessible and
-/// mutable from both host and WebAssembly.
-///
-/// Spec: <https://webassembly.github.io/spec/core/exec/runtime.html#table-instances>
+// A WebAssembly `table` instance.
+//
+// The `Table` struct is an array-like structure representing a WebAssembly Table,
+// which stores function references.
+//
+// A table created by the host or in WebAssembly code will be accessible and
+// mutable from both host and WebAssembly.
+//
+// Spec: <https://webassembly.github.io/spec/core/exec/runtime.html#table-instances>
 gen_rt_ty! {
     #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
     #[derive(Debug, Clone, PartialEq, Eq, derive_more::From)]

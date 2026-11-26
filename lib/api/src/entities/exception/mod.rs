@@ -1,11 +1,7 @@
 pub(crate) mod inner;
 pub(crate) use inner::*;
-use wasmer_types::{TagType, Type};
 
-use crate::{
-    AsStoreMut, AsStoreRef, ExportError, Exportable, Extern, Tag, Value,
-    vm::{VMExceptionRef, VMExtern, VMExternTag},
-};
+use crate::{AsStoreMut, AsStoreRef, Tag, Value, vm::VMExceptionRef};
 
 /// A WebAssembly `exception` instance.
 ///

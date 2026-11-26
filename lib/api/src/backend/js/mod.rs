@@ -12,6 +12,6 @@ pub(crate) mod lent;
 pub(crate) mod utils;
 pub(crate) mod vm;
 
-pub use entities::*;
+pub(crate) use entities::*;
 pub use memory::JsSharedMemoryExt;
 pub use utils::*;

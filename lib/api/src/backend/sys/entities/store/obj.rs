@@ -1,6 +1,3 @@
-use wasmer_vm::StoreId;
-
-use crate::AsStoreMut;
 
 impl crate::StoreObjects {
     /// Consume store objects into [`crate::backend::sys::store::StoreObjects`].

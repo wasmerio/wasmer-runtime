@@ -112,7 +112,7 @@ impl SharedJsHandle {
                 return Self { id, owner };
             }
             let id = NEXT_ID
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
                 .expect("shared JavaScript handle IDs exhausted");
             let owner = Arc::new(Owner { kind });
             let weak = Arc::downgrade(&owner);

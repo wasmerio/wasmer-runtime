@@ -11,7 +11,7 @@ mod tests {
     use crate::sys::NativeEngineExt;
     use std::ptr::NonNull;
     use wasmer_compiler::Tunables;
-    use wasmer_types::{MemoryType, Pages};
+    use wasmer_types::MemoryType;
     use wasmer_vm::{
         MemoryError, MemoryStyle, TableStyle, VMConfig, VMMemory, VMMemoryDefinition, VMTable,
         VMTableDefinition,

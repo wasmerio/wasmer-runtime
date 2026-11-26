@@ -10,30 +10,6 @@ impl VMExternToExtern for VMExtern {
     }
 }
 
-impl VMFunctionEnvironment {
-    #[allow(clippy::should_implement_trait)]
-    /// Returns a reference to the underlying value.
-    pub fn as_ref(&self) -> &(dyn std::any::Any + Send + 'static) {
-        match_rt!(on self => s {
-            s.as_ref()
-        })
-    }
-
-    #[allow(clippy::should_implement_trait)]
-    /// Returns a mutable reference to the underlying value.
-    pub fn as_mut(&mut self) -> &mut (dyn std::any::Any + Send + 'static) {
-        match_rt!(on self => s {
-            s.as_mut()
-        })
-    }
-
-    pub fn contents(self) -> Box<(dyn std::any::Any + Send + 'static)> {
-        match_rt!(on self => s {
-            s.into_contents()
-        })
-    }
-}
-
 impl VMFuncRef {
     /// Converts the `VMFuncRef` into a `RawValue`.
     pub fn into_raw(self) -> RawValue {
@@ -79,6 +55,7 @@ impl VMSharedMemory {
         }
     }
 
+    #[cfg_attr(not(feature = "v8"), allow(unused_variables))]
     pub(crate) fn try_into_vm_memory(
         self,
         store: &mut impl AsStoreMut,

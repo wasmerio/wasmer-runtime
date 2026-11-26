@@ -4,8 +4,7 @@ use wasmer_types::{FunctionType, RawValue};
 use crate::entities::function::async_host::{boxed_body, typed_host_body};
 use crate::{
     AsStoreMut, AsStoreRef, CallWrapper, ExportError, Exportable, Extern, FunctionEnv,
-    FunctionEnvMut, HostFunction, StoreMut, StoreRef, TypedFunction, Value, WasmTypeList, WithEnv,
-    WithoutEnv,
+    FunctionEnvMut, HostFunction, TypedFunction, Value, WasmTypeList, WithEnv, WithoutEnv,
     error::RuntimeError,
     macros::backend::{gen_rt_ty, match_rt},
     vm::{VMExtern, VMExternFunction, VMFuncRef},
@@ -13,23 +12,23 @@ use crate::{
 #[cfg(feature = "experimental-async")]
 use crate::{AsyncEnv, AsyncHostFunction};
 
-/// A WebAssembly `function` instance.
-///
-/// A function instance is the runtime representation of a function.
-/// It effectively is a closure of the original function (defined in either
-/// the host or the WebAssembly module) over the runtime `Instance` of its
-/// originating `Module`.
-///
-/// The module instance is used to resolve references to other definitions
-/// during execution of the function.
-///
-/// Spec: <https://webassembly.github.io/spec/core/exec/runtime.html#function-instances>
-///
-/// # Panics
-/// - Closures (functions with captured environments) are not currently supported
-///   with native functions. Attempting to create a native `Function` with one will
-///   result in a panic.
-///   [Closures as host functions tracking issue](https://github.com/wasmerio/wasmer/issues/1840)
+// A WebAssembly `function` instance.
+//
+// A function instance is the runtime representation of a function.
+// It effectively is a closure of the original function (defined in either
+// the host or the WebAssembly module) over the runtime `Instance` of its
+// originating `Module`.
+//
+// The module instance is used to resolve references to other definitions
+// during execution of the function.
+//
+// Spec: <https://webassembly.github.io/spec/core/exec/runtime.html#function-instances>
+//
+// # Panics
+// - Closures (functions with captured environments) are not currently supported
+//   with native functions. Attempting to create a native `Function` with one will
+//   result in a panic.
+//   [Closures as host functions tracking issue](https://github.com/wasmerio/wasmer/issues/1840)
 gen_rt_ty! {
     #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,19 +181,19 @@ impl BackendFunction {
     {
         match &store.as_store_mut().inner.store {
             #[cfg(feature = "sys")]
-            crate::BackendStore::Sys(s) => Self::Sys(
+            crate::BackendStore::Sys(_) => Self::Sys(
                 crate::backend::sys::entities::function::Function::new_typed_with_env(
                     store, env, func,
                 ),
             ),
             #[cfg(feature = "v8")]
-            crate::BackendStore::V8(s) => Self::V8(
+            crate::BackendStore::V8(_) => Self::V8(
                 crate::backend::v8::entities::function::Function::new_typed_with_env(
                     store, env, func,
                 ),
             ),
             #[cfg(feature = "js")]
-            crate::BackendStore::Js(s) => Self::Js(
+            crate::BackendStore::Js(_) => Self::Js(
                 crate::backend::js::entities::function::Function::new_typed_with_env(
                     store, env, func,
                 ),
@@ -314,50 +313,6 @@ impl BackendFunction {
         })
     }
 
-    /// Returns the number of parameters that this function takes.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use wasmer::{Function, FunctionEnv, FunctionEnvMut, Store, Type};
-    /// # let mut store = Store::default();
-    /// # let env = FunctionEnv::new(&mut store, ());
-    /// #
-    /// fn sum(_env: FunctionEnvMut<()>, a: i32, b: i32) -> i32 {
-    ///     a + b
-    /// }
-    ///
-    /// let f = Function::new_typed_with_env(&mut store, &env, sum);
-    ///
-    /// assert_eq!(f.param_arity(&mut store), 2);
-    /// ```
-    #[inline]
-    pub fn param_arity(&self, store: &impl AsStoreRef) -> usize {
-        self.ty(store).params().len()
-    }
-
-    /// Returns the number of results this function produces.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// # use wasmer::{Function, FunctionEnv, FunctionEnvMut, Store, Type};
-    /// # let mut store = Store::default();
-    /// # let env = FunctionEnv::new(&mut store, ());
-    /// #
-    /// fn sum(_env: FunctionEnvMut<()>, a: i32, b: i32) -> i32 {
-    ///     a + b
-    /// }
-    ///
-    /// let f = Function::new_typed_with_env(&mut store, &env, sum);
-    ///
-    /// assert_eq!(f.result_arity(&mut store), 1);
-    /// ```
-    #[inline]
-    pub fn result_arity(&self, store: &impl AsStoreRef) -> usize {
-        self.ty(store).params().len()
-    }
-
     /// Call the `Function` function.
     ///
     /// Depending on where the Function is defined, it will call it.
@@ -441,21 +396,21 @@ impl BackendFunction {
     pub(crate) unsafe fn from_vm_funcref(store: &mut impl AsStoreMut, funcref: VMFuncRef) -> Self {
         match &store.as_store_mut().inner.store {
             #[cfg(feature = "sys")]
-            crate::BackendStore::Sys(s) => Self::Sys(unsafe {
+            crate::BackendStore::Sys(_) => Self::Sys(unsafe {
                 crate::backend::sys::entities::function::Function::from_vm_funcref(
                     store,
                     funcref.unwrap_sys(),
                 )
             }),
             #[cfg(feature = "v8")]
-            crate::BackendStore::V8(s) => Self::V8(unsafe {
+            crate::BackendStore::V8(_) => Self::V8(unsafe {
                 crate::backend::v8::entities::function::Function::from_vm_funcref(
                     store,
                     funcref.unwrap_v_8(),
                 )
             }),
             #[cfg(feature = "js")]
-            crate::BackendStore::Js(s) => Self::Js(unsafe {
+            crate::BackendStore::Js(_) => Self::Js(unsafe {
                 crate::backend::js::entities::function::Function::from_vm_funcref(
                     store,
                     funcref.unwrap_js(),

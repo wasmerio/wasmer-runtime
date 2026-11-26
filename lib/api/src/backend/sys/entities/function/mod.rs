@@ -15,7 +15,7 @@ use crate::{
     RuntimeError, StoreContext, StoreInner, StorePtrWrapper, Value, WithEnv, WithoutEnv,
     backend::sys::{engine::NativeEngineExt, vm::VMFunctionCallback},
     entities::function::call_wrapper::call_wrapped,
-    entities::store::{AsStoreMut, AsStoreRef, StoreMut},
+    entities::store::{AsStoreMut, AsStoreRef},
     utils::{FromToNativeWasmType, IntoResult, NativeWasmTypeInto, WasmTypeList},
     vm::{VMExtern, VMExternFunction},
 };
@@ -27,24 +27,23 @@ use std::{
     cmp::max,
     error::Error,
     ffi::c_void,
-    marker::PhantomData,
     ptr,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::atomic::{AtomicBool, Ordering},
 };
 #[cfg(feature = "experimental-async")]
 use std::{pin::Pin, rc::Rc};
 use wasmer_types::{NativeWasmType, RawValue, StoreId, Type};
+#[cfg(feature = "experimental-async")]
+use crate::entities::store::StoreMut;
 #[cfg(feature = "experimental-host-interrupt")]
 use wasmer_vm::interrupt_registry;
 use wasmer_vm::{
-    MaybeInstanceOwned, StoreHandle, Trap, TrapCode, VMCallerCheckedAnyfunc, VMContext,
-    VMDynamicFunctionContext, VMExceptionRef, VMFuncRef, VMFunction, VMFunctionBody,
-    VMFunctionContext, VMFunctionKind, VMTrampoline, on_host_stack, raise_lib_trap,
+    MaybeInstanceOwned, StoreHandle, VMCallerCheckedAnyfunc, VMContext, VMDynamicFunctionContext,
+    VMFuncRef, VMFunction, VMFunctionContext, VMFunctionKind, VMTrampoline, on_host_stack,
     raise_user_trap, resume_panic, wasmer_call_trampoline,
 };
+#[cfg(any(feature = "experimental-async", feature = "experimental-host-interrupt"))]
+use wasmer_vm::{Trap, TrapCode, raise_lib_trap};
 
 /// The values of a synchronous call (its arguments and results, raw or not,
 /// and the types of its results), inline for as many as most signatures
@@ -99,7 +98,7 @@ impl Function {
         let store_id = store.objects_mut().id();
         let wrapper = move |values_vec: *mut RawValue| -> HostCallOutcome {
             unsafe {
-                let mut store_wrapper = unsafe { StoreContext::get_current(store_id) };
+                let mut store_wrapper = StoreContext::get_current(store_id);
                 let mut store_mut = store_wrapper.as_mut();
                 let mut args = InlineValues::<Value>::new();
                 for (i, ty) in func_ty.params().iter().enumerate() {
@@ -470,6 +469,7 @@ impl Function {
     ) -> Result<(), RuntimeError> {
         // Call the trampoline.
         let result = {
+            #[cfg(feature = "experimental-host-interrupt")]
             let store_id = store.objects_mut().id();
 
             #[cfg(feature = "experimental-host-interrupt")]
@@ -569,11 +569,6 @@ impl Function {
             *slot = param.as_raw(&store_ref);
         }
         Ok((values, signature.results().to_vec()))
-    }
-
-    pub(crate) fn result_arity(&self, store: &impl AsStoreRef) -> usize {
-        let store = store.as_store_ref();
-        self.handle.get(store.objects().as_sys()).signature.results().len()
     }
 
     pub(crate) fn call(
@@ -695,6 +690,7 @@ enum InvocationResult<T> {
     Success(T),
     Exception(crate::Exception),
     Trap(Box<dyn Error + Send + Sync>),
+    #[cfg(feature = "experimental-async")]
     YieldOutsideAsyncContext,
 }
 
@@ -874,7 +870,7 @@ where
     // `None` if the guest is to wait for the host future of the import. The
     // results come with the pointer of the store's active entry, which the
     // host stack has in hand and the Wasm stack converts them with.
-    let mut result = on_host_stack(|| {
+    let result = on_host_stack(|| {
         panic::catch_unwind(AssertUnwindSafe(|| {
             // Safety: this is the trampoline of an import, which borrows the
             // active entry. The first poll of the future keeps the borrow.
@@ -1124,8 +1120,8 @@ unsafe fn finish_typed_host_call<Rets: WasmTypeList>(
             // away from the WASM stack at any time.
             // Safety: The pointer is only used for the duration of the call to `throw` and
             // `is_interrupted`.
-            let mut store_wrapper = StoreContext::get_current_transient(store_id);
-            let mut store = store_wrapper.as_mut().unwrap();
+            let store_wrapper = StoreContext::get_current_transient(store_id);
+            let store = store_wrapper.as_mut().unwrap();
             #[cfg(feature = "experimental-host-interrupt")]
             if interrupt_registry::is_interrupted(store.objects.id()) {
                 raise_lib_trap(Trap::lib(TrapCode::HostInterrupt))
@@ -1136,6 +1132,7 @@ unsafe fn finish_typed_host_call<Rets: WasmTypeList>(
             )
         },
         Ok(InvocationResult::Trap(trap)) => unsafe { raise_user_trap(trap) },
+        #[cfg(feature = "experimental-async")]
         Ok(InvocationResult::YieldOutsideAsyncContext) => unsafe {
             raise_lib_trap(Trap::lib(TrapCode::YieldOutsideAsyncContext))
         },
@@ -1247,8 +1244,8 @@ where
                 // away from the WASM stack at any time.
                 // Safety: The pointer is only used for the duration of the call to `throw` and
                 // `is_interrupted`.
-                let mut store_wrapper = StoreContext::get_current_transient(this.ctx.store_id);
-                let mut store = store_wrapper.as_mut().unwrap();
+                let store_wrapper = StoreContext::get_current_transient(this.ctx.store_id);
+                let store = store_wrapper.as_mut().unwrap();
                 #[cfg(feature = "experimental-host-interrupt")]
                 if interrupt_registry::is_interrupted(store.objects.id()) {
                     raise_lib_trap(Trap::lib(TrapCode::HostInterrupt))
@@ -1259,6 +1256,7 @@ where
                 )
             },
             Ok(InvocationResult::Trap(trap)) => unsafe { raise_user_trap(trap) },
+            #[cfg(feature = "experimental-async")]
             Ok(InvocationResult::YieldOutsideAsyncContext) => unsafe {
                 raise_lib_trap(Trap::lib(TrapCode::YieldOutsideAsyncContext))
             },
@@ -1402,7 +1400,7 @@ macro_rules! impl_host_function {
         #[allow(non_snake_case)]
         pub(crate) fn [<gen_fn_callback_ $c_struct_name:lower _no_env>]
             <$( $x: FromToNativeWasmType, )* Rets: WasmTypeList, RetsAsResult: IntoResult<Rets>, Func: Fn($( $x , )*) -> RetsAsResult + 'static>
-            (this: &Func) -> crate::backend::sys::vm::VMFunctionCallback {
+            (_this: &Func) -> crate::backend::sys::vm::VMFunctionCallback {
             /// This is a function that wraps the real host
             /// function. Its address will be used inside the
             /// runtime.
@@ -1424,6 +1422,8 @@ macro_rules! impl_host_function {
                     panic::catch_unwind(AssertUnwindSafe(|| {
                         let mut store_wrapper = unsafe { StoreContext::get_current(env.store_id) };
                         let store_ptr = store_wrapper.as_ptr();
+                        // Only a function with arguments converts them with it.
+                        #[allow(unused_mut)]
                         let mut store = store_wrapper.as_mut();
                         $(
                             let $x = unsafe {
@@ -1512,7 +1512,7 @@ macro_rules! impl_host_function {
         #[allow(non_snake_case)]
         pub(crate) fn [<gen_fn_callback_ $c_struct_name:lower>]
             <$( $x: FromToNativeWasmType, )* Rets: WasmTypeList, RetsAsResult: IntoResult<Rets>, T: Send + 'static,  Func: Fn(FunctionEnvMut<T>, $( $x , )*) -> RetsAsResult + 'static>
-            (this: &Func) -> crate::backend::sys::vm::VMFunctionCallback {
+            (_this: &Func) -> crate::backend::sys::vm::VMFunctionCallback {
             /// This is a function that wraps the real host
             /// function. Its address will be used inside the
             /// runtime.
@@ -1529,6 +1529,8 @@ macro_rules! impl_host_function {
                     panic::catch_unwind(AssertUnwindSafe(|| {
                         let mut store_wrapper = unsafe { StoreContext::get_current(env.store_id) };
                         let store_ptr = store_wrapper.as_ptr();
+                        // Only a function with arguments converts them with it.
+                        #[allow(unused_mut)]
                         let mut store = store_wrapper.as_mut();
                         $(
                             let $x = unsafe {

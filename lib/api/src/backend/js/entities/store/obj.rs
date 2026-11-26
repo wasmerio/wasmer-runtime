@@ -1,4 +1,3 @@
-use std::{marker::PhantomData, num::NonZeroUsize};
 
 use wasm_bindgen::JsValue;
 use wasmer_types::StoreId;

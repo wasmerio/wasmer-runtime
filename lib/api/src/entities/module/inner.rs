@@ -4,7 +4,6 @@
 use std::{fs, path::Path};
 
 use bytes::Bytes;
-use thiserror::Error;
 #[cfg(feature = "wat")]
 use wasmer_types::WasmError;
 use wasmer_types::{
@@ -32,14 +31,14 @@ fn wat_to_binary(bytes: &[u8]) -> Result<Option<Vec<u8>>, CompileError> {
     }
 }
 
-/// A WebAssembly Module contains stateless WebAssembly
-/// code that has already been compiled and can be instantiated
-/// multiple times.
-///
-/// ## Cloning a module
-///
-/// Cloning a module is cheap: it does a shallow copy of the compiled
-/// contents rather than a deep copy.
+// A WebAssembly Module contains stateless WebAssembly
+// code that has already been compiled and can be instantiated
+// multiple times.
+//
+// ## Cloning a module
+//
+// Cloning a module is cheap: it does a shallow copy of the compiled
+// contents rather than a deep copy.
 gen_rt_ty! {
     #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
     #[derive(Clone, PartialEq, Eq, derive_more::From)]
@@ -79,6 +78,8 @@ impl BackendModule {
     }
 
     #[inline]
+    // Only `sys` reports compilation progress.
+    #[cfg_attr(not(feature = "sys"), allow(unused_variables))]
     pub fn new_with_progress(
         engine: &impl AsEngineRef,
         bytes: impl AsRef<[u8]>,

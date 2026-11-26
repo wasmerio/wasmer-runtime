@@ -24,7 +24,6 @@ use crate::{
 pub(crate) mod view;
 pub use view::*;
 
-use super::store::Store;
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]

@@ -5,7 +5,6 @@ use std::marker::PhantomData;
 #[cfg(feature = "experimental-async")]
 use std::rc::Rc;
 
-pub(crate) use typed::*;
 
 #[wasm_bindgen(inline_js = r#"
 export function variadic(f) {
@@ -107,13 +106,11 @@ impl Drop for EnteredGuest {
 }
 
 use js_sys::{Array, Function as JsFunction};
-#[cfg(feature = "experimental-async")]
-use js_sys::Reflect;
 use wasm_bindgen::{JsCast, prelude::*};
 use wasmer_types::{FunctionType, RawValue, Type};
 
 use crate::{
-    AsStoreMut, AsStoreRef, BackendFunction, BackendFunctionEnv, BackendFunctionEnvMut,
+    AsStoreMut, AsStoreRef, BackendFunction, BackendFunctionEnvMut,
     CallWrapper, FromToNativeWasmType, FunctionEnv, FunctionEnvMut, HostFunction,
     HostFunctionKind, IntoResult, NativeWasmType, NativeWasmTypeInto, RuntimeError, StoreMut,
     Value, WasmTypeList, WithEnv, WithoutEnv,
@@ -872,7 +869,7 @@ macro_rules! impl_host_function {
         #[allow(non_snake_case)]
         pub(crate) fn [<gen_fn_callback_ $c_struct_name:lower _no_env>]
             <$( $x: FromToNativeWasmType, )* Rets: WasmTypeList, RetsAsResult: IntoResult<Rets>, Func: Fn($( $x , )*) -> RetsAsResult + 'static>
-            (this: &Func) -> crate::backend::js::vm::VMFunctionCallback {
+            (_this: &Func) -> crate::backend::js::vm::VMFunctionCallback {
 
             /// This is a function that wraps the real host
             /// function. Its address will be used inside the
@@ -924,7 +921,7 @@ macro_rules! impl_host_function {
         #[allow(non_snake_case)]
         pub(crate) fn [<gen_fn_callback_ $c_struct_name:lower>]
             <$( $x: FromToNativeWasmType, )* Rets: WasmTypeList, RetsAsResult: IntoResult<Rets>, T: Send + 'static,  Func: Fn(FunctionEnvMut<T>, $( $x , )*) -> RetsAsResult + 'static>
-            (this: &Func) -> crate::backend::js::vm::VMFunctionCallback {
+            (_this: &Func) -> crate::backend::js::vm::VMFunctionCallback {
 
             /// This is a function that wraps the real host
             /// function. Its address will be used inside the

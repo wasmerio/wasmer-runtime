@@ -56,29 +56,6 @@ impl AsEngineRef for Store {
 }
 
 impl crate::BackendStore {
-    /// Consume [`self`] into [`crate::backend::js::store::Store`].
-    pub fn into_js(self) -> crate::backend::js::store::Store {
-        match self {
-            Self::Js(s) => s,
-            _ => panic!("Not a `js` store!"),
-        }
-    }
-
-    /// Convert a reference to [`self`] into a reference [`crate::backend::js::store::Store`].
-    pub fn as_js(&self) -> &crate::backend::js::store::Store {
-        match self {
-            Self::Js(s) => s,
-            _ => panic!("Not a `js` store!"),
-        }
-    }
-
-    /// Convert a mutable reference to [`self`] into a mutable reference [`crate::backend::js::store::Store`].
-    pub fn as_js_mut(&mut self) -> &mut crate::backend::js::store::Store {
-        match self {
-            Self::Js(s) => s,
-            _ => panic!("Not a `js` store!"),
-        }
-    }
     /// Return true if [`self`] is a store from the `js` runtime.
     pub fn is_js(&self) -> bool {
         matches!(self, Self::Js(_))
@@ -86,21 +63,6 @@ impl crate::BackendStore {
 }
 
 impl crate::Store {
-    /// Consume [`self`] into [`crate::backend::js::store::Store`].
-    pub(crate) fn into_js(self) -> crate::backend::js::store::Store {
-        self.inner.into_box().store.into_js()
-    }
-
-    /// Convert a reference to [`self`] into a reference [`crate::backend::js::store::Store`].
-    pub(crate) fn as_js(&self) -> &crate::backend::js::store::Store {
-        self.inner.store.as_js()
-    }
-
-    /// Convert a mutable reference to [`self`] into a mutable reference [`crate::backend::js::store::Store`].
-    pub(crate) fn as_js_mut(&mut self) -> &mut crate::backend::js::store::Store {
-        self.inner.store.as_js_mut()
-    }
-
     /// Return true if [`self`] is a store from the `js` runtime.
     pub fn is_js(&self) -> bool {
         self.inner.store.is_js()

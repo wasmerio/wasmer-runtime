@@ -1,7 +1,7 @@
 use wasmer_types::{RawValue, Type};
 
 use crate::{
-    AsStoreRef, Tag,
+    AsStoreRef,
     entities::{Exception, ExternRef, Function},
     vm::{VMExceptionRef, VMExternRef, VMFuncRef},
 };

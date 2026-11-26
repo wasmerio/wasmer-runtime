@@ -259,6 +259,8 @@ where
 
 macro_rules! impl_async_host_function {
     ( $( $x:ident ),* ) => {
+        // A single argument is `(A1)`, which is `A1` itself.
+        #[allow(unused_parens)]
         impl<$( $x, )* Rets, RetsAsResult, T, F>
             sealed::Sealed<T, ( $( $x ),* ), Rets, ReturnsFuture> for F
         where
@@ -271,6 +273,8 @@ macro_rules! impl_async_host_function {
         {
         }
 
+        // A single argument is `(A1)`, which is `A1` itself.
+        #[allow(unused_parens)]
         impl<$( $x, )* Rets, RetsAsResult, T, F>
             sealed::Sealed<T, ( $( $x ),* ), Rets, ReturnsDeferred> for F
         where
@@ -283,6 +287,8 @@ macro_rules! impl_async_host_function {
         {
         }
 
+        // A single argument is `(A1)`, which is `A1` itself.
+        #[allow(unused_parens)]
         impl<$( $x, )* Rets, RetsAsResult, T, F>
             AsyncHostFunction<T, ( $( $x ),* ), Rets, ReturnsDeferred> for F
         where
@@ -312,6 +318,8 @@ macro_rules! impl_async_host_function {
             }
         }
 
+        // A single argument is `(A1)`, which is `A1` itself.
+        #[allow(unused_parens)]
         impl<$( $x, )* Rets, RetsAsResult, T, F>
             AsyncHostFunction<T, ( $( $x ),* ), Rets, ReturnsFuture> for F
         where

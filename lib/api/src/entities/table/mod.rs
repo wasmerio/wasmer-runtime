@@ -4,10 +4,8 @@ pub(crate) mod inner;
 pub(crate) use inner::*;
 
 use crate::{
-    AsStoreMut, AsStoreRef, ExportError, Exportable, Extern, StoreMut, StoreRef, TypedFunction,
-    Value, WasmTypeList,
+    AsStoreMut, AsStoreRef, ExportError, Exportable, Extern, TypedFunction, Value, WasmTypeList,
     error::RuntimeError,
-    store::BackendStore,
     vm::{VMExtern, VMExternTable},
 };
 

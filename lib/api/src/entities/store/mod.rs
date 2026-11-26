@@ -4,10 +4,12 @@
 /// Defines [`SharedStore`] and how async calls reach their store.
 #[cfg(feature = "experimental-async")]
 mod async_;
+#[cfg(all(feature = "experimental-async", feature = "js"))]
+pub(crate) use async_::StoreSlice;
 #[cfg(all(test, feature = "experimental-async", feature = "sys"))]
 pub(crate) use async_::is_published;
 #[cfg(feature = "experimental-async")]
-pub(crate) use async_::{CallStore, PollScope, PollStore, SharedState, StoreSlice, WithSlice};
+pub(crate) use async_::{CallStore, PollScope, PollStore, SharedState, WithSlice};
 #[cfg(feature = "experimental-async")]
 pub use async_::{SharedStore, StoreBusy, WeakSharedStore};
 #[cfg(feature = "experimental-async")]
@@ -75,6 +77,7 @@ impl StoreBox {
     }
 
     /// Gives the allocation up to another owner.
+    #[cfg(feature = "experimental-async")]
     pub(crate) fn into_box(self) -> Box<StoreInner> {
         self.keeper.check_owner();
         let mut this = ManuallyDrop::new(self);

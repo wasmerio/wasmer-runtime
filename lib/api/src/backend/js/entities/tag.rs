@@ -20,7 +20,7 @@ unsafe impl Sync for Tag {}
 // unsafe impl Send for Tag {}
 
 impl Tag {
-    pub fn new<P: Into<Box<[Type]>>>(store: &mut impl AsStoreMut, params: P) -> Self {
+    pub fn new<P: Into<Box<[Type]>>>(_store: &mut impl AsStoreMut, params: P) -> Self {
         let descriptor = js_sys::Object::new();
         let params: Box<[Type]> = params.into();
         let parameters: Vec<String> = params
@@ -41,17 +41,17 @@ impl Tag {
         Self { handle }
     }
 
-    pub fn ty(&self, store: &impl AsStoreRef) -> TagType {
+    pub fn ty(&self, _store: &impl AsStoreRef) -> TagType {
         self.handle.ty.clone()
     }
 
-    pub(crate) fn from_vm_extern(store: &mut impl AsStoreMut, vm_extern: VMExternTag) -> Self {
+    pub(crate) fn from_vm_extern(_store: &mut impl AsStoreMut, vm_extern: VMExternTag) -> Self {
         Self {
             handle: vm_extern.unwrap_js(),
         }
     }
 
-    pub fn is_from_store(&self, store: &impl AsStoreRef) -> bool {
+    pub fn is_from_store(&self, _store: &impl AsStoreRef) -> bool {
         true
     }
 
@@ -61,26 +61,10 @@ impl Tag {
 }
 
 impl crate::Tag {
-    /// Consume [`self`] into [`crate::backend::js::tag::Tag`].
-    pub(crate) fn into_js(self) -> crate::backend::js::tag::Tag {
-        match self.0 {
-            BackendTag::Js(s) => s,
-            _ => panic!("Not a `js` tag!"),
-        }
-    }
-
     /// Convert a reference to [`self`] into a reference [`crate::backend::js::tag::Tag`].
     pub(crate) fn as_js(&self) -> &crate::backend::js::tag::Tag {
         match self.0 {
             BackendTag::Js(ref s) => s,
-            _ => panic!("Not a `js` tag!"),
-        }
-    }
-
-    /// Convert a mutable reference to [`self`] into a mutable reference [`crate::backend::js::tag::Tag`].
-    pub(crate) fn as_js_mut(&mut self) -> &mut crate::backend::js::tag::Tag {
-        match self.0 {
-            BackendTag::Js(ref mut s) => s,
             _ => panic!("Not a `js` tag!"),
         }
     }

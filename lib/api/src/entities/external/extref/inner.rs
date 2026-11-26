@@ -1,6 +1,5 @@
 use std::any::Any;
 
-use crate::StoreRef;
 use crate::entities::store::{AsStoreMut, AsStoreRef};
 use crate::macros::backend::{gen_rt_ty, match_rt};
 use crate::vm::VMExternRef;
@@ -19,15 +18,15 @@ impl BackendExternRef {
     {
         match &store.as_store_mut().inner.store {
             #[cfg(feature = "sys")]
-            crate::BackendStore::Sys(s) => Self::Sys(
+            crate::BackendStore::Sys(_) => Self::Sys(
                 crate::backend::sys::entities::external::ExternRef::new(store, value),
             ),
             #[cfg(feature = "v8")]
-            crate::BackendStore::V8(s) => Self::V8(
+            crate::BackendStore::V8(_) => Self::V8(
                 crate::backend::v8::entities::external::ExternRef::new(store, value),
             ),
             #[cfg(feature = "js")]
-            crate::BackendStore::Js(s) => Self::Js(
+            crate::BackendStore::Js(_) => Self::Js(
                 crate::backend::js::entities::external::ExternRef::new(store, value),
             ),
         }

@@ -9,9 +9,11 @@ use std::{
 
 use wasmer_types::RawValue;
 
+#[cfg(feature = "sys")]
+use crate::WithSlice;
 use crate::{
     AsStoreMut, AsyncEnv, BackendFunction, CallStore, Function, RuntimeError, SharedStore,
-    StoreInner, StoreMut, Value, WasmTypeList, WithSlice,
+    StoreInner, StoreMut, Value, WasmTypeList,
 };
 
 /// The future of every async call.

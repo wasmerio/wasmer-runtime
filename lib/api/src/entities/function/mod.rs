@@ -2,7 +2,7 @@
 //! interact with them.
 
 pub(crate) mod inner;
-pub use inner::*;
+pub(crate) use inner::*;
 
 pub(crate) mod host;
 pub use host::*;
@@ -34,8 +34,7 @@ pub use deferred::Deferred;
 use wasmer_types::{FunctionType, RawValue};
 
 use crate::{
-    AsStoreMut, AsStoreRef, ExportError, Exportable, Extern, StoreMut, StoreRef, TypedFunction,
-    Value, WasmTypeList,
+    AsStoreMut, AsStoreRef, ExportError, Exportable, Extern, TypedFunction, Value, WasmTypeList,
     error::RuntimeError,
     vm::{VMExtern, VMExternFunction, VMFuncRef},
 };

@@ -12,8 +12,13 @@
 #![allow(
     clippy::new_without_default,
     ambiguous_wide_pointer_comparisons,
-    unreachable_patterns,
-    unused
+    unreachable_patterns
+)]
+// Parts of the shared layer, and their `js` implementations, are only reached
+// from the native backends (`sys` and `v8`), which a `js` build never has.
+#![cfg_attr(
+    all(feature = "js", not(any(feature = "sys", feature = "v8"))),
+    allow(dead_code)
 )]
 #![warn(
     clippy::float_arithmetic,

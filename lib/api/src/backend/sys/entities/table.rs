@@ -8,7 +8,7 @@ use crate::{
     vm::{VMExtern, VMExternTable},
 };
 use wasmer_types::TableType;
-use wasmer_vm::{StoreHandle, TableElement, Trap, VMTable};
+use wasmer_vm::{StoreHandle, TableElement, VMTable};
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "artifact-size", derive(loupe::MemoryUsage))]
@@ -76,7 +76,7 @@ fn value_from_table_element(store: &mut impl AsStoreMut, item: wasmer_vm::TableE
 
 impl Table {
     pub(crate) fn new(
-        mut store: &mut impl AsStoreMut,
+        store: &mut impl AsStoreMut,
         ty: TableType,
         init: Value,
     ) -> Result<Self, RuntimeError> {

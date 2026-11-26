@@ -2,7 +2,7 @@ pub use shared::{MemoryOps, SharedMemory};
 use wasmer_types::{MemoryError, MemoryType, Pages};
 
 use crate::{
-    AsStoreMut, AsStoreRef, ExportError, Exportable, Extern, StoreMut, StoreRef,
+    AsStoreMut, AsStoreRef, ExportError, Exportable, Extern,
     vm::{VMExtern, VMExternMemory, VMMemory},
 };
 

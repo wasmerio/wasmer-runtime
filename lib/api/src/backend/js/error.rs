@@ -5,7 +5,7 @@ use wasm_bindgen::{JsValue, prelude::*};
 
 use crate::{
     RuntimeError,
-    js::{exception::Exception, vm::VMExceptionRef},
+    js::vm::VMExceptionRef,
 };
 
 #[derive(Debug)]

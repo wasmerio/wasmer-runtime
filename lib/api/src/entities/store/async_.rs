@@ -373,6 +373,14 @@ pub(crate) enum CallStore<'a> {
 }
 
 impl CallStore<'_> {
+    #[cfg_attr(
+        not(any(
+            feature = "experimental-host-interrupt",
+            feature = "js",
+            feature = "v8"
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn id(&self) -> StoreId {
         match self {
             Self::Exclusive { id, .. } | Self::Env { id, .. } => *id,

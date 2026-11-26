@@ -1,13 +1,8 @@
 //! Data types, functions and traits for `sys` runtime's `Tag` implementation.
-use std::any::Any;
 
-use wasmer_types::{TagType, Type};
-use wasmer_vm::{StoreHandle, StoreId};
+use wasmer_vm::StoreHandle;
 
-use crate::{
-    AsStoreMut, AsStoreRef, BackendTag, Tag, Value,
-    sys::vm::{VMExceptionObj, VMExceptionRef},
-};
+use crate::{AsStoreMut, AsStoreRef, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// A WebAssembly `exnref` in the `sys` runtime.
@@ -25,7 +20,6 @@ impl Exception {
         }
 
         let store_objects = store.as_store_ref().objects().as_sys();
-        let store_id = store_objects.id();
 
         let tag_ty = tag.handle.get(store_objects).signature.params();
 

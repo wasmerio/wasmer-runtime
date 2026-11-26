@@ -3,19 +3,20 @@ use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use wasmer_compiler::{Artifact, ArtifactCreate, Engine};
+use wasmer_compiler::{Artifact, ArtifactCreate};
 use wasmer_types::{
     CompilationProgressCallback, CompileError, DeserializeError, ExportType, ExportsIterator,
     ImportType, ImportsIterator, ModuleInfo, SerializeError,
 };
 #[cfg(feature = "experimental-host-interrupt")]
 use wasmer_vm::interrupt_registry;
+#[cfg(feature = "experimental-host-interrupt")]
 use wasmer_vm::{Trap, TrapCode};
 
 use crate::{
     AsStoreMut, AsStoreRef, BackendModule, IntoBytes, StoreContext,
     backend::sys::entities::engine::NativeEngineExt, engine::AsEngineRef,
-    error::InstantiationError, vm::VMInstance,
+    error::InstantiationError,
 };
 use wasmer_vm::StoreHandle;
 

@@ -1,19 +1,12 @@
 //! Defines the [`self::Engine`] type and useful traits and data types to interact with an engine.
 
-use bytes::Bytes;
-use std::{path::Path, sync::Arc};
 use wasmer_types::{
-    CompileError, DeserializeError, Features,
+    CompileError, Features,
     target::{Target, UserCompilerOptimizations},
 };
 
-#[cfg(feature = "sys")]
-use wasmer_compiler::Artifact;
-
 #[cfg(feature = "compiler")]
 use wasmer_compiler::CompilerConfig;
-
-use crate::{BackendKind, IntoBytes, Store};
 
 /// Create temporary handles to engines.
 mod engine_ref;
@@ -77,6 +70,11 @@ impl Engine {
     /// Returns the default WebAssembly features supported by this backend for a given target.
     ///
     /// These are the features that will be enabled by default without any user configuration.
+    // Only the compilers have features that depend on the target.
+    #[cfg_attr(
+        not(any(feature = "cranelift", feature = "llvm", feature = "singlepass")),
+        allow(unused_variables)
+    )]
     pub fn default_features_for_backend(backend: &crate::BackendKind, target: &Target) -> Features {
         match backend {
             #[cfg(feature = "cranelift")]
@@ -108,6 +106,10 @@ impl Engine {
     /// Returns all WebAssembly features supported by the specified backend for a given target.
     ///
     /// This static method allows checking features for any backend, not just the current one.
+    #[cfg_attr(
+        not(any(feature = "cranelift", feature = "llvm", feature = "singlepass")),
+        allow(unused_variables)
+    )]
     pub fn supported_features_for_backend(
         backend: &crate::BackendKind,
         target: &Target,
@@ -136,76 +138,6 @@ impl Engine {
             // Default case
             _ => Features::default(),
         }
-    }
-
-    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
-    /// Deserializes a WebAssembly module which was previously serialized with
-    /// `Module::serialize`,
-    ///
-    /// # Note
-    /// You should almost always prefer [`Self::deserialize`].
-    ///
-    /// # Errors
-    /// Not every implementer supports serializing and deserializing modules.
-    /// Currently, only the `sys` engines support it, and only when the target
-    /// architecture is not `wasm32`.
-    ///
-    /// # Safety
-    /// See [`Artifact::deserialize_unchecked`].
-    unsafe fn deserialize_unchecked(
-        &self,
-        bytes: impl IntoBytes,
-    ) -> Result<Arc<Artifact>, DeserializeError> {
-        unsafe { self.be.deserialize_unchecked(bytes) }
-    }
-
-    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
-    /// Deserializes a WebAssembly module which was previously serialized with
-    /// `Module::serialize`,
-    ///
-    /// # Errors
-    /// Not every implementer supports serializing and deserializing modules.
-    /// Currently, only the `sys` engines support it, and only when the target
-    /// architecture is not `wasm32`.
-    unsafe fn deserialize(&self, bytes: impl IntoBytes) -> Result<Arc<Artifact>, DeserializeError> {
-        unsafe { self.be.deserialize(bytes) }
-    }
-
-    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
-    /// Load a serialized WebAssembly module from a file and deserialize it.
-    ///
-    /// # Note
-    /// You should almost always prefer [`Self::deserialize_from_file`].
-    ///
-    /// # Errors
-    /// Not every implementer supports serializing and deserializing modules.
-    /// Currently, only the `sys` engines support it, and only when the target
-    /// architecture is not `wasm32`.
-    ///
-    /// # Safety
-    /// See [`Artifact::deserialize_unchecked`].
-    unsafe fn deserialize_from_file_unchecked(
-        &self,
-        file_ref: &Path,
-    ) -> Result<Arc<Artifact>, DeserializeError> {
-        unsafe { self.be.deserialize_from_file_unchecked(file_ref) }
-    }
-
-    #[cfg(all(feature = "sys", not(target_arch = "wasm32")))]
-    /// Load a serialized WebAssembly module from a file and deserialize it.
-    ///
-    /// # Errors
-    /// Not every implementer supports serializing and deserializing modules.
-    /// Currently, only the `sys` engines support it, and only when the target
-    /// architecture is not `wasm32`.
-    ///
-    /// # Safety
-    /// See [`Artifact::deserialize`].
-    unsafe fn deserialize_from_file(
-        &self,
-        file_ref: &Path,
-    ) -> Result<Arc<Artifact>, DeserializeError> {
-        unsafe { self.be.deserialize_from_file_unchecked(file_ref) }
     }
 
     /// Add suggested optimizations to this engine.

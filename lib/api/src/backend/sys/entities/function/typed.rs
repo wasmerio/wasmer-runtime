@@ -1,16 +1,13 @@
+use crate::backend::sys::engine::NativeEngineExt;
 #[cfg(feature = "experimental-host-interrupt")]
-use crate::backend::sys::vm::interrupt_registry;
-use crate::backend::sys::{
-    engine::NativeEngineExt,
-    vm::{Trap, TrapCode},
-};
+use crate::backend::sys::vm::{Trap, TrapCode, interrupt_registry};
 use crate::{
-    CallWrapper, FromToNativeWasmType, Function, NativeWasmTypeInto, RuntimeError, StoreContext,
-    TypedFunction, Value, WasmTypeList,
+    CallWrapper, FromToNativeWasmType, NativeWasmTypeInto, RuntimeError, StoreContext,
+    TypedFunction, WasmTypeList,
     entities::function::call_wrapper::call_wrapped,
     store::{AsStoreMut, AsStoreRef},
 };
-use wasmer_types::{FunctionType, RawValue, Type};
+use wasmer_types::RawValue;
 
 macro_rules! impl_native_traits {
     (  $( $x:ident ),* ) => {
@@ -61,10 +58,8 @@ macro_rules! impl_native_traits {
                     rets_list.as_mut()
                 };
 
-                let store_id = store.objects_mut().id();
-
                 #[cfg(feature = "experimental-host-interrupt")]
-                let interrupt_guard = match interrupt_registry::install(store_id) {
+                let interrupt_guard = match interrupt_registry::install(store.objects_mut().id()) {
                     Ok(x) => x,
                     Err(interrupt_registry::InstallError::AlreadyInterrupted) => {
                         return Err(Trap::lib(TrapCode::HostInterrupt).into());
@@ -157,10 +152,8 @@ macro_rules! impl_native_traits {
                     rets_list.as_mut()
                 };
 
-                let store_id = store.objects_mut().id();
-
                 #[cfg(feature = "experimental-host-interrupt")]
-                let interrupt_guard = match interrupt_registry::install(store_id) {
+                let interrupt_guard = match interrupt_registry::install(store.objects_mut().id()) {
                     Ok(x) => x,
                     Err(interrupt_registry::InstallError::AlreadyInterrupted) => {
                         return Err(Trap::lib(TrapCode::HostInterrupt).into());

@@ -40,6 +40,9 @@ pub enum BackendKind {
 }
 
 impl Default for BackendKind {
+    // The first backend enabled is returned; the code after it is
+    // unreachable.
+    #[allow(unreachable_code)]
     fn default() -> Self {
         #[cfg(feature = "sys-default")]
         {

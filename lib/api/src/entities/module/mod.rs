@@ -8,14 +8,12 @@ use std::{fs, path::Path};
 
 use bytes::Bytes;
 use thiserror::Error;
-#[cfg(feature = "wat")]
-use wasmer_types::WasmError;
 use wasmer_types::{
-    CompilationProgress, CompilationProgressCallback, CompileError, DeserializeError, ExportType,
-    ExportsIterator, ImportType, ImportsIterator, ModuleInfo, SerializeError, UserAbort,
+    CompileError, DeserializeError, ExportType, ExportsIterator, ImportType, ImportsIterator,
+    ModuleInfo, SerializeError,
 };
 
-use crate::{AsEngineRef, macros::backend::match_rt, utils::IntoBytes};
+use crate::{AsEngineRef, utils::IntoBytes};
 
 /// IO errors that can happen while compiling a [`Module`].
 #[derive(Error, Debug)]

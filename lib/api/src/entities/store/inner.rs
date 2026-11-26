@@ -7,9 +7,6 @@ use crate::{
     macros::backend::{gen_rt_ty, match_rt},
 };
 
-#[cfg(feature = "sys")]
-use wasmer_vm::TrapHandlerFn;
-
 /// We require the context to have a fixed memory address for its lifetime since
 /// various bits of the VM have raw pointers that point back to it. Hence we
 /// wrap the actual context in a box.
@@ -76,6 +73,7 @@ pub(crate) trait KeepsStore {
     fn check_owner(&self) {}
 
     /// Whether a call holds the store while no slice of it runs.
+    #[cfg(feature = "experimental-async")]
     #[inline]
     fn holds_store(&self) -> bool {
         false
@@ -105,6 +103,7 @@ impl BackendStoreKeeper {
     }
 
     /// See [`KeepsStore::holds_store`].
+    #[cfg(feature = "experimental-async")]
     #[inline]
     pub(crate) fn holds_store(&self) -> bool {
         match_rt!(on self => k {

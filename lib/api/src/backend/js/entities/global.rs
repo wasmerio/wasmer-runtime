@@ -1,4 +1,4 @@
-use wasm_bindgen::{JsValue, prelude::*};
+use wasm_bindgen::JsValue;
 use wasmer_types::{GlobalType, Mutability, RawValue, Type};
 
 use crate::{

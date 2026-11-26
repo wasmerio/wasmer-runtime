@@ -5,7 +5,7 @@ use js_sys::{Reflect, Uint8Array, WebAssembly};
 use tracing::{debug, warn};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
-use wasm_bindgen::{JsValue, prelude::*};
+use wasm_bindgen::JsValue;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_futures::JsFuture;
 use wasmer_types::{
@@ -19,7 +19,7 @@ use crate::{
     AsEngineRef, AsStoreMut, BackendModule, Extern, Imports, InstantiationError, IntoBytes,
     RuntimeError,
     js::{
-        utils::{convert::AsJs as _, shared_handle::SharedJsHandle},
+        utils::shared_handle::SharedJsHandle,
         vm::VMInstance,
     },
 };
