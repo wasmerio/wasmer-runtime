@@ -1,7 +1,7 @@
 use wasmer_types::{FunctionType, RawValue};
 
 #[cfg(all(feature = "async", any(feature = "js", feature = "v8")))]
-use crate::entities::function::async_host::{boxed_body, typed_host_body};
+use crate::entities::function::async_host::{TypedCall, boxed_body, typed_call, typed_host_body};
 use crate::{
     AsStoreMut, AsStoreRef, CallWrapper, ExportError, Exportable, Extern, FunctionEnv,
     FunctionEnvMut, HostFunction, TypedFunction, Value, WasmTypeList, WithEnv, WithoutEnv,
@@ -269,22 +269,39 @@ impl BackendFunction {
                     store, env, func,
                 ),
             ),
+            #[cfg(any(feature = "v8", feature = "js"))]
+            _ => Self::new_typed_async_erased(store, env, typed_call(func)),
+        }
+    }
+
+    /// [`new_typed_async`](Self::new_typed_async) on a backend whose host
+    /// functions take and return [`Value`]s, once per environment type and
+    /// signature rather than per host function.
+    #[inline(never)]
+    #[cfg(all(feature = "async", any(feature = "v8", feature = "js")))]
+    fn new_typed_async_erased<T, Args, Rets>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        func: std::rc::Rc<dyn TypedCall<T, Args, Rets>>,
+    ) -> Self
+    where
+        T: Send + 'static,
+        Args: WasmTypeList + 'static,
+        Rets: WasmTypeList + 'static,
+    {
+        let ty = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
+        let body = typed_host_body(func, ty.clone());
+        match &store.as_store_mut().inner.store {
             #[cfg(feature = "v8")]
-            crate::BackendStore::V8(_) => {
-                let ty = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
-                let body = typed_host_body(func, ty.clone());
-                Self::V8(crate::backend::v8::entities::function::Function::new_async(
-                    store, env, ty, body,
-                ))
-            }
+            crate::BackendStore::V8(_) => Self::V8(
+                crate::backend::v8::entities::function::Function::new_async(store, env, ty, body),
+            ),
             #[cfg(feature = "js")]
-            crate::BackendStore::Js(_) => {
-                let ty = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
-                let body = typed_host_body(func, ty.clone());
-                Self::Js(crate::backend::js::entities::function::Function::new_async(
-                    store, env, ty, body,
-                ))
-            }
+            crate::BackendStore::Js(_) => Self::Js(
+                crate::backend::js::entities::function::Function::new_async(store, env, ty, body),
+            ),
+            #[allow(unreachable_patterns)]
+            _ => unreachable!("the backend of this store does not take values"),
         }
     }
 

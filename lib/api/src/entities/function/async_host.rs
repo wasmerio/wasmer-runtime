@@ -500,13 +500,46 @@ where
     }
 }
 
-/// Turns a typed async host function into the body of a dynamic one, for a
-/// backend whose host functions take and return [`Value`]s.
+/// The call of a typed async host function, with the type of the function
+/// erased: what a backend whose host functions take and return [`Value`]s
+/// keeps of one.
+///
+/// Only [`call`](Self::call) is instantiated per host function, and it does
+/// no more than box the function's future. The rest of the body, converting
+/// arguments and results and awaiting that future, is instantiated once per
+/// environment type and signature, at the cost of one more allocation per
+/// call.
 #[cfg(any(feature = "js", feature = "v8"))]
-pub(crate) fn typed_host_body<T, F, Args, Rets, Kind>(
-    func: F,
-    ty: FunctionType,
-) -> impl Fn(AsyncEnv<T>, Vec<Value>) -> HostFuture + 'static
+pub(crate) trait TypedCall<T, Args, Rets> {
+    fn call<'a>(
+        &'a self,
+        cx: &'a mut AsyncEnv<T>,
+        args: Args,
+    ) -> Pin<Box<dyn Future<Output = Result<Rets, RuntimeError>> + 'a>>;
+}
+
+#[cfg(any(feature = "js", feature = "v8"))]
+struct Typed<F, Kind>(F, PhantomData<fn() -> Kind>);
+
+#[cfg(any(feature = "js", feature = "v8"))]
+impl<T, F, Args, Rets, Kind> TypedCall<T, Args, Rets> for Typed<F, Kind>
+where
+    F: AsyncHostFunction<T, Args, Rets, Kind>,
+    Args: WasmTypeList + 'static,
+    Rets: WasmTypeList + 'static,
+{
+    fn call<'a>(
+        &'a self,
+        cx: &'a mut AsyncEnv<T>,
+        args: Args,
+    ) -> Pin<Box<dyn Future<Output = Result<Rets, RuntimeError>> + 'a>> {
+        Box::pin(self.0.invoke(cx, args))
+    }
+}
+
+/// `func`, with its type erased.
+#[cfg(any(feature = "js", feature = "v8"))]
+pub(crate) fn typed_call<T, F, Args, Rets, Kind>(func: F) -> Rc<dyn TypedCall<T, Args, Rets>>
 where
     T: 'static,
     Kind: 'static,
@@ -514,16 +547,28 @@ where
     Args: WasmTypeList + 'static,
     Rets: WasmTypeList + 'static,
 {
-    // Only the call of `func` is instantiated per host function. The
-    // conversions are once per environment type and signature.
-    let func = Rc::new(func);
+    Rc::new(Typed(func, PhantomData))
+}
+
+/// Turns a typed async host function into the body of a dynamic one, for a
+/// backend whose host functions take and return [`Value`]s.
+#[cfg(any(feature = "js", feature = "v8"))]
+pub(crate) fn typed_host_body<T, Args, Rets>(
+    func: Rc<dyn TypedCall<T, Args, Rets>>,
+    ty: FunctionType,
+) -> impl Fn(AsyncEnv<T>, Vec<Value>) -> HostFuture + 'static
+where
+    T: 'static,
+    Args: WasmTypeList + 'static,
+    Rets: WasmTypeList + 'static,
+{
     let ty = Rc::new(ty);
     move |mut cx, values| -> HostFuture {
         let func = Rc::clone(&func);
         let ty = Rc::clone(&ty);
         Box::pin(async move {
             let args = typed_args::<T, Args>(&mut cx, &ty, &values)?;
-            let rets = func.invoke(&mut cx, args).await?;
+            let rets = func.call(&mut cx, args).await?;
             typed_results::<T, Rets>(&mut cx, &ty, rets)
         })
     }
