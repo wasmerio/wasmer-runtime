@@ -450,6 +450,17 @@ compile_error!(
 // A `baremetal` trap leaves through the embedder's unwinder, which cannot
 // stop at the coroutine of a `call_async`, and a call dropped while suspended
 // cannot be unwound either: it would be forgotten, stack and all.
+// The `js` backend runs in a JavaScript host, and the native backends do not.
+#[cfg(all(feature = "js", not(target_arch = "wasm32")))]
+compile_error!(
+    "the `js` feature requires the `wasm32` target architecture: build with `--target wasm32-unknown-unknown`."
+);
+
+#[cfg(all(any(feature = "sys", feature = "v8"), target_arch = "wasm32"))]
+compile_error!(
+    "the `sys` and `v8` features require a native target: use `js` or `js-default` for `wasm32`."
+);
+
 #[cfg(all(feature = "sys", feature = "experimental-async", feature = "baremetal"))]
 compile_error!(
     "the `experimental-async` feature is not supported with `baremetal`: traps and cancelled calls cannot unwind a `call_async` coroutine there."

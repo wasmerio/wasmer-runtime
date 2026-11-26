@@ -975,10 +975,6 @@ macro_rules! impl_host_function {
                 match result {
                     Ok(Ok(c_struct)) => c_struct,
                     #[allow(deprecated)]
-                    #[cfg(feature = "std")]
-                    Ok(Err(trap)) => crate::js::error::raise(Box::new(trap)),
-                    #[cfg(feature = "core")]
-                    #[allow(deprecated)]
                     Ok(Err(trap)) => crate::js::error::raise(Box::new(trap)),
                     Err(panic) => raise_host_function_panic(panic),
                 }
