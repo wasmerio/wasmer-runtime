@@ -2201,7 +2201,14 @@ pub fn host_call_in_place() -> Option<HostCallInPlace> {
 /// The current stack pointer.
 #[inline(always)]
 fn stack_pointer() -> usize {
-    psm::stack_pointer().addr()
+    #[cfg(not(miri))]
+    {
+        psm::stack_pointer().addr()
+    }
+    #[cfg(miri)]
+    {
+        0
+    }
 }
 
 #[cfg(windows)]
