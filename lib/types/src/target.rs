@@ -129,18 +129,12 @@ impl CpuFeature {
         // We default to an empty hash set
         EnumSet::new()
     }
-
-    /// Build a set of all available `CpuFeature`s.
-    pub fn all() -> EnumSet<Self> {
-        EnumSet::all()
-    }
 }
 
 // This options should map exactly the GCC options indicated
 // here by architectures:
 //
 // X86: https://gcc.gnu.org/onlinedocs/gcc/x86-Options.html
-// ARM: https://gcc.gnu.org/onlinedocs/gcc/ARM-Options.html
 // Aarch64: https://gcc.gnu.org/onlinedocs/gcc/AArch64-Options.html
 impl FromStr for CpuFeature {
     type Err = ParseCpuFeatureError;
