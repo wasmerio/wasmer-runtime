@@ -819,13 +819,8 @@ impl EmitterX64 for AssemblerX64 {
     }
 
     fn arch_has_xzcnt(&self) -> bool {
-        match &self.target {
-            Some(target) => {
-                target.cpu_features().contains(CpuFeature::LZCNT)
-                    && target.cpu_features().contains(CpuFeature::BMI1)
-            }
-            None => false,
-        }
+        self.target.cpu_features().contains(CpuFeature::LZCNT)
+            && self.target.cpu_features().contains(CpuFeature::BMI1)
     }
 
     fn arch_emit_lzcnt(

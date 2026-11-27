@@ -105,6 +105,10 @@ pub trait Machine {
     /// A stack alignment in bytes that fulfills the ABI requirement.
     const STACK_ALIGNMENT: usize;
 
+    /// Validate that the target provides the minimal set of CPU features
+    /// this backend needs to generate code.
+    fn requires_features(target: &Target) -> Result<(), CompileError>;
+
     /// Get current assembler offset
     fn assembler_get_offset(&self) -> Offset;
     /// Get the GPR that hold vmctx
@@ -2352,7 +2356,7 @@ pub fn gen_std_trampoline(
 ) -> Result<CompileOutput, CompileError> {
     let body = match target.triple().architecture {
         Architecture::X86_64 => {
-            let machine = MachineX86_64::new(Some(target.clone()))?;
+            let machine = MachineX86_64::new(target.clone());
             machine.gen_std_trampoline(sig, calling_convention, progress_callback)
         }
         Architecture::Aarch64(_) => {
@@ -2384,7 +2388,7 @@ pub fn gen_std_dynamic_import_trampoline(
 ) -> Result<CompileOutput, CompileError> {
     let body = match target.triple().architecture {
         Architecture::X86_64 => {
-            let machine = MachineX86_64::new(Some(target.clone()))?;
+            let machine = MachineX86_64::new(target.clone());
             machine.gen_std_dynamic_import_trampoline(
                 vmoffsets,
                 sig,
@@ -2430,7 +2434,7 @@ pub fn gen_import_call_trampoline(
 ) -> Result<CompileOutput, CompileError> {
     let section = match target.triple().architecture {
         Architecture::X86_64 => {
-            let machine = MachineX86_64::new(Some(target.clone()))?;
+            let machine = MachineX86_64::new(target.clone());
             machine.gen_import_call_trampoline(
                 vmoffsets,
                 index,

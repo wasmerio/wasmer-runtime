@@ -1360,6 +1360,15 @@ impl Machine for MachineARM64 {
 
     const STACK_ALIGNMENT: usize = 16;
 
+    fn requires_features(target: &Target) -> Result<(), CompileError> {
+        if !target.cpu_features().contains(CpuFeature::NEON) {
+            return Err(CompileError::UnsupportedTarget(
+                "aarch64 without NEON, use -m neon to enable".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn assembler_get_offset(&self) -> Offset {
         self.assembler.get_offset()
     }

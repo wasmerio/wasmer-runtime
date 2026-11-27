@@ -71,9 +71,9 @@ impl SinglepassCompiler {
         )?;
         let arch = target.triple().architecture;
         match arch {
-            Architecture::X86_64 => {}
-            Architecture::Aarch64(_) => {}
-            Architecture::Riscv64(_) => {}
+            Architecture::X86_64 => MachineX86_64::requires_features(target)?,
+            Architecture::Aarch64(_) => MachineARM64::requires_features(target)?,
+            Architecture::Riscv64(_) => MachineRiscv::requires_features(target)?,
             _ => {
                 return Err(CompileError::UnsupportedTarget(
                     target.triple().architecture.to_string(),
@@ -165,7 +165,7 @@ impl SinglepassCompiler {
 
                 let res = match arch {
                     Architecture::X86_64 => {
-                        let machine = MachineX86_64::new(Some(target.clone()))?;
+                        let machine = MachineX86_64::new(target.clone());
                         let mut generator = FuncGen::new(
                             module,
                             target,
@@ -395,7 +395,13 @@ impl Compiler for SinglepassCompiler {
     }
 
     fn get_cpu_features_used(&self, cpu_features: &EnumSet<CpuFeature>) -> EnumSet<CpuFeature> {
-        let used = CpuFeature::AVX | CpuFeature::SSE42 | CpuFeature::LZCNT | CpuFeature::BMI1;
+        let used = CpuFeature::AVX
+            | CpuFeature::SSE42
+            | CpuFeature::LZCNT
+            | CpuFeature::BMI1
+            | CpuFeature::POPCNT
+            // AArch64
+            | CpuFeature::NEON;
         cpu_features.intersection(used)
     }
 }

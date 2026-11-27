@@ -1909,6 +1909,11 @@ impl Machine for MachineRiscv {
 
     const STACK_ALIGNMENT: usize = 16;
 
+    fn requires_features(_target: &Target) -> Result<(), CompileError> {
+        // TODO: require the F/D extensions once they are detected.
+        Ok(())
+    }
+
     fn assembler_get_offset(&self) -> Offset {
         self.assembler.get_offset()
     }
