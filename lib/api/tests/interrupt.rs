@@ -1,4 +1,4 @@
-#![cfg(all(unix, feature = "experimental-host-interrupt"))]
+#![cfg(all(unix, feature = "cranelift", feature = "experimental-host-interrupt"))]
 
 // TODO: tests for recursive function calls across different stores
 
@@ -27,69 +27,112 @@ const INFINITE_LOOP_WAT: &str = r#"
       )
     )"#;
 
-// TODO: VMOwnedMemory doesn't support memory.atomic.wait, otherwise the
-// memory here doesn't need to be shared
-const INFINITE_ATOMIC_WAIT_WAT: &str = r#"
-    (module
-      (memory 1 1 shared)
-      (func (export "infinite")
-        i32.const 0
-        i32.const 0
-        i64.const -1
-        memory.atomic.wait32
-        drop
-      )
-    )"#;
-
 #[test]
-fn test_interrupt_hot_loop() -> Result<()> {
-    test_interruptible(INFINITE_LOOP_WAT)
+fn cranelift_polls_at_function_entry() -> Result<()> {
+    use wasmer::{
+        WasmCall,
+        sys::{Cranelift, EngineBuilder},
+    };
+
+    let mut store = Store::new(EngineBuilder::new(Cranelift::default()).engine());
+    let module = Module::new(
+        &store,
+        wat::parse_str(r#"(module (func (export "run") unreachable))"#)?,
+    )?;
+    let instance = Instance::new(&mut store, &module, &imports! {})?;
+    let run = instance
+        .exports
+        .get_typed_function::<(), ()>(&store, "run")?;
+    let interrupter = store.interrupter();
+    let mut wrapper = |call: &mut WasmCall<'_>| {
+        interrupter.interrupt();
+        let result = call.invoke();
+        assert_eq!(
+            result.as_ref().unwrap_err().clone().to_trap(),
+            Some(TrapCode::HostInterrupt)
+        );
+        result
+    };
+    assert_eq!(
+        run.call_wrapped(&mut store, &mut wrapper)
+            .unwrap_err()
+            .to_trap(),
+        Some(TrapCode::HostInterrupt)
+    );
+    assert_eq!(
+        run.call(&mut store).unwrap_err().to_trap(),
+        Some(TrapCode::UnreachableCodeReached)
+    );
+    Ok(())
 }
 
 #[test]
-fn test_interrupt_memory_wait() -> Result<()> {
-    test_interruptible(INFINITE_ATOMIC_WAIT_WAT)
-}
+fn cranelift_polls_for_interrupts_on_loop_backedges() -> Result<()> {
+    use std::{sync::mpsc, time::Instant};
+    use wasmer::{
+        Memory, MemoryType,
+        sys::{Cranelift, EngineBuilder},
+    };
 
-// TODO: update/fix this as we implement more of the feature
-fn test_interruptible(wat: &'static str) -> Result<()> {
-    let barrier = Arc::new(Barrier::new(2));
-    let interrupter_slot = Arc::new(Mutex::new(None));
-
-    let worker = thread::spawn({
-        let barrier = barrier.clone();
-        let interrupter_slot = interrupter_slot.clone();
-        move || {
-            let wasm = wat::parse_str(wat)?;
-
-            let mut store = Store::default();
-            let interrupter = store.interrupter();
-            interrupter_slot.lock().unwrap().replace(interrupter);
-            let module = Module::new(&store, &wasm)?;
-            let imports = imports! {};
-            let instance = Instance::new(&mut store, &module, &imports)?;
-            let f = instance
-                .exports
-                .get_typed_function::<(), ()>(&store, "infinite")?;
-
-            barrier.wait();
-            anyhow::Ok(f.call(&mut store))
-        }
+    let (setup_tx, setup_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+    let worker = thread::spawn(move || -> Result<()> {
+        let mut store = Store::new(EngineBuilder::new(Cranelift::default()).engine());
+        let module = Module::new(
+            &store,
+            wat::parse_str(
+                r#"
+            (module
+              (import "env" "memory" (memory 1 1 shared))
+              (func (export "spin")
+                (loop $spin
+                  (i32.atomic.store8 (i32.const 0) (i32.const 1))
+                  (br_if $spin (i32.eqz (i32.atomic.load8_u (i32.const 1))))))
+              (func (export "noop")))
+        "#,
+            )?,
+        )?;
+        let memory = Memory::new(&mut store, MemoryType::new(1, Some(1), true))?;
+        let instance = Instance::new(
+            &mut store,
+            &module,
+            &imports! { "env" => { "memory" => memory.clone() } },
+        )?;
+        let spin = instance
+            .exports
+            .get_typed_function::<(), ()>(&store, "spin")?;
+        let noop = instance
+            .exports
+            .get_typed_function::<(), ()>(&store, "noop")?;
+        setup_tx.send((store.interrupter(), memory.as_shared(&store).unwrap()))?;
+        result_tx.send(spin.call(&mut store).map_err(|err| err.to_trap()))?;
+        // A later call on the same store must not inherit the interrupt.
+        noop.call(&mut store)?;
+        Ok(())
     });
 
-    barrier.wait();
-    // Make absolutely sure the function is running WASM when we raise the signal
-    thread::sleep(Duration::from_millis(500));
-
-    interrupter_slot
-        .lock()
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .interrupt();
-    let result = worker.join().unwrap().unwrap().unwrap_err();
-    assert_eq!(result.to_trap().unwrap(), TrapCode::HostInterrupt);
-
+    let timeout = Duration::from_secs(5);
+    let (interrupter, shared) = setup_rx.recv_timeout(timeout)?;
+    let mut store = Store::new(EngineBuilder::new(Cranelift::default()).engine());
+    let memory = shared.attach(&mut store);
+    let view = memory.view(&store);
+    let deadline = Instant::now() + timeout;
+    let entered = loop {
+        if view.read_u8(0)? == 1 {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        thread::yield_now();
+    };
+    interrupter.interrupt();
+    let result = result_rx.recv_timeout(timeout);
+    // Let the worker exit even if the interrupt poll did not work.
+    view.write_u8(1, 1)?;
+    worker.join().unwrap()?;
+    assert!(entered, "Wasm never entered the loop");
+    assert_eq!(result?, Err(Some(TrapCode::HostInterrupt)));
     Ok(())
 }
 
@@ -127,7 +170,7 @@ fn correct_store_is_interrupted_only() -> Result<()> {
     let interrupter2 = store2.interrupter();
 
     barrier.wait();
-    // Make absolutely sure the function is running WASM when we raise the signal
+    // Give the guest time to enter the loop before requesting interruption.
     thread::sleep(Duration::from_millis(500));
 
     // Interrupt store2; this should have no effect
@@ -152,15 +195,13 @@ fn correct_store_is_interrupted_only() -> Result<()> {
 
 #[test]
 fn interrupted_store_cant_be_entered_again() -> Result<()> {
-    // It's important to build an actual Store here so that initialization
-    // logic is run and the signal handler is registered
-    let store = Store::default();
-    let store_id = store.id();
+    let mut store = Store::default();
+    let objects = store.objects_mut().as_sys();
 
-    let interrupt_guard = wasmer_vm::interrupt_registry::install(store_id)?;
-    wasmer_vm::interrupt_registry::interrupt(store_id)?;
+    let interrupt_guard = wasmer_vm::interrupt_registry::install(objects)?;
+    wasmer_vm::interrupt_registry::interrupt(objects.id())?;
     assert!(matches!(
-        wasmer_vm::interrupt_registry::install(store_id),
+        wasmer_vm::interrupt_registry::install(objects),
         Err(wasmer_vm::interrupt_registry::InstallError::AlreadyInterrupted)
     ));
 
@@ -168,7 +209,7 @@ fn interrupted_store_cant_be_entered_again() -> Result<()> {
 
     // The refused entry must not count as an installation: once the last
     // real one is gone, the store can be entered again.
-    drop(wasmer_vm::interrupt_registry::install(store_id)?);
+    drop(wasmer_vm::interrupt_registry::install(objects)?);
 
     Ok(())
 }

@@ -435,8 +435,24 @@ impl FuncTranslator {
         let mut params_locals = params.clone();
         params_locals.extend(locals.iter().cloned());
 
+        #[cfg(feature = "experimental-host-interrupt")]
+        let interrupt_flag = {
+            // The slot pointer is immutable, so load it once in the function prologue.
+            let vmctx = self.abi.get_vmctx_ptr_param(&func);
+            let offset = intrinsics
+                .isize_ty
+                .const_int(offsets.vmctx_interrupt_slot().into(), false);
+            let slot = unsafe {
+                err!(cache_builder.build_gep(intrinsics.i8_ty, vmctx, &[offset], "interrupt_slot"))
+            };
+            err!(cache_builder.build_load(intrinsics.ptr_ty, slot, "interrupt_flag"))
+                .into_pointer_value()
+        };
+
         let mut fcg = LLVMFunctionCodeGenerator {
             m0_param,
+            #[cfg(feature = "experimental-host-interrupt")]
+            interrupt_flag,
             context: &self.ctx,
             builder,
             alloca_builder,
@@ -476,6 +492,9 @@ impl FuncTranslator {
             fcg.ctx.basic(),
             &func_attrs,
         );
+
+        #[cfg(feature = "experimental-host-interrupt")]
+        fcg.emit_interrupt_check()?;
 
         while fcg.state.has_control_frames() {
             let pos = reader.current_position() as u32;
@@ -2373,6 +2392,8 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
 
 pub struct LLVMFunctionCodeGenerator<'ctx, 'a> {
     m0_param: Option<PointerValue<'ctx>>,
+    #[cfg(feature = "experimental-host-interrupt")]
+    interrupt_flag: PointerValue<'ctx>,
     context: &'ctx Context,
     builder: Builder<'ctx>,
     alloca_builder: Builder<'ctx>,
@@ -2399,6 +2420,60 @@ pub struct LLVMFunctionCodeGenerator<'ctx, 'a> {
 }
 
 impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
+    #[cfg(feature = "experimental-host-interrupt")]
+    fn emit_interrupt_check(&self) -> Result<(), CompileError> {
+        let flag = err!(self.builder.build_load(
+            self.intrinsics.i8_ty,
+            self.interrupt_flag,
+            "interrupt_flag_value",
+        ));
+        let load = flag.as_instruction_value().unwrap();
+        // The host writes this byte atomically from another thread. The poll
+        // needs no synchronization beyond reading the flag itself.
+        err!(load.set_atomic_ordering(AtomicOrdering::Monotonic));
+        err!(load.set_volatile(true));
+        let interrupted = err!(self.builder.build_int_compare(
+            IntPredicate::NE,
+            flag.into_int_value(),
+            self.intrinsics.i8_ty.const_zero(),
+            "interrupted",
+        ));
+        let interrupted = err!(self.builder.build_call(
+            self.intrinsics.expect_i1,
+            &[
+                interrupted.into(),
+                self.intrinsics.i1_ty.const_zero().into()
+            ],
+            "interrupt_unlikely",
+        ))
+        .try_as_basic_value()
+        .unwrap_basic()
+        .into_int_value();
+        let trap = self
+            .context
+            .append_basic_block(self.function, "interrupt_trap");
+        let resume = self
+            .context
+            .append_basic_block(self.function, "interrupt_continue");
+        err!(
+            self.builder
+                .build_conditional_branch(interrupted, trap, resume)
+        );
+
+        self.builder.position_at_end(trap);
+        let code = self
+            .intrinsics
+            .i32_ty
+            .const_int(wasmer_vm::TrapCode::HostInterrupt as u64, false);
+        err!(
+            self.builder
+                .build_call(self.intrinsics.throw_trap, &[code.into()], "")
+        );
+        err!(self.builder.build_unreachable());
+        self.builder.position_at_end(resume);
+        Ok(())
+    }
+
     fn quiet_nan(&self, value: BasicValueEnum<'ctx>) -> Result<BasicValueEnum<'ctx>, CompileError> {
         let intrinsic = if value
             .get_type()
@@ -2722,6 +2797,8 @@ impl<'ctx> LLVMFunctionCodeGenerator<'ctx, '_> {
                 let num_inputs = loop_phis.len();
                 self.state
                     .push_loop(loop_body, loop_next, loop_phis, phis, num_inputs);
+                #[cfg(feature = "experimental-host-interrupt")]
+                self.emit_interrupt_check()?;
             }
             Operator::Br { relative_depth } => {
                 let frame = self.state.frame_at_depth(relative_depth)?;

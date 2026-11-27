@@ -457,10 +457,8 @@ impl VMOffsets {
             .vmctx_stack_limit_begin
             .checked_add(4)
             .ok_or(ERR_MESSAGE)?;
-        self.size_of_vmctx = self
-            .vmctx_stack_limit_begin
-            .checked_add(4)
-            .ok_or(ERR_MESSAGE)?;
+        self.size_of_vmctx =
+            offset_by(self.vmctx_stack_limit_begin, 1, pointer_size + pointer_size)?;
 
         Ok(())
     }
@@ -773,6 +771,11 @@ impl VMOffsets {
     /// Return the size of the `VMContext` allocation.
     pub fn size_of_vmctx(&self) -> u32 {
         self.size_of_vmctx
+    }
+
+    /// Offset of the pointer to the store's interrupt slot.
+    pub fn vmctx_interrupt_slot(&self) -> u32 {
+        self.vmctx_stack_limit_begin + self.pointer_size as u32
     }
 
     /// Return the offset to `VMFunctionImport` index `index`.

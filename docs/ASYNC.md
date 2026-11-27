@@ -342,9 +342,9 @@ like any other dynamic one.
 
 Nothing a call leaves on the thread outlives the slice that put it there. Each
 resumption installs what a synchronous call installs, the store context entry
-of the call and the trap handler, and `wasmer_vm::ActivationState`, which holds
-the stores the interrupt registry sees as entered, and takes them off when
-control comes back, whether the guest waits, returns or unwinds.
+of the call and the trap handler, and takes them off when control comes back,
+whether the guest waits, returns or unwinds. The interrupt registration belongs
+to the call itself and stays installed while the guest waits.
 
 A call's Wasm stack comes from the VM's stack cache and goes back to it when
 the call is over or dropped. A dropped call drops its host future and resets
@@ -406,18 +406,11 @@ it holds. A new call on the store gets a fresh flag, so that a forgotten call
 cannot keep the store interrupted, and the store's interrupt entries are
 released when it drops.
 
-This has a known gap. A call nested behind a switch of stacks is taken for a
-new call, so it can run after its caller was interrupted. That happens when an
-async import calls `call_async(cx, ..)` after its future waited, since its own
-call's entry of the store is off the thread while the guest waits, or when an
-interrupt lands between the poll and the entry of a `call_async` made from a
-sync host function. A nested call made in the first poll of an import's future
-is refused, as that poll runs with its call on the thread
-(`an_async_call_nested_after_an_interrupt_is_interrupted`).
-`an_async_call_nested_after_waiting_is_interrupted` in
-[`interrupt_async.rs`](../lib/api/tests/interrupt_async.rs) and a unit test in
-[`interrupt_registry/unix.rs`](../lib/vm/src/interrupt_registry/unix.rs) record
-the gap, and are ignored until it is fixed.
+All instances in a store poll the same flag. An interrupt wakes suspended
+calls so they can end with `HostInterrupt` at their next poll. Until the last
+installed entry exits, new calls are also refused, including nested calls from
+an async import that has already suspended. A forgotten suspended call can
+therefore leave its store interrupted until the store is dropped.
 
 ## Owning-thread execution
 

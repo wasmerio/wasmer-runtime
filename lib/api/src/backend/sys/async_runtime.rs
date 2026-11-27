@@ -16,11 +16,6 @@
 //! when control comes back. Dropping the call drops the host future and
 //! resets the stack: no guest or host code runs.
 
-#[cfg(feature = "experimental-host-interrupt")]
-use std::{
-    collections::HashMap,
-    sync::{Arc, LazyLock, atomic::AtomicU64},
-};
 use std::{
     alloc::{Layout, alloc, dealloc, handle_alloc_error},
     cell::Cell,
@@ -29,6 +24,11 @@ use std::{
     pin::Pin,
     ptr,
     task::{Context, Poll, Waker},
+};
+#[cfg(feature = "experimental-host-interrupt")]
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock, atomic::AtomicU64},
 };
 
 #[cfg(feature = "experimental-host-interrupt")]
@@ -43,10 +43,10 @@ use crate::{
     },
     entities::function::async_call::CallFinish,
 };
+use std::{marker::PhantomPinned, ptr::NonNull};
 #[cfg(feature = "experimental-host-interrupt")]
 use wasmer_types::StoreId;
 use wasmer_types::{RawValue, Type};
-use std::{marker::PhantomPinned, ptr::NonNull};
 use wasmer_vm::{SuspendedCall, wasmer_call_trampoline_suspendable};
 
 #[cfg(feature = "experimental-host-interrupt")]
@@ -104,64 +104,6 @@ thread_local! {
     static WAITING: Cell<*mut Waiting> = const { Cell::new(ptr::null_mut()) };
 }
 
-/// The store's interrupt registration, which follows the guest of a call: it
-/// is on the thread while the guest runs, and kept with the call while it
-/// waits, so that an interrupt still finds the store.
-#[cfg(feature = "experimental-host-interrupt")]
-struct Interrupts {
-    state: wasmer_vm::ActivationState,
-    installed: Option<super::vm::interrupt_registry::InterruptInstallGuard>,
-}
-
-#[cfg(feature = "experimental-host-interrupt")]
-impl Interrupts {
-    /// Puts the registration on the thread, where the guest is about to
-    /// run, until the returned guard is dropped. The first time, the store
-    /// is registered: that fails if it is interrupted already.
-    fn switch_in(&mut self, store_id: StoreId) -> Result<impl Drop + '_, RuntimeError> {
-        struct SwitchBack<'s>(&'s mut wasmer_vm::ActivationState);
-        impl Drop for SwitchBack<'_> {
-            fn drop(&mut self) {
-                // Safety: the second half of the pair below.
-                unsafe { self.0.swap() };
-            }
-        }
-        // Safety: host code, about to run the guest's stack on its thread;
-        // swapped back as soon as control is back.
-        unsafe { self.state.swap() };
-        let switch_back = SwitchBack(&mut self.state);
-        if self.installed.is_none() {
-            use super::vm::interrupt_registry::{InstallError, install};
-            match install(store_id) {
-                Ok(installed) => self.installed = Some(installed),
-                Err(InstallError::AlreadyInterrupted) => {
-                    return Err(super::vm::Trap::lib(super::vm::TrapCode::HostInterrupt).into());
-                }
-            }
-        }
-        Ok(switch_back)
-    }
-}
-
-#[cfg(feature = "experimental-host-interrupt")]
-impl Drop for Interrupts {
-    fn drop(&mut self) {
-        let Some(installed) = self.installed.take() else {
-            return;
-        };
-        if !wasmer_vm::ActivationState::thread_is_usable() {
-            // What uninstalling needs of the thread is gone.
-            std::mem::forget(installed);
-            self.state.abandon();
-            return;
-        }
-        // Safety: host code, with the guest's stack not running.
-        unsafe { self.state.swap() };
-        drop(installed);
-        unsafe { self.state.swap() };
-    }
-}
-
 /// What differs from one kind of call to another: how its guest is made, and
 /// what is made of its results.
 pub(crate) trait Entry {
@@ -207,8 +149,9 @@ struct Suspended {
     #[cfg(feature = "experimental-host-interrupt")]
     waker_id: Option<AsyncCallFutureId>,
     call: SuspendedCall,
+    /// Keeps the store interruptible while the guest is suspended.
     #[cfg(feature = "experimental-host-interrupt")]
-    interrupts: Interrupts,
+    _interrupt_guard: super::vm::interrupt_registry::InterruptInstallGuard,
     /// The values of the call, in its future.
     values: NonNull<[RawValue]>,
     waiting: Waiting,
@@ -284,16 +227,9 @@ impl<'a, E: Entry> AsyncCallFuture<'a, E> {
         drop(previous);
     }
 
-    /// Whether the store was interrupted where this call can see it: on the
-    /// thread, or in its own guest while that waits.
     #[cfg(feature = "experimental-host-interrupt")]
     fn interrupted(&self) -> bool {
-        let store_id = self.store.id();
-        super::vm::interrupt_registry::is_interrupted(store_id)
-            || self
-                .suspended
-                .as_ref()
-                .is_some_and(|suspended| suspended.interrupts.state.is_interrupted(store_id))
+        super::vm::interrupt_registry::is_interrupted(self.store.id())
     }
 
     /// Ends the call as an interrupt of its store does.
@@ -365,6 +301,11 @@ impl<E: Entry> Future for AsyncCallFuture<'_, E> {
                 Poll::Pending => return this.wait(cx),
                 Poll::Ready(result) => suspended.waiting.ready = Some(result),
             }
+            // The host future may have requested an interrupt in this poll.
+            #[cfg(feature = "experimental-host-interrupt")]
+            if this.interrupted() {
+                return Poll::Ready(this.interrupt());
+            }
         }
 
         // The store is taken for as long as the guest runs, and given up as
@@ -375,8 +316,6 @@ impl<E: Entry> Future for AsyncCallFuture<'_, E> {
         let trap_handler = unsafe { StoreMut::from_raw(slice.ptr()) }
             .as_store_ref()
             .signal_handler();
-        #[cfg(feature = "experimental-host-interrupt")]
-        let store_id = this.store.id();
         // A call that starts in this poll keeps what it shares with an async
         // import on this frame, and makes nothing to keep unless its guest
         // waits: most return at once.
@@ -389,8 +328,6 @@ impl<E: Entry> Future for AsyncCallFuture<'_, E> {
         let (values, returned) = match this.suspended.as_deref_mut() {
             Some(suspended) => {
                 let returned = running(slice.ptr(), &mut suspended.waiting, cx, || {
-                    #[cfg(feature = "experimental-host-interrupt")]
-                    let _switch_back = suspended.interrupts.switch_in(store_id)?;
                     // Safety: on the thread of the call, which is not over.
                     Ok(unsafe { suspended.call.resume(trap_handler) }?)
                 });
@@ -411,13 +348,15 @@ impl<E: Entry> Future for AsyncCallFuture<'_, E> {
                 let values = NonNull::from(&mut this.values[..]);
                 let values_vec = values.as_ptr().cast();
                 #[cfg(feature = "experimental-host-interrupt")]
-                let mut interrupts = Interrupts {
-                    state: wasmer_vm::ActivationState::new(),
-                    installed: None,
+                let interrupt_guard = match super::vm::interrupt_registry::install(
+                    store.as_store_ref().objects().as_sys(),
+                ) {
+                    Ok(guard) => guard,
+                    Err(super::vm::interrupt_registry::InstallError::AlreadyInterrupted) => {
+                        return Poll::Ready(this.interrupt());
+                    }
                 };
                 let started = running(slice.ptr(), &mut first, cx, || {
-                    #[cfg(feature = "experimental-host-interrupt")]
-                    let _switch_back = interrupts.switch_in(store_id)?;
                     // Safety: the function belongs to the store, which
                     // outlives the call, and the values are in this future,
                     // which is pinned.
@@ -442,7 +381,7 @@ impl<E: Entry> Future for AsyncCallFuture<'_, E> {
                             waker_id: None,
                             call,
                             #[cfg(feature = "experimental-host-interrupt")]
-                            interrupts,
+                            _interrupt_guard: interrupt_guard,
                             values,
                             waiting: first,
                         }));
@@ -616,10 +555,7 @@ impl<R> Entry for Typed<R> {
         Ok(self.function.as_ref().expect("polled after completion"))
     }
 
-    fn finish(
-        &mut self,
-        outcome: Result<(&mut StoreMut<'_>, &[RawValue]), RuntimeError>,
-    ) -> R {
+    fn finish(&mut self, outcome: Result<(&mut StoreMut<'_>, &[RawValue]), RuntimeError>) -> R {
         self.function = None;
         (self.finish)(outcome)
     }
@@ -691,7 +627,10 @@ pub(crate) fn wait_for_host_future<B: HostFutureBox>(
                 }
             }
         } else {
-            match future.as_pin_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            match future
+                .as_pin_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            {
                 Poll::Ready(result) => HostWait::Ready(result),
                 Poll::Pending => HostWait::CannotSuspend,
             }
@@ -955,7 +894,11 @@ mod instantiation {
             Some(crate::sys::vm::TrapCode::YieldOutsideAsyncContext)
         );
         drop(call);
-        assert_eq!(instances(&store), before + 1, "the instance is not the store's");
+        assert_eq!(
+            instances(&store),
+            before + 1,
+            "the instance is not the store's"
+        );
     }
 }
 
@@ -1052,7 +995,9 @@ mod future_block {
         let block = FutureBlock::default();
         let drops = Rc::new(Cell::new(0));
         let mut first = block.place(Counted::new(&drops));
-        let polled = first.as_pin_mut().poll(&mut Context::from_waker(Waker::noop()));
+        let polled = first
+            .as_pin_mut()
+            .poll(&mut Context::from_waker(Waker::noop()));
         assert!(polled.is_ready());
         let at = address(&first);
         drop(first);

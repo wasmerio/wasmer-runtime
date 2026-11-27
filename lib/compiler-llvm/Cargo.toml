@@ -41,6 +41,7 @@ crossbeam-channel.workspace = true
 enum-iterator.workspace = true
 
 [features]
+experimental-host-interrupt = []
 test = []
 
 [package.metadata.docs.rs]

@@ -5,8 +5,10 @@ use super::*;
 /// Install interrupt state for the given store.
 ///
 /// On unsupported platforms this is a no-op.
-pub fn install(store_id: StoreId) -> Result<InterruptInstallGuard, InstallError> {
-    Ok(InterruptInstallGuard { store_id })
+pub fn install(objects: &crate::StoreObjects) -> Result<InterruptInstallGuard, InstallError> {
+    Ok(InterruptInstallGuard {
+        store_id: objects.id(),
+    })
 }
 
 pub(super) fn uninstall(_store_id: StoreId) {}
@@ -26,29 +28,4 @@ pub fn interrupt(_store_id: StoreId) -> Result<(), InterruptError> {
 /// On unsupported platforms interrupts are not tracked.
 pub fn is_interrupted(_store_id: StoreId) -> bool {
     false
-}
-
-/// On unsupported platforms no store is ever registered as active.
-pub(crate) fn thread_is_usable() -> bool {
-    true
-}
-
-pub(crate) struct ActiveStores;
-
-impl ActiveStores {
-    pub(crate) const fn new() -> Self {
-        Self
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        true
-    }
-
-    pub(crate) fn is_interrupted(&self, _store_id: StoreId) -> bool {
-        false
-    }
-
-    pub(crate) fn swap(&mut self) {}
-
-    pub(crate) fn abandon(&mut self) {}
 }

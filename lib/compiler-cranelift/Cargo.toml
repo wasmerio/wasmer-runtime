@@ -54,6 +54,7 @@ cranelift-codegen = { workspace = true, features = ["all-arch"] }
 maintenance = { status = "actively-developed" }
 
 [features]
+experimental-host-interrupt = []
 default = ["std"]
 wasm = ["std"]
 # Kept for backward compatibility purpose only.

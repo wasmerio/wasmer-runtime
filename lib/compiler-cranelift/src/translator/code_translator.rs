@@ -323,6 +323,8 @@ pub fn translate_operator(
                 .extend_from_slice(builder.block_params(loop_body));
 
             builder.switch_to_block(loop_body);
+            #[cfg(feature = "experimental-host-interrupt")]
+            environ.emit_interrupt_check(builder)?;
         }
         Operator::If { blockty } => {
             let val = state.pop1();

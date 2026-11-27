@@ -192,8 +192,9 @@ mod interrupts {
     }
 
     #[test]
-    fn a_forgotten_call_does_not_keep_the_store_interrupted() {
+    fn a_forgotten_call_keeps_the_store_interrupted_until_teardown() {
         let mut store = Store::default();
+        let id = store.id();
         let interrupter = store.interrupter();
         let (run, plain) = guest(&mut store);
         let mut call = Box::pin(run.call_async(&mut store, &[]));
@@ -201,15 +202,18 @@ mod interrupts {
         std::mem::forget(call);
 
         interrupter.interrupt();
-        for _ in 0..3 {
-            let results = plain.call(&mut store, &[]).unwrap();
-            assert_eq!(results[0], Value::I32(7));
-        }
+        let error = plain.call(&mut store, &[]).unwrap_err();
+        assert_eq!(error.to_trap(), Some(wasmer_vm::TrapCode::HostInterrupt));
+        drop(store);
+        assert!(matches!(
+            wasmer_vm::interrupt_registry::interrupt(id),
+            Err(wasmer_vm::interrupt_registry::InterruptError::StoreNotRunning)
+        ));
     }
 
-    /// A live call stays interrupted, while a new call on the store runs.
+    /// A suspended call keeps the store interrupted until it exits.
     #[test]
-    fn an_interrupt_reaches_a_suspended_call_after_a_new_one_ran() {
+    fn a_new_call_is_refused_until_the_interrupted_call_exits() {
         let mut store = Store::default();
         let interrupter = store.interrupter();
         let (run, plain) = guest(&mut store);
@@ -218,15 +222,21 @@ mod interrupts {
         assert!(poll(suspended.as_mut()).is_pending());
 
         interrupter.interrupt();
+        let error = shared
+            .try_with(|mut store| plain.call(&mut store, &[]))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.to_trap(), Some(wasmer_vm::TrapCode::HostInterrupt));
+        let Poll::Ready(Err(error)) = poll(suspended.as_mut()) else {
+            panic!("the suspended call was not interrupted");
+        };
+        assert_eq!(error.to_trap(), Some(wasmer_vm::TrapCode::HostInterrupt));
+
         let results = shared
             .try_with(|mut store| plain.call(&mut store, &[]))
             .unwrap()
             .unwrap();
         assert_eq!(results[0], Value::I32(7));
-        let Poll::Ready(Err(error)) = poll(suspended.as_mut()) else {
-            panic!("the suspended call was not interrupted");
-        };
-        assert_eq!(error.to_trap(), Some(wasmer_vm::TrapCode::HostInterrupt));
     }
 
     #[test]

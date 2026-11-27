@@ -1229,6 +1229,12 @@ impl VMInstance {
                 VMBuiltinFunctionsArray::initialized(),
             );
 
+            // StoreObjects owns both this instance and the stable slot allocation.
+            ptr::write(
+                instance.vmctx_plus_offset(instance.offsets.vmctx_interrupt_slot()),
+                Arc::as_ptr(&context.interrupted),
+            );
+
             // Perform infallible initialization in this constructor, while fallible
             // initialization is deferred to the `initialize` method.
             initialize_passive_elements(instance);

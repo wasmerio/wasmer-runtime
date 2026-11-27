@@ -62,7 +62,7 @@ macro_rules! impl_native_traits {
                 };
 
                 #[cfg(feature = "experimental-host-interrupt")]
-                let interrupt_guard = match interrupt_registry::install(store.objects_mut().id()) {
+                let interrupt_guard = match interrupt_registry::install(store.as_store_ref().objects().as_sys()) {
                     Ok(x) => x,
                     Err(interrupt_registry::InstallError::AlreadyInterrupted) => {
                         return Err(Trap::lib(TrapCode::HostInterrupt).into());
@@ -156,7 +156,7 @@ macro_rules! impl_native_traits {
                 };
 
                 #[cfg(feature = "experimental-host-interrupt")]
-                let interrupt_guard = match interrupt_registry::install(store.objects_mut().id()) {
+                let interrupt_guard = match interrupt_registry::install(store.as_store_ref().objects().as_sys()) {
                     Ok(x) => x,
                     Err(interrupt_registry::InstallError::AlreadyInterrupted) => {
                         return Err(Trap::lib(TrapCode::HostInterrupt).into());

@@ -8,8 +8,6 @@
 
 use super::trap::UnwindReason;
 use crate::Trap;
-#[cfg(feature = "experimental-host-interrupt")]
-use crate::interrupt_registry;
 use backtrace::Backtrace;
 use bytesize::ByteSize;
 use core::ptr::{read, read_unaligned};
@@ -266,11 +264,8 @@ cfg_select! {
         static mut PREV_SIGILL: MaybeUninit<libc::sigaction> = MaybeUninit::uninit();
         static mut PREV_SIGFPE: MaybeUninit<libc::sigaction> = MaybeUninit::uninit();
 
-        #[cfg(feature = "experimental-host-interrupt")]
-        static mut PREV_SIGUSR1: MaybeUninit<libc::sigaction> = MaybeUninit::uninit();
-
         unsafe fn platform_init() { unsafe {
-            let register = |slot: &mut MaybeUninit<libc::sigaction>, signal: i32, nodefer: bool| {
+            let register = |slot: &mut MaybeUninit<libc::sigaction>, signal: i32| {
                 let mut handler: libc::sigaction = mem::zeroed();
                 // The flags here are relatively careful, and they are...
                 //
@@ -285,10 +280,7 @@ cfg_select! {
                 // SA_NODEFER allows us to reenter the signal handler if we
                 // crash while handling the signal, and fall through to the
                 // Breakpad handler by testing handlingSegFault.
-                handler.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-                if nodefer {
-                    handler.sa_flags |= libc::SA_NODEFER;
-                }
+                handler.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK | libc::SA_NODEFER;
                 handler.sa_sigaction = trap_handler as *const () as usize;
                 libc::sigemptyset(&mut handler.sa_mask);
                 if libc::sigaction(signal, &handler, slot.as_mut_ptr()) != 0 {
@@ -300,27 +292,20 @@ cfg_select! {
             };
 
             // Allow handling OOB with signals on all architectures
-            register(&mut PREV_SIGSEGV, libc::SIGSEGV, true);
+            register(&mut PREV_SIGSEGV, libc::SIGSEGV);
 
             // Handle `unreachable` instructions which execute `ud2` right now
-            register(&mut PREV_SIGILL, libc::SIGILL, true);
-
-            // SIGUSR1 is used to interrupt long-running WASM code.
-            // It doesn't use NODEFER since, if a second interruption
-            // request comes in while one is already being processed,
-            // there's nothing meaningful we can do.
-            #[cfg(feature = "experimental-host-interrupt")]
-            register(&mut PREV_SIGUSR1, libc::SIGUSR1, false);
+            register(&mut PREV_SIGILL, libc::SIGILL);
 
             // x86 uses SIGFPE to report division by zero
             if cfg!(target_arch = "x86") || cfg!(target_arch = "x86_64") {
-                register(&mut PREV_SIGFPE, libc::SIGFPE, true);
+                register(&mut PREV_SIGFPE, libc::SIGFPE);
             }
 
             // On ARM, handle Unaligned Accesses.
             // On Darwin, guard page accesses are raised as SIGBUS.
             if cfg!(target_arch = "arm") || cfg!(target_vendor = "apple") {
-                register(&mut PREV_SIGBUS, libc::SIGBUS, true);
+                register(&mut PREV_SIGBUS, libc::SIGBUS);
             }
 
             // This is necessary to support debugging under LLDB on Darwin.
@@ -371,8 +356,6 @@ cfg_select! {
                 libc::SIGBUS => &PREV_SIGBUS,
                 libc::SIGFPE => &PREV_SIGFPE,
                 libc::SIGILL => &PREV_SIGILL,
-                #[cfg(feature = "experimental-host-interrupt")]
-                libc::SIGUSR1 => &PREV_SIGUSR1,
                 _ => panic!("unknown signal: {signum}"),
             };
             // We try to get the fault address associated to this signal
@@ -388,15 +371,6 @@ cfg_select! {
                     let addr = (*siginfo).si_addr() as usize;
                     process_illegal_op(addr)
                 }
-                #[cfg(feature = "experimental-host-interrupt")]
-                libc::SIGUSR1 => {
-                    // If we're not running WASM code from the specific store for which
-                    // an interrupt was requested, there's nothing to do.
-                    if !interrupt_registry::on_interrupted() {
-                        return;
-                    }
-                    Some(TrapCode::HostInterrupt)
-                }
                 _ => None,
             };
             let ucontext = &mut *(context as *mut ucontext_t);
@@ -411,13 +385,6 @@ cfg_select! {
             );
 
             if handled {
-                return;
-            }
-
-            // If we're not running WASM code at all, there's nothing to
-            // do for an interrupt.
-            #[cfg(feature = "experimental-host-interrupt")]
-            if signum == libc::SIGUSR1 {
                 return;
             }
 
@@ -1129,95 +1096,6 @@ impl FromUnwind for UnwindReason {
 impl<T> FromUnwind for Result<T, UnwindReason> {
     fn from_unwind(reason: UnwindReason) -> Self {
         Err(reason)
-    }
-}
-
-/// What a suspended [`SuspendedCall`] keeps registered beyond its thread:
-/// with `experimental-host-interrupt`, the stores it entered, which an
-/// interrupt has to find while their guest waits. Without that feature it
-/// holds nothing.
-///
-/// The registrations are on the thread while the call runs, and here while
-/// it waits: [`Self::swap`] exchanges them with the thread's around every
-/// resumption, in both directions, so that suspended calls can be resumed in
-/// any order. The trap handler needs none of this: each resumption installs
-/// it and takes it off again.
-pub struct ActivationState {
-    #[cfg(feature = "experimental-host-interrupt")]
-    active_stores: interrupt_registry::ActiveStores,
-    _not_send: std::marker::PhantomData<*mut ()>,
-}
-
-impl Default for ActivationState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ActivationState {
-    /// The state of an activation that has not entered Wasm.
-    pub const fn new() -> Self {
-        Self {
-            #[cfg(feature = "experimental-host-interrupt")]
-            active_stores: interrupt_registry::ActiveStores::new(),
-            _not_send: std::marker::PhantomData,
-        }
-    }
-
-    /// Exchanges this state with the calling thread's.
-    ///
-    /// # Safety
-    ///
-    /// Calls come in pairs on one thread, from host code: one immediately
-    /// before resuming the call that owns this state, and one immediately
-    /// after control comes back from it, whether it waits or is over. A
-    /// state that is not empty (see [`Self::is_empty`]) must not be swapped
-    /// in on another thread.
-    pub unsafe fn swap(&mut self) {
-        debug_assert!(
-            with_stacks(|stacks| stacks.wasm.get()).is_none(),
-            "registrations switched while running on the Wasm stack"
-        );
-        #[cfg(feature = "experimental-host-interrupt")]
-        self.active_stores.swap();
-    }
-
-    /// Whether this call, while it is not running, has entered `store_id`
-    /// and the store was interrupted.
-    #[cfg(feature = "experimental-host-interrupt")]
-    pub fn is_interrupted(&self, store_id: wasmer_types::StoreId) -> bool {
-        self.active_stores.is_interrupted(store_id)
-    }
-
-    /// Whether the calling thread still has what swapping a state in needs of
-    /// it: false once its thread locals are being destroyed, as it exits. A
-    /// state is then abandoned (see [`Self::abandon`]). The VM's own state
-    /// for the thread has no destructor; only the interrupt registry's does.
-    pub fn thread_is_usable() -> bool {
-        #[cfg(feature = "experimental-host-interrupt")]
-        return interrupt_registry::thread_is_usable();
-        #[cfg(not(feature = "experimental-host-interrupt"))]
-        true
-    }
-
-    /// Whether nothing is registered: true before a call first runs and after
-    /// it is over.
-    pub fn is_empty(&self) -> bool {
-        #[cfg(feature = "experimental-host-interrupt")]
-        if !self.active_stores.is_empty() {
-            return false;
-        }
-        true
-    }
-
-    /// Gives up the registrations of a call that is dropped while they are
-    /// not swapped in, and cannot be: the interrupt registrations of the
-    /// stores it entered, which would otherwise keep those stores
-    /// interrupted, and aimed at this thread, for good. The thread's own
-    /// state is not touched: it may be gone (see [`Self::thread_is_usable`]).
-    pub fn abandon(&mut self) {
-        #[cfg(feature = "experimental-host-interrupt")]
-        self.active_stores.abandon();
     }
 }
 

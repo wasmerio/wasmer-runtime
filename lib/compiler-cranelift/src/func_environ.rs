@@ -376,6 +376,28 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         })
     }
 
+    #[cfg(feature = "experimental-host-interrupt")]
+    pub(crate) fn emit_interrupt_check(
+        &mut self,
+        builder: &mut FunctionBuilder<'_>,
+    ) -> WasmResult<()> {
+        let pointer_type = self.pointer_type();
+        let vmctx = self.vmctx(builder.func);
+        let vmctx = materialize_global_value(&mut builder.cursor(), pointer_type, vmctx);
+        let readonly = MemFlagsData::trusted().with_readonly(true);
+        let flag = builder.ins().load(
+            pointer_type,
+            readonly,
+            vmctx,
+            vmctx_offset(self.offsets.vmctx_interrupt_slot())?,
+        );
+        // The pointer is immutable; the flag can change on another thread.
+        let flags = MemFlagsData::trusted();
+        let interrupted = builder.ins().atomic_load(ir::types::I8, flags, flag);
+        builder.ins().trapnz(interrupted, crate::TRAP_INTERRUPT);
+        Ok(())
+    }
+
     fn get_table_fill_sig(&mut self, func: &mut Function) -> ir::SigRef {
         let sig = self.table_fill_sig.unwrap_or_else(|| {
             func.import_signature(Signature {
