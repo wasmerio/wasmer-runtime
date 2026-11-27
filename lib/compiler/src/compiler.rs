@@ -33,7 +33,7 @@ use wasmer_types::{
     CompilationProgressCallback, Features, FunctionIndex, LocalFunctionIndex,
     entity::{EntityRef, PrimaryMap},
     error::CompileError,
-    target::{CpuFeature, Target, UserCompilerOptimizations},
+    target::{CpuFeature, Target},
 };
 use wasmer_types::{FunctionType, MemoryIndex, SignatureIndex};
 use wasmer_vm::MemoryStyle;
@@ -190,15 +190,6 @@ pub trait Compiler: Send + std::fmt::Debug {
     /// It covers the compiler's own configuration only. The id of an engine
     /// adds the compiler's middlewares.
     fn deterministic_id(&self) -> String;
-
-    /// Add suggested optimizations to this compiler.
-    #[deprecated(note = "User compilation options are currently unused")]
-    fn with_opts(
-        &mut self,
-        _suggested_compiler_opts: &UserCompilerOptimizations,
-    ) -> Result<(), CompileError> {
-        Ok(())
-    }
 
     /// Validates a module.
     ///

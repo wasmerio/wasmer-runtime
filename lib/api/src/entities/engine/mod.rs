@@ -1,9 +1,6 @@
 //! Defines the [`self::Engine`] type and useful traits and data types to interact with an engine.
 
-use wasmer_types::{
-    CompileError, Features,
-    target::{Target, UserCompilerOptimizations},
-};
+use wasmer_types::{Features, target::Target};
 
 // The compilers are configured through this trait.
 #[cfg(any(feature = "cranelift", feature = "llvm", feature = "singlepass"))]
@@ -139,15 +136,6 @@ impl Engine {
             // Default case
             _ => Features::default(),
         }
-    }
-
-    /// Add suggested optimizations to this engine.
-    #[deprecated(note = "User compilation options are currently unused")]
-    pub fn with_opts(
-        &mut self,
-        _suggested_opts: &UserCompilerOptimizations,
-    ) -> Result<(), CompileError> {
-        Ok(())
     }
 
     #[cfg(feature = "async")]
