@@ -331,21 +331,20 @@ impl FuncTrampoline {
             let memory_definition_ptr =
                 err!(builder.build_bit_cast(memory_definition_ptr, intrinsics.ptr_ty, "",))
                     .into_pointer_value();
+            let dynamic = matches!(&memory_styles[memory_index], MemoryStyle::Dynamic { .. });
             let base_ptr = err!(builder.build_struct_gep(
                 intrinsics.vmmemory_definition_ty,
                 memory_definition_ptr,
                 intrinsics.vmmemory_definition_base_element,
-                "",
+                if dynamic { "trmpl_m0_base_ptr" } else { "" },
             ));
 
-            let memory_style = &memory_styles[memory_index];
-            let base_ptr = if let MemoryStyle::Dynamic { .. } = memory_style {
+            let base_ptr = if dynamic {
                 base_ptr
             } else {
-                err!(builder.build_load(intrinsics.ptr_ty, base_ptr, "")).into_pointer_value()
+                err!(builder.build_load(intrinsics.ptr_ty, base_ptr, "trmpl_m0_base_ptr"))
+                    .into_pointer_value()
             };
-
-            base_ptr.set_name("trmpl_m0_base_ptr");
 
             args_vec.push(base_ptr.into());
         }
@@ -424,7 +423,7 @@ impl FuncTrampoline {
                 func_sig.params().len().try_into().unwrap(),
                 func_sig.results().len().try_into().unwrap(),
             )),
-            "",
+            "value_ptr",
         ));
 
         // Copy params to 'values'.
@@ -459,13 +458,14 @@ impl FuncTrampoline {
         let vmctx = self.abi.get_vmctx_ptr_param(&trampoline_func);
         let callee_ty =
             err!(builder.build_bit_cast(vmctx, self.ctx.ptr_type(AddressSpace::default()), ""));
-        let callee =
-            err!(builder.build_load(intrinsics.ptr_ty, callee_ty.into_pointer_value(), ""))
-                .into_pointer_value();
-        callee.set_name("func_ptr");
+        let callee = err!(builder.build_load(
+            intrinsics.ptr_ty,
+            callee_ty.into_pointer_value(),
+            "func_ptr",
+        ))
+        .into_pointer_value();
 
         let values_ptr = err!(builder.build_pointer_cast(values, intrinsics.ptr_ty, ""));
-        values_ptr.set_name("value_ptr");
         err!(builder.build_indirect_call(
             callee_ptr_ty,
             callee,
