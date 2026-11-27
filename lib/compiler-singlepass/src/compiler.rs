@@ -188,7 +188,7 @@ impl SinglepassCompiler {
                         generator.finalize(input, arch, target, &source_map)
                     }
                     Architecture::Aarch64(_) => {
-                        let machine = MachineARM64::new(Some(target.clone()));
+                        let machine = MachineARM64::new();
                         let mut generator = FuncGen::new(
                             module,
                             target,

@@ -2360,7 +2360,7 @@ pub fn gen_std_trampoline(
             machine.gen_std_trampoline(sig, calling_convention, progress_callback)
         }
         Architecture::Aarch64(_) => {
-            let machine = MachineARM64::new(Some(target.clone()));
+            let machine = MachineARM64::new();
             machine.gen_std_trampoline(sig, calling_convention, progress_callback)
         }
         Architecture::Riscv64(_) => {
@@ -2397,7 +2397,7 @@ pub fn gen_std_dynamic_import_trampoline(
             )
         }
         Architecture::Aarch64(_) => {
-            let machine = MachineARM64::new(Some(target.clone()));
+            let machine = MachineARM64::new();
             machine.gen_std_dynamic_import_trampoline(
                 vmoffsets,
                 sig,
@@ -2444,7 +2444,7 @@ pub fn gen_import_call_trampoline(
             )
         }
         Architecture::Aarch64(_) => {
-            let machine = MachineARM64::new(Some(target.clone()));
+            let machine = MachineARM64::new();
             machine.gen_import_call_trampoline(
                 vmoffsets,
                 index,
