@@ -174,6 +174,11 @@ fn results_to_js_array(values: &[Value], types: &[Type]) -> Array {
     Array::from_iter(values.map(|(index, value)| result_to_js(value, types.get(index))))
 }
 
+/// The body of a dynamic host function. Boxed, so that the closures that
+/// call it, `wasm_bindgen` closures with their own shims, are instantiated
+/// once per environment type rather than once per host function.
+type DynamicBody<T> = Box<dyn Fn(FunctionEnvMut<'_, T>, &[Value]) -> Result<Vec<Value>, RuntimeError>>;
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct Function {
     pub(crate) handle: VMFunction,
@@ -245,7 +250,6 @@ impl Function {
         )
     }
 
-    #[allow(clippy::cast_ptr_alignment)]
     pub fn new_with_env<FT, F, T: Send + 'static>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
@@ -259,8 +263,19 @@ impl Function {
             + Send
             + Sync,
     {
+        // Only this is instantiated per host function: what follows is once
+        // per environment type.
+        Self::new_with_env_boxed(store, env, ty.into(), Box::new(func))
+    }
+
+    #[allow(clippy::cast_ptr_alignment)]
+    fn new_with_env_boxed<T: Send + 'static>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        function_type: FunctionType,
+        func: DynamicBody<T>,
+    ) -> Self {
         let mut store = store.as_store_mut();
-        let function_type = ty.into();
         let func_ty = function_type.clone();
         // The host function runs with its store as the call it runs in lends
         // it, which it finds by the store's id, and holds it until it returns
