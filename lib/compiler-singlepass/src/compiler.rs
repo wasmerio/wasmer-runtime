@@ -462,6 +462,34 @@ mod tests {
     }
 
     #[test]
+    fn rejects_targets_missing_required_cpu_features() {
+        let compiler = SinglepassCompiler::new(Singlepass::default());
+        let x86_64 = triple!("x86_64-unknown-linux-gnu");
+        let cases = [
+            (x86_64.clone(), CpuFeature::AVX.into(), "without POPCNT"),
+            (x86_64, CpuFeature::POPCNT.into(), "without AVX or SSE 4.2"),
+            (
+                triple!("aarch64-unknown-linux-gnu"),
+                EnumSet::empty(),
+                "without NEON",
+            ),
+        ];
+
+        for (triple, features, reason) in cases {
+            let target = Target::new(triple, features);
+            let (mut info, translation, inputs) = dummy_compilation_ingredients();
+            match compiler.compile_module(&target, &mut info, &translation, inputs, None) {
+                Err(CompileError::UnsupportedTarget(message)) => assert!(
+                    message.contains(reason),
+                    "Expected UnsupportedTarget mentioning {reason:?}, got {message:?}"
+                ),
+                Err(error) => panic!("Expected UnsupportedTarget for {reason}, got {error:?}"),
+                Ok(_) => panic!("Compilation unexpectedly succeeded for target {reason}"),
+            }
+        }
+    }
+
+    #[test]
     fn errors_for_unsupported_cpufeatures() {
         let compiler = SinglepassCompiler::new(Singlepass::default());
         let mut features =
