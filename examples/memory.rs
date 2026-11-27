@@ -87,7 +87,7 @@ fn main() -> anyhow::Result<()> {
     // querying the memory directly.
     println!("Querying memory size...");
     let memory_view = memory.view(&store);
-    assert_eq!(memory_view.size(), Pages::from(1));
+    assert_eq!(memory_view.size(), Pages::ONE);
     assert_eq!(memory_view.size().bytes(), Bytes::from(65536_usize));
     assert_eq!(memory_view.data_size(), 65536);
 
@@ -97,7 +97,7 @@ fn main() -> anyhow::Result<()> {
 
     let memory_view = memory.view(&store);
     println!("Memory size: {result:?}");
-    assert_eq!(Pages::from(result as u32), memory_view.size());
+    assert_eq!(Pages::try_from_pages(result as u32)?, memory_view.size());
 
     // Now that we know the size of our memory, it's time to see how wa
     // can change this.
@@ -107,10 +107,10 @@ fn main() -> anyhow::Result<()> {
     println!("Growing memory...");
 
     // Here we are requesting two more pages for our memory.
-    memory.grow(&mut store, 2)?;
+    memory.grow(&mut store, Pages::try_from_pages(2)?)?;
 
     let memory_view = memory.view(&store);
-    assert_eq!(memory_view.size(), Pages::from(3));
+    assert_eq!(memory_view.size(), Pages::try_from_pages(3)?);
     assert_eq!(memory_view.data_size(), 65536 * 3);
 
     // Now that we know how to query and adjust the size of the memory,

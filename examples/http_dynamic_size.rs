@@ -1,7 +1,7 @@
 use anyhow::Result;
 use wasmer::{
-    AsStoreRef, Function, FunctionEnv, FunctionEnvMut, Instance, Memory, MemoryView, Module, Store,
-    WasmPtr, imports, wat2wasm,
+    AsStoreRef, Function, FunctionEnv, FunctionEnvMut, Instance, Memory, MemoryView, Module, Pages,
+    Store, WasmPtr, imports, wat2wasm,
 };
 
 // Utils
@@ -28,7 +28,7 @@ impl ExampleEnv {
     }
 }
 
-fn http_get(mut ctx: FunctionEnvMut<ExampleEnv>, url: u32, url_len: u32) -> u32 {
+fn http_get(mut ctx: FunctionEnvMut<ExampleEnv>, url: u32, url_len: u32) -> std::io::Result<u32> {
     // Setup environment
     let (response, memory_size) = {
         // Read url from memory
@@ -46,7 +46,11 @@ fn http_get(mut ctx: FunctionEnvMut<ExampleEnv>, url: u32, url_len: u32) -> u32 
     if 1114112 + response.len() > memory_size {
         let delta = (1114112 + response.len() - memory_size) / wasmer::WASM_PAGE_SIZE + 1;
         let memory = ctx.data().get_memory().clone();
-        memory.grow(&mut ctx, delta as u32).unwrap();
+        let delta = u32::try_from(delta).map_err(std::io::Error::other)?;
+        let pages = Pages::try_from_pages(delta).map_err(std::io::Error::other)?;
+        memory
+            .grow(&mut ctx, pages)
+            .map_err(std::io::Error::other)?;
     }
 
     // Write response as string [ptr, cap, len] to wasm memory and return pointer
@@ -57,7 +61,7 @@ fn http_get(mut ctx: FunctionEnvMut<ExampleEnv>, url: u32, url_len: u32) -> u32 
     view.write(1114120, &u32::to_le_bytes(response.len() as u32))
         .unwrap();
     view.write(1114124, &response).unwrap();
-    1114112
+    Ok(1114112)
 }
 
 fn main() -> Result<()> {

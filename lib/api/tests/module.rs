@@ -190,7 +190,7 @@ fn imports() -> Result<(), String> {
             ImportType::new(
                 "host",
                 "memory",
-                ExternType::Memory(MemoryType::new(Pages(1), None, false))
+                ExternType::Memory(MemoryType::new(Pages::ONE, None, false))
             ),
             ImportType::new(
                 "host",
@@ -219,7 +219,7 @@ fn imports() -> Result<(), String> {
         vec![ImportType::new(
             "host",
             "memory",
-            MemoryType::new(Pages(1), None, false)
+            MemoryType::new(Pages::ONE, None, false)
         ),]
     );
     assert_eq!(
@@ -260,7 +260,7 @@ fn exports() -> Result<(), String> {
             ),
             ExportType::new(
                 "memory",
-                ExternType::Memory(MemoryType::new(Pages(1), None, false))
+                ExternType::Memory(MemoryType::new(Pages::ONE, None, false))
             ),
             ExportType::new(
                 "table",
@@ -282,7 +282,7 @@ fn exports() -> Result<(), String> {
         module.exports().memories().collect::<Vec<_>>(),
         vec![ExportType::new(
             "memory",
-            MemoryType::new(Pages(1), None, false)
+            MemoryType::new(Pages::ONE, None, false)
         ),]
     );
     assert_eq!(

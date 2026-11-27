@@ -311,7 +311,11 @@ mod tests {
                 let function = Function::new_typed(&mut raw, move || {
                     record.store(seen.load(Ordering::SeqCst), Ordering::SeqCst);
                 });
-                let memory = Memory::new(&mut raw, MemoryType::new(1, None, false)).unwrap();
+                let memory = Memory::new(
+                    &mut raw,
+                    MemoryType::new(wasmer_api::Pages::ONE, None, false),
+                )
+                .unwrap();
                 (module, function, memory)
             })
             .unwrap();
@@ -392,7 +396,12 @@ mod tests {
         let other_store = unsafe { wasm_store_new(Some(&engine)) }.unwrap();
         let other_memory = other_store
             .inner
-            .with_mut(|mut raw| Memory::new(&mut raw, MemoryType::new(1, None, false)))
+            .with_mut(|mut raw| {
+                Memory::new(
+                    &mut raw,
+                    MemoryType::new(wasmer_api::Pages::ONE, None, false),
+                )
+            })
             .unwrap()
             .unwrap();
 

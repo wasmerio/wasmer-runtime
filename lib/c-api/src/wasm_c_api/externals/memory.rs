@@ -103,9 +103,9 @@ pub unsafe extern "C" fn wasm_memory_size(memory: Option<&wasm_memory_t>) -> u32
     };
     let wasm_memory = memory.extern_.memory();
     c_try!(
-        memory.extern_.store.with(|store| wasm_memory.view(&store).size().0);
+        memory.extern_.store.with(|store| wasm_memory.view(&store).size().pages());
         otherwise 0
-    ) as _
+    )
 }
 
 // delta is in pages
@@ -117,9 +117,11 @@ pub unsafe extern "C" fn wasm_memory_grow(memory: Option<&mut wasm_memory_t>, de
     };
     let wasm_memory = memory.extern_.memory();
     let store = &memory.extern_.store;
+    let delta = c_try!(Pages::try_from_pages(delta); otherwise false);
     let grown = c_try!(
-        store.with_mut(|mut store_mut| wasm_memory.grow(&mut store_mut, Pages(delta)));
+        store.with_mut(|mut store_mut| wasm_memory.grow(&mut store_mut, delta));
         otherwise false
     );
-    grown.is_ok()
+    c_try!(grown; otherwise false);
+    true
 }

@@ -1290,9 +1290,15 @@ fn wasm_memorytype_new(mut env: FunctionEnvMut<WasmCapiEnv>, limits_ptr: i32) ->
     let Some((min, max)) = read_limits(&mut env, limits_ptr) else {
         return INVALID_HANDLE;
     };
+    let (Ok(min), Ok(max)) = (
+        Pages::try_from_pages(min),
+        max.map(Pages::try_from_pages).transpose(),
+    ) else {
+        return INVALID_HANDLE;
+    };
     insert(
         &mut env,
-        WasmObject::MemoryType(MemoryType::new(Pages(min), max.map(Pages), false)),
+        WasmObject::MemoryType(MemoryType::new(min, max, false)),
     )
 }
 
@@ -1311,11 +1317,14 @@ fn wasm_memory_size(env: FunctionEnvMut<WasmCapiEnv>, memory_handle: i32) -> i32
     let Some(memory) = memory_from_handle(&env, memory_handle) else {
         return INVALID_SIZE;
     };
-    i32::try_from(memory.size(&env).0).unwrap_or(INVALID_SIZE)
+    i32::try_from(memory.size(&env).pages()).unwrap_or(INVALID_SIZE)
 }
 
 fn wasm_memory_grow(mut env: FunctionEnvMut<WasmCapiEnv>, memory_handle: i32, delta: i32) -> i32 {
-    let Ok(delta) = u32::try_from(delta) else {
+    let Some(delta) = u32::try_from(delta)
+        .ok()
+        .and_then(|delta| Pages::try_from_pages(delta).ok())
+    else {
         return BOOL_FALSE;
     };
     let memory = match env.data().state.get(memory_handle) {
@@ -1323,7 +1332,7 @@ fn wasm_memory_grow(mut env: FunctionEnvMut<WasmCapiEnv>, memory_handle: i32, de
         Some(WasmObject::Extern(WasmExtern::Memory(memory))) => memory.clone(),
         _ => return BOOL_FALSE,
     };
-    if memory.grow(&mut env, Pages(delta)).is_ok() {
+    if memory.grow(&mut env, delta).is_ok() {
         BOOL_TRUE
     } else {
         BOOL_FALSE
@@ -2686,8 +2695,11 @@ mod tests {
     #[test]
     fn size_apis_distinguish_invalid_from_zero() {
         let mut store = Store::default();
-        let memory = Memory::new(&mut store, MemoryType::new(Pages(0), Some(Pages(1)), false))
-            .expect("zero-page memory can be created");
+        let memory = Memory::new(
+            &mut store,
+            MemoryType::new(Pages::ZERO, Some(Pages::ONE), false),
+        )
+        .expect("zero-page memory can be created");
         let table = Table::new(
             &mut store,
             TableType::new(Type::FuncRef, 0, Some(1)),
@@ -2731,7 +2743,8 @@ mod tests {
     #[test]
     fn shared_memory_data_shadow_fails_closed() {
         let mut store = Store::default();
-        let memory = Memory::new(&mut store, MemoryType::new(Pages(1), Some(Pages(2)), true))
+        let max = Pages::try_from_pages(2).unwrap();
+        let memory = Memory::new(&mut store, MemoryType::new(Pages::ONE, Some(max), true))
             .expect("shared memory can be created");
         let func_env = FunctionEnv::new(&mut store, WasmCapiEnv::default());
         let memory_handle = func_env
@@ -2752,8 +2765,11 @@ mod tests {
     #[test]
     fn memory_shadow_copy_rejects_same_memory() {
         let mut store = Store::default();
-        let memory = Memory::new(&mut store, MemoryType::new(Pages(1), Some(Pages(1)), false))
-            .expect("memory can be created");
+        let memory = Memory::new(
+            &mut store,
+            MemoryType::new(Pages::ONE, Some(Pages::ONE), false),
+        )
+        .expect("memory can be created");
         let func_env = FunctionEnv::new(
             &mut store,
             WasmCapiEnv {
@@ -2770,11 +2786,9 @@ mod tests {
     #[test]
     fn memory_shadow_sync_preserves_registered_shadows() {
         let mut store = Store::default();
-        let guest_memory =
-            Memory::new(&mut store, MemoryType::new(Pages(1), Some(Pages(1)), false))
-                .expect("guest memory can be created");
-        let memory = Memory::new(&mut store, MemoryType::new(Pages(1), Some(Pages(1)), false))
-            .expect("memory can be created");
+        let ty = MemoryType::new(Pages::ONE, Some(Pages::ONE), false);
+        let guest_memory = Memory::new(&mut store, ty).expect("guest memory can be created");
+        let memory = Memory::new(&mut store, ty).expect("memory can be created");
         guest_memory
             .view(&store)
             .write(16, &[1, 2, 3, 4])
@@ -2847,8 +2861,11 @@ mod tests {
     #[test]
     fn null_ref_values_marshal_to_a_null_handle() {
         let mut store = Store::default();
-        let memory = Memory::new(&mut store, MemoryType::new(Pages(1), Some(Pages(1)), false))
-            .expect("memory can be created");
+        let memory = Memory::new(
+            &mut store,
+            MemoryType::new(Pages::ONE, Some(Pages::ONE), false),
+        )
+        .expect("memory can be created");
         let func_env = FunctionEnv::new(
             &mut store,
             WasmCapiEnv {
@@ -3038,8 +3055,11 @@ mod tests {
     #[test]
     fn externref_marshals_through_guest_memory() {
         let mut store = Store::default();
-        let memory = Memory::new(&mut store, MemoryType::new(Pages(1), Some(Pages(1)), false))
-            .expect("memory can be created");
+        let memory = Memory::new(
+            &mut store,
+            MemoryType::new(Pages::ONE, Some(Pages::ONE), false),
+        )
+        .expect("memory can be created");
         let func_env = FunctionEnv::new(
             &mut store,
             WasmCapiEnv {

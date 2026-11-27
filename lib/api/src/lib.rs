@@ -155,14 +155,15 @@
 //!
 //! ```
 //! # use wasmer::{imports, Function, FunctionEnv, FunctionEnvMut, Memory, MemoryType, Store, Imports};
-//! # fn imports_example(mut store: &mut Store) -> Imports {
-//! let memory = Memory::new(&mut store, MemoryType::new(1, None, false)).unwrap();
-//! imports! {
+//! # fn imports_example(mut store: &mut Store) -> anyhow::Result<Imports> {
+//! let page = wasmer::Pages::ONE;
+//! let memory = Memory::new(&mut store, MemoryType::new(page, None, false))?;
+//! Ok(imports! {
 //!     "env" => {
 //!          "my_function" => Function::new_typed(&mut store, || println!("Hello")),
 //!          "memory" => memory,
 //!     }
-//! }
+//! })
 //! # }
 //! ```
 //!
@@ -505,9 +506,9 @@ mod entities;
 pub use wasmer_types::{
     Bytes, CompileError, DeserializeError, ExportIndex, ExportType, ExternType, FrameInfo,
     FunctionType, GlobalInit, GlobalType, ImportType, LocalFunctionIndex, MemoryError, MemoryStyle,
-    MemoryType, ModuleInfo, Mutability, Pages, ParseCpuFeatureError, SerializeError, TableStyle,
-    TableType, TagKind, TagType, Type, ValueType, WASM_MAX_PAGES, WASM_MIN_PAGES, WASM_PAGE_SIZE,
-    WasmError, WasmResult, is_wasm,
+    MemoryType, ModuleInfo, Mutability, Pages, PagesError, ParseCpuFeatureError, SerializeError,
+    TableStyle, TableType, TagKind, TagType, Type, ValueType, WASM_MAX_PAGES, WASM_MIN_PAGES,
+    WASM_PAGE_SIZE, WasmError, WasmResult, is_wasm,
 };
 
 #[cfg(feature = "wasmparser")]

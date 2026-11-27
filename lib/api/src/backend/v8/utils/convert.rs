@@ -238,11 +238,15 @@ impl IntoWasmerExternType for *const wasm_externtype_t {
                     let memorytype = wasm_externtype_as_memorytype_const(self);
                     let limits = *wasm_memorytype_limits(memorytype);
                     ExternType::Memory(wasmer_types::MemoryType {
-                        minimum: wasmer_types::Pages(limits.min),
+                        minimum: wasmer_types::Pages::try_from_pages(limits.min)
+                            .map_err(|err| err.to_string())?,
                         maximum: if limits.max == 0 || limits.max == u32::MAX {
                             None
                         } else {
-                            Some(wasmer_types::Pages(limits.max))
+                            Some(
+                                wasmer_types::Pages::try_from_pages(limits.max)
+                                    .map_err(|err| err.to_string())?,
+                            )
                         },
                         shared: limits.shared,
                     })

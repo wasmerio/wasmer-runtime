@@ -91,9 +91,11 @@ impl<'a> MemoryView<'a> {
     /// # use wasmer::{Memory, MemoryType, Pages, Store, Type, Value};
     /// # let mut store = Store::default();
     /// #
-    /// let m = Memory::new(& mut store, MemoryType::new(1, None, false)).unwrap();
+    /// let page = Pages::ONE;
+    /// let m = Memory::new(&mut store, MemoryType::new(page, None, false))?;
     ///
-    /// assert_eq!(m.size(&store), Pages(1));
+    /// assert_eq!(m.size(&store), page);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn size(&self) -> Pages {
         Bytes(self.size as usize).try_into().unwrap()
@@ -123,15 +125,18 @@ impl<'a> MemoryView<'a> {
     /// # Example
     ///
     /// ```ignore
-    /// # use wasmer::{Memory, MemoryType, Store};
+    /// # use wasmer::{Memory, MemoryType, Pages, Store};
     /// # let mut store = Store::default();
-    /// let memory = Memory::new(&mut store, MemoryType::new(1, Some(2), true)).unwrap();
+    /// let min = Pages::ONE;
+    /// let max = Pages::try_from_pages(2)?;
+    /// let memory = Memory::new(&mut store, MemoryType::new(min, Some(max), true))?;
     /// let view = memory.as_js().view(&store);
     ///
     /// // The word is 0: it becomes 7.
     /// assert_eq!(view.compare_exchange_u32(0, 0, 7).unwrap(), 0);
     /// // The word is not 0 anymore: it stays 7.
     /// assert_eq!(view.compare_exchange_u32(0, 0, 9).unwrap(), 7);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn compare_exchange_u32(
         &self,

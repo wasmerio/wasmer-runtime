@@ -555,11 +555,11 @@ fn memory_new() -> Result<(), String> {
     let mut store = Store::default();
     let memory_type = MemoryType {
         shared: false,
-        minimum: Pages(0),
-        maximum: Some(Pages(10)),
+        minimum: Pages::ZERO,
+        maximum: Some(Pages::try_from_pages(10).map_err(|err| err.to_string())?),
     };
     let memory = Memory::new(&mut store, memory_type).map_err(|e| format!("{e:?}"))?;
-    assert_eq!(memory.view(&store).size(), Pages(0));
+    assert_eq!(memory.view(&store).size(), Pages::ZERO);
     assert_eq!(memory.ty(&store), memory_type);
     Ok(())
 }
@@ -570,10 +570,11 @@ fn memory_ty_round_trips_in_v8() -> Result<(), String> {
     let engine: Engine = wasmer::v8::V8::new().into();
     let mut store = Store::new(engine);
 
+    let max = Pages::try_from_pages(2).map_err(|err| err.to_string())?;
     for memory_type in [
-        MemoryType::new(Pages(1), None, false),
-        MemoryType::new(Pages(1), Some(Pages(2)), false),
-        MemoryType::new(Pages(1), Some(Pages(2)), true),
+        MemoryType::new(Pages::ONE, None, false),
+        MemoryType::new(Pages::ONE, Some(max), false),
+        MemoryType::new(Pages::ONE, Some(max), true),
     ] {
         let memory = Memory::new(&mut store, memory_type).map_err(|e| format!("{e:?}"))?;
         assert_eq!(memory.ty(&store), memory_type);
@@ -585,27 +586,31 @@ fn memory_ty_round_trips_in_v8() -> Result<(), String> {
 #[engine_test]
 fn memory_grow() -> Result<(), String> {
     let mut store = Store::default();
-    let desc = MemoryType::new(Pages(10), Some(Pages(16)), false);
+    let pages = |count| Pages::try_from_pages(count).map_err(|err| err.to_string());
+    let min = pages(10)?;
+    let desc = MemoryType::new(min, Some(pages(16)?), false);
     let memory = Memory::new(&mut store, desc).map_err(|e| format!("{e:?}"))?;
-    assert_eq!(memory.view(&store).size(), Pages(10));
+    assert_eq!(memory.view(&store).size(), min);
 
-    let result = memory.grow(&mut store, Pages(2)).unwrap();
-    assert_eq!(result, Pages(10));
-    assert_eq!(memory.view(&store).size(), Pages(12));
+    let result = memory
+        .grow(&mut store, pages(2)?)
+        .map_err(|err| err.to_string())?;
+    assert_eq!(result, min);
+    assert_eq!(memory.view(&store).size().pages(), 12);
 
-    let result = memory.grow(&mut store, Pages(10));
+    let result = memory.grow(&mut store, min);
     assert_eq!(
         result,
         Err(MemoryError::CouldNotGrow {
-            current: 12.into(),
-            attempted_delta: 10.into()
+            current: pages(12)?,
+            attempted_delta: min,
         })
     );
 
     // JS will never give BadMemory unless V8 is broken somehow
     #[cfg(feature = "sys")]
     {
-        let bad_desc = MemoryType::new(Pages(15), Some(Pages(10)), false);
+        let bad_desc = MemoryType::new(pages(15)?, Some(min), false);
         let bad_result = Memory::new(&mut store, bad_desc);
         assert!(matches!(bad_result, Err(MemoryError::InvalidMemory { .. })));
     }

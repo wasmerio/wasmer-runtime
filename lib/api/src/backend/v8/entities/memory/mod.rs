@@ -3,7 +3,7 @@ use std::{marker::PhantomData, mem::MaybeUninit};
 
 use tracing::warn;
 pub use wasmer_types::MemoryError;
-use wasmer_types::{MemoryType, Pages, WASM_PAGE_SIZE, StoreId};
+use wasmer_types::{MemoryType, Pages, StoreId};
 
 use crate::{
     AsStoreMut, AsStoreRef, BackendMemory, MemoryAccessError, SharedMemory,
@@ -33,16 +33,14 @@ impl Memory {
 
         let max_requested = ty.maximum.unwrap_or(Pages::max_value());
 
-        let min = ty.minimum.0;
-        let max = ty
-            .maximum
-            .map_or(wasm_limits_max_default, |maximum| maximum.0);
+        let min = ty.minimum.pages();
+        let max = ty.maximum.map_or(wasm_limits_max_default, Pages::pages);
 
-        if max_requested.0 < min {
+        if max_requested.pages() < min {
             return Err(MemoryError::InvalidMemory {
                 reason: format!(
                     "the maximum ({} pages) is less than the minimum ({min} pages)",
-                    max_requested.0
+                    max_requested.pages()
                 ),
             });
         }
@@ -92,12 +90,16 @@ impl Memory {
 
         MemoryType {
             shared: unsafe { (*limits).shared },
-            minimum: unsafe { wasmer_types::Pages((*limits).min) },
+            minimum: Pages::try_from_pages(unsafe { (*limits).min })
+                .expect("V8 memory minimum must fit in wasm32 pages"),
             maximum: unsafe {
                 if (*limits).max == wasm_limits_max_default {
                     None
                 } else {
-                    Some(wasmer_types::Pages((*limits).max))
+                    Some(
+                        Pages::try_from_pages((*limits).max)
+                            .expect("V8 memory maximum must fit in wasm32 pages"),
+                    )
                 }
             },
         }
@@ -106,7 +108,7 @@ impl Memory {
     pub fn size(&self, store: &impl AsStoreRef) -> Pages {
         check_owner(store, self.store_id);
         let size = unsafe { wasm_memory_size(self.handle.0) };
-        Pages(size)
+        Pages::try_from_pages(size).expect("V8 memory size must fit in wasm32 pages")
     }
 
     pub fn view<'a>(&self, store: &'a impl AsStoreRef) -> MemoryView<'a> {
@@ -128,9 +130,10 @@ impl Memory {
         let store_mut = store.as_store_mut();
         unsafe {
             let delta: Pages = delta.into();
-            let current = Pages(wasm_memory_size(self.handle.0));
+            let current = Pages::try_from_pages(wasm_memory_size(self.handle.0))
+                .map_err(|err| MemoryError::Generic(err.to_string()))?;
 
-            if !wasm_memory_grow(self.handle.0, delta.0) {
+            if !wasm_memory_grow(self.handle.0, delta.pages()) {
                 Err(MemoryError::CouldNotGrow {
                     current,
                     attempted_delta: delta,
@@ -147,16 +150,14 @@ impl Memory {
         min_size: u64,
     ) -> Result<(), MemoryError> {
         check_owner(store, self.store_id);
-        let store_mut = store.as_store_mut();
-        let min_size = Pages::from_bytes_rounded_up(min_size).ok_or_else(|| {
-            MemoryError::Generic("could not represent {min_size} in Pages".to_owned())
+        let target = Pages::from_bytes_rounded_up(min_size).map_err(|err| {
+            MemoryError::Generic(format!("could not represent {min_size} in Pages: {err}"))
         })?;
-
-        unsafe {
-            let current_pages = wasm_memory_size(self.handle.0);
-            if min_size.0 > current_pages {
-                self.grow(store, Pages(min_size.0 - current_pages))?;
-            }
+        let current = self.size(store);
+        if target > current {
+            let delta = Pages::try_from_pages(target.pages() - current.pages())
+                .map_err(|err| MemoryError::Generic(err.to_string()))?;
+            self.grow(store, delta)?;
         }
 
         Ok(())
@@ -189,8 +190,8 @@ impl Memory {
         let v8_store = store_ref.inner.store.as_v8();
 
         let limits = wasm_limits_t {
-            min: ty.minimum.0,
-            max: ty.maximum.unwrap_or(Pages::max_value()).0,
+            min: ty.minimum.pages(),
+            max: ty.maximum.unwrap_or(Pages::max_value()).pages(),
             shared: ty.shared,
         };
 
@@ -216,14 +217,13 @@ impl Memory {
         let dst_pages = dst_view.size();
 
         if src_pages > dst_pages {
-            let delta = src_pages.0.checked_sub(dst_pages.0).ok_or_else(|| {
-                MemoryError::Generic("failed to calculate V8 memory copy growth".to_owned())
-            })?;
+            let delta = Pages::try_from_pages(src_pages.pages() - dst_pages.pages())
+                .map_err(|err| MemoryError::Generic(err.to_string()))?;
 
-            if !unsafe { wasm_memory_grow(copied.handle.0, delta) } {
+            if !unsafe { wasm_memory_grow(copied.handle.0, delta.pages()) } {
                 return Err(MemoryError::CouldNotGrow {
                     current: dst_pages,
-                    attempted_delta: Pages(delta),
+                    attempted_delta: delta,
                 });
             }
         }

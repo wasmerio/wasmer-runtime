@@ -624,22 +624,9 @@ pub fn parse_import_section(
             TypeRef::Tag(t) => {
                 module_info.declare_tag_import(t, module_name, field_name)?;
             }
-            TypeRef::Memory(WPMemoryType {
-                shared,
-                memory64,
-                initial,
-                maximum,
-                ..
-            }) => {
-                if memory64 {
-                    return Err("64bit memory not implemented yet".to_owned());
-                }
+            TypeRef::Memory(ty) => {
                 module_info.declare_memory_import(
-                    MemoryType {
-                        minimum: Pages(initial as u32),
-                        maximum: maximum.map(|p| Pages(p as u32)),
-                        shared,
-                    },
+                    wpmemorytype_to_type(ty)?,
                     module_name,
                     field_name,
                 )?;
@@ -710,6 +697,21 @@ pub fn parse_table_section(
     Ok(())
 }
 
+fn wpmemorytype_to_type(ty: WPMemoryType) -> WasmResult<MemoryType> {
+    if ty.memory64 {
+        return Err("64bit memory not implemented yet".to_owned());
+    }
+    let pages = |count: u64| {
+        let count = u32::try_from(count).map_err(|err| err.to_string())?;
+        Pages::try_from_pages(count).map_err(|err| err.to_string())
+    };
+    Ok(MemoryType::new(
+        pages(ty.initial)?,
+        ty.maximum.map(pages).transpose()?,
+        ty.shared,
+    ))
+}
+
 /// Parses the Memory section of the wasm module.
 pub fn parse_memory_section(
     memories: MemorySectionReader,
@@ -718,21 +720,8 @@ pub fn parse_memory_section(
     module_info.reserve_memories(memories.count())?;
 
     for entry in memories {
-        let WPMemoryType {
-            shared,
-            memory64,
-            initial,
-            maximum,
-            ..
-        } = entry.map_err(transform_err)?;
-        if memory64 {
-            return Err("64bit memory not implemented yet".to_owned());
-        }
-        module_info.declare_memory(MemoryType {
-            minimum: Pages(initial as u32),
-            maximum: maximum.map(|p| Pages(p as u32)),
-            shared,
-        })?;
+        let ty = entry.map_err(transform_err)?;
+        module_info.declare_memory(wpmemorytype_to_type(ty)?)?;
     }
 
     Ok(())

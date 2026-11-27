@@ -51,8 +51,8 @@ use crate::{VMFuncRef, on_host_stack};
 pub use eh::{throw, wasmer_eh_personality, wasmer_eh_personality2};
 pub use wasmer_types::LibCall;
 use wasmer_types::{
-    DataIndex, ElemIndex, FunctionIndex, LocalMemoryIndex, LocalTableIndex, MemoryIndex, RawValue,
-    TableIndex, TagIndex, Type,
+    DataIndex, ElemIndex, FunctionIndex, LocalMemoryIndex, LocalTableIndex, MemoryIndex, Pages,
+    RawValue, TableIndex, TagIndex, Type,
 };
 
 /// Implementation of f32.ceil
@@ -126,14 +126,17 @@ pub unsafe extern "C" fn wasmer_vm_memory32_grow(
     delta_in_pages: u32,
     memory_index: u32,
 ) -> u32 {
+    let Ok(delta) = Pages::try_from_pages(delta_in_pages) else {
+        return u32::MAX;
+    };
     unsafe {
         on_host_stack(|| {
             let instance = (*vmctx).instance_mut();
             let memory_index = LocalMemoryIndex::from_u32(memory_index);
 
             instance
-                .memory_grow(memory_index, delta_in_pages)
-                .map_or(u32::MAX, |pages| pages.0)
+                .memory_grow(memory_index, delta)
+                .map_or(u32::MAX, |pages| pages.pages())
         })
     }
 }
@@ -149,14 +152,17 @@ pub unsafe extern "C" fn wasmer_vm_imported_memory32_grow(
     delta_in_pages: u32,
     memory_index: u32,
 ) -> u32 {
+    let Ok(delta) = Pages::try_from_pages(delta_in_pages) else {
+        return u32::MAX;
+    };
     unsafe {
         on_host_stack(|| {
             let instance = (*vmctx).instance_mut();
             let memory_index = MemoryIndex::from_u32(memory_index);
 
             instance
-                .imported_memory_grow(memory_index, delta_in_pages)
-                .map_or(u32::MAX, |pages| pages.0)
+                .imported_memory_grow(memory_index, delta)
+                .map_or(u32::MAX, |pages| pages.pages())
         })
     }
 }
@@ -172,7 +178,7 @@ pub unsafe extern "C" fn wasmer_vm_memory32_size(vmctx: *mut VMContext, memory_i
         let instance = (*vmctx).instance();
         let memory_index = LocalMemoryIndex::from_u32(memory_index);
 
-        instance.memory_size(memory_index).0
+        instance.memory_size(memory_index).pages()
     }
 }
 
@@ -190,7 +196,7 @@ pub unsafe extern "C" fn wasmer_vm_imported_memory32_size(
         let instance = (*vmctx).instance();
         let memory_index = MemoryIndex::from_u32(memory_index);
 
-        instance.imported_memory_size(memory_index).0
+        instance.imported_memory_size(memory_index).pages()
     }
 }
 

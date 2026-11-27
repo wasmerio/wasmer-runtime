@@ -54,7 +54,7 @@ pub enum MemoryError {
     Region(String),
     /// The operation would cause the size of the memory to exceed the maximum or would cause
     /// an overflow leading to unindexable memory.
-    #[error("The memory could not grow: current size {} pages, requested increase: {} pages", current.0, attempted_delta.0)]
+    #[error("The memory could not grow: current size {} pages, requested increase: {} pages", current.pages(), attempted_delta.pages())]
     CouldNotGrow {
         /// The current size in pages.
         current: Pages,
@@ -68,7 +68,7 @@ pub enum MemoryError {
         reason: String,
     },
     /// Caller asked for more minimum memory than we can give them.
-    #[error("The minimum requested ({} pages) memory is greater than the maximum allowed memory ({} pages)", min_requested.0, max_allowed.0)]
+    #[error("The minimum requested ({} pages) memory is greater than the maximum allowed memory ({} pages)", min_requested.pages(), max_allowed.pages())]
     MinimumMemoryTooLarge {
         /// The number of pages requested as the minimum amount of memory.
         min_requested: Pages,
@@ -76,7 +76,7 @@ pub enum MemoryError {
         max_allowed: Pages,
     },
     /// Caller asked for a maximum memory greater than we can give them.
-    #[error("The maximum requested memory ({} pages) is greater than the maximum allowed memory ({} pages)", max_requested.0, max_allowed.0)]
+    #[error("The maximum requested memory ({} pages) is greater than the maximum allowed memory ({} pages)", max_requested.pages(), max_allowed.pages())]
     MaximumMemoryTooLarge {
         /// The number of pages requested as the maximum amount of memory.
         max_requested: Pages,

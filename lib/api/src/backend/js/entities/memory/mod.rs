@@ -19,7 +19,7 @@ use crate::{
 // QuickJS currently represents ArrayBuffer lengths with a signed 32-bit value.
 // Keep shared WASIX memories just below 2 GiB so nested WebAssembly runtimes can
 // grow large workloads without exposing a buffer QuickJS cannot address.
-const JS_SHARED_MEMORY_MAXIMUM_PAGES: Pages = Pages(32_767);
+const JS_SHARED_MEMORY_MAXIMUM_PAGES: Pages = Pages::try_from_pages(32_767).unwrap();
 
 #[derive(Debug, Clone, Eq)]
 pub struct Memory {
@@ -67,8 +67,8 @@ impl Memory {
                     let candidate = MemoryType::new(ty.minimum, Some(maximum), true);
                     if let Ok(memory) = Self::js_memory_from_type(&candidate) {
                         tracing::debug!(
-                            requested_maximum = requested_maximum.0,
-                            allocated_maximum = maximum.0,
+                            requested_maximum = requested_maximum.pages(),
+                            allocated_maximum = maximum.pages(),
                             "browser rejected the requested shared memory maximum; using a smaller compatible maximum",
                         );
                         ty = candidate;
@@ -92,9 +92,10 @@ impl Memory {
         // Annotation is here to prevent spurious IDE warnings.
         #[allow(unused_unsafe)]
         unsafe {
-            js_sys::Reflect::set(&descriptor, &"initial".into(), &ty.minimum.0.into()).unwrap();
+            js_sys::Reflect::set(&descriptor, &"initial".into(), &ty.minimum.pages().into())
+                .unwrap();
             if let Some(max) = ty.maximum {
-                js_sys::Reflect::set(&descriptor, &"maximum".into(), &max.0.into()).unwrap();
+                js_sys::Reflect::set(&descriptor, &"maximum".into(), &max.pages().into()).unwrap();
             }
             js_sys::Reflect::set(&descriptor, &"shared".into(), &ty.shared.into()).unwrap();
         }
@@ -146,7 +147,8 @@ impl Memory {
             },
         };
 
-        Pages(byte_length.div_ceil(WASM_PAGE_SIZE as u32))
+        Pages::try_from_pages(byte_length.div_ceil(WASM_PAGE_SIZE as u32))
+            .expect("JavaScript memory size must fit in wasm32 pages")
     }
 
     pub fn grow<IntoPages>(
@@ -160,17 +162,17 @@ impl Memory {
         let pages = delta.into();
         let js_memory = &self.handle.memory;
         let our_js_memory: &JSMemory = JsCast::unchecked_from_js_ref(js_memory);
-        let new_pages = our_js_memory.grow(pages.0).map_err(|err| {
+        let previous_pages = our_js_memory.grow(pages.pages()).map_err(|err| {
             if err.is_instance_of::<js_sys::RangeError>() {
                 MemoryError::CouldNotGrow {
                     current: self.view(&store.as_store_ref()).size(),
                     attempted_delta: pages,
                 }
             } else {
-                MemoryError::Generic(err.as_string().unwrap())
+                MemoryError::Generic(err.as_string().unwrap_or_else(|| format!("{err:?}")))
             }
         })?;
-        Ok(Pages(new_pages))
+        Pages::try_from_pages(previous_pages).map_err(|err| MemoryError::Generic(err.to_string()))
     }
 
     pub fn grow_at_least(
@@ -178,12 +180,13 @@ impl Memory {
         store: &mut impl AsStoreMut,
         min_size: u64,
     ) -> Result<(), MemoryError> {
-        let cur_size = self.view(store).data_size();
-        if min_size > cur_size {
-            let delta = min_size - cur_size;
-            let pages = ((delta - 1) / wasmer_types::WASM_PAGE_SIZE as u64) + 1;
-
-            self.grow(store, Pages(pages as u32))?;
+        let target = Pages::from_bytes_rounded_up(min_size)
+            .map_err(|err| MemoryError::Generic(err.to_string()))?;
+        let current = self.size(store);
+        if target > current {
+            let delta = Pages::try_from_pages(target.pages() - current.pages())
+                .map_err(|err| MemoryError::Generic(err.to_string()))?;
+            self.grow(store, delta)?;
         }
         Ok(())
     }
@@ -223,13 +226,13 @@ fn smaller_shared_memory_maxima(minimum: Pages, maximum: Pages) -> impl Iterator
     // reservation gradually so a child process can still retain a useful heap
     // alongside its parent instead of jumping straight to half the capacity.
     const STEP: u32 = 1_024; // 64 MiB
-    let mut candidate = maximum.0;
+    let mut candidate = maximum.pages();
     std::iter::from_fn(move || {
-        if candidate <= minimum.0 {
+        if candidate <= minimum.pages() {
             return None;
         }
-        candidate = candidate.saturating_sub(STEP).max(minimum.0);
-        Some(Pages(candidate))
+        candidate = candidate.saturating_sub(STEP).max(minimum.pages());
+        Some(Pages::try_from_pages(candidate).expect("candidate is bounded by the maximum"))
     })
 }
 
@@ -265,15 +268,18 @@ pub trait JsSharedMemoryExt {
     /// # Example
     ///
     /// ```ignore
-    /// # use wasmer::{Memory, MemoryType, Store};
+    /// # use wasmer::{Memory, MemoryType, Pages, Store};
     /// use wasmer::js::JsSharedMemoryExt;
     ///
     /// # let mut store = Store::default();
-    /// let memory = Memory::new(&mut store, MemoryType::new(1, Some(2), true)).unwrap();
+    /// let min = Pages::ONE;
+    /// let max = Pages::try_from_pages(2)?;
+    /// let memory = Memory::new(&mut store, MemoryType::new(min, Some(max), true))?;
     /// let shared = memory.as_shared(&store).unwrap();
     ///
     /// // The same memory JavaScript sees: hand it to code that is not Wasmer's.
     /// let js_memory: js_sys::WebAssembly::Memory = shared.local_js_memory().unwrap();
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     fn local_js_memory(&self) -> Option<js_sys::WebAssembly::Memory>;
 }

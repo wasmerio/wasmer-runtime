@@ -203,7 +203,7 @@ fn is_memory_compatible(
         shared: imported_shared,
     } = imported;
 
-    imported_minimum.0 <= imported_runtime_size.unwrap_or(exported_minimum.0)
+    imported_minimum.pages() <= imported_runtime_size.unwrap_or(exported_minimum.pages())
         && (imported_maximum.is_none()
             || (!exported_maximum.is_none()
                 && imported_maximum.unwrap() >= exported_maximum.unwrap()))

@@ -25,7 +25,9 @@ impl BackendMemory {
     /// # use wasmer::{Memory, MemoryType, Pages, Store, Type, Value};
     /// # let mut store = Store::default();
     /// #
-    /// let m = Memory::new(&mut store, MemoryType::new(1, None, false)).unwrap();
+    /// let page = Pages::ONE;
+    /// let m = Memory::new(&mut store, MemoryType::new(page, None, false))?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[inline]
     pub fn new(store: &mut impl AsStoreMut, ty: MemoryType) -> Result<Self, MemoryError> {
@@ -81,10 +83,11 @@ impl BackendMemory {
     /// # use wasmer::{Memory, MemoryType, Pages, Store, Type, Value};
     /// # let mut store = Store::default();
     /// #
-    /// let mt = MemoryType::new(1, None, false);
-    /// let m = Memory::new(&mut store, mt).unwrap();
+    /// let mt = MemoryType::new(Pages::ONE, None, false);
+    /// let m = Memory::new(&mut store, mt)?;
     ///
     /// assert_eq!(m.ty(&mut store), mt);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[inline]
     pub fn ty(&self, store: &impl AsStoreRef) -> MemoryType {
@@ -109,11 +112,14 @@ impl BackendMemory {
     /// # use wasmer::{Memory, MemoryType, Pages, Store, Type, Value, WASM_MAX_PAGES};
     /// # let mut store = Store::default();
     /// #
-    /// let m = Memory::new(&mut store, MemoryType::new(1, Some(3), false)).unwrap();
-    /// let p = m.grow(&mut store, 2).unwrap();
+    /// let min = Pages::ONE;
+    /// let max = Pages::try_from_pages(3)?;
+    /// let m = Memory::new(&mut store, MemoryType::new(min, Some(max), false))?;
+    /// let p = m.grow(&mut store, Pages::try_from_pages(2)?)?;
     ///
-    /// assert_eq!(p, Pages(1));
-    /// assert_eq!(m.view(&mut store).size(), Pages(3));
+    /// assert_eq!(p, min);
+    /// assert_eq!(m.view(&store).size(), max);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     ///
     /// # Errors
@@ -127,10 +133,12 @@ impl BackendMemory {
     /// # let mut store = Store::default();
     /// # let env = FunctionEnv::new(&mut store, ());
     /// #
-    /// let m = Memory::new(&mut store, MemoryType::new(1, Some(1), false)).unwrap();
+    /// let page = Pages::ONE;
+    /// let m = Memory::new(&mut store, MemoryType::new(page, Some(page), false))?;
     ///
     /// // This results in an error: `MemoryError::CouldNotGrow`.
-    /// let s = m.grow(&mut store, 1).unwrap();
+    /// let s = m.grow(&mut store, page).unwrap();
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     #[inline]
     pub fn grow<IntoPages>(

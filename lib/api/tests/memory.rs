@@ -7,12 +7,20 @@ use std::sync::{
 use wasm_bindgen::JsCast;
 #[cfg(feature = "js")]
 use wasm_bindgen_test::*;
-use wasmer::{Instance, Memory, MemoryLocation, MemoryType, Module, Store, imports};
+use wasmer::{Instance, Memory, MemoryLocation, MemoryType, Module, Pages, Store, imports};
 #[cfg(feature = "js")]
 use wasmer::{
     MemoryAccessError, Value,
     js::{AsJs, JsSharedMemoryExt},
 };
+
+fn memory_type(minimum: u32, maximum: u32, shared: bool) -> MemoryType {
+    MemoryType::new(
+        Pages::try_from_pages(minimum).unwrap(),
+        Some(Pages::try_from_pages(maximum).unwrap()),
+        shared,
+    )
+}
 
 #[test]
 #[allow(unused_attributes)]
@@ -29,7 +37,7 @@ fn test_shared_memory_atomics_notify_send() {
         .map_err(|e| format!("{e:?}"))
         .unwrap();
 
-    let mem = Memory::new(&mut store, MemoryType::new(10, Some(65536), true)).unwrap();
+    let mem = Memory::new(&mut store, memory_type(10, 65536, true)).unwrap();
 
     let imports = imports! {
         "host" => {
@@ -88,7 +96,7 @@ fn test_shared_memory_disable_atomics() {
     use wasmer::AtomicsError;
 
     let mut store = Store::default();
-    let mem = Memory::new(&mut store, MemoryType::new(10, Some(65536), true)).unwrap();
+    let mem = Memory::new(&mut store, memory_type(10, 65536, true)).unwrap();
 
     let mem = mem.as_shared(&store).unwrap();
     mem.disable_atomics().unwrap();
@@ -101,7 +109,7 @@ fn test_shared_memory_disable_atomics() {
 #[test]
 fn test_shared_memory_copy_is_independent() {
     let mut store = Store::default();
-    let memory = Memory::new(&mut store, MemoryType::new(1, Some(2), true)).unwrap();
+    let memory = Memory::new(&mut store, memory_type(1, 2, true)).unwrap();
 
     memory.view(&store).write(0, b"before").unwrap();
 
@@ -118,7 +126,7 @@ fn test_shared_memory_copy_is_independent() {
 #[engine_test]
 fn test_non_shared_memory_copy_is_rejected() -> Result<(), String> {
     let mut store = Store::default();
-    let memory = Memory::new(&mut store, MemoryType::new(1, Some(2), false)).unwrap();
+    let memory = Memory::new(&mut store, memory_type(1, 2, false)).unwrap();
     assert!(matches!(
         memory.copy(&store),
         Err(wasmer::MemoryError::MemoryNotShared)
@@ -144,7 +152,7 @@ fn test_wasm_slice_issue_5444() {
         .map_err(|e| format!("{e:?}"))
         .unwrap();
 
-    let mem = Memory::new(&mut store, MemoryType::new(10, Some(65536), false)).unwrap();
+    let mem = Memory::new(&mut store, memory_type(10, 65536, false)).unwrap();
 
     let imports = imports! {
         "host" => {
@@ -167,7 +175,7 @@ fn test_wasm_slice_issue_5444() {
 #[test]
 fn test_wasm_slice_new_rejects_out_of_bounds_ranges() {
     let mut store = Store::default();
-    let memory = Memory::new(&mut store, MemoryType::new(1, Some(1), false)).unwrap();
+    let memory = Memory::new(&mut store, memory_type(1, 1, false)).unwrap();
     let view = memory.view(&store);
 
     let slice = wasmer::WasmSlice::<u64>::new(&view, 0, 8193);
@@ -183,19 +191,38 @@ fn test_wasm_memory_size() {
 
     // Test once with not-shared memory...
     {
-        let memory = Memory::new(&mut store, MemoryType::new(10, Some(65536), false)).unwrap();
-        assert_eq!(memory.size(&store).0, 10);
-        memory.grow(&mut store, wasmer::Pages(1)).unwrap();
-        assert_eq!(memory.size(&store).0, 11);
+        let memory = Memory::new(&mut store, memory_type(10, 65536, false)).unwrap();
+        assert_eq!(memory.size(&store).pages(), 10);
+        memory.grow(&mut store, wasmer::Pages::ONE).unwrap();
+        assert_eq!(memory.size(&store).pages(), 11);
     }
 
     // ... and once with shared memory, since JS has different representations for it
     {
-        let memory = Memory::new(&mut store, MemoryType::new(10, Some(65536), true)).unwrap();
-        assert_eq!(memory.size(&store).0, 10);
-        memory.grow(&mut store, wasmer::Pages(1)).unwrap();
-        assert_eq!(memory.size(&store).0, 11);
+        let memory = Memory::new(&mut store, memory_type(10, 65536, true)).unwrap();
+        assert_eq!(memory.size(&store).pages(), 10);
+        memory.grow(&mut store, wasmer::Pages::ONE).unwrap();
+        assert_eq!(memory.size(&store).pages(), 11);
     }
+}
+
+#[test]
+fn test_wasm_memory_grow_at_least_rounds_up() {
+    let mut store = Store::default();
+    let memory = Memory::new(&mut store, memory_type(1, 2, false)).unwrap();
+    let page_size = wasmer::WASM_PAGE_SIZE as u64;
+
+    memory.grow_at_least(&mut store, page_size + 1).unwrap();
+    assert_eq!(memory.size(&store).pages(), 2);
+}
+
+#[test]
+fn test_wasm_memory_grow_at_least_rejects_unrepresentable_size() {
+    let mut store = Store::default();
+    let memory = Memory::new(&mut store, memory_type(1, 2, false)).unwrap();
+
+    assert!(memory.grow_at_least(&mut store, u64::MAX).is_err());
+    assert_eq!(memory.size(&store), wasmer::Pages::ONE);
 }
 
 /// The 32-bit word of `memory` at `offset`.
@@ -211,7 +238,7 @@ fn word_at(memory: &Memory, store: &Store, offset: u64) -> u32 {
 fn js_compare_exchange_replaces_only_an_expected_word() {
     for shared in [false, true] {
         let mut store = Store::default();
-        let memory = Memory::new(&mut store, MemoryType::new(1, Some(2), shared)).unwrap();
+        let memory = Memory::new(&mut store, memory_type(1, 2, shared)).unwrap();
         let view = memory.as_js().view(&store);
 
         // The word is the expected one: it is replaced.
@@ -238,7 +265,7 @@ fn js_compare_exchange_replaces_only_an_expected_word() {
 fn js_compare_exchange_refuses_unaligned_and_out_of_bounds_offsets() {
     for shared in [false, true] {
         let mut store = Store::default();
-        let memory = Memory::new(&mut store, MemoryType::new(1, Some(2), shared)).unwrap();
+        let memory = Memory::new(&mut store, memory_type(1, 2, shared)).unwrap();
         let view = memory.as_js().view(&store);
 
         for offset in [1, 2, 3, 65534] {
@@ -270,7 +297,7 @@ fn js_compare_exchange_refuses_unaligned_and_out_of_bounds_offsets() {
 fn js_compare_exchange_needs_a_new_view_after_growth() {
     for shared in [false, true] {
         let mut store = Store::default();
-        let memory = Memory::new(&mut store, MemoryType::new(1, Some(2), shared)).unwrap();
+        let memory = Memory::new(&mut store, memory_type(1, 2, shared)).unwrap();
         let old_view = memory.as_js().view(&store);
         // A view borrows its store, so the memory grows as a guest on another
         // worker grows it: through its JavaScript object.
@@ -313,7 +340,7 @@ fn js_compare_exchange_is_the_atomic_exchange_of_a_guest() {
   (i32.atomic.rmw.cmpxchg (local.get 0) (local.get 1) (local.get 2)))
 )"#;
     let module = Module::new(&store, wat).unwrap();
-    let memory = Memory::new(&mut store, MemoryType::new(1, Some(2), true)).unwrap();
+    let memory = Memory::new(&mut store, memory_type(1, 2, true)).unwrap();
     let imports = imports! { "host" => { "memory" => memory.clone() } };
     let instance = Instance::new(&mut store, &module, &imports).unwrap();
     let guest_cas = instance.exports.get_function("cas").unwrap();
@@ -340,7 +367,7 @@ fn js_compare_exchange_is_the_atomic_exchange_of_a_guest() {
 #[wasm_bindgen_test]
 fn js_shared_memory_gives_its_local_js_memory() {
     let mut store = Store::default();
-    let memory = Memory::new(&mut store, MemoryType::new(1, Some(2), true)).unwrap();
+    let memory = Memory::new(&mut store, memory_type(1, 2, true)).unwrap();
     let shared = memory.as_shared(&store).unwrap();
 
     // It is the object of the memory, not a copy of it.
@@ -361,7 +388,7 @@ fn js_shared_memory_gives_its_local_js_memory() {
     assert_eq!(&buffer, b"Wasmer");
 
     // So is a growth, and the memory attached to another store.
-    memory.grow(&mut store, 1).unwrap();
+    memory.grow(&mut store, Pages::ONE).unwrap();
     let bytes = js_sys::Uint8Array::new(&js_memory.buffer());
     assert_eq!(bytes.length(), 2 * 65536);
     let mut other_store = Store::default();
