@@ -30,8 +30,8 @@ mod tests {
             s => panic!("Unexpected memory style: {s:?}"),
         }
 
-        // Large maximum
-        let requested = MemoryType::new(3, Some(5_000_000), true);
+        // Largest valid maximum.
+        let requested = MemoryType::new(minimum, Some(Pages::max_value()), true);
         let style = tunables.memory_style(&requested);
         match style {
             MemoryStyle::Static => {}
