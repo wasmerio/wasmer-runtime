@@ -103,11 +103,7 @@ impl fmt::Debug for Bytes {
 impl From<Pages> for Bytes {
     fn from(pages: Pages) -> Self {
         // At the maximum page count, 4 GiB is one byte more than a 32-bit usize can hold.
-        Self(
-            (pages.0 as usize)
-                .checked_mul(WASM_PAGE_SIZE)
-                .unwrap_or(usize::MAX),
-        )
+        Self((pages.0 as usize).saturating_mul(WASM_PAGE_SIZE))
     }
 }
 
