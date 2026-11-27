@@ -19,7 +19,10 @@ use crate::{
 // QuickJS currently represents ArrayBuffer lengths with a signed 32-bit value.
 // Keep shared WASIX memories just below 2 GiB so nested WebAssembly runtimes can
 // grow large workloads without exposing a buffer QuickJS cannot address.
-const JS_SHARED_MEMORY_MAXIMUM_PAGES: Pages = Pages::try_from_pages(32_767).unwrap();
+const JS_SHARED_MEMORY_MAXIMUM_PAGES: Pages = match Pages::try_from_pages(32_767) {
+    Ok(pages) => pages,
+    Err(_) => panic!("JavaScript shared memory limit must fit in wasm32 pages"),
+};
 
 #[derive(Debug, Clone, Eq)]
 pub struct Memory {
@@ -50,8 +53,8 @@ impl Memory {
         {
             ty.maximum = Some(JS_SHARED_MEMORY_MAXIMUM_PAGES);
             tracing::debug!(
-                requested_maximum = maximum.0,
-                allocated_maximum = JS_SHARED_MEMORY_MAXIMUM_PAGES.0,
+                requested_maximum = maximum.pages(),
+                allocated_maximum = JS_SHARED_MEMORY_MAXIMUM_PAGES.pages(),
                 "bounding shared memory growth for the JavaScript backend",
             );
         }
