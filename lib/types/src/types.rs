@@ -296,15 +296,17 @@ impl FunctionType {
         &self.results
     }
 
-    /// Returns a stable 32-bit signature hash derived from the Wasm value types.
-    pub fn signature_hash(&self) -> u32 {
-        let mut hasher = crc32fast::Hasher::new();
+    /// Returns a stable 64-bit BLAKE3 signature hash derived from the Wasm value types.
+    pub fn signature_hash(&self) -> u64 {
+        let mut hasher = blake3::Hasher::new();
         hasher.update(&self.results.len().to_le_bytes());
         hasher.update(&self.params.len().to_le_bytes());
         for ty in self.results.iter().chain(self.params.iter()) {
             hasher.update(&[*ty as u8]);
         }
-        hasher.finalize()
+        let mut hash = [0; 8];
+        hasher.finalize_xof().fill(&mut hash);
+        u64::from_le_bytes(hash)
     }
 }
 

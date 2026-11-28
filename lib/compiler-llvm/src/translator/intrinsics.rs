@@ -393,7 +393,7 @@ impl<'ctx> Intrinsics<'ctx> {
         let anyfunc_ty = context.struct_type(
             &[
                 i8_ptr_ty_basic,
-                i32_ty.into(),
+                i64_ty.into(),
                 i8_ty.into(),
                 ctx_ptr_ty_basic,
                 ptr_ty.into(),

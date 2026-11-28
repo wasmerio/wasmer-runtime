@@ -2572,15 +2572,15 @@ impl<'a, M: Machine> FuncGen<'a, M> {
                     )?;
                 }
                 self.machine.move_location(
-                    Size::S32,
-                    Location::Imm32(expected_sig_hash.as_u32()),
+                    Size::S64,
+                    Location::Imm64(expected_sig_hash.as_u64()),
                     Location::GPR(sig_hash),
                 )?;
 
                 // Trap if signature mismatches.
                 self.machine.jmp_on_condition(
                     UnsignedCondition::NotEqual,
-                    Size::S32,
+                    Size::S64,
                     Location::GPR(sig_hash),
                     Location::Memory(
                         table_count,
