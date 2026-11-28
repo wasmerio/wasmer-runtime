@@ -71,9 +71,9 @@ impl SinglepassCompiler {
         )?;
         let arch = target.triple().architecture;
         match arch {
-            Architecture::X86_64 => {}
-            Architecture::Aarch64(_) => {}
-            Architecture::Riscv64(_) => {}
+            Architecture::X86_64 => MachineX86_64::requires_features(target)?,
+            Architecture::Aarch64(_) => MachineARM64::requires_features(target)?,
+            Architecture::Riscv64(_) => MachineRiscv::requires_features(target)?,
             _ => {
                 return Err(CompileError::UnsupportedTarget(
                     target.triple().architecture.to_string(),
@@ -165,7 +165,7 @@ impl SinglepassCompiler {
 
                 let res = match arch {
                     Architecture::X86_64 => {
-                        let machine = MachineX86_64::new(Some(target.clone()))?;
+                        let machine = MachineX86_64::new(target.clone());
                         let mut generator = FuncGen::new(
                             module,
                             target,
@@ -188,7 +188,7 @@ impl SinglepassCompiler {
                         generator.finalize(input, arch, target, &source_map)
                     }
                     Architecture::Aarch64(_) => {
-                        let machine = MachineARM64::new(Some(target.clone()));
+                        let machine = MachineARM64::new();
                         let mut generator = FuncGen::new(
                             module,
                             target,
@@ -395,7 +395,13 @@ impl Compiler for SinglepassCompiler {
     }
 
     fn get_cpu_features_used(&self, cpu_features: &EnumSet<CpuFeature>) -> EnumSet<CpuFeature> {
-        let used = CpuFeature::AVX | CpuFeature::SSE42 | CpuFeature::LZCNT | CpuFeature::BMI1;
+        let used = CpuFeature::AVX
+            | CpuFeature::SSE42
+            | CpuFeature::LZCNT
+            | CpuFeature::BMI1
+            | CpuFeature::POPCNT
+            // AArch64
+            | CpuFeature::NEON;
         cpu_features.intersection(used)
     }
 }
@@ -453,6 +459,34 @@ mod tests {
             Err(error) => panic!("Unexpected error: {error:?}"),
             Ok(_) => panic!("Compilation unexpectedly succeeded"),
         };
+    }
+
+    #[test]
+    fn rejects_targets_missing_required_cpu_features() {
+        let compiler = SinglepassCompiler::new(Singlepass::default());
+        let x86_64 = triple!("x86_64-unknown-linux-gnu");
+        let cases = [
+            (x86_64.clone(), CpuFeature::AVX.into(), "without POPCNT"),
+            (x86_64, CpuFeature::POPCNT.into(), "without AVX or SSE 4.2"),
+            (
+                triple!("aarch64-unknown-linux-gnu"),
+                EnumSet::empty(),
+                "without NEON",
+            ),
+        ];
+
+        for (triple, features, reason) in cases {
+            let target = Target::new(triple, features);
+            let (mut info, translation, inputs) = dummy_compilation_ingredients();
+            match compiler.compile_module(&target, &mut info, &translation, inputs, None) {
+                Err(CompileError::UnsupportedTarget(message)) => assert!(
+                    message.contains(reason),
+                    "Expected UnsupportedTarget mentioning {reason:?}, got {message:?}"
+                ),
+                Err(error) => panic!("Expected UnsupportedTarget for {reason}, got {error:?}"),
+                Ok(_) => panic!("Compilation unexpectedly succeeded for target {reason}"),
+            }
+        }
     }
 
     #[test]

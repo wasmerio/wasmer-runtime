@@ -40,31 +40,24 @@ pub struct AssemblerX64 {
     /// Currently only supports SSE 4.2 and AVX
     pub simd_arch: CpuFeature,
     /// Full Target cpu
-    pub target: Option<Target>,
+    pub target: Target,
 }
 
 impl AssemblerX64 {
-    fn new(baseaddr: usize, target: Option<Target>) -> Result<Self, CompileError> {
-        let simd_arch = target.as_ref().map_or_else(
-            || Ok(CpuFeature::SSE42),
-            |target| {
-                if target.cpu_features().contains(CpuFeature::AVX) {
-                    Ok(CpuFeature::AVX)
-                } else if target.cpu_features().contains(CpuFeature::SSE42) {
-                    Ok(CpuFeature::SSE42)
-                } else {
-                    Err(CompileError::UnsupportedTarget(
-                        "x86_64 without AVX or SSE 4.2, use -m avx to enable".to_string(),
-                    ))
-                }
-            },
-        )?;
+    fn new(baseaddr: usize, target: Target) -> Self {
+        let simd_arch = if target.cpu_features().contains(CpuFeature::AVX) {
+            CpuFeature::AVX
+        } else if target.cpu_features().contains(CpuFeature::SSE42) {
+            CpuFeature::SSE42
+        } else {
+            unreachable!("checked by MachineX86_64::requires_features")
+        };
 
-        Ok(Self {
+        Self {
             inner: Assembler::new(baseaddr),
             simd_arch,
             target,
-        })
+        }
     }
 
     fn finalize(self) -> Result<Vec<u8>, DynasmError> {
@@ -111,9 +104,9 @@ pub(crate) const X86_64_RETURN_VALUE_REGISTERS: [GPR; 2] = [GPR::RAX, GPR::RDX];
 const DIV_REM_REGISTERS: [GPR; 2] = [GPR::RAX, GPR::RDX];
 
 impl MachineX86_64 {
-    pub fn new(target: Option<Target>) -> Result<Self, CompileError> {
-        let assembler = AssemblerX64::new(0, target)?;
-        Ok(MachineX86_64 {
+    pub fn new(target: Target) -> Self {
+        let assembler = AssemblerX64::new(0, target);
+        MachineX86_64 {
             assembler,
             used_gprs: FixedBitSet::with_capacity(16),
             used_simd: FixedBitSet::with_capacity(16),
@@ -121,7 +114,7 @@ impl MachineX86_64 {
             instructions_address_map: vec![],
             src_loc: 0,
             unwind_ops: vec![],
-        })
+        }
     }
     pub fn emit_relaxed_binop(
         &mut self,
@@ -1966,6 +1959,21 @@ impl Machine for MachineX86_64 {
 
     /// x86_64 stack slots are 8 bytes; 16-byte stack alignment for calls is handled separately.
     const STACK_ALIGNMENT: usize = 8;
+
+    fn requires_features(target: &Target) -> Result<(), CompileError> {
+        let features = target.cpu_features();
+        if !features.contains(CpuFeature::SSE42) && !features.contains(CpuFeature::AVX) {
+            return Err(CompileError::UnsupportedTarget(
+                "x86_64 without AVX or SSE 4.2, use -m avx to enable".to_string(),
+            ));
+        }
+        if !features.contains(CpuFeature::POPCNT) {
+            return Err(CompileError::UnsupportedTarget(
+                "x86_64 without POPCNT, use -m popcnt to enable".to_string(),
+            ));
+        }
+        Ok(())
+    }
 
     fn assembler_get_offset(&self) -> Offset {
         self.assembler.get_offset()
@@ -8014,8 +8022,7 @@ impl Machine for MachineX86_64 {
         _calling_convention: CallingConvention,
         progress_callback: Option<&CompilationProgressCallback>,
     ) -> Result<Compilation, CompileError> {
-        // the cpu feature here is irrelevant
-        let mut a = AssemblerX64::new(0, None)?;
+        let mut a = AssemblerX64::new(0, self.assembler.target.clone());
         let mut output_reporter = ChunkedOutputReporter::new(progress_callback);
 
         // Calculate stack offset (+1 for the vmctx argument we are going to pass).
@@ -8139,8 +8146,7 @@ impl Machine for MachineX86_64 {
         calling_convention: CallingConvention,
         progress_callback: Option<&CompilationProgressCallback>,
     ) -> Result<Compilation, CompileError> {
-        // the cpu feature here is irrelevant
-        let mut a = AssemblerX64::new(0, None)?;
+        let mut a = AssemblerX64::new(0, self.assembler.target.clone());
         let mut output_reporter = ChunkedOutputReporter::new(progress_callback);
 
         // Allocate argument array.
@@ -8241,8 +8247,7 @@ impl Machine for MachineX86_64 {
         calling_convention: CallingConvention,
         progress_callback: Option<&CompilationProgressCallback>,
     ) -> Result<Vec<u8>, CompileError> {
-        // the cpu feature here is irrelevant
-        let mut a = AssemblerX64::new(0, None)?;
+        let mut a = AssemblerX64::new(0, self.assembler.target.clone());
         let mut output_reporter = ChunkedOutputReporter::new(progress_callback);
 
         // TODO: ARM entry trampoline is not emitted.
@@ -8752,7 +8757,7 @@ mod test {
     fn tests_avx() -> Result<(), CompileError> {
         let set = enum_set!(CpuFeature::AVX);
         let target = Target::new(Triple::from_str("x86_64-linux-gnu").unwrap(), set);
-        let mut machine = MachineX86_64::new(Some(target))?;
+        let mut machine = MachineX86_64::new(target);
 
         test_move_location(&mut machine)?;
         test_move_location_extended(&mut machine, false, Size::S8)?;
@@ -8788,7 +8793,7 @@ mod test {
     fn tests_sse42() -> Result<(), CompileError> {
         let set = enum_set!(CpuFeature::SSE42);
         let target = Target::new(Triple::from_str("x86_64-linux-gnu").unwrap(), set);
-        let mut machine = MachineX86_64::new(Some(target))?;
+        let mut machine = MachineX86_64::new(target);
 
         test_move_location(&mut machine)?;
         test_move_location_extended(&mut machine, false, Size::S8)?;

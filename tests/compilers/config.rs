@@ -139,7 +139,8 @@ impl Config {
                         | CpuFeature::SSE3
                         | CpuFeature::SSSE3
                         | CpuFeature::SSE41
-                        | CpuFeature::SSE42;
+                        | CpuFeature::SSE42
+                        | CpuFeature::POPCNT;
                     engine =
                         engine.set_target(Some(Target::new(target.triple().clone(), cpu_features)));
                 }
