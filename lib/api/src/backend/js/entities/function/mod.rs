@@ -1,3 +1,5 @@
+#[cfg(feature = "async")]
+pub(crate) mod async_host;
 pub(crate) mod env;
 pub(crate) mod numeric;
 pub(crate) mod typed;
@@ -124,7 +126,9 @@ use crate::{
     vm::{VMExtern, VMExternFunction},
 };
 #[cfg(feature = "async")]
-use crate::{AsyncEnv, entities::function::async_host::HostFuture, js::jspi};
+use crate::{AsyncEnv, AsyncHostFunction, js::jspi};
+#[cfg(feature = "async")]
+use async_host::{HostFuture, TypedCall, typed_call, typed_host_body};
 
 use std::panic::{self, AssertUnwindSafe};
 
@@ -174,6 +178,11 @@ fn results_to_js_array(values: &[Value], types: &[Type]) -> Array {
     Array::from_iter(values.map(|(index, value)| result_to_js(value, types.get(index))))
 }
 
+/// The body of a dynamic host function. Boxed, so that the closures that
+/// call it, `wasm_bindgen` closures with their own shims, are instantiated
+/// once per environment type rather than once per host function.
+type DynamicBody<T> = Box<dyn Fn(FunctionEnvMut<'_, T>, &[Value]) -> Result<Vec<Value>, RuntimeError>>;
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct Function {
     pub(crate) handle: VMFunction,
@@ -197,8 +206,10 @@ impl Function {
         ))
     }
 
+    /// Creates an async host function from its body, which takes the
+    /// arguments of a call and returns its future.
     #[cfg(feature = "async")]
-    pub(crate) fn new_async<FT, F, T>(
+    pub(crate) fn new_async<FT, F, Fut, T>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
         ty: FT,
@@ -206,7 +217,61 @@ impl Function {
     ) -> Self
     where
         FT: Into<FunctionType>,
-        F: Fn(AsyncEnv<T>, Vec<Value>) -> HostFuture + 'static,
+        F: Fn(AsyncEnv<T>, Vec<Value>) -> Fut + 'static,
+        Fut: std::future::Future<Output = Result<Vec<Value>, RuntimeError>> + 'static,
+        T: Send + 'static,
+    {
+        // Only this is instantiated per host function: what follows is once
+        // per environment type.
+        let body = move |cx, values| -> HostFuture { Box::pin(func(cx, values)) };
+        Self::new_async_boxed(store, env, ty.into(), Box::new(body))
+    }
+
+    /// Creates an async host function from a typed one, which is called as
+    /// a dynamic one.
+    #[inline]
+    #[cfg(feature = "async")]
+    pub(crate) fn new_typed_async<T, Args, Rets, Kind>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        func: impl AsyncHostFunction<T, Args, Rets, Kind>,
+    ) -> Self
+    where
+        T: Send + 'static,
+        Args: WasmTypeList + 'static,
+        Rets: WasmTypeList + 'static,
+        Kind: 'static,
+    {
+        Self::new_typed_async_erased(store, env, typed_call(func))
+    }
+
+    /// [`new_typed_async`](Self::new_typed_async), once per environment type
+    /// and signature rather than per host function.
+    #[inline(never)]
+    #[cfg(feature = "async")]
+    fn new_typed_async_erased<T, Args, Rets>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        func: Rc<dyn TypedCall<T, Args, Rets>>,
+    ) -> Self
+    where
+        T: Send + 'static,
+        Args: WasmTypeList + 'static,
+        Rets: WasmTypeList + 'static,
+    {
+        let ty = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
+        let body = typed_host_body(func, ty.clone());
+        Self::new_async_boxed(store, env, ty, Box::new(body))
+    }
+
+    #[cfg(feature = "async")]
+    fn new_async_boxed<T>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        func_ty: FunctionType,
+        func: AsyncBody<T>,
+    ) -> Self
+    where
         T: Send + 'static,
     {
         assert!(
@@ -214,7 +279,6 @@ impl Function {
             "the JavaScript host does not support WebAssembly JSPI"
         );
 
-        let func_ty: FunctionType = ty.into();
         let host = Rc::new(AsyncHost {
             func,
             env: env.clone(),
@@ -231,7 +295,6 @@ impl Function {
         )
     }
 
-    #[allow(clippy::cast_ptr_alignment)]
     pub fn new_with_env<FT, F, T: Send + 'static>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
@@ -245,8 +308,19 @@ impl Function {
             + Send
             + Sync,
     {
+        // Only this is instantiated per host function: what follows is once
+        // per environment type.
+        Self::new_with_env_boxed(store, env, ty.into(), Box::new(func))
+    }
+
+    #[allow(clippy::cast_ptr_alignment)]
+    fn new_with_env_boxed<T: Send + 'static>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        function_type: FunctionType,
+        func: DynamicBody<T>,
+    ) -> Self {
         let mut store = store.as_store_mut();
-        let function_type = ty.into();
         let func_ty = function_type.clone();
         // The host function runs with its store as the call it runs in lends
         // it, which it finds by the store's id, and holds it until it returns
@@ -257,18 +331,21 @@ impl Function {
             // Nothing but numbers: the guest calls the closure itself, with
             // no array of arguments in between.
             let arity = function_type.params().len();
-            let function = numeric::closure(arity, move |numbers| {
-                let (store, _hold) = lent::hold(store_id).map_err(trap_value)?;
-                let mut store: StoreMut = unsafe { StoreMut::from_raw(store) };
-                let _entered = enter_sync();
-                let arguments = numeric::values(function_type.params(), numbers);
-                let env: FunctionEnvMut<T> = raw_env.clone().into_mut(&mut store);
-                let results = func(env, &arguments[..numbers.len()]).map_err(trap_value)?;
-                Ok(match function_type.results() {
-                    [] => 0.0,
-                    _ => numeric::result(&results)?,
-                })
-            });
+            let function = numeric::closure(
+                arity,
+                Box::new(move |numbers| {
+                    let (store, _hold) = lent::hold(store_id).map_err(trap_value)?;
+                    let mut store: StoreMut = unsafe { StoreMut::from_raw(store) };
+                    let _entered = enter_sync();
+                    let arguments = numeric::values(function_type.params(), numbers);
+                    let env: FunctionEnvMut<T> = raw_env.clone().into_mut(&mut store);
+                    let results = func(env, &arguments[..numbers.len()]).map_err(trap_value)?;
+                    Ok(match function_type.results() {
+                        [] => 0.0,
+                        _ => numeric::result(&results)?,
+                    })
+                }),
+            );
             let function = owned(function, store.as_store_ref().objects().id());
             let vm_function = VMFunction::new(function, func_ty);
             return Self::from_vm_extern(&mut store, VMExternFunction::Js(vm_function));
@@ -714,21 +791,23 @@ enum Arguments {
     Numbers(numeric::Numbers),
 }
 
+/// The body of an async host function: given the arguments of a call, its
+/// future. Boxed, so that the glue around it is instantiated once per
+/// environment type rather than once per host function.
+#[cfg(feature = "async")]
+type AsyncBody<T> = Box<dyn Fn(AsyncEnv<T>, Vec<Value>) -> HostFuture>;
+
 /// An async host function, as the body of its import needs it.
 #[cfg(feature = "async")]
-struct AsyncHost<T, F> {
-    func: F,
+struct AsyncHost<T> {
+    func: AsyncBody<T>,
     env: FunctionEnv<T>,
     ty: FunctionType,
     store_id: wasmer_types::StoreId,
 }
 
 #[cfg(feature = "async")]
-impl<T, F> AsyncHost<T, F>
-where
-    T: 'static,
-    F: Fn(AsyncEnv<T>, Vec<Value>) -> HostFuture + 'static,
-{
+impl<T: 'static> AsyncHost<T> {
     /// The body of the `WebAssembly.Suspending` import a guest calls, given
     /// the arguments in an array: it returns the promise the guest waits on.
     /// Nothing of the host function runs here: its future runs on the
@@ -741,10 +820,14 @@ where
         let id = self.store_id;
         if numeric::takes_numbers(&self.ty) {
             let arity = self.ty.params().len();
-            let start = numeric::closure_returning_any(arity, move |numbers| {
-                let (host, args) = (Rc::clone(&self), Arguments::Numbers(numeric::copy(numbers)));
-                jspi::start(id, move || host.import(args))
-            });
+            let start = numeric::closure_returning_any(
+                arity,
+                Box::new(move |numbers| {
+                    let numbers = Arguments::Numbers(numeric::copy(numbers));
+                    let (host, args) = (Rc::clone(&self), numbers);
+                    jspi::start(id, move || host.import(args))
+                }),
+            );
             return (start.into(), false);
         }
         let start = Closure::wrap(Box::new(move |args: Array| {

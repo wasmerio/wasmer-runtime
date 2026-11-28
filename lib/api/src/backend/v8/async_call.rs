@@ -19,7 +19,7 @@ use wasmer_types::{StoreId, TrapCode};
 use super::error::Trap;
 use crate::{
     AsStoreMut, AsyncCallRequest, BackendTrap, CallStore, PollScope, PollStore, RuntimeError,
-    StoreInner, StoreMut, Value, entities::function::async_host::HostFuture,
+    StoreInner, StoreMut, Value, v8::entities::function::async_host::HostFuture,
 };
 
 /// One guest entry through V8's C API, while it runs.

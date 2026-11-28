@@ -2,26 +2,14 @@
 //! [`AsyncDynamicHostFunction`].
 
 use std::{future::Future, marker::PhantomData};
-#[cfg(any(feature = "js", feature = "v8"))]
-use std::{pin::Pin, rc::Rc};
 
-#[cfg(any(feature = "js", feature = "v8"))]
-use wasmer_types::FunctionType;
 use wasmer_types::StoreId;
 
 use super::deferred::Deferred;
-#[cfg(any(feature = "js", feature = "v8"))]
-use crate::AsStoreMut;
 use crate::{
     FunctionEnv, FunctionEnvMut, RuntimeError, StoreBusy, StoreMut, Value, WasmTypeList, WithSlice,
     utils::{FromToNativeWasmType, IntoResult},
 };
-
-/// The future of one call of an async host function, for a backend whose
-/// host functions take and return [`Value`]s.
-#[cfg(any(feature = "js", feature = "v8"))]
-pub(crate) type HostFuture =
-    Pin<Box<dyn Future<Output = Result<Vec<Value>, RuntimeError>> + 'static>>;
 
 /// What an async host function holds across `.await`. It contains no borrow of
 /// the store.
@@ -417,17 +405,6 @@ impl_async_host_function!(
     A22, A23, A24, A25, A26
 );
 
-/// Boxes the futures of the body of an async host function, for a backend
-/// that keeps them as [`HostFuture`]s.
-#[cfg(any(feature = "js", feature = "v8"))]
-pub(crate) fn boxed_body<T, F, Fut>(body: F) -> impl Fn(AsyncEnv<T>, Vec<Value>) -> HostFuture
-where
-    F: Fn(AsyncEnv<T>, Vec<Value>) -> Fut,
-    Fut: Future<Output = Result<Vec<Value>, RuntimeError>> + 'static,
-{
-    move |cx, values| -> HostFuture { Box::pin(body(cx, values)) }
-}
-
 /// A function usable as a dynamic async host function: what
 /// [`Function::new_async`](crate::Function::new_async) takes.
 ///
@@ -498,74 +475,4 @@ where
     ) -> impl Future<Output = Result<Vec<Value>, RuntimeError>> + 'e {
         self(env, values).into_results()
     }
-}
-
-/// Turns a typed async host function into the body of a dynamic one, for a
-/// backend whose host functions take and return [`Value`]s.
-#[cfg(any(feature = "js", feature = "v8"))]
-pub(crate) fn typed_host_body<T, F, Args, Rets, Kind>(
-    func: F,
-    ty: FunctionType,
-) -> impl Fn(AsyncEnv<T>, Vec<Value>) -> HostFuture + 'static
-where
-    T: 'static,
-    Kind: 'static,
-    F: AsyncHostFunction<T, Args, Rets, Kind>,
-    Args: WasmTypeList + 'static,
-    Rets: WasmTypeList + 'static,
-{
-    let func = Rc::new(func);
-    let ty = Rc::new(ty);
-    move |mut cx, values| -> HostFuture {
-        let func = Rc::clone(&func);
-        let ty = Rc::clone(&ty);
-        Box::pin(async move {
-            let args = cx.with(|mut env| args_from_values::<Args>(&mut env, &ty, &values))?;
-            let rets = func.invoke(&mut cx, args).await?;
-            cx.with(|mut env| results_to_values::<Rets>(&mut env, &ty, rets))
-        })
-    }
-}
-
-#[cfg(any(feature = "js", feature = "v8"))]
-fn args_from_values<Args: WasmTypeList>(
-    store: &mut impl AsStoreMut,
-    ty: &FunctionType,
-    values: &[Value],
-) -> Result<Args, RuntimeError> {
-    if values.len() != ty.params().len() {
-        return Err(RuntimeError::new(
-            "typed host function received wrong number of parameters",
-        ));
-    }
-    let mut raw_array = Args::empty_array();
-    for ((slot, value), expected) in raw_array.as_mut().iter_mut().zip(values).zip(ty.params()) {
-        debug_assert_eq!(
-            value.ty(),
-            *expected,
-            "wasm should only call host functions with matching signatures"
-        );
-        *slot = value.as_raw(store);
-    }
-    // Safety: the raw values were read from values of the parameter types.
-    Ok(unsafe { Args::from_array(store, raw_array) })
-}
-
-#[cfg(any(feature = "js", feature = "v8"))]
-fn results_to_values<Rets: WasmTypeList>(
-    store: &mut impl AsStoreMut,
-    ty: &FunctionType,
-    rets: Rets,
-) -> Result<Vec<Value>, RuntimeError> {
-    // The raw form of a reference does not say which store it is of, so one
-    // of another store would be read back below as one of this store.
-    if !rets.is_from_store(store) {
-        return Err(RuntimeError::new("cross-`Store` values are not supported"));
-    }
-    // Safety: the raw values are read back as the result types of `Rets`.
-    let mut raw_array = unsafe { rets.into_array(store) };
-    let results = raw_array.as_mut().iter().zip(ty.results());
-    Ok(results
-        .map(|(raw, ty)| unsafe { Value::from_raw(store, *ty, *raw) })
-        .collect())
 }

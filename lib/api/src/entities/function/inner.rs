@@ -1,7 +1,5 @@
 use wasmer_types::{FunctionType, RawValue};
 
-#[cfg(all(feature = "async", any(feature = "js", feature = "v8")))]
-use crate::entities::function::async_host::{boxed_body, typed_host_body};
 use crate::{
     AsStoreMut, AsStoreRef, CallWrapper, ExportError, Exportable, Extern, FunctionEnv,
     FunctionEnvMut, HostFunction, TypedFunction, Value, WasmTypeList, WithEnv, WithoutEnv,
@@ -223,32 +221,23 @@ impl BackendFunction {
                 crate::backend::sys::entities::function::Function::new_async(store, env, ty, func),
             ),
             #[cfg(feature = "v8")]
-            crate::BackendStore::V8(_) => {
-                Self::V8(crate::backend::v8::entities::function::Function::new_async(
-                    store,
-                    env,
-                    ty,
-                    boxed_body(func),
-                ))
-            }
+            crate::BackendStore::V8(_) => Self::V8(
+                crate::backend::v8::entities::function::Function::new_async(store, env, ty, func),
+            ),
             #[cfg(feature = "js")]
-            crate::BackendStore::Js(_) => {
-                Self::Js(crate::backend::js::entities::function::Function::new_async(
-                    store,
-                    env,
-                    ty,
-                    boxed_body(func),
-                ))
-            }
+            crate::BackendStore::Js(_) => Self::Js(
+                crate::backend::js::entities::function::Function::new_async(store, env, ty, func),
+            ),
         }
     }
 
     /// Creates an async host `Function` from a typed function of either
     /// kind.
     ///
-    /// On `sys` the function reads its arguments and writes its results as
-    /// the trampoline has them, and one that returns `Deferred` is called
-    /// without a future. The other backends call it as a dynamic one.
+    /// Each backend decides how. On `sys` the function reads its arguments
+    /// and writes its results as the trampoline has them, and one that
+    /// returns `Deferred` is called without a future. The other backends call
+    /// it as a dynamic one.
     #[inline]
     #[cfg(feature = "async")]
     pub(crate) fn new_typed_async<T, Args, Rets, Kind>(
@@ -270,21 +259,13 @@ impl BackendFunction {
                 ),
             ),
             #[cfg(feature = "v8")]
-            crate::BackendStore::V8(_) => {
-                let ty = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
-                let body = typed_host_body(func, ty.clone());
-                Self::V8(crate::backend::v8::entities::function::Function::new_async(
-                    store, env, ty, body,
-                ))
-            }
+            crate::BackendStore::V8(_) => Self::V8(
+                crate::backend::v8::entities::function::Function::new_typed_async(store, env, func),
+            ),
             #[cfg(feature = "js")]
-            crate::BackendStore::Js(_) => {
-                let ty = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
-                let body = typed_host_body(func, ty.clone());
-                Self::Js(crate::backend::js::entities::function::Function::new_async(
-                    store, env, ty, body,
-                ))
-            }
+            crate::BackendStore::Js(_) => Self::Js(
+                crate::backend::js::entities::function::Function::new_typed_async(store, env, func),
+            ),
         }
     }
 
