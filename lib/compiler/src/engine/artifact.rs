@@ -410,9 +410,9 @@ impl Artifact {
 
     /// Build an [`AllocatedArtifact`] from a compiled native ELF image.
     ///
-    /// Note that, unlike [`Self::allocate_elf_artifact_from_path`], no debugger
-    /// command file is registered here: the image only exists in memory, so
-    /// there is no path a debugger could load symbols from.
+    /// Note that, unlike [`Self::allocate_elf_artifact_from_path`], the image
+    /// only exists in memory: for a debugger, which loads symbols from a
+    /// path, the engine saves a copy of the image to a file.
     fn allocate_elf_artifact(
         engine_inner: &mut EngineInner,
         module_info: &ModuleInfo,
@@ -421,6 +421,10 @@ impl Artifact {
         let image = object::File::parse(elf_file_data)
             .map_err(|e| DeserializeError::CorruptedBinary(format!("cannot parse image: {e}")))?;
         let (base, map_size) = engine_inner.map_elf_binary(&image, elf_file_data)?;
+        #[cfg(all(unix, feature = "compiler"))]
+        if let Some(debugger) = engine_inner.debugger() {
+            engine_inner.register_debugger_image(elf_file_data, base, debugger)?;
+        }
         Self::allocate_elf_artifact_from_image(
             engine_inner,
             module_info,

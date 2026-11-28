@@ -118,6 +118,11 @@ pub trait CompilerConfig {
     }
 
     /// Enable generation of a debugger command file for JIT compiled frames.
+    ///
+    /// The engine adds each module it loads to `/tmp/wasmer-<debugger>.<pid>`.
+    /// A module that it does not load from a file is first saved to
+    /// `/tmp/wasmer-<debugger>.<pid>.<random>.image`, for the debugger to load
+    /// symbols from. The engine does not remove these files.
     fn enable_debugger(&mut self, _debugger: Debugger) {
         // By default we do nothing, each backend will need to customize this.
     }

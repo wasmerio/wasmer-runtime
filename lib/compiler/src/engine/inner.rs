@@ -499,6 +499,23 @@ impl EngineInner {
             .and_then(|compiler| compiler.get_debugger())
     }
 
+    /// Registers with the debugger an image that only exists in memory.
+    ///
+    /// A debugger loads the symbols of a module from a file, so the image is
+    /// first saved next to the debugger's command file.
+    #[cfg(all(not(target_arch = "wasm32"), unix, feature = "compiler"))]
+    pub(crate) fn register_debugger_image(
+        &self,
+        image: &[u8],
+        base: *mut c_void,
+        debugger: Debugger,
+    ) -> Result<(), CompileError> {
+        let path = save_debugger_image(image, debugger).map_err(|error| {
+            CompileError::Resource(format!("Cannot save the module for {debugger}: {error}"))
+        })?;
+        self.register_debugger(&path, base, debugger)
+    }
+
     #[cfg(all(not(target_arch = "wasm32"), unix, feature = "compiler"))]
     pub(crate) fn register_debugger(
         &self,
@@ -536,7 +553,9 @@ impl EngineInner {
             .create(true)
             .open(&filename)
             .map_err(|error| CompileError::Resource(format!("Cannot open {filename}: {error}")))?;
-        writeln!(file, "{command}")
+        // A single write: the engines of a process append to the same file,
+        // and the parts of a `writeln!` could interleave with theirs.
+        file.write_all(format!("{command}\n").as_bytes())
             .map_err(|error| CompileError::Resource(format!("Cannot write {filename}: {error}")))?;
 
         eprintln!("**************************");
@@ -618,6 +637,29 @@ impl EngineInner {
 
         Ok(())
     }
+}
+
+/// Saves `image` to a new file that `debugger` can load symbols from, and
+/// returns the path of that file.
+///
+/// The engine never removes the file: like the command file that points at
+/// it, it has to outlive the engine for a debugger that reads it later.
+#[cfg(all(not(target_arch = "wasm32"), unix, feature = "compiler"))]
+fn save_debugger_image(image: &[u8], debugger: Debugger) -> std::io::Result<std::path::PathBuf> {
+    let prefix = format!(
+        "wasmer-{}.{}.",
+        debugger.to_string().to_lowercase(),
+        std::process::id()
+    );
+    // A random name that is created exclusively: a process that had this pid
+    // before may have left its own images behind.
+    let mut file = tempfile::Builder::new()
+        .prefix(&prefix)
+        .suffix(".image")
+        .tempfile_in("/tmp")?;
+    file.write_all(image)?;
+    let (_, path) = file.keep().map_err(|error| error.error)?;
+    Ok(path)
 }
 
 #[cfg(feature = "compiler")]
