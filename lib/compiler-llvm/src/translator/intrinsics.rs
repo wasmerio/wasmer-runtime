@@ -1943,48 +1943,43 @@ impl<'ctx, 'a> CtxType<'ctx, 'a> {
                 let offset = offsets.vmctx_vmfunction_import(function_index);
                 let offset = intrinsics.i32_ty.const_int(offset.into(), false);
                 let vmfunction_import_ptr = unsafe {
-                    err!(cache_builder.build_gep(intrinsics.i8_ty, *ctx_ptr_value, &[offset], ""))
+                    err!(cache_builder.build_gep(
+                        intrinsics.i8_ty,
+                        *ctx_ptr_value,
+                        &[offset],
+                        "vmfunction_import_ptr",
+                    ))
                 };
-                let vmfunction_import_ptr = err!(cache_builder.build_bit_cast(
-                    vmfunction_import_ptr,
-                    intrinsics.ptr_ty,
-                    "",
-                ))
-                .into_pointer_value();
-                vmfunction_import_ptr.set_name("vmfunction_import_ptr");
 
                 let body_ptr_ptr = err!(cache_builder.build_struct_gep(
                     intrinsics.vmfunction_import_ty,
                     vmfunction_import_ptr,
                     intrinsics.vmfunction_import_body_element,
-                    "",
+                    "body_ptr_ptr",
                 ));
-                body_ptr_ptr.set_name("body_ptr_ptr");
-                let body_ptr = err!(cache_builder.build_load(intrinsics.ptr_ty, body_ptr_ptr, ""));
-                let body_ptr = err!(cache_builder.build_bit_cast(body_ptr, intrinsics.ptr_ty, ""))
-                    .into_pointer_value();
-                body_ptr.set_name("body_ptr");
+                let body_ptr =
+                    err!(cache_builder.build_load(intrinsics.ptr_ty, body_ptr_ptr, "body_ptr"))
+                        .into_pointer_value();
                 let vmctx_ptr_ptr = err!(cache_builder.build_struct_gep(
                     intrinsics.vmfunction_import_ty,
                     vmfunction_import_ptr,
                     intrinsics.vmfunction_import_vmctx_element,
-                    "",
+                    "vmctx_ptr_ptr",
                 ));
-                vmctx_ptr_ptr.set_name("vmctx_ptr_ptr");
                 let vmctx_ptr =
-                    err!(cache_builder.build_load(intrinsics.ptr_ty, vmctx_ptr_ptr, ""));
-                vmctx_ptr.set_name("vmctx_ptr");
+                    err!(cache_builder.build_load(intrinsics.ptr_ty, vmctx_ptr_ptr, "vmctx_ptr"));
                 let include_m0_param_ptr = err!(cache_builder.build_struct_gep(
                     intrinsics.vmfunction_import_ty,
                     vmfunction_import_ptr,
                     intrinsics.vmfunction_import_include_m0_param_element,
-                    "",
+                    "include_m0_param_ptr",
                 ));
-                include_m0_param_ptr.set_name("include_m0_param_ptr");
-                let imported_include_m0_param =
-                    err!(cache_builder.build_load(intrinsics.i1_ty, include_m0_param_ptr, "",))
-                        .into_int_value();
-                imported_include_m0_param.set_name("imported_include_m0_param");
+                let imported_include_m0_param = err!(cache_builder.build_load(
+                    intrinsics.i1_ty,
+                    include_m0_param_ptr,
+                    "imported_include_m0_param",
+                ))
+                .into_int_value();
 
                 Ok(entry.insert(FunctionCache {
                     func: body_ptr,
