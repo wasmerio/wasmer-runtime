@@ -22,6 +22,8 @@ use super::{super::error::Trap, check_isolate, check_owner, store::StoreHandle};
 use itertools::Itertools;
 use wasmer_types::{FunctionType, RawValue, StoreId};
 
+#[cfg(feature = "async")]
+pub(crate) mod async_host;
 pub(crate) mod env;
 pub(crate) mod typed;
 
@@ -74,7 +76,7 @@ impl Function {
     /// suspend on this backend, so the import blocks its stack until the
     /// future is ready (see `v8::async_call`).
     #[cfg(feature = "async")]
-    pub(crate) fn new_async<FT, F, T>(
+    pub(crate) fn new_async<FT, F, Fut, T>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
         ty: FT,
@@ -82,8 +84,63 @@ impl Function {
     ) -> Self
     where
         FT: Into<FunctionType>,
-        F: Fn(crate::AsyncEnv<T>, Vec<Value>) -> crate::entities::function::async_host::HostFuture
-            + 'static,
+        F: Fn(crate::AsyncEnv<T>, Vec<Value>) -> Fut + 'static,
+        Fut: std::future::Future<Output = Result<Vec<Value>, RuntimeError>> + 'static,
+        T: Send + 'static,
+    {
+        Self::new_async_boxed(store, env, ty, move |cx, values| -> async_host::HostFuture {
+            Box::pin(func(cx, values))
+        })
+    }
+
+    /// Creates an async host function from a typed one, which is called as
+    /// a dynamic one.
+    #[inline]
+    #[cfg(feature = "async")]
+    pub(crate) fn new_typed_async<T, Args, Rets, Kind>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        func: impl crate::AsyncHostFunction<T, Args, Rets, Kind>,
+    ) -> Self
+    where
+        T: Send + 'static,
+        Args: WasmTypeList + 'static,
+        Rets: WasmTypeList + 'static,
+        Kind: 'static,
+    {
+        Self::new_typed_async_erased(store, env, async_host::typed_call(func))
+    }
+
+    /// [`new_typed_async`](Self::new_typed_async), once per environment type
+    /// and signature rather than per host function.
+    #[inline(never)]
+    #[cfg(feature = "async")]
+    fn new_typed_async_erased<T, Args, Rets>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        func: std::rc::Rc<dyn async_host::TypedCall<T, Args, Rets>>,
+    ) -> Self
+    where
+        T: Send + 'static,
+        Args: WasmTypeList + 'static,
+        Rets: WasmTypeList + 'static,
+    {
+        let ty = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
+        let body = async_host::typed_host_body(func, ty.clone());
+        Self::new_async_boxed(store, env, ty, body)
+    }
+
+    /// [`new_async`](Self::new_async), from a body that boxes its futures.
+    #[cfg(feature = "async")]
+    fn new_async_boxed<FT, F, T>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        ty: FT,
+        func: F,
+    ) -> Self
+    where
+        FT: Into<FunctionType>,
+        F: Fn(crate::AsyncEnv<T>, Vec<Value>) -> async_host::HostFuture + 'static,
         T: Send + 'static,
     {
         /// The body and environment handle of an import. V8 requires a host

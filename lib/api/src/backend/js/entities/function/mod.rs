@@ -1,3 +1,5 @@
+#[cfg(feature = "async")]
+pub(crate) mod async_host;
 pub(crate) mod env;
 pub(crate) mod numeric;
 pub(crate) mod typed;
@@ -124,7 +126,9 @@ use crate::{
     vm::{VMExtern, VMExternFunction},
 };
 #[cfg(feature = "async")]
-use crate::{AsyncEnv, entities::function::async_host::HostFuture, js::jspi};
+use crate::{AsyncEnv, AsyncHostFunction, js::jspi};
+#[cfg(feature = "async")]
+use async_host::{HostFuture, TypedCall, typed_call, typed_host_body};
 
 use std::panic::{self, AssertUnwindSafe};
 
@@ -202,8 +206,10 @@ impl Function {
         ))
     }
 
+    /// Creates an async host function from its body, which takes the
+    /// arguments of a call and returns its future.
     #[cfg(feature = "async")]
-    pub(crate) fn new_async<FT, F, T>(
+    pub(crate) fn new_async<FT, F, Fut, T>(
         store: &mut impl AsStoreMut,
         env: &FunctionEnv<T>,
         ty: FT,
@@ -211,12 +217,51 @@ impl Function {
     ) -> Self
     where
         FT: Into<FunctionType>,
-        F: Fn(AsyncEnv<T>, Vec<Value>) -> HostFuture + 'static,
+        F: Fn(AsyncEnv<T>, Vec<Value>) -> Fut + 'static,
+        Fut: std::future::Future<Output = Result<Vec<Value>, RuntimeError>> + 'static,
         T: Send + 'static,
     {
         // Only this is instantiated per host function: what follows is once
         // per environment type.
-        Self::new_async_boxed(store, env, ty.into(), Box::new(func))
+        let body = move |cx, values| -> HostFuture { Box::pin(func(cx, values)) };
+        Self::new_async_boxed(store, env, ty.into(), Box::new(body))
+    }
+
+    /// Creates an async host function from a typed one, which is called as
+    /// a dynamic one.
+    #[inline]
+    #[cfg(feature = "async")]
+    pub(crate) fn new_typed_async<T, Args, Rets, Kind>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        func: impl AsyncHostFunction<T, Args, Rets, Kind>,
+    ) -> Self
+    where
+        T: Send + 'static,
+        Args: WasmTypeList + 'static,
+        Rets: WasmTypeList + 'static,
+        Kind: 'static,
+    {
+        Self::new_typed_async_erased(store, env, typed_call(func))
+    }
+
+    /// [`new_typed_async`](Self::new_typed_async), once per environment type
+    /// and signature rather than per host function.
+    #[inline(never)]
+    #[cfg(feature = "async")]
+    fn new_typed_async_erased<T, Args, Rets>(
+        store: &mut impl AsStoreMut,
+        env: &FunctionEnv<T>,
+        func: Rc<dyn TypedCall<T, Args, Rets>>,
+    ) -> Self
+    where
+        T: Send + 'static,
+        Args: WasmTypeList + 'static,
+        Rets: WasmTypeList + 'static,
+    {
+        let ty = FunctionType::new(Args::wasm_types(), Rets::wasm_types());
+        let body = typed_host_body(func, ty.clone());
+        Self::new_async_boxed(store, env, ty, Box::new(body))
     }
 
     #[cfg(feature = "async")]
