@@ -12,7 +12,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use wasmer::{
     Function, FunctionType, Global, Instance, InstantiationError, Memory, MemoryType, Module,
-    RuntimeError, Store, Table, TableType, Type, Value, imports,
+    Pages, RuntimeError, Store, Table, TableType, Type, Value, imports,
 };
 
 const GUEST: &str = r#"(module
@@ -75,7 +75,7 @@ fn a_handle_belongs_to_its_store() {
         assert!(!table.is_from_store(&second));
     }
     for memory in [
-        &Memory::new(&mut first, MemoryType::new(1, None, false)).unwrap(),
+        &Memory::new(&mut first, MemoryType::new(Pages::ONE, None, false)).unwrap(),
         exports.get_memory("memory").unwrap(),
     ] {
         assert!(memory.is_from_store(&first));
@@ -107,7 +107,7 @@ fn an_import_of_another_store_is_refused() {
     let mut second = Store::default();
     let function = Function::new_typed(&mut first, || {});
     let global = Global::new(&mut first, Value::I32(1)).unwrap();
-    let memory = Memory::new(&mut first, MemoryType::new(1, None, false)).unwrap();
+    let memory = Memory::new(&mut first, MemoryType::new(Pages::ONE, None, false)).unwrap();
     let cases = [
         (
             r#"(import "h" "x" (func))"#,
@@ -156,7 +156,7 @@ fn a_handle_used_with_another_store_panics() {
         panic_of(|| table.size(&second)),
         panic_of(|| table.get(&mut second, 0)),
         panic_of(|| memory.view(&second).data_size()),
-        panic_of(|| memory.grow(&mut second, 1)),
+        panic_of(|| memory.grow(&mut second, Pages::ONE)),
     ];
     for (index, message) in panics.iter().enumerate() {
         assert!(message.contains("wrong context"), "{index}: {message}");

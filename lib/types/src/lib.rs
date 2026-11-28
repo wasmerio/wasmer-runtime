@@ -66,9 +66,7 @@ pub use crate::types::{
     ExportType, ExternType, FunctionType, GlobalInit, GlobalType, ImportType, InitExpr, InitExprOp,
     MemoryType, Mutability, TableType, TagKind, TagType, Type, V128,
 };
-pub use crate::units::{
-    Bytes, PageCountOutOfRange, Pages, WASM_MAX_PAGES, WASM_MIN_PAGES, WASM_PAGE_SIZE,
-};
+pub use crate::units::{Bytes, Pages, PagesError, WASM_MAX_PAGES, WASM_MIN_PAGES, WASM_PAGE_SIZE};
 pub use value::{RawValue, ValueType};
 
 pub use crate::exception::CATCH_ALL_TAG_VALUE;

@@ -51,39 +51,38 @@ impl VMMemory {
         let new_memory = crate::js::memory::Memory::js_memory_from_type(&self.ty)?;
 
         let src = crate::js::memory::MemoryView::new_raw(&self.memory);
-        let amount = src.data_size() as usize;
+        let amount = src.data_size();
 
         trace!(%amount, "memory copy started");
 
         let mut dst = crate::js::memory::MemoryView::new_raw(&new_memory);
-        let dst_size = dst.data_size() as usize;
+        let dst_size = dst.data_size();
 
         if amount > dst_size {
-            let delta = amount - dst_size;
-            let pages = ((delta - 1) / WASM_PAGE_SIZE) + 1;
+            let pages = Pages::from_bytes_rounded_up(amount - dst_size)
+                .map_err(|err| MemoryError::Generic(err.to_string()))?;
 
             let our_js_memory: &crate::js::memory::JSMemory =
                 JsCast::unchecked_from_js_ref(&new_memory);
-            our_js_memory.grow(pages as u32).map_err(|err| {
+            our_js_memory.grow(pages.pages()).map_err(|err| {
                 if err.is_instance_of::<js_sys::RangeError>() {
-                    let cur_pages = dst_size;
                     MemoryError::CouldNotGrow {
-                        current: Pages(cur_pages as u32),
-                        attempted_delta: Pages(pages as u32),
+                        current: dst.size(),
+                        attempted_delta: pages,
                     }
                 } else {
-                    MemoryError::Generic(err.as_string().unwrap())
+                    MemoryError::Generic(err.as_string().unwrap_or_else(|| format!("{err:?}")))
                 }
             })?;
 
             dst = crate::js::memory::MemoryView::new_raw(&new_memory);
         }
 
-        src.copy_to_memory(amount as u64, &dst).map_err(|err| {
+        src.copy_to_memory(amount, &dst).map_err(|err| {
             wasmer_types::MemoryError::Generic(format!("failed to copy the memory - {err}"))
         })?;
 
-        trace!("memory copy finished (size={})", dst.size().bytes().0);
+        trace!("memory copy finished (size={})", dst.data_size());
 
         Ok(Self {
             memory: JsHandle::new(new_memory),
@@ -160,10 +159,18 @@ mod tests {
     use crate::{Memory, MemoryError, MemoryType, Pages, Store};
     use wasm_bindgen_test::wasm_bindgen_test;
 
+    fn memory_type(shared: bool) -> MemoryType {
+        MemoryType::new(
+            Pages::ONE,
+            Some(Pages::try_from_pages(4).unwrap()),
+            shared,
+        )
+    }
+
     #[wasm_bindgen_test]
     fn nonshared_memory_cannot_be_detached() {
         let mut store = Store::default();
-        let ty = MemoryType::new(1, Some(4), false);
+        let ty = memory_type(false);
         let source = Memory::new(&mut store, ty).unwrap();
         assert!(matches!(
             source.copy(&store),
@@ -177,7 +184,7 @@ mod tests {
             Err(MemoryError::MemoryNotShared)
         ));
         // Incorrect metadata must not turn a non-shared JS object into a shared handle.
-        let mislabeled = VMMemory::new(js, MemoryType::new(1, Some(4), true));
+        let mislabeled = VMMemory::new(js, memory_type(true));
         assert!(matches!(
             VMSharedMemory::try_from(mislabeled),
             Err(MemoryError::MemoryNotShared)
@@ -187,7 +194,7 @@ mod tests {
     #[wasm_bindgen_test]
     fn undelivered_shared_memory_fails_to_attach() {
         let mut store = Store::default();
-        let source = Memory::new(&mut store, MemoryType::new(1, Some(4), true)).unwrap();
+        let source = Memory::new(&mut store, memory_type(true)).unwrap();
         let shared = source.as_shared(&store).unwrap();
         assert!(shared.local_js_memory().is_some());
         crate::js::utils::shared_handle::forget_local_objects();
@@ -201,12 +208,12 @@ mod tests {
     #[wasm_bindgen_test]
     fn shared_copy_allocates_independent_shared_memory() {
         let mut store = Store::default();
-        let source = Memory::new(&mut store, MemoryType::new(1, Some(4), true)).unwrap();
-        source.grow(&mut store, 1u32).unwrap();
+        let source = Memory::new(&mut store, memory_type(true)).unwrap();
+        source.grow(&mut store, Pages::ONE).unwrap();
         source.view(&store).write(0, &[41]).unwrap();
         let copy = source.copy(&store).unwrap().attach(&mut store);
         assert!(copy.ty(&store).shared);
-        assert_eq!(copy.size(&store), Pages(2));
+        assert_eq!(copy.size(&store).pages(), 2);
         source.view(&store).write(0, &[99]).unwrap();
         let mut byte = [0];
         copy.view(&store).read(0, &mut byte).unwrap();

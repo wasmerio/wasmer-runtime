@@ -10,11 +10,10 @@ pub(crate) struct WasmMemoryType {
 impl WasmMemoryType {
     pub(crate) fn new(memory_type: MemoryType) -> Self {
         let limits = wasm_limits_t {
-            min: memory_type.minimum.0 as _,
+            min: memory_type.minimum.pages(),
             max: memory_type
                 .maximum
-                .map(|max| max.0 as _)
-                .unwrap_or(LIMITS_MAX_SENTINEL),
+                .map_or(LIMITS_MAX_SENTINEL, Pages::pages),
         };
 
         Self {
@@ -51,17 +50,19 @@ impl wasm_memorytype_t {
 wasm_declare_boxed_vec!(memorytype);
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn wasm_memorytype_new(limits: &wasm_limits_t) -> Box<wasm_memorytype_t> {
-    let min_pages = Pages(limits.min as _);
+pub unsafe extern "C" fn wasm_memorytype_new(
+    limits: &wasm_limits_t,
+) -> Option<Box<wasm_memorytype_t>> {
+    let min_pages = c_try!(Pages::try_from_pages(limits.min));
     let max_pages = if limits.max == LIMITS_MAX_SENTINEL {
         None
     } else {
-        Some(Pages(limits.max as _))
+        Some(c_try!(Pages::try_from_pages(limits.max)))
     };
 
-    Box::new(wasm_memorytype_t::new(MemoryType::new(
+    Some(Box::new(wasm_memorytype_t::new(MemoryType::new(
         min_pages, max_pages, false,
-    )))
+    ))))
 }
 
 #[unsafe(no_mangle)]

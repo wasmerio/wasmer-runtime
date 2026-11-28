@@ -16,12 +16,11 @@ use crate::{
 };
 use more_asserts::assert_ge;
 use std::cell::UnsafeCell;
-use std::convert::TryInto;
 use std::ptr::NonNull;
 use std::slice;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use wasmer_types::{Bytes, MemoryError, MemoryStyle, MemoryType, Pages, WASM_PAGE_SIZE};
+use wasmer_types::{MemoryError, MemoryStyle, MemoryType, Pages, WASM_PAGE_SIZE};
 
 // The memory mapped area
 #[derive(Debug)]
@@ -50,13 +49,18 @@ impl WasmMmap {
         unsafe {
             let md_ptr = self.get_vm_memory_definition();
             let md = md_ptr.as_ref();
-            Bytes::from(md.current_length).try_into().unwrap()
+            Self::pages_rounded_down(md.current_length)
         }
+    }
+
+    fn pages_rounded_down(byte_len: usize) -> Pages {
+        // A file-backed mapping may include a partial Wasm page.
+        Pages::try_from_pages(u32::try_from(byte_len / WASM_PAGE_SIZE).unwrap()).unwrap()
     }
 
     fn grow(&mut self, delta: Pages, conf: VMMemoryConfig) -> Result<Pages, MemoryError> {
         // Optimization of memory.grow 0 calls.
-        if delta.0 == 0 {
+        if delta.pages() == 0 {
             return Ok(self.size);
         }
 
@@ -100,9 +104,9 @@ impl WasmMmap {
             let request_bytes =
                 new_bytes
                     .checked_add(guard_bytes)
-                    .ok_or_else(|| MemoryError::CouldNotGrow {
-                        current: new_pages,
-                        attempted_delta: Bytes(guard_bytes).try_into().unwrap(),
+                    .ok_or(MemoryError::CouldNotGrow {
+                        current: prev_pages,
+                        attempted_delta: delta,
                     })?;
 
             let mut new_mmap =
@@ -138,9 +142,11 @@ impl WasmMmap {
     fn grow_at_least(&mut self, min_size: u64, conf: VMMemoryConfig) -> Result<(), MemoryError> {
         let cur_size = self.size.bytes().0 as u64;
         if cur_size < min_size {
-            let growth = min_size - cur_size;
-            let growth_pages = ((growth - 1) / WASM_PAGE_SIZE as u64) + 1;
-            self.grow(Pages(growth_pages as u32), conf)?;
+            let delta_bytes = min_size - cur_size;
+            let delta = Pages::from_bytes_rounded_up(delta_bytes).map_err(|err| {
+                MemoryError::Generic(format!("could not represent {delta_bytes} in Pages: {err}"))
+            })?;
+            self.grow(delta, conf)?;
         }
 
         Ok(())
@@ -148,7 +154,7 @@ impl WasmMmap {
 
     /// Resets the memory down to a zero size
     fn reset(&mut self) -> Result<(), MemoryError> {
-        self.size.0 = 0;
+        self.size = Pages::ZERO;
         // update memory definition
         unsafe {
             let mut md_ptr = self.vm_memory_definition.as_ptr();
@@ -320,7 +326,8 @@ impl VMOwnedMemory {
                     return Err(MemoryError::InvalidMemory {
                         reason: format!(
                             "the maximum ({} pages) is less than the minimum ({} pages)",
-                            max.0, memory.minimum.0
+                            max.pages(),
+                            memory.minimum.pages()
                         ),
                     });
                 }
@@ -374,7 +381,7 @@ impl VMOwnedMemory {
                     })))
                 },
                 alloc,
-                size: Bytes::from(mem_length).try_into().unwrap(),
+                size: WasmMmap::pages_rounded_down(mem_length),
             };
 
             Ok(Self {
@@ -766,7 +773,7 @@ impl VMMemory {
 
     /// Returns the number of pages in the allocated memory block
     pub fn get_runtime_size(&self) -> u32 {
-        self.0.size().0
+        self.0.size().pages()
     }
 
     /// Create a new linear memory instance with specified minimum and maximum number of wasm pages.

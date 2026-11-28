@@ -145,7 +145,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Here is where the fun begins
     let base = BaseTunables::new();
-    let tunables = LimitingTunables::new(base, Pages(24));
+    let limit = Pages::try_from_pages(24)?;
+    let tunables = LimitingTunables::new(base, limit);
     let mut engine: Engine = compiler.into();
     engine.set_tunables(tunables);
 
@@ -172,7 +173,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let first_memory = memories.pop().unwrap();
     println!("Memory of this instance: {first_memory:?}");
-    assert_eq!(first_memory.ty(&store).maximum.unwrap(), Pages(24));
+    assert_eq!(first_memory.ty(&store).maximum, Some(limit));
 
     Ok(())
 }

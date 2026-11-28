@@ -69,9 +69,11 @@ impl<'a> MemoryView<'a> {
     /// # use wasmer::{Memory, MemoryType, Pages, Store, Type, Value};
     /// # let mut store = Store::default();
     /// #
-    /// let m = Memory::new(&mut store, MemoryType::new(1, None, false)).unwrap();
+    /// let page = Pages::ONE;
+    /// let m = Memory::new(&mut store, MemoryType::new(page, None, false))?;
     ///
-    /// assert_eq!(m.view(&mut store).size(), Pages(1));
+    /// assert_eq!(m.view(&mut store).size(), page);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn size(&self) -> Pages {
         self.0.size()

@@ -11,7 +11,7 @@ mod tests {
     use crate::sys::NativeEngineExt;
     use std::ptr::NonNull;
     use wasmer_compiler::Tunables;
-    use wasmer_types::MemoryType;
+    use wasmer_types::{MemoryType, Pages};
     use wasmer_vm::{
         MemoryError, MemoryStyle, TableStyle, VMConfig, VMMemory, VMMemoryDefinition, VMTable,
         VMTableDefinition,
@@ -22,15 +22,16 @@ mod tests {
         let tunables = BaseTunables::new();
 
         // No maximum: treat as wasm32 maximum, so static.
-        let requested = MemoryType::new(3, None, true);
+        let minimum = Pages::try_from_pages(3).unwrap();
+        let requested = MemoryType::new(minimum, None, true);
         let style = tunables.memory_style(&requested);
         match style {
             MemoryStyle::Static => {}
             s => panic!("Unexpected memory style: {s:?}"),
         }
 
-        // Large maximum
-        let requested = MemoryType::new(3, Some(5_000_000), true);
+        // Largest valid maximum.
+        let requested = MemoryType::new(minimum, Some(Pages::max_value()), true);
         let style = tunables.memory_style(&requested);
         match style {
             MemoryStyle::Static => {}
@@ -38,7 +39,7 @@ mod tests {
         }
 
         // Small maximum
-        let requested = MemoryType::new(3, Some(16), true);
+        let requested = MemoryType::new(minimum, Some(Pages::try_from_pages(16).unwrap()), true);
         let style = tunables.memory_style(&requested);
         match style {
             MemoryStyle::Static => {}

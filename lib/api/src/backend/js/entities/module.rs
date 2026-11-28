@@ -519,7 +519,7 @@ impl Module {
                             "memory" => {
                                 // The javascript API does not yet expose these properties so without
                                 // the type_hints we don't know what memory to import.
-                                let memory_type = MemoryType::new(Pages(1), None, false);
+                                let memory_type = MemoryType::new(Pages::ONE, None, false);
                                 ExternType::Memory(memory_type)
                             }
                             "table" => {
@@ -630,7 +630,7 @@ impl Module {
                             ExternType::Global(global_type)
                         }
                         "memory" => {
-                            let memory_type = MemoryType::new(Pages(1), None, false);
+                            let memory_type = MemoryType::new(Pages::ONE, None, false);
                             ExternType::Memory(memory_type)
                         }
                         "table" => {
@@ -769,7 +769,7 @@ mod tests {
             panic!("expected a memory import");
         };
         assert!(memory.shared);
-        assert_eq!(memory.maximum.map(|pages| pages.0), Some(16));
+        assert_eq!(memory.maximum.map(|pages| pages.pages()), Some(16));
         assert!(matches!(imports[1].ty(), ExternType::Function(f) if f.params().len() == 1));
         let exports = module.exports().map(|e| e.name().to_owned()).collect::<Vec<_>>();
         assert_eq!(exports, ["g", "h"]);

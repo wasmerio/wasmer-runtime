@@ -198,9 +198,12 @@ fn call_with_static_data_pointers(mut config: crate::Config) -> Result<()> {
     let mut env = FunctionEnv::new(&mut store, env);
     let memory = Memory::new(
         &mut store,
-        MemoryType::new(Pages(1024), Some(Pages(2048)), false),
-    )
-    .unwrap();
+        MemoryType::new(
+            Pages::try_from_pages(1024)?,
+            Some(Pages::try_from_pages(2048)?),
+            false,
+        ),
+    )?;
     env.as_mut(&mut store).memory = Some(memory.clone());
     let mut exports = Exports::new();
     exports.insert("memory", memory);
@@ -791,15 +794,17 @@ fn issue_5795_memory_reset_size(mut config: crate::Config) {
     let instance = Instance::new(&mut store, &module, &imports! {}).unwrap();
     let memory = instance.exports.get_memory("memory").unwrap();
 
-    let _ = memory.grow(&mut store, 999).unwrap();
+    let _ = memory
+        .grow(&mut store, Pages::try_from_pages(999).unwrap())
+        .unwrap();
     memory.reset(&mut store);
 
     assert_eq!(memory.size(&store).bytes().0, 0);
-    assert_eq!(memory.view(&store).size().0, 0);
+    assert_eq!(memory.view(&store).size(), Pages::ZERO);
 
-    assert_eq!(memory.grow(&mut store, 1).unwrap().0, 0);
+    assert_eq!(memory.grow(&mut store, Pages::ONE).unwrap(), Pages::ZERO);
 
-    assert_eq!(memory.view(&store).size().0, 1);
+    assert_eq!(memory.view(&store).size(), Pages::ONE);
 }
 
 #[compiler_test(issues)]
@@ -1801,7 +1806,11 @@ fn static_memory_calls(enable_m0: bool) -> Result<()> {
 
     let tunables = BaseTunables::new();
     assert!(matches!(
-        tunables.memory_style(&MemoryType::new(1, Some(2), false)),
+        tunables.memory_style(&MemoryType::new(
+            Pages::ONE,
+            Some(Pages::try_from_pages(2).unwrap()),
+            false,
+        )),
         MemoryStyle::Static
     ));
     let mut engine = EngineBuilder::new(config).engine();
@@ -2097,7 +2106,8 @@ fn indirect_call_runtime_m0_abi(mut config: crate::Config) -> Result<()> {
             i32.const 0 i32.load local.get 0 i32.add))
     "#,
     )?;
-    let memory = Memory::new(&mut store, MemoryType::new(1, Some(1), false))?;
+    let page = Pages::ONE;
+    let memory = Memory::new(&mut store, MemoryType::new(page, Some(page), false))?;
     memory.view(&store).write(0, &73_i32.to_le_bytes())?;
     let provider = Instance::new(
         &mut store,

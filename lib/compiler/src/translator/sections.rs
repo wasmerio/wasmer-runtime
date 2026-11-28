@@ -110,6 +110,21 @@ pub fn parse_type_section(
     Ok(())
 }
 
+fn wpmemorytype_to_type(ty: WPMemoryType) -> WasmResult<MemoryType> {
+    if ty.memory64 {
+        return Err(wasm_unsupported!("64bit memory not implemented yet"));
+    }
+    let pages = |count| {
+        let count = u32::try_from(count).map_err(|_| WasmError::ImplLimitExceeded)?;
+        Pages::try_from_pages(count).map_err(|_| WasmError::ImplLimitExceeded)
+    };
+    Ok(MemoryType::new(
+        pages(ty.initial)?,
+        ty.maximum.map(pages).transpose()?,
+        ty.shared,
+    ))
+}
+
 /// Parses the Import section of the wasm module.
 pub fn parse_import_section<'data>(
     imports: ImportSectionReader<'data>,
@@ -143,22 +158,9 @@ pub fn parse_import_section<'data>(
             TypeRef::Tag(t) => {
                 environ.declare_tag_import(t, module_name, field_name)?;
             }
-            TypeRef::Memory(WPMemoryType {
-                shared,
-                memory64,
-                initial,
-                maximum,
-                ..
-            }) => {
-                if memory64 {
-                    unimplemented!("64bit memory not implemented yet");
-                }
+            TypeRef::Memory(ty) => {
                 environ.declare_memory_import(
-                    MemoryType {
-                        minimum: Pages(initial as u32),
-                        maximum: maximum.map(|p| Pages(p as u32)),
-                        shared,
-                    },
+                    wpmemorytype_to_type(ty)?,
                     module_name,
                     field_name,
                 )?;
@@ -244,21 +246,8 @@ pub fn parse_memory_section(
     environ.reserve_memories(memories.count())?;
 
     for entry in memories {
-        let WPMemoryType {
-            shared,
-            memory64,
-            initial,
-            maximum,
-            ..
-        } = entry.map_err(from_binaryreadererror_wasmerror)?;
-        if memory64 {
-            unimplemented!("64bit memory not implemented yet");
-        }
-        environ.declare_memory(MemoryType {
-            minimum: Pages(initial as u32),
-            maximum: maximum.map(|p| Pages(p as u32)),
-            shared,
-        })?;
+        let ty = entry.map_err(from_binaryreadererror_wasmerror)?;
+        environ.declare_memory(wpmemorytype_to_type(ty)?)?;
     }
 
     Ok(())

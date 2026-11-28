@@ -26,10 +26,10 @@ pub fn spectest_importobject(store: &mut Store) -> Imports {
     let ty = TableType::new(Type::FuncRef, 10, Some(20));
     let table = Table::new(store, ty, Value::FuncRef(None)).unwrap();
 
-    let ty = MemoryType::new(1, Some(2), false);
+    let ty = MemoryType::new(Pages::ONE, Some(Pages::try_from_pages(2).unwrap()), false);
     let memory = Memory::new(store, ty).unwrap();
 
-    let ty = MemoryType::new(1, Some(2), true);
+    let ty = MemoryType::new(Pages::ONE, Some(Pages::try_from_pages(2).unwrap()), true);
     let shared_memory = Memory::new(store, ty).unwrap();
 
     imports! {

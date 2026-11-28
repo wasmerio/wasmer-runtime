@@ -17,8 +17,9 @@ fn called_through_foreign_frames<R>(f: impl FnOnce() -> R) -> R {
 /// A memory the host can grow, shared where the backend allows it (the case
 /// the API exists for) and plain where it does not.
 fn growable_memory(store: &mut Store) -> Memory {
-    let shared = MemoryType::new(Pages(1), Some(Pages(4)), true);
-    let owned = MemoryType::new(Pages(1), Some(Pages(4)), false);
+    let max = Pages::try_from_pages(4).unwrap();
+    let shared = MemoryType::new(Pages::ONE, Some(max), true);
+    let owned = MemoryType::new(Pages::ONE, Some(max), false);
     Memory::new(&mut *store, shared)
         .or_else(|_| Memory::new(&mut *store, owned))
         .expect("create memory")
@@ -94,7 +95,9 @@ fn store_is_lent_out_only_while_parked() -> Result<(), String> {
                                 && memory.is_from_store(&*store);
                             // The whole point: reach the store's ordinary API from
                             // code that was never given a store.
-                            memory.grow(store, Pages(1)).expect("grow the lent memory");
+                            memory
+                                .grow(store, Pages::ONE)
+                                .expect("grow the lent memory");
                         })
                     })
                 })
@@ -138,7 +141,9 @@ fn store_is_lent_out_only_while_parked() -> Result<(), String> {
     );
     assert_eq!(
         Some(memory.view(&store).size()),
-        report.size_before_grow.map(|before| before + Pages(1)),
+        report
+            .size_before_grow
+            .and_then(|before| before.checked_add(Pages::ONE)),
         "a grow through the lent store must be visible to its owner"
     );
 
