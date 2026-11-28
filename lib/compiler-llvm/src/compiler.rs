@@ -315,12 +315,4 @@ impl Compiler for LLVMCompiler {
             module_hash,
         )
     }
-
-    /// Add suggested optimizations to this compiler.
-    fn with_opts(
-        &mut self,
-        _suggested_compiler_opts: &wasmer_types::target::UserCompilerOptimizations,
-    ) -> Result<(), CompileError> {
-        Ok(())
-    }
 }

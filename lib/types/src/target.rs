@@ -239,14 +239,3 @@ impl Default for Target {
         }
     }
 }
-
-/// User-suggested optimization that might be operated on the module when (and if) compiled.
-///
-// Note: This type is a copy of `wasmer_config::package::SuggestedCompilerOptimizations`, so to
-// avoid dependencies on `wasmer_config` for crates that already depend on `wasmer_types`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
-pub struct UserCompilerOptimizations {
-    /// DEPRECATED: The `pass_params` (also known as m0) optimization is enabled (or disabled) globally
-    /// in the LLVM configuration. This field is kept for backward compatibility.
-    pub pass_params: Option<bool>,
-}

@@ -345,15 +345,6 @@ impl Engine {
     pub fn tunables(&self) -> &dyn Tunables {
         self.tunables.as_ref()
     }
-
-    /// Add suggested optimizations to this engine.
-    #[deprecated(note = "User compilation options are currently unused")]
-    pub fn with_opts(
-        &mut self,
-        _suggested_opts: &wasmer_types::target::UserCompilerOptimizations,
-    ) -> Result<(), CompileError> {
-        Ok(())
-    }
 }
 
 impl std::fmt::Debug for Engine {
